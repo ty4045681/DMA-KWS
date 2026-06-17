@@ -78,6 +78,32 @@ Then install the project Python dependencies:
 pip install -r requirements.txt
 ```
 
+`g2p_en` uses NLTK data files at runtime. Download them once inside the same conda environment before preparing
+phoneme manifests:
+
+```bash
+python3 - <<'PY'
+import nltk
+
+for pkg in [
+    "averaged_perceptron_tagger_eng",
+    "averaged_perceptron_tagger",
+    "cmudict",
+    "punkt",
+    "punkt_tab",
+]:
+    print(f"Downloading {pkg} ...")
+    nltk.download(pkg)
+PY
+```
+
+If the training server cannot access the internet, download the same NLTK data on another machine and copy the
+`nltk_data` directory to one of the paths shown by the error message, for example `/root/nltk_data`, or set:
+
+```bash
+export NLTK_DATA=/path/to/nltk_data
+```
+
 Check lightweight local tests and script entry points:
 
 ```bash
@@ -250,6 +276,19 @@ If your LibriSpeech data was downloaded from HuggingFace as parquet shards, for 
 ```
 
 prepare the training manifest directly from those shards:
+
+```bash
+python3 scripts/prepare_stage1_librispeech.py \
+  --config configs/demo_librispeech100.yaml \
+  --limit 100 \
+  --input-format hf-parquet \
+  --parquet-root /home/h00513998/librispeech_train_clean_360 \
+  --parquet-split train-clean-360 \
+  --dev-parquet-root /home/h00513998/librispeech_dev_clean \
+  --dev-parquet-split dev-clean
+```
+
+Remove `--limit 100` for the full run after the smoke run completes:
 
 ```bash
 python3 scripts/prepare_stage1_librispeech.py \
@@ -499,6 +538,53 @@ Install requirements:
 ```bash
 pip install -r requirements.txt
 ```
+
+### `Resource 'averaged_perceptron_tagger_eng' not found`
+
+This comes from `g2p_en` calling NLTK's POS tagger while converting text to phonemes. Download the required NLTK
+runtime data in the active environment:
+
+```bash
+python3 - <<'PY'
+import nltk
+
+for pkg in [
+    "averaged_perceptron_tagger_eng",
+    "averaged_perceptron_tagger",
+    "cmudict",
+    "punkt",
+    "punkt_tab",
+]:
+    nltk.download(pkg)
+PY
+```
+
+To install into a specific shared directory:
+
+```bash
+mkdir -p /root/nltk_data
+
+python3 -m nltk.downloader \
+  -d /root/nltk_data \
+  averaged_perceptron_tagger_eng averaged_perceptron_tagger cmudict punkt punkt_tab
+```
+
+Verify:
+
+```bash
+python3 - <<'PY'
+from nltk.data import find
+
+for path in [
+    "taggers/averaged_perceptron_tagger_eng/",
+    "corpora/cmudict",
+]:
+    print(path, "=>", find(path))
+PY
+```
+
+For offline servers, copy a prepared `nltk_data` directory to one of NLTK's search paths, or set `NLTK_DATA` to
+that directory before running the preparation scripts.
 
 ### Stage II parquet columns do not match
 
