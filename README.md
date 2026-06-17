@@ -223,6 +223,33 @@ python3 scripts/prepare_stage1_librispeech.py \
   --config configs/demo_librispeech100.yaml
 ```
 
+If your LibriSpeech data was downloaded from HuggingFace as parquet shards, for example:
+
+```text
+/home/h00513998/librispeech_train_clean_360/
+├── 0000.parquet
+├── 0001.parquet
+└── ...
+```
+
+prepare the training manifest directly from those shards:
+
+```bash
+python3 scripts/prepare_stage1_librispeech.py \
+  --config configs/demo_librispeech100.yaml \
+  --input-format hf-parquet \
+  --parquet-root /home/h00513998/librispeech_train_clean_360 \
+  --parquet-split train-clean-360
+```
+
+This mode extracts `audio.bytes` from the parquet records into:
+
+```text
+/data/dma-kws/processed/stage1_phoneme_ctc/audio/train-clean-360/
+```
+
+and writes `train.jsonl` with `wav_path` values pointing at the extracted audio files.
+
 Notes:
 
 - The script uses `g2p_en` to convert English transcripts to ARPAbet-like phonemes.

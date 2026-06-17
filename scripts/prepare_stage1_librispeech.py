@@ -15,13 +15,35 @@ from typing import Iterable
 
 from dma_kws.config import load_config, require_sections
 from dma_kws.phonemes import PhonemeVocabulary, normalize_english_text
-from dma_kws.stage1.librispeech import iter_librispeech_utterances, strip_stress_marker
+from dma_kws.stage1.librispeech import (
+    ParquetAudioUtterance,
+    iter_librispeech_parquet_utterances,
+    iter_librispeech_utterances,
+    strip_stress_marker,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="Path to YAML config")
     parser.add_argument("--limit", type=int, default=0, help="Optional max utterances per split for smoke runs")
+    parser.add_argument(
+        "--input-format",
+        choices=("librispeech-dir", "hf-parquet"),
+        default="librispeech-dir",
+        help="Input format for the training split. Default keeps the official LibriSpeech directory layout.",
+    )
+    parser.add_argument("--parquet-root", default="", help="Directory or file containing HuggingFace parquet shard(s)")
+    parser.add_argument(
+        "--parquet-split",
+        default="",
+        help="Split label to write into the training manifest for --input-format hf-parquet",
+    )
+    parser.add_argument(
+        "--parquet-audio-dir",
+        default="",
+        help="Optional directory for audio extracted from parquet bytes",
+    )
     return parser.parse_args()
 
 
@@ -72,6 +94,56 @@ def prepare_split(
     return all_phones
 
 
+def _parquet_utterance_audio_path(utt: ParquetAudioUtterance, audio_output_dir: Path) -> Path:
+    if utt.audio_bytes is not None:
+        speaker_id = utt.speaker_id or "_unknown_speaker"
+        chapter_id = utt.chapter_id or "_unknown_chapter"
+        extension = utt.audio_extension or ".flac"
+        output_path = audio_output_dir / speaker_id / chapter_id / f"{utt.utt_id}{extension}"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(utt.audio_bytes)
+        return output_path
+    if utt.audio_path is not None:
+        return utt.audio_path
+    raise ValueError(
+        f"Parquet utterance {utt.utt_id} has neither audio bytes nor a local audio path; "
+        "download parquet shards with the audio column or convert them to local audio files first."
+    )
+
+
+def prepare_parquet_split(
+    *,
+    g2p,
+    parquet_root: Path,
+    split: str,
+    output_path: Path,
+    audio_output_dir: Path,
+    limit: int,
+) -> list[str]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    all_phones: list[str] = []
+    count = 0
+    with output_path.open("w", encoding="utf-8") as writer:
+        for utt in iter_librispeech_parquet_utterances(parquet_root, split=split):
+            wav_path = _parquet_utterance_audio_path(utt, audio_output_dir)
+            phones = text_to_phonemes(g2p, utt.text)
+            all_phones.extend(phones)
+            record = {
+                "utt_id": utt.utt_id,
+                "split": utt.split,
+                "wav_path": str(wav_path),
+                "text": utt.text,
+                "normalized_text": normalize_english_text(utt.text),
+                "phonemes": phones,
+            }
+            writer.write(json.dumps(record, ensure_ascii=False) + "\n")
+            count += 1
+            if limit and count >= limit:
+                break
+    print(f"Wrote {count} parquet utterances to {output_path}")
+    return all_phones
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -86,13 +158,27 @@ def main() -> None:
     dev_splits = stage1.get("dev_splits", ["dev-clean"])
 
     g2p = make_g2p()
-    train_phones = prepare_split(
-        g2p=g2p,
-        librispeech_root=librispeech_root,
-        splits=train_splits,
-        output_path=output_dir / "train.jsonl",
-        limit=args.limit,
-    )
+    if args.input_format == "hf-parquet":
+        if not args.parquet_root:
+            raise SystemExit("--parquet-root is required when --input-format hf-parquet")
+        parquet_split = args.parquet_split or (train_splits[0] if train_splits else "train-clean-360")
+        parquet_audio_dir = Path(args.parquet_audio_dir) if args.parquet_audio_dir else output_dir / "audio" / parquet_split
+        train_phones = prepare_parquet_split(
+            g2p=g2p,
+            parquet_root=Path(args.parquet_root),
+            split=parquet_split,
+            output_path=output_dir / "train.jsonl",
+            audio_output_dir=parquet_audio_dir,
+            limit=args.limit,
+        )
+    else:
+        train_phones = prepare_split(
+            g2p=g2p,
+            librispeech_root=librispeech_root,
+            splits=train_splits,
+            output_path=output_dir / "train.jsonl",
+            limit=args.limit,
+        )
     prepare_split(
         g2p=g2p,
         librispeech_root=librispeech_root,
