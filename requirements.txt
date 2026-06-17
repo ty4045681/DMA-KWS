@@ -11,3 +11,4 @@ tqdm
 pytorch-lightning
 torchmetrics
 transformers
+huggingface_hub
