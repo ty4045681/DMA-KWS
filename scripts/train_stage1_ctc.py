@@ -32,6 +32,26 @@ def read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def _sum_loss_part(value):
+    if hasattr(value, "sum"):
+        return value.sum()
+    if isinstance(value, (list, tuple)):
+        return sum(value)
+    return value
+
+
+def reduce_stage1_loss(loss_output):
+    """Reduce possibly gathered DataParallel CTC loss parts to one scalar.
+
+    ``Stage1CTCModel.forward`` returns ``(local_loss_sum, local_batch_size)``.
+    With ``nn.DataParallel`` each per-GPU scalar is gathered into a vector, so
+    reducing both parts here keeps ``backward()`` scalar-valued and preserves a
+    proper batch-size weighted mean for uneven last batches.
+    """
+    loss_sum, batch_size = loss_output
+    return _sum_loss_part(loss_sum) / _sum_loss_part(batch_size)
+
+
 def train(args: argparse.Namespace) -> None:
     try:
         import torch
@@ -129,7 +149,8 @@ def train(args: argparse.Namespace) -> None:
             encoder_out, encoder_mask = self.encoder(feats, feat_lengths)
             encoder_lens = encoder_mask.squeeze(1).sum(1)
             loss, _ = self.ctc(encoder_out, encoder_lens, targets, target_lengths)
-            return loss
+            batch_size = loss.new_tensor(feats.size(0))
+            return loss * batch_size, batch_size
 
     dataset = Stage1Dataset(train_manifest)
     if len(dataset) == 0:
@@ -159,7 +180,9 @@ def train(args: argparse.Namespace) -> None:
     for epoch in range(max_epochs):
         for batch in dataloader:
             batch = {key: value.to(device) for key, value in batch.items()}
-            loss = model(batch["feats"], batch["feat_lengths"], batch["targets"], batch["target_lengths"])
+            loss = reduce_stage1_loss(
+                model(batch["feats"], batch["feat_lengths"], batch["targets"], batch["target_lengths"])
+            )
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(stage1.get("gradient_clip_val", 1.0)))

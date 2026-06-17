@@ -107,6 +107,7 @@ def train(args: argparse.Namespace) -> None:
             "feats": pad_sequence(feats, batch_first=True, padding_value=0.0),
             "feat_lengths": torch.tensor([feat.size(0) for feat in feats], dtype=torch.long),
             "anchors": pad_sequence(anchors, batch_first=True, padding_value=0),
+            "anchor_lengths": torch.tensor([anchor.size(0) for anchor in anchors], dtype=torch.long),
             "labels": torch.stack([item["label"] for item in batch]),
         }
 
@@ -136,9 +137,10 @@ def train(args: argparse.Namespace) -> None:
                 post_num_layers=int(stage2.get("qbyt_layers", 2)),
             )
 
-        def forward(self, feats, feat_lengths, anchors):
-            encoder_out, _ = self.encoder(feats, feat_lengths)
-            logits, _ = self.qbyt(encoder_out, anchors)
+        def forward(self, feats, feat_lengths, anchors, anchor_lengths):
+            encoder_out, encoder_mask = self.encoder(feats, feat_lengths)
+            encoder_lens = encoder_mask.squeeze(1).sum(1)
+            logits, _ = self.qbyt(encoder_out, anchors, encoder_lens, anchor_lengths)
             return logits
 
     dataset = Stage2Dataset(pair_path)
@@ -176,7 +178,7 @@ def train(args: argparse.Namespace) -> None:
     while global_step < max_steps:
         for batch in dataloader:
             batch = {key: value.to(device) for key, value in batch.items()}
-            logits = model(batch["feats"], batch["feat_lengths"], batch["anchors"])
+            logits = model(batch["feats"], batch["feat_lengths"], batch["anchors"], batch["anchor_lengths"])
             loss = F.binary_cross_entropy_with_logits(logits, batch["labels"])
             optimizer.zero_grad()
             loss.backward()

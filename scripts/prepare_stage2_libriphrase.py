@@ -39,7 +39,18 @@ def make_g2p():
 
 def text_to_phonemes(g2p, text: str) -> list[str]:
     normalized = normalize_english_text(text)
-    return [strip_stress_marker(phone) for phone in g2p(normalized) if phone != " "]
+    return clean_phoneme_tokens(g2p(normalized))
+
+
+def clean_phoneme_tokens(tokens) -> list[str]:
+    phonemes: list[str] = []
+    for phone in tokens:
+        if phone == " ":
+            continue
+        cleaned = strip_stress_marker(str(phone)).strip()
+        if cleaned:
+            phonemes.append(cleaned)
+    return phonemes
 
 
 def parse_clips(raw_clips: Any) -> list[str]:
@@ -91,7 +102,7 @@ def main() -> None:
     for _, row in df.iterrows():
         text = str(row["ngram"])
         if "ngram_g2p" in df.columns and row.get("ngram_g2p"):
-            phonemes = [strip_stress_marker(phone) for phone in str(row["ngram_g2p"]).split()]
+            phonemes = clean_phoneme_tokens(str(row["ngram_g2p"]).split())
         else:
             phonemes = text_to_phonemes(g2p, text)
         clips = parse_clips(row["clips"])

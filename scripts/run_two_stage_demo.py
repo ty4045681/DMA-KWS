@@ -40,7 +40,69 @@ def make_g2p():
 
 def text_to_phonemes(g2p, text: str) -> list[str]:
     normalized = normalize_english_text(text)
-    return [strip_stress_marker(phone) for phone in g2p(normalized) if phone != " "]
+    return clean_phoneme_tokens(g2p(normalized))
+
+
+def clean_phoneme_tokens(tokens) -> list[str]:
+    phonemes: list[str] = []
+    for phone in tokens:
+        if phone == " ":
+            continue
+        cleaned = strip_stress_marker(str(phone)).strip()
+        if cleaned:
+            phonemes.append(cleaned)
+    return phonemes
+
+
+def num_fbank_frames(
+    num_samples: int,
+    *,
+    sample_rate: int,
+    frame_length_ms: float = 25.0,
+    frame_shift_ms: float = 10.0,
+) -> int:
+    frame_length_samples = round(sample_rate * frame_length_ms / 1000.0)
+    frame_shift_samples = round(sample_rate * frame_shift_ms / 1000.0)
+    if num_samples < frame_length_samples:
+        return 0
+    return 1 + (num_samples - frame_length_samples) // frame_shift_samples
+
+
+def min_samples_for_fbank_frames(
+    min_frames: int,
+    *,
+    sample_rate: int,
+    frame_length_ms: float = 25.0,
+    frame_shift_ms: float = 10.0,
+) -> int:
+    if min_frames <= 0:
+        return 0
+    frame_length_samples = round(sample_rate * frame_length_ms / 1000.0)
+    frame_shift_samples = round(sample_rate * frame_shift_ms / 1000.0)
+    return frame_length_samples + (min_frames - 1) * frame_shift_samples
+
+
+def has_min_fbank_frames(
+    num_samples: int,
+    *,
+    min_frames: int,
+    sample_rate: int,
+    frame_length_ms: float = 25.0,
+    frame_shift_ms: float = 10.0,
+) -> bool:
+    return num_samples >= min_samples_for_fbank_frames(
+        min_frames,
+        sample_rate=sample_rate,
+        frame_length_ms=frame_length_ms,
+        frame_shift_ms=frame_shift_ms,
+    )
+
+
+def load_model_state(model, ckpt_path: str, load_fn):
+    ckpt = load_fn(ckpt_path, map_location="cpu")
+    state = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(state, strict=True)
+    return model
 
 
 def run(args: argparse.Namespace) -> None:
@@ -117,15 +179,17 @@ def run(args: argparse.Namespace) -> None:
                 post_num_layers=int(stage2.get("qbyt_layers", 2)),
             )
 
-        def forward(self, feats, feat_lengths, anchors):
-            encoder_out, _ = self.encoder(feats, feat_lengths)
-            logits, _ = self.qbyt(encoder_out, anchors)
+        def forward(self, feats, feat_lengths, anchors, anchor_lengths):
+            encoder_out, encoder_mask = self.encoder(feats, feat_lengths)
+            encoder_lens = encoder_mask.squeeze(1).sum(1)
+            logits, _ = self.qbyt(encoder_out, anchors, encoder_lens, anchor_lengths)
             return torch.sigmoid(logits)
 
     def load_state(model, ckpt_path: str):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        state = ckpt.get("model_state_dict", ckpt)
-        model.load_state_dict(state, strict=False)
+        try:
+            load_model_state(model, ckpt_path, torch.load)
+        except RuntimeError as exc:
+            raise SystemExit(f"Checkpoint {ckpt_path} is incompatible with the model architecture: {exc}") from exc
         return model.to(device).eval()
 
     waveform, sr = torchaudio.load(args.audio)
@@ -177,10 +241,18 @@ def run(args: argparse.Namespace) -> None:
     stage2_model = load_state(Stage2Model(), args.stage2_ckpt)
     stage2_scores = []
     anchor = torch.tensor([keyword_ids], dtype=torch.long).to(device)
+    anchor_lengths = torch.tensor([len(keyword_ids)], dtype=torch.long).to(device)
+    min_stage2_fbank_frames = int(demo.get("min_stage2_fbank_frames", 7))
     for candidate in candidates:
         start = max(0, int(candidate.start_sec * sample_rate))
         end = min(waveform.size(1), int(candidate.end_sec * sample_rate))
         if end <= start:
+            continue
+        if not has_min_fbank_frames(
+            end - start,
+            min_frames=min_stage2_fbank_frames,
+            sample_rate=sample_rate,
+        ):
             continue
         candidate_wave = waveform[:, start:end]
         candidate_feat = kaldi.fbank(
@@ -193,7 +265,16 @@ def run(args: argparse.Namespace) -> None:
         ).unsqueeze(0)
         candidate_lens = torch.tensor([candidate_feat.size(1)], dtype=torch.long)
         with torch.no_grad():
-            score = float(stage2_model(candidate_feat.to(device), candidate_lens.to(device), anchor).cpu().item())
+            score = float(
+                stage2_model(
+                    candidate_feat.to(device),
+                    candidate_lens.to(device),
+                    anchor,
+                    anchor_lengths,
+                )
+                .cpu()
+                .item()
+            )
         stage2_scores.append(
             {
                 "start_sec": candidate.start_sec,

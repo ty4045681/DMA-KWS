@@ -27,7 +27,7 @@ class ModalityEmbedding(nn.Module):
         super(ModalityEmbedding, self).__init__()
         self.text_emb = nn.Parameter(torch.randn(1, 1, d_model))
         self.audio_emb = nn.Parameter(torch.randn(1, 1, d_model))
-        
+
     def forward(self, x, modality_type):
         batch_size, seq_len = x.size(0), x.size(1)
         if modality_type == 'text':
@@ -79,8 +79,13 @@ class QbyT(nn.Module):
         self.fc = nn.Linear(embed_dim, 1)
         self.seq_fc = nn.Linear(embed_dim, 1)
 
-    
-    def forward(self, speech, text):
+
+    def _padding_mask(self, lengths, max_len, device):
+        positions = torch.arange(max_len, device=device).unsqueeze(0)
+        return positions >= lengths.unsqueeze(1)
+
+
+    def forward(self, speech, text, speech_lengths=None, text_lengths=None):
         # 文本处理
         text_emb = self.text_projection(text)
         text_emb = self.pos_enc(text_emb)
@@ -92,9 +97,33 @@ class QbyT(nn.Module):
         audio_emb = self.modality_enc(audio_emb, 'audio')
 
         combined_feat = torch.cat([text_emb, audio_emb], dim=1)
-        combined_feat = self.phone_matchor(combined_feat)
+        batch_size = combined_feat.size(0)
+        if speech_lengths is None:
+            speech_lengths = torch.full(
+                (batch_size,),
+                speech.size(1),
+                device=speech.device,
+                dtype=torch.long,
+            )
+        else:
+            speech_lengths = speech_lengths.to(device=speech.device, dtype=torch.long)
+        speech_lengths = speech_lengths.clamp(min=0, max=speech.size(1))
+
+        if text_lengths is None:
+            text_lengths = text.ne(0).sum(dim=1)
+        else:
+            text_lengths = text_lengths.to(device=speech.device, dtype=torch.long)
+        text_lengths = text_lengths.clamp(min=0, max=text.size(1))
+
+        text_padding_mask = self._padding_mask(text_lengths, text.size(1), speech.device)
+        speech_padding_mask = self._padding_mask(speech_lengths, speech.size(1), speech.device)
+        padding_mask = torch.cat([text_padding_mask, speech_padding_mask], dim=1)
+
+        combined_feat = self.phone_matchor(combined_feat, src_key_padding_mask=padding_mask)
         gru_out, _ = self.gru(combined_feat)
-        gru_out = gru_out[:, -1, :]
+        combined_lengths = (text_lengths + speech_lengths).clamp(min=1, max=combined_feat.size(1))
+        last_valid_indices = (combined_lengths - 1).view(batch_size, 1, 1).expand(-1, 1, gru_out.size(-1))
+        gru_out = gru_out.gather(1, last_valid_indices).squeeze(1)
         logits = self.fc(gru_out).squeeze(-1)
 
         text_logits = self.seq_fc(combined_feat[:, :text_emb.shape[1], :]).squeeze(-1)

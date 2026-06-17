@@ -239,7 +239,9 @@ python3 scripts/prepare_stage1_librispeech.py \
   --config configs/demo_librispeech100.yaml \
   --input-format hf-parquet \
   --parquet-root /home/h00513998/librispeech_train_clean_360 \
-  --parquet-split train-clean-360
+  --parquet-split train-clean-360 \
+  --dev-parquet-root /home/h00513998/librispeech_dev_clean \
+  --dev-parquet-split dev-clean
 ```
 
 This mode extracts `audio.bytes` from the parquet records into:
@@ -248,7 +250,9 @@ This mode extracts `audio.bytes` from the parquet records into:
 /data/dma-kws/processed/stage1_phoneme_ctc/audio/train-clean-360/
 ```
 
-and writes `train.jsonl` with `wav_path` values pointing at the extracted audio files.
+and writes `train.jsonl` / `dev.jsonl` with `wav_path` values pointing at the extracted audio files. If you omit
+`--dev-parquet-root`, `paths.librispeech_root` must contain the configured dev split in the official LibriSpeech
+directory layout; otherwise the script stops instead of silently writing an empty dev manifest.
 
 Notes:
 

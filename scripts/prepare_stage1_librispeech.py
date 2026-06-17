@@ -44,6 +44,21 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional directory for audio extracted from parquet bytes",
     )
+    parser.add_argument(
+        "--dev-parquet-root",
+        default="",
+        help="Optional parquet file/directory for the dev split when --input-format hf-parquet is used",
+    )
+    parser.add_argument(
+        "--dev-parquet-split",
+        default="",
+        help="Split label to write into dev.jsonl for --dev-parquet-root",
+    )
+    parser.add_argument(
+        "--dev-parquet-audio-dir",
+        default="",
+        help="Optional directory for dev audio extracted from parquet bytes",
+    )
     return parser.parse_args()
 
 
@@ -144,6 +159,13 @@ def prepare_parquet_split(
     return all_phones
 
 
+def has_librispeech_transcripts(librispeech_root: Path, splits: Iterable[str]) -> bool:
+    for split in splits:
+        if any((librispeech_root / split).rglob("*.trans.txt")):
+            return True
+    return False
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -179,13 +201,43 @@ def main() -> None:
             output_path=output_dir / "train.jsonl",
             limit=args.limit,
         )
-    prepare_split(
-        g2p=g2p,
-        librispeech_root=librispeech_root,
-        splits=dev_splits,
-        output_path=output_dir / "dev.jsonl",
-        limit=args.limit,
-    )
+    if args.input_format == "hf-parquet":
+        if args.dev_parquet_root:
+            dev_parquet_split = args.dev_parquet_split or (dev_splits[0] if dev_splits else "dev-clean")
+            dev_parquet_audio_dir = (
+                Path(args.dev_parquet_audio_dir)
+                if args.dev_parquet_audio_dir
+                else output_dir / "audio" / dev_parquet_split
+            )
+            prepare_parquet_split(
+                g2p=g2p,
+                parquet_root=Path(args.dev_parquet_root),
+                split=dev_parquet_split,
+                output_path=output_dir / "dev.jsonl",
+                audio_output_dir=dev_parquet_audio_dir,
+                limit=args.limit,
+            )
+        elif has_librispeech_transcripts(librispeech_root, dev_splits):
+            prepare_split(
+                g2p=g2p,
+                librispeech_root=librispeech_root,
+                splits=dev_splits,
+                output_path=output_dir / "dev.jsonl",
+                limit=args.limit,
+            )
+        else:
+            raise SystemExit(
+                "No LibriSpeech dev transcripts found under paths.librispeech_root. "
+                "Pass --dev-parquet-root when using --input-format hf-parquet in a parquet-only environment."
+            )
+    else:
+        prepare_split(
+            g2p=g2p,
+            librispeech_root=librispeech_root,
+            splits=dev_splits,
+            output_path=output_dir / "dev.jsonl",
+            limit=args.limit,
+        )
 
     vocab = PhonemeVocabulary.build(train_phones)
     vocab_path = output_dir / "phoneme_vocab.txt"
