@@ -7,6 +7,11 @@ paths:
   exp_root: /data/dma-kws/exp
 
 stage1:
+  train_splits:
+    - train-clean-100
+  dev_splits:
+    - dev-clean
+  sample_rate: 16000
   input_dim: 80
   encoder_output_dim: 144
   attention_heads: 4
@@ -14,7 +19,16 @@ stage1:
   num_blocks: 6
   batch_size_per_gpu: 48
   max_epochs: 30
+  max_train_steps: 0
+  num_workers: 4
   learning_rate: 0.001
+  dropout_rate: 0.1
+  positional_dropout_rate: 0.1
+  attention_dropout_rate: 0.0
+  ctc_dropout: 0.0
+  cnn_module_kernel: 3
+  gradient_clip_val: 1.0
+  log_interval: 10
   checkpoint_dir: /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints
 
 stage2:

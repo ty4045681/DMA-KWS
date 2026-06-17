@@ -1,0 +1,13 @@
+# Core Python dependencies for data preparation and lightweight local checks.
+# On the remote GPU machine, install CUDA-enabled torch/torchaudio separately
+# following the PyTorch instructions for that machine's CUDA driver.
+PyYAML>=6.0
+pytest>=8.0
+g2p_en>=2.1.0
+numpy
+pandas
+pyarrow
+tqdm
+pytorch-lightning
+torchmetrics
+transformers
