@@ -161,12 +161,29 @@ For the small real demo, start with:
 ZhiqiAi/LibriPhrase-100
 ```
 
-Download with HuggingFace Hub:
+Download with the current Hugging Face Hub CLI. The newer CLI entrypoint is `hf`; if your environment only has
+`huggingface-cli` and it reports `invalid choice: 'download'`, upgrade `huggingface_hub` first.
 
 ```bash
-huggingface-cli download ZhiqiAi/LibriPhrase-100 \
+python3 -m pip install -U "huggingface_hub"
+
+hf download ZhiqiAi/LibriPhrase-100 \
   --repo-type dataset \
   --local-dir /data/dma-kws/raw/LibriPhrase-100
+```
+
+Fallback if the `hf` command is still unavailable after upgrading:
+
+```bash
+python3 - <<'PY'
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="ZhiqiAi/LibriPhrase-100",
+    repo_type="dataset",
+    local_dir="/data/dma-kws/raw/LibriPhrase-100",
+)
+PY
 ```
 
 The Stage II preparation script currently expects a LibriPhrase-style parquet containing at least:
