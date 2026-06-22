@@ -13,10 +13,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import numpy as np
+
 from dma_kws.config import load_config, require_sections
 from dma_kws.phonemes import normalize_english_text
 from dma_kws.stage1.librispeech import strip_stress_marker
-from dma_kws.stage2.pairs import AnchorExample, make_pair_records
+from dma_kws.stage2.pairs import (
+    AnchorExample,
+    PairRecord,
+    clip_to_audio_rel,
+    iter_decoded_audio_rows,
+    make_pair_records,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,6 +82,67 @@ def find_default_parquet(root: Path) -> Path:
     if not matches:
         raise SystemExit(f"No parquet files found under {root}; pass --input-parquet explicitly")
     return matches[0]
+
+
+def _read_parquet(path: Path):
+    import pandas as pd
+
+    return pd.read_parquet(path)
+
+
+def find_decoded_parquets(root: Path) -> list[Path]:
+    if root.is_file():
+        return [root]
+    matches = sorted(root.rglob("LP-100-decoded-*.parquet"))
+    if not matches:
+        matches = sorted(root.rglob("*.parquet"))
+    if not matches:
+        raise SystemExit(f"No decoded parquet shards found under {root}")
+    return matches
+
+
+def materialize_pairs(
+    pairs: list[PairRecord],
+    *,
+    decoded_parquet_paths: list[Path],
+    audio_dir: Path,
+    read_parquet=_read_parquet,
+) -> tuple[list[PairRecord], int]:
+    """Extract referenced clips to .npy and rewrite each pair's wav_path.
+
+    Returns (rewritten_pairs, unmatched_count). Pairs whose audio could not
+    be found in any decoded shard are dropped from the returned list.
+    """
+    needed = {clip_to_audio_rel(pair.wav_path) for pair in pairs}
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    rel_for_key: dict[str, str] = {}
+    for audio_rel, audio, _sr in iter_decoded_audio_rows(
+        decoded_parquet_paths, needed, read_parquet=read_parquet
+    ):
+        out_path = audio_dir / f"{audio_rel}.npy"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(out_path, np.asarray(audio, dtype=np.float32))
+        # wav_path is relative to audio_dir.parent (the stage2_qbyt dir)
+        rel_for_key[audio_rel] = f"{audio_dir.name}/{audio_rel}"
+
+    rewritten: list[PairRecord] = []
+    unmatched = 0
+    for pair in pairs:
+        key = clip_to_audio_rel(pair.wav_path)
+        rel = rel_for_key.get(key)
+        if rel is None:
+            unmatched += 1
+            continue
+        rewritten.append(
+            PairRecord(
+                anchor_text=pair.anchor_text,
+                anchor_phonemes=pair.anchor_phonemes,
+                wav_path=rel,
+                label=pair.label,
+                sample_rate=pair.sample_rate,
+            )
+        )
+    return rewritten, unmatched
 
 
 def main() -> None:
