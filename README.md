@@ -221,20 +221,23 @@ snapshot_download(
 PY
 ```
 
-The Stage II preparation script currently expects a LibriPhrase-style parquet containing at least:
+The Stage II preparation reads two kinds of files from the download:
 
-```text
-ngram
-clips
-```
+1. An **aggregated** parquet for phrase metadata — at least columns:
 
-and optionally:
+   ```text
+   ngram
+   clips
+   ```
 
-```text
-ngram_g2p
-```
+   and optionally `ngram_g2p` (skips on-the-fly G2P if present). Recommended:
+   `aggregated_segments_with_g2p.parquet`.
 
-If your download contains multiple parquet shards, start with one shard for a smoke run, or pass a specific merged parquet with `--input-parquet`.
+2. The **decoded** audio shards `LP-100-decoded-*.parquet` (columns
+   `audio_rel`, `audio`, `sampling_rate`, ...). The script extracts only the
+   clips actually referenced by the pairs and writes them as float32 `.npy`
+   files under `<processed_root>/stage2_qbyt/audio/`. No loose `.wav` files
+   are needed.
 
 Inspect columns if needed:
 
@@ -370,10 +373,10 @@ stage1:
 
 ## 6. Stage II: prepare QbyT pairs
 
-Pick a LibriPhrase parquet shard or merged parquet:
+Pick the aggregated LibriPhrase parquet with phrase metadata and G2P, and specify the decoded audio root:
 
 ```bash
-LP_PARQUET=/data/dma-kws/raw/LibriPhrase-100/path/to/file.parquet
+LP_AGG=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p.parquet
 ```
 
 Smoke pair preparation:
@@ -381,18 +384,20 @@ Smoke pair preparation:
 ```bash
 python3 scripts/prepare_stage2_libriphrase.py \
   --config configs/demo_librispeech100.yaml \
-  --input-parquet "$LP_PARQUET" \
-  --limit-anchors 100 \
-  --negatives-per-anchor 1
+  --input-parquet "$LP_AGG" \
+  --decoded-parquet-root /data/dma-kws/raw/LibriPhrase-100 \
+  --limit-anchors 50
 ```
+
+The `--decoded-parquet-root` defaults to `paths.libriphrase100_root`, so it can be omitted if the decoded shards live there.
 
 Full first run on the selected parquet:
 
 ```bash
 python3 scripts/prepare_stage2_libriphrase.py \
   --config configs/demo_librispeech100.yaml \
-  --input-parquet "$LP_PARQUET" \
-  --negatives-per-anchor 1
+  --input-parquet "$LP_AGG" \
+  --decoded-parquet-root /data/dma-kws/raw/LibriPhrase-100
 ```
 
 Expected output:
@@ -407,10 +412,13 @@ The generated file contains pair records like:
 {
   "anchor_text": "hello world",
   "anchor_phonemes": ["HH", "AH", "L", "OW", "W", "ER", "L", "D"],
-  "wav_path": "relative/or/absolute/audio/path.wav",
+  "wav_path": "relative/audio/path.npy",
+  "sample_rate": 16000,
   "label": 1
 }
 ```
+
+Note: `wav_path` points to `.npy` waveforms (float32) produced by the preparation script, relative to `<processed_root>/stage2_qbyt`. The trainer loads these `.npy` files and no longer reads `.wav` from `libriphrase100_root`.
 
 ---
 
