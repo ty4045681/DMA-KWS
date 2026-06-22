@@ -85,3 +85,30 @@ def test_materialize_pairs_counts_unmatched(tmp_path):
 def test_find_decoded_parquets_raises_when_none(tmp_path):
     with pytest.raises(SystemExit):
         prep.find_decoded_parquets(tmp_path)
+
+
+def test_materialize_pairs_rejects_non_mono_audio(tmp_path):
+    audio_dir = tmp_path / "stage2_qbyt" / "audio"
+    pairs = [
+        PairRecord(
+            anchor_text="hi",
+            anchor_phonemes=["HH", "AY"],
+            wav_path="LP-100/hi/1-2-3_000.wav",
+            label=1,
+            sample_rate=16000,
+        )
+    ]
+    rows = [
+        {"audio_rel": "hi/1-2-3_000.wav", "audio": [[0.1, 0.2], [0.3, 0.4]], "sampling_rate": 16000},
+    ]
+
+    def fake_read(path):
+        return _FakeDF(rows)
+
+    with pytest.raises(SystemExit):
+        prep.materialize_pairs(
+            pairs,
+            decoded_parquet_paths=[Path("0000.parquet")],
+            audio_dir=audio_dir,
+            read_parquet=fake_read,
+        )
