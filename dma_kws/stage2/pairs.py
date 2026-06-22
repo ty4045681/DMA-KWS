@@ -65,6 +65,8 @@ def iter_decoded_audio_rows(
                 continue
             remaining.discard(audio_rel)
             yield audio_rel, row["audio"], int(row["sampling_rate"])
+            if not remaining:
+                break
 
 
 def make_pair_records(

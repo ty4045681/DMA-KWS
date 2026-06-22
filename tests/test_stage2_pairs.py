@@ -70,3 +70,23 @@ def test_iter_decoded_audio_rows_filters_to_needed_keys():
 
     assert [(rel, sr) for rel, _, sr in got] == [("a/x.wav", 16000), ("b/z.wav", 16000)]
     assert got[0][1] == [0.1, 0.2]
+
+
+def test_iter_decoded_audio_rows_stops_after_all_keys_found():
+    first = _FakeDF([
+        {"audio_rel": "a/x.wav", "audio": [0.1], "sampling_rate": 16000},
+    ])
+
+    def fake_read(path):
+        if str(path) == "0001.parquet":
+            raise AssertionError("should not read second shard once all keys found")
+        return first
+
+    got = list(
+        iter_decoded_audio_rows(
+            [Path("0000.parquet"), Path("0001.parquet")],
+            {"a/x.wav"},
+            read_parquet=fake_read,
+        )
+    )
+    assert [rel for rel, _, _ in got] == ["a/x.wav"]
