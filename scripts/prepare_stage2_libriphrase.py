@@ -123,7 +123,7 @@ def materialize_pairs(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(out_path, np.asarray(audio, dtype=np.float32))
         # wav_path is relative to audio_dir.parent (the stage2_qbyt dir)
-        rel_for_key[audio_rel] = f"{audio_dir.name}/{audio_rel}"
+        rel_for_key[audio_rel] = f"{audio_dir.name}/{audio_rel}.npy"
 
     rewritten: list[PairRecord] = []
     unmatched = 0

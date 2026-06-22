@@ -1,7 +1,7 @@
-import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from dma_kws.stage2.pairs import PairRecord
 from scripts import prepare_stage2_libriphrase as prep
@@ -50,7 +50,7 @@ def test_materialize_pairs_writes_npy_and_rewrites_paths(tmp_path):
     )
 
     assert unmatched == 0
-    assert rewritten[0].wav_path == "audio/hi/1-2-3_000.wav"
+    assert rewritten[0].wav_path == "audio/hi/1-2-3_000.wav.npy"
     saved = np.load(audio_dir / "hi" / "1-2-3_000.wav.npy")
     assert saved.dtype == np.float32
     np.testing.assert_allclose(saved, np.array([0.1, 0.2, 0.3], dtype=np.float32))
@@ -80,3 +80,8 @@ def test_materialize_pairs_counts_unmatched(tmp_path):
 
     assert unmatched == 1
     assert rewritten == []
+
+
+def test_find_decoded_parquets_raises_when_none(tmp_path):
+    with pytest.raises(SystemExit):
+        prep.find_decoded_parquets(tmp_path)
