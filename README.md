@@ -78,6 +78,15 @@ Then install the project Python dependencies:
 pip install -r requirements.txt
 ```
 
+The requirements include `soundfile` for FLAC decoding support and `openai-whisper` for the vendored QbyT/Wenet
+encoder utilities. On some Linux/conda systems, `torchaudio` may still need system audio libraries for `.flac`
+files; install them before training if `torchaudio.load()` cannot read LibriSpeech audio:
+
+```bash
+conda install -c conda-forge libsndfile ffmpeg -y
+pip install -U soundfile
+```
+
 `g2p_en` uses NLTK data files at runtime. Download them once inside the same conda environment before preparing
 phoneme manifests:
 
@@ -530,6 +539,72 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
 Use the wheel index that matches your CUDA driver.
+
+### `ModuleNotFoundError: No module named 'whisper'`
+
+The vendored QbyT/Wenet encoder utilities import `whisper.tokenizer`, which is provided by the `openai-whisper`
+package. Install the project requirements after pulling the latest repo:
+
+```bash
+pip install -r requirements.txt
+```
+
+If you installed a different package named `whisper`, remove it and install OpenAI Whisper:
+
+```bash
+pip uninstall -y whisper
+pip install -U openai-whisper
+```
+
+Verify:
+
+```bash
+python3 - <<'PY'
+from whisper.tokenizer import LANGUAGES
+
+print("whisper tokenizer OK, languages:", len(LANGUAGES))
+PY
+```
+
+### `Couldn't find appropriate backend to handle uri ... .flac`
+
+This means `torchaudio.load()` cannot decode the LibriSpeech FLAC file in the current environment, or the manifest
+points at a missing/corrupt file. First verify the path from the traceback:
+
+```bash
+WAV=/path/to/LibriSpeech/train-clean-100/5652/39938/5652-39938-0026.flac
+
+ls -lh "$WAV"
+file "$WAV"
+```
+
+If the file is missing, check `paths.librispeech_root` / `paths.processed_root` in your config and regenerate the
+Stage I manifest. If the file exists, inspect the available torchaudio backends:
+
+```bash
+python3 - <<'PY'
+import torch
+import torchaudio
+
+p = "/path/to/LibriSpeech/train-clean-100/5652/39938/5652-39938-0026.flac"
+
+print("torch:", torch.__version__)
+print("torchaudio:", torchaudio.__version__)
+print("audio backends:", torchaudio.list_audio_backends())
+print(torchaudio.info(p))
+waveform, sr = torchaudio.load(p)
+print(waveform.shape, sr)
+PY
+```
+
+Install FLAC-capable audio libraries and retry:
+
+```bash
+conda install -c conda-forge libsndfile ffmpeg -y
+pip install -U soundfile
+```
+
+Then rerun the small training smoke command.
 
 ### `Missing dependency g2p_en`
 

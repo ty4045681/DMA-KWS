@@ -175,7 +175,6 @@ def main() -> None:
     paths = config["paths"]
     librispeech_root = Path(paths["librispeech_root"])
     output_dir = Path(paths["processed_root"]) / "stage1_phoneme_ctc"
-
     train_splits = stage1.get("train_splits", ["train-clean-100"])
     dev_splits = stage1.get("dev_splits", ["dev-clean"])
 

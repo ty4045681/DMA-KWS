@@ -7,8 +7,10 @@ g2p_en>=2.1.0
 numpy
 pandas
 pyarrow
+soundfile
 tqdm
 pytorch-lightning
 torchmetrics
 transformers
 huggingface_hub
+openai-whisper
