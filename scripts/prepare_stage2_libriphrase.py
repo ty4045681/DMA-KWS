@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-anchors", type=int, default=0, help="Optional anchor cap for smoke runs")
     parser.add_argument("--negatives-per-anchor", type=int, default=1)
     parser.add_argument("--seed", type=int, default=2025)
+    parser.add_argument(
+        "--decoded-parquet-root",
+        default="",
+        help="Directory or file with LP-100-decoded-*.parquet shards; defaults to libriphrase100_root",
+    )
     return parser.parse_args()
 
 
@@ -180,13 +185,31 @@ def main() -> None:
         if args.limit_anchors and len(anchors) >= args.limit_anchors:
             break
 
-    pairs = make_pair_records(anchors, negatives_per_anchor=args.negatives_per_anchor, seed=args.seed)
+    pairs = make_pair_records(
+        anchors,
+        negatives_per_anchor=args.negatives_per_anchor,
+        seed=args.seed,
+    )
+
+    libriphrase_root = Path(paths["libriphrase100_root"])
+    decoded_root = Path(args.decoded_parquet_root) if args.decoded_parquet_root else libriphrase_root
+    decoded_parquet_paths = find_decoded_parquets(decoded_root)
+    audio_dir = output_dir / "audio"
+
+    rewritten, unmatched = materialize_pairs(
+        pairs,
+        decoded_parquet_paths=decoded_parquet_paths,
+        audio_dir=audio_dir,
+    )
+
     with output_path.open("w", encoding="utf-8") as writer:
-        for pair in pairs:
+        for pair in rewritten:
             writer.write(json.dumps(pair.to_json_dict(), ensure_ascii=False) + "\n")
 
     print(f"Read {len(anchors)} anchors from {input_path}")
-    print(f"Wrote {len(pairs)} pairs to {output_path}")
+    print(f"Materialized {len(rewritten)} pairs to {output_path} (audio under {audio_dir})")
+    if unmatched:
+        print(f"WARNING: {unmatched} pairs had clips not found in decoded parquet and were skipped")
 
 
 if __name__ == "__main__":
