@@ -7,6 +7,18 @@ from dataclasses import asdict, dataclass
 from typing import Sequence
 
 
+def clip_to_audio_rel(clip_path: str) -> str:
+    """Map a LibriPhrase `clips` path to a decoded-parquet `audio_rel` key.
+
+    The aggregated parquet stores clip paths like `LP-100/<ngram>/<id>.wav`
+    while the decoded shards key audio by `audio_rel` = `<ngram>/<id>.wav`.
+    """
+    prefix = "LP-100/"
+    if clip_path.startswith(prefix):
+        return clip_path[len(prefix):]
+    return clip_path
+
+
 @dataclass(frozen=True)
 class AnchorExample:
     """Phrase anchor and available audio clips."""
@@ -24,6 +36,7 @@ class PairRecord:
     anchor_phonemes: list[str]
     wav_path: str
     label: int
+    sample_rate: int
 
     def to_json_dict(self) -> dict:
         return asdict(self)
@@ -34,6 +47,7 @@ def make_pair_records(
     *,
     negatives_per_anchor: int = 1,
     seed: int = 2025,
+    sample_rate: int = 16000,
 ) -> list[PairRecord]:
     """Create positive pairs plus random negative pairs from phrase anchors."""
     rng = random.Random(seed)
@@ -48,6 +62,7 @@ def make_pair_records(
                 anchor_phonemes=anchor.phonemes,
                 wav_path=positive_clip,
                 label=1,
+                sample_rate=sample_rate,
             )
         )
 
@@ -63,6 +78,7 @@ def make_pair_records(
                     anchor_phonemes=anchor.phonemes,
                     wav_path=negative_clip,
                     label=0,
+                    sample_rate=sample_rate,
                 )
             )
 

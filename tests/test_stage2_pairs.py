@@ -1,4 +1,23 @@
-from dma_kws.stage2.pairs import AnchorExample, make_pair_records
+from dma_kws.stage2.pairs import AnchorExample, PairRecord, clip_to_audio_rel, make_pair_records
+
+
+def test_clip_to_audio_rel_strips_lp100_prefix():
+    assert clip_to_audio_rel("LP-100/missus_rachel/103-1240-0000_000.wav") == "missus_rachel/103-1240-0000_000.wav"
+
+
+def test_clip_to_audio_rel_without_prefix_is_identity():
+    assert clip_to_audio_rel("missus_rachel/103-1240-0000_000.wav") == "missus_rachel/103-1240-0000_000.wav"
+
+
+def test_pair_record_carries_sample_rate():
+    record = PairRecord(
+        anchor_text="hi",
+        anchor_phonemes=["HH", "AY"],
+        wav_path="audio/a.npy",
+        label=1,
+        sample_rate=16000,
+    )
+    assert record.to_json_dict()["sample_rate"] == 16000
 
 
 def test_make_pair_records_creates_positive_and_negative_pair():
