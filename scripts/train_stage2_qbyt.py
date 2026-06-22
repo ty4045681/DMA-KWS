@@ -41,6 +41,7 @@ def train(args: argparse.Namespace) -> None:
         import torch.nn.functional as F
         from torch.nn.utils.rnn import pad_sequence
         from torch.utils.data import DataLoader, Dataset
+        import numpy as np
     except ImportError as exc:
         raise SystemExit(
             "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
@@ -65,13 +66,13 @@ def train(args: argparse.Namespace) -> None:
 
     sample_rate = int(stage1.get("sample_rate", 16000))
     num_mel_bins = int(stage1.get("input_dim", 80))
-    libriphrase_root = Path(paths["libriphrase100_root"])
+    stage2_dir = processed_root / "stage2_qbyt"
 
     def resolve_wav_path(raw_path: str) -> str:
         path = Path(raw_path)
         if path.is_absolute():
             return str(path)
-        return str(libriphrase_root / path)
+        return str(stage2_dir / path)
 
     class Stage2Dataset(Dataset):
         def __init__(self, pairs_path: Path):
@@ -83,11 +84,8 @@ def train(args: argparse.Namespace) -> None:
         def __getitem__(self, index: int) -> dict:
             record = self.records[index]
             wav_path = resolve_wav_path(record["wav_path"])
-            waveform, sr = torchaudio.load(wav_path)
-            if waveform.size(0) > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            if sr != sample_rate:
-                waveform = torchaudio.transforms.Resample(sr, sample_rate)(waveform)
+            audio = np.load(wav_path).astype("float32")
+            waveform = torch.from_numpy(audio).reshape(1, -1)
             feat = kaldi.fbank(
                 waveform,
                 num_mel_bins=num_mel_bins,
