@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -12,7 +11,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from dma_kws.audio import extract_fbank
 from dma_kws.config import load_config, require_sections
+from dma_kws.jsonl import read_jsonl
+from dma_kws.nn import build_encoder
 from dma_kws.phonemes import PhonemeVocabulary
 
 
@@ -23,22 +25,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocab", default="", help="Override phoneme vocab path")
     parser.add_argument("--stage1-ckpt", default="", help="Optional Stage I checkpoint for encoder init")
     parser.add_argument("--device", default="cuda", help="cuda or cpu")
-    parser.add_argument("--devices", type=int, default=1, help="Number of visible GPUs to use via DataParallel")
+    parser.add_argument("--devices", type=int, default=1, help="Number of visible GPUs to use")
     parser.add_argument("--limit-steps", type=int, default=0, help="Optional training step cap for smoke runs")
     return parser.parse_args()
-
-
-def read_jsonl(path: Path) -> list[dict]:
-    with path.open("r", encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
 
 
 def train(args: argparse.Namespace) -> None:
     try:
         import torch
-        import torchaudio
-        import torchaudio.compliance.kaldi as kaldi
         import torch.nn.functional as F
+        import pytorch_lightning as pl
         from torch.nn.utils.rnn import pad_sequence
         from torch.utils.data import DataLoader, Dataset
         import numpy as np
@@ -51,7 +47,6 @@ def train(args: argparse.Namespace) -> None:
     if str(qbyt_root) not in sys.path:
         sys.path.insert(0, str(qbyt_root))
     from model import QbyT
-    from models.encoder import ConformerEncoder
 
     config = load_config(args.config)
     require_sections(config, ["paths", "stage1", "stage2"])
@@ -86,13 +81,11 @@ def train(args: argparse.Namespace) -> None:
             wav_path = resolve_wav_path(record["wav_path"])
             audio = np.load(wav_path).astype("float32")
             waveform = torch.from_numpy(audio).reshape(1, -1)
-            feat = kaldi.fbank(
+            feat = extract_fbank(
                 waveform,
                 num_mel_bins=num_mel_bins,
-                frame_length=25,
-                frame_shift=10,
+                sample_rate=sample_rate,
                 dither=0.1,
-                sample_frequency=sample_rate,
             )
             anchor = torch.tensor(vocab.encode(record["anchor_phonemes"]), dtype=torch.long)
             label = torch.tensor(float(record["label"]), dtype=torch.float32)
@@ -109,25 +102,11 @@ def train(args: argparse.Namespace) -> None:
             "labels": torch.stack([item["label"] for item in batch]),
         }
 
-    class Stage2QbyTModel(torch.nn.Module):
+    class Stage2Module(pl.LightningModule):
         def __init__(self):
             super().__init__()
             encoder_dim = int(stage2.get("encoder_output_dim", 144))
-            self.encoder = ConformerEncoder(
-                input_size=int(stage1.get("input_dim", 80)),
-                output_size=encoder_dim,
-                attention_heads=int(stage1.get("attention_heads", 4)),
-                linear_units=int(stage1.get("linear_units", 576)),
-                num_blocks=int(stage1.get("num_blocks", 6)),
-                dropout_rate=float(stage1.get("dropout_rate", 0.1)),
-                positional_dropout_rate=float(stage1.get("positional_dropout_rate", 0.1)),
-                attention_dropout_rate=float(stage1.get("attention_dropout_rate", 0.0)),
-                use_cnn_module=True,
-                input_layer="conv2d",
-                pos_enc_layer_type="rel_pos",
-                selfattention_layer_type="rel_selfattn",
-                cnn_module_kernel=int(stage1.get("cnn_module_kernel", 3)),
-            )
+            self.encoder = build_encoder(stage1, output_dim=encoder_dim)
             self.qbyt = QbyT(
                 encoder_output_size=encoder_dim,
                 num_embeds=len(vocab.token_to_id),
@@ -141,6 +120,15 @@ def train(args: argparse.Namespace) -> None:
             logits, _ = self.qbyt(encoder_out, anchors, encoder_lens, anchor_lengths)
             return logits
 
+        def training_step(self, batch, batch_idx):
+            logits = self(batch["feats"], batch["feat_lengths"], batch["anchors"], batch["anchor_lengths"])
+            loss = F.binary_cross_entropy_with_logits(logits, batch["labels"])
+            self.log("train_loss", loss, prog_bar=True)
+            return loss
+
+        def configure_optimizers(self):
+            return torch.optim.Adam(self.parameters(), lr=float(stage2.get("learning_rate", 1e-3)))
+
     dataset = Stage2Dataset(pair_path)
     if len(dataset) == 0:
         raise SystemExit(f"No records found in {pair_path}")
@@ -153,8 +141,7 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=collate_fn,
     )
 
-    device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
-    model = Stage2QbyTModel().to(device)
+    model = Stage2Module()
 
     if args.stage1_ckpt:
         ckpt = torch.load(args.stage1_ckpt, map_location="cpu")
@@ -163,36 +150,28 @@ def train(args: argparse.Namespace) -> None:
         missing, unexpected = model.encoder.load_state_dict(encoder_state, strict=False)
         print(f"Loaded Stage I encoder weights: missing={len(missing)} unexpected={len(unexpected)}")
 
-    if args.devices > 1 and device.type == "cuda" and torch.cuda.device_count() >= args.devices:
-        model = torch.nn.DataParallel(model, device_ids=list(range(args.devices)))
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(stage2.get("learning_rate", 1e-3)))
     max_steps = args.limit_steps or int(stage2.get("max_steps", 50000))
     checkpoint_dir = Path(stage2.get("checkpoint_dir", Path(paths["exp_root"]) / "stage2_qbyt" / "checkpoints"))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    global_step = 0
-    model.train()
-    while global_step < max_steps:
-        for batch in dataloader:
-            batch = {key: value.to(device) for key, value in batch.items()}
-            logits = model(batch["feats"], batch["feat_lengths"], batch["anchors"], batch["anchor_lengths"])
-            loss = F.binary_cross_entropy_with_logits(logits, batch["labels"])
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(stage2.get("gradient_clip_val", 1.0)))
-            optimizer.step()
-            global_step += 1
-            if global_step % int(stage2.get("log_interval", 10)) == 0:
-                print(f"step={global_step} loss={loss.item():.4f}")
-            if global_step >= max_steps:
-                break
+    accelerator = "gpu" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
+    devices = max(1, int(args.devices)) if accelerator == "gpu" else 1
+    trainer = pl.Trainer(
+        accelerator=accelerator,
+        devices=devices,
+        max_steps=max_steps,
+        gradient_clip_val=float(stage2.get("gradient_clip_val", 1.0)),
+        log_every_n_steps=int(stage2.get("log_interval", 10)),
+        enable_checkpointing=False,
+        logger=False,
+    )
+    trainer.fit(model, dataloader)
 
-    ckpt_model = model.module if hasattr(model, "module") else model
+    global_step = int(trainer.global_step)
     ckpt_path = checkpoint_dir / f"stage2_step{global_step:06d}.pt"
     torch.save(
         {
-            "model_state_dict": ckpt_model.state_dict(),
+            "model_state_dict": model.state_dict(),
             "vocab": vocab.token_to_id,
             "config": config,
             "step": global_step,

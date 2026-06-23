@@ -12,10 +12,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from dma_kws.audio import extract_fbank, load_audio
 from dma_kws.config import load_config, require_sections
-from dma_kws.phonemes import PhonemeVocabulary, normalize_english_text
+from dma_kws.g2p import make_g2p, text_to_phonemes
+from dma_kws.nn import build_encoder
+from dma_kws.phonemes import PhonemeVocabulary
 from dma_kws.stage1.candidates import PhonemeFrame, find_keyword_candidates
-from dma_kws.stage1.librispeech import strip_stress_marker
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,30 +30,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocab", default="", help="Override phoneme vocab path")
     parser.add_argument("--device", default="cuda", help="cuda or cpu")
     return parser.parse_args()
-
-
-def make_g2p():
-    try:
-        from g2p_en import G2p
-    except ImportError as exc:
-        raise SystemExit("Missing dependency g2p_en. Install it with: pip install g2p_en") from exc
-    return G2p()
-
-
-def text_to_phonemes(g2p, text: str) -> list[str]:
-    normalized = normalize_english_text(text)
-    return clean_phoneme_tokens(g2p(normalized))
-
-
-def clean_phoneme_tokens(tokens) -> list[str]:
-    phonemes: list[str] = []
-    for phone in tokens:
-        if phone == " ":
-            continue
-        cleaned = strip_stress_marker(str(phone)).strip()
-        if cleaned:
-            phonemes.append(cleaned)
-    return phonemes
 
 
 def num_fbank_frames(
@@ -108,8 +86,6 @@ def load_model_state(model, ckpt_path: str, load_fn):
 def run(args: argparse.Namespace) -> None:
     try:
         import torch
-        import torchaudio
-        import torchaudio.compliance.kaldi as kaldi
     except ImportError as exc:
         raise SystemExit(
             "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
@@ -120,7 +96,6 @@ def run(args: argparse.Namespace) -> None:
         sys.path.insert(0, str(qbyt_root))
     from model import QbyT
     from models.ctc import CTC
-    from models.encoder import ConformerEncoder
 
     config = load_config(args.config)
     require_sections(config, ["paths", "stage1", "stage2", "demo"])
@@ -140,27 +115,10 @@ def run(args: argparse.Namespace) -> None:
     encoder_dim = int(stage1.get("encoder_output_dim", 144))
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
 
-    def build_encoder(output_dim: int):
-        return ConformerEncoder(
-            input_size=int(stage1.get("input_dim", 80)),
-            output_size=output_dim,
-            attention_heads=int(stage1.get("attention_heads", 4)),
-            linear_units=int(stage1.get("linear_units", 576)),
-            num_blocks=int(stage1.get("num_blocks", 6)),
-            dropout_rate=float(stage1.get("dropout_rate", 0.1)),
-            positional_dropout_rate=float(stage1.get("positional_dropout_rate", 0.1)),
-            attention_dropout_rate=float(stage1.get("attention_dropout_rate", 0.0)),
-            use_cnn_module=True,
-            input_layer="conv2d",
-            pos_enc_layer_type="rel_pos",
-            selfattention_layer_type="rel_selfattn",
-            cnn_module_kernel=int(stage1.get("cnn_module_kernel", 3)),
-        )
-
     class Stage1Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.encoder = build_encoder(encoder_dim)
+            self.encoder = build_encoder(stage1, output_dim=encoder_dim)
             self.ctc = CTC(len(vocab.token_to_id), encoder_dim, blank_id=0)
 
         def forward(self, feats, feat_lengths):
@@ -171,7 +129,7 @@ def run(args: argparse.Namespace) -> None:
         def __init__(self):
             super().__init__()
             stage2_encoder_dim = int(stage2.get("encoder_output_dim", 144))
-            self.encoder = build_encoder(stage2_encoder_dim)
+            self.encoder = build_encoder(stage1, output_dim=stage2_encoder_dim)
             self.qbyt = QbyT(
                 encoder_output_size=stage2_encoder_dim,
                 num_embeds=len(vocab.token_to_id),
@@ -192,18 +150,12 @@ def run(args: argparse.Namespace) -> None:
             raise SystemExit(f"Checkpoint {ckpt_path} is incompatible with the model architecture: {exc}") from exc
         return model.to(device).eval()
 
-    waveform, sr = torchaudio.load(args.audio)
-    if waveform.size(0) > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sr != sample_rate:
-        waveform = torchaudio.transforms.Resample(sr, sample_rate)(waveform)
-    feat = kaldi.fbank(
+    waveform, sample_rate = load_audio(args.audio, sample_rate=sample_rate)
+    feat = extract_fbank(
         waveform,
         num_mel_bins=num_mel_bins,
-        frame_length=25,
-        frame_shift=10,
+        sample_rate=sample_rate,
         dither=0.0,
-        sample_frequency=sample_rate,
     ).unsqueeze(0)
     feat_lengths = torch.tensor([feat.size(1)], dtype=torch.long)
 
@@ -255,13 +207,11 @@ def run(args: argparse.Namespace) -> None:
         ):
             continue
         candidate_wave = waveform[:, start:end]
-        candidate_feat = kaldi.fbank(
+        candidate_feat = extract_fbank(
             candidate_wave,
             num_mel_bins=num_mel_bins,
-            frame_length=25,
-            frame_shift=10,
+            sample_rate=sample_rate,
             dither=0.0,
-            sample_frequency=sample_rate,
         ).unsqueeze(0)
         candidate_lens = torch.tensor([candidate_feat.size(1)], dtype=torch.long)
         with torch.no_grad():

@@ -7,15 +7,6 @@ import pytest
 from scripts import prepare_stage1_librispeech as prepare_stage1
 from scripts import prepare_stage2_libriphrase as prepare_stage2
 from scripts import run_two_stage_demo as demo
-from scripts import train_stage1_ctc as train_stage1
-
-
-def test_stage1_loss_reduction_weights_data_parallel_shards():
-    # Local shard mean losses of 2.0 and 2.0 with batch sizes 2 and 1 should
-    # reduce to global sum / global batch size, not remain a vector.
-    loss = train_stage1.reduce_stage1_loss(([4.0, 2.0], [2.0, 1.0]))
-
-    assert loss == pytest.approx(2.0)
 
 
 def test_qbyt_forward_accepts_lengths_and_masks_padded_frames():

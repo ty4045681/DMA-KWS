@@ -14,12 +14,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from typing import Iterable
 
 from dma_kws.config import load_config, require_sections
+from dma_kws.g2p import make_g2p, text_to_phonemes
 from dma_kws.phonemes import PhonemeVocabulary, normalize_english_text
 from dma_kws.stage1.librispeech import (
     ParquetAudioUtterance,
     iter_librispeech_parquet_utterances,
     iter_librispeech_utterances,
-    strip_stress_marker,
 )
 
 
@@ -60,22 +60,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional directory for dev audio extracted from parquet bytes",
     )
     return parser.parse_args()
-
-
-def make_g2p():
-    try:
-        from g2p_en import G2p
-    except ImportError as exc:
-        raise SystemExit("Missing dependency g2p_en. Install it with: pip install g2p_en") from exc
-    return G2p()
-
-
-def text_to_phonemes(g2p, text: str, *, strip_stress: bool = True) -> list[str]:
-    normalized = normalize_english_text(text)
-    phones = [phone for phone in g2p(normalized) if phone != " "]
-    if strip_stress:
-        phones = [strip_stress_marker(phone) for phone in phones]
-    return [phone for phone in phones if phone]
 
 
 def prepare_split(

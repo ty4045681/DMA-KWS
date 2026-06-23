@@ -16,8 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 
 from dma_kws.config import load_config, require_sections
-from dma_kws.phonemes import normalize_english_text
-from dma_kws.stage1.librispeech import strip_stress_marker
+from dma_kws.g2p import clean_phoneme_tokens, make_g2p, text_to_phonemes
 from dma_kws.stage2.pairs import (
     AnchorExample,
     PairRecord,
@@ -40,30 +39,6 @@ def parse_args() -> argparse.Namespace:
         help="Directory or file with LP-100-decoded-*.parquet shards; defaults to libriphrase100_root",
     )
     return parser.parse_args()
-
-
-def make_g2p():
-    try:
-        from g2p_en import G2p
-    except ImportError as exc:
-        raise SystemExit("Missing dependency g2p_en. Install it with: pip install g2p_en") from exc
-    return G2p()
-
-
-def text_to_phonemes(g2p, text: str) -> list[str]:
-    normalized = normalize_english_text(text)
-    return clean_phoneme_tokens(g2p(normalized))
-
-
-def clean_phoneme_tokens(tokens) -> list[str]:
-    phonemes: list[str] = []
-    for phone in tokens:
-        if phone == " ":
-            continue
-        cleaned = strip_stress_marker(str(phone)).strip()
-        if cleaned:
-            phonemes.append(cleaned)
-    return phonemes
 
 
 def parse_clips(raw_clips: Any) -> list[str]:
