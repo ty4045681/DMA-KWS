@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,19 @@ def parse_args() -> argparse.Namespace:
         "--decoded-parquet-root",
         default="",
         help="Directory or file with LP-100-decoded-*.parquet shards; defaults to libriphrase100_root",
+    )
+    parser.add_argument(
+        "--eval-parquet",
+        default="",
+        help="Optional separate parquet for the dev split; when given, dev pairs are built from it "
+        "instead of carving a hold-out from the training anchors",
+    )
+    parser.add_argument(
+        "--holdout-anchor-fraction",
+        type=float,
+        default=None,
+        help="Fraction of anchors held out for dev when --eval-parquet is not given; "
+        "overrides config stage2.dev.holdout_anchor_fraction (default 0.1)",
     )
     return parser.parse_args()
 
@@ -130,22 +144,8 @@ def materialize_pairs(
     return rewritten, unmatched
 
 
-def main() -> None:
-    args = parse_args()
-    try:
-        import pandas as pd
-    except ImportError as exc:
-        raise SystemExit("Missing dependency pandas/pyarrow. Install with: pip install pandas pyarrow") from exc
-
-    config = load_config(args.config)
-    require_sections(config, ["paths"])
-    paths = config["paths"]
-    input_path = Path(args.input_parquet) if args.input_parquet else find_default_parquet(Path(paths["libriphrase100_root"]))
-    output_dir = Path(paths["processed_root"]) / "stage2_qbyt"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "train.jsonl"
-
-    df = pd.read_parquet(input_path)
+def read_anchors(df, *, limit_anchors: int = 0) -> list[AnchorExample]:
+    """Build AnchorExample rows from a LibriPhrase parquet frame."""
     required = {"ngram", "clips"}
     missing = sorted(required - set(df.columns))
     if missing:
@@ -162,34 +162,145 @@ def main() -> None:
         clips = parse_clips(row["clips"])
         if clips and phonemes:
             anchors.append(AnchorExample(text=text, phonemes=phonemes, clips=clips))
-        if args.limit_anchors and len(anchors) >= args.limit_anchors:
+        if limit_anchors and len(anchors) >= limit_anchors:
             break
+    return anchors
 
+
+def split_anchors(
+    anchors: list[AnchorExample],
+    *,
+    holdout_fraction: float,
+    seed: int,
+) -> tuple[list[AnchorExample], list[AnchorExample]]:
+    """Split anchors into (train, dev) by anchor so no phrase leaks across splits.
+
+    Returns an empty dev list when there are too few anchors to hold any out.
+    """
+    if holdout_fraction <= 0.0:
+        return list(anchors), []
+    shuffled = list(anchors)
+    random.Random(seed).shuffle(shuffled)
+    holdout_count = int(len(shuffled) * holdout_fraction)
+    if holdout_count <= 0:
+        return shuffled, []
+    dev_anchors = shuffled[:holdout_count]
+    train_anchors = shuffled[holdout_count:]
+    return train_anchors, dev_anchors
+
+
+def build_split(
+    anchors: list[AnchorExample],
+    output_path: Path,
+    *,
+    negatives_per_anchor: int,
+    seed: int,
+    decoded_parquet_paths: list[Path],
+    audio_dir: Path,
+) -> tuple[int, int]:
+    """Generate pairs for ``anchors``, materialize audio, and write ``output_path``.
+
+    Returns (written_pairs, unmatched_pairs).
+    """
     pairs = make_pair_records(
         anchors,
-        negatives_per_anchor=args.negatives_per_anchor,
-        seed=args.seed,
+        negatives_per_anchor=negatives_per_anchor,
+        seed=seed,
     )
+    rewritten, unmatched = materialize_pairs(
+        pairs,
+        decoded_parquet_paths=decoded_parquet_paths,
+        audio_dir=audio_dir,
+    )
+    with output_path.open("w", encoding="utf-8") as writer:
+        for pair in rewritten:
+            writer.write(json.dumps(pair.to_json_dict(), ensure_ascii=False) + "\n")
+    return len(rewritten), unmatched
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise SystemExit("Missing dependency pandas/pyarrow. Install with: pip install pandas pyarrow") from exc
+
+    config = load_config(args.config)
+    require_sections(config, ["paths"])
+    paths = config["paths"]
+    dev_config = config.get("stage2", {}).get("dev", {})
+    holdout_fraction = (
+        args.holdout_anchor_fraction
+        if args.holdout_anchor_fraction is not None
+        else float(dev_config.get("holdout_anchor_fraction", 0.1))
+    )
+    dev_seed = int(dev_config.get("seed", 2025))
+
+    input_path = Path(args.input_parquet) if args.input_parquet else find_default_parquet(Path(paths["libriphrase100_root"]))
+    output_dir = Path(paths["processed_root"]) / "stage2_qbyt"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    train_path = output_dir / "train.jsonl"
+    dev_path = output_dir / "dev.jsonl"
+
+    df = pd.read_parquet(input_path)
+    anchors = read_anchors(df, limit_anchors=args.limit_anchors)
 
     libriphrase_root = Path(paths["libriphrase100_root"])
     decoded_root = Path(args.decoded_parquet_root) if args.decoded_parquet_root else libriphrase_root
     decoded_parquet_paths = find_decoded_parquets(decoded_root)
     audio_dir = output_dir / "audio"
 
-    rewritten, unmatched = materialize_pairs(
-        pairs,
+    if args.eval_parquet:
+        # Dev pairs come from a separate parquet; train uses all main-input anchors.
+        train_anchors = anchors
+        eval_df = pd.read_parquet(Path(args.eval_parquet))
+        dev_anchors = read_anchors(eval_df)
+        print(f"Read {len(anchors)} anchors from {input_path}")
+        print(f"Read {len(dev_anchors)} dev anchors from {args.eval_parquet}")
+    else:
+        # Carve a hold-out split BY ANCHOR before pairing so no phrase leaks across splits.
+        train_anchors, dev_anchors = split_anchors(
+            anchors, holdout_fraction=holdout_fraction, seed=dev_seed
+        )
+        print(f"Read {len(anchors)} anchors from {input_path}")
+        if dev_anchors:
+            print(
+                f"Held out {len(dev_anchors)} dev anchors "
+                f"(fraction {holdout_fraction}, seed {dev_seed}); {len(train_anchors)} train anchors"
+            )
+        else:
+            print(
+                f"NOTE: too few anchors ({len(anchors)}) to hold out fraction {holdout_fraction}; "
+                f"no dev.jsonl will be produced"
+            )
+
+    train_written, train_unmatched = build_split(
+        train_anchors,
+        train_path,
+        negatives_per_anchor=args.negatives_per_anchor,
+        seed=args.seed,
         decoded_parquet_paths=decoded_parquet_paths,
         audio_dir=audio_dir,
     )
+    print(f"Materialized {train_written} train pairs to {train_path} (audio under {audio_dir})")
+    if train_unmatched:
+        print(f"WARNING: {train_unmatched} train pairs had clips not found in decoded parquet and were skipped")
 
-    with output_path.open("w", encoding="utf-8") as writer:
-        for pair in rewritten:
-            writer.write(json.dumps(pair.to_json_dict(), ensure_ascii=False) + "\n")
-
-    print(f"Read {len(anchors)} anchors from {input_path}")
-    print(f"Materialized {len(rewritten)} pairs to {output_path} (audio under {audio_dir})")
-    if unmatched:
-        print(f"WARNING: {unmatched} pairs had clips not found in decoded parquet and were skipped")
+    if dev_anchors:
+        dev_written, dev_unmatched = build_split(
+            dev_anchors,
+            dev_path,
+            negatives_per_anchor=args.negatives_per_anchor,
+            seed=args.seed,
+            decoded_parquet_paths=decoded_parquet_paths,
+            audio_dir=audio_dir,
+        )
+        print(f"Materialized {dev_written} dev pairs to {dev_path} (audio under {audio_dir})")
+        if dev_unmatched:
+            print(f"WARNING: {dev_unmatched} dev pairs had clips not found in decoded parquet and were skipped")
+    elif dev_path.exists():
+        # Avoid a stale dev split from a prior run shadowing the "no dev" decision.
+        dev_path.unlink()
 
 
 if __name__ == "__main__":

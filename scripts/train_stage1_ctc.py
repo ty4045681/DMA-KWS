@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from dma_kws.audio import extract_fbank, load_audio
 from dma_kws.config import load_config, require_sections
 from dma_kws.jsonl import read_jsonl
+from dma_kws.metrics import collapse_ctc, edit_distance
 from dma_kws.nn import build_encoder
 from dma_kws.phonemes import PhonemeVocabulary
 
@@ -57,6 +58,11 @@ def train(args: argparse.Namespace) -> None:
 
     sample_rate = int(stage1.get("sample_rate", 16000))
     num_mel_bins = int(stage1.get("input_dim", 80))
+
+    validation_cfg = stage1.get("validation", {})
+    dev_manifest_cfg = str(validation_cfg.get("dev_manifest", "")).strip()
+    dev_manifest = Path(dev_manifest_cfg) if dev_manifest_cfg else processed_dir / "dev.jsonl"
+    num_decode_batches = int(validation_cfg.get("num_decode_batches", 0))
 
     class Stage1Dataset(Dataset):
         def __init__(self, manifest_path: Path):
@@ -106,6 +112,34 @@ def train(args: argparse.Namespace) -> None:
             self.log("train_loss", loss, prog_bar=True, batch_size=batch["feats"].size(0))
             return loss
 
+        def on_validation_epoch_start(self):
+            self._val_total_dist = 0
+            self._val_total_ref = 0
+
+        def validation_step(self, batch, batch_idx):
+            # num_decode_batches == 0 means decode all batches.
+            if num_decode_batches and batch_idx >= num_decode_batches:
+                return
+            encoder_out, encoder_mask = self.encoder(batch["feats"], batch["feat_lengths"])
+            encoder_lens = encoder_mask.squeeze(1).sum(1)
+            log_probs = self.ctc.log_softmax(encoder_out)
+            preds = log_probs.argmax(dim=2)
+            targets = batch["targets"]
+            target_lengths = batch["target_lengths"]
+            for i in range(preds.size(0)):
+                frames = int(encoder_lens[i].item())
+                raw_ids = preds[i, :frames].tolist()
+                hyp_ids = collapse_ctc(raw_ids, blank_id=0)
+                ref_len = int(target_lengths[i].item())
+                ref_ids = targets[i, :ref_len].tolist()
+                self._val_total_dist += edit_distance(ref_ids, hyp_ids)
+                self._val_total_ref += ref_len
+
+        def on_validation_epoch_end(self):
+            if self._val_total_ref > 0:
+                per = self._val_total_dist / self._val_total_ref
+                self.log("val/per", per, prog_bar=True)
+
         def configure_optimizers(self):
             return torch.optim.Adam(self.parameters(), lr=float(stage1.get("learning_rate", 1e-3)))
 
@@ -121,10 +155,37 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=collate_fn,
     )
 
+    # Dev set is optional: if the manifest is missing we skip validation
+    # entirely so existing no-dev runs keep working.
+    dev_dataloader = None
+    if dev_manifest.exists():
+        dev_dataset = Stage1Dataset(dev_manifest)
+        if len(dev_dataset) > 0:
+            dev_dataloader = DataLoader(
+                dev_dataset,
+                batch_size=int(validation_cfg.get("batch_size", stage1.get("batch_size_per_gpu", 16))),
+                shuffle=False,
+                num_workers=int(stage1.get("num_workers", 2)),
+                collate_fn=collate_fn,
+            )
+
     model = Stage1Module()
     max_epochs = int(stage1.get("max_epochs", 1))
     max_steps = args.limit_steps or int(stage1.get("max_train_steps", 0))
     accelerator = "gpu" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
+
+    callbacks = []
+    checkpoint_callback = None
+    trainer_kwargs = {}
+    if dev_dataloader is not None:
+        from pytorch_lightning.callbacks import ModelCheckpoint
+
+        checkpoint_callback = ModelCheckpoint(monitor="val/per", mode="min", save_top_k=1)
+        callbacks.append(checkpoint_callback)
+        trainer_kwargs["check_val_every_n_epoch"] = int(
+            validation_cfg.get("check_val_every_n_epoch", 1)
+        )
+
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=max(1, int(args.devices)),
@@ -132,8 +193,20 @@ def train(args: argparse.Namespace) -> None:
         max_steps=max_steps if max_steps else -1,
         gradient_clip_val=float(stage1.get("gradient_clip_val", 1.0)),
         log_every_n_steps=int(stage1.get("log_interval", 10)),
+        callbacks=callbacks,
+        **trainer_kwargs,
     )
-    trainer.fit(model, dataloader)
+    if dev_dataloader is not None:
+        trainer.fit(model, dataloader, dev_dataloader)
+    else:
+        trainer.fit(model, dataloader)
+
+    # Constraint #3: when best-ckpt selection ran, reload the best weights into
+    # the module before writing the legacy dict so it carries the BEST weights,
+    # not just the last step. Fall back to last weights when no validation ran.
+    if checkpoint_callback is not None and checkpoint_callback.best_model_path:
+        best_state = torch.load(checkpoint_callback.best_model_path, map_location="cpu")
+        model.load_state_dict(best_state["state_dict"])
 
     global_step = int(trainer.global_step)
     checkpoint_dir = Path(stage1.get("checkpoint_dir", Path(paths["exp_root"]) / "stage1_phoneme_ctc" / "checkpoints"))

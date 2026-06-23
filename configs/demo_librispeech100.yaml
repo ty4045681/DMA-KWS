@@ -30,6 +30,11 @@ stage1:
   gradient_clip_val: 1.0
   log_interval: 10
   checkpoint_dir: /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints
+  validation:
+    dev_manifest: ""
+    batch_size: 48
+    check_val_every_n_epoch: 1
+    num_decode_batches: 0
 
 stage2:
   encoder_output_dim: 144
@@ -42,6 +47,14 @@ stage2:
   gradient_clip_val: 1.0
   log_interval: 10
   checkpoint_dir: /data/dma-kws/exp/stage2_qbyt/checkpoints
+  dev:
+    eval_parquet: ""
+    holdout_anchor_fraction: 0.1
+    seed: 2025
+  validation:
+    dev_manifest: ""
+    batch_size: 128
+    val_check_interval: 1000
 
 demo:
   stage1_candidate_margin_sec: 0.15

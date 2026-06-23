@@ -35,9 +35,11 @@ def train(args: argparse.Namespace) -> None:
         import torch
         import torch.nn.functional as F
         import pytorch_lightning as pl
+        from pytorch_lightning.callbacks import ModelCheckpoint
         from torch.nn.utils.rnn import pad_sequence
         from torch.utils.data import DataLoader, Dataset
         import numpy as np
+        import torchmetrics
     except ImportError as exc:
         raise SystemExit(
             "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
@@ -113,6 +115,13 @@ def train(args: argparse.Namespace) -> None:
                 embed_dim=int(stage2.get("qbyt_embed_dim", 128)),
                 post_num_layers=int(stage2.get("qbyt_layers", 2)),
             )
+            self.auc_metric = torchmetrics.AUROC(task="binary")
+            try:
+                self.eer_metric = torchmetrics.classification.EER(task="binary")
+            except AttributeError as exc:  # pragma: no cover - torchmetrics version guard
+                raise SystemExit(
+                    "torchmetrics.classification.EER unavailable. Upgrade torchmetrics on the training machine."
+                ) from exc
 
         def forward(self, feats, feat_lengths, anchors, anchor_lengths):
             encoder_out, encoder_mask = self.encoder(feats, feat_lengths)
@@ -125,6 +134,19 @@ def train(args: argparse.Namespace) -> None:
             loss = F.binary_cross_entropy_with_logits(logits, batch["labels"])
             self.log("train_loss", loss, prog_bar=True)
             return loss
+
+        def validation_step(self, batch, batch_idx):
+            logits = self(batch["feats"], batch["feat_lengths"], batch["anchors"], batch["anchor_lengths"])
+            preds = torch.sigmoid(logits)
+            labels = batch["labels"].int()
+            self.auc_metric.update(preds, labels)
+            self.eer_metric.update(preds, labels)
+
+        def on_validation_epoch_end(self):
+            self.log("val/auc", self.auc_metric.compute(), prog_bar=True)
+            self.log("val/eer", self.eer_metric.compute())
+            self.auc_metric.reset()
+            self.eer_metric.reset()
 
         def configure_optimizers(self):
             return torch.optim.Adam(self.parameters(), lr=float(stage2.get("learning_rate", 1e-3)))
@@ -141,6 +163,21 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=collate_fn,
     )
 
+    validation = stage2.get("validation", {}) or {}
+    dev_manifest = validation.get("dev_manifest", "")
+    dev_path = Path(dev_manifest) if dev_manifest else stage2_dir / "dev.jsonl"
+    dev_dataloader = None
+    if dev_path.exists():
+        dev_dataset = Stage2Dataset(dev_path)
+        if len(dev_dataset) > 0:
+            dev_dataloader = DataLoader(
+                dev_dataset,
+                batch_size=int(validation.get("batch_size", stage2.get("batch_size_per_gpu", 64))),
+                shuffle=False,
+                num_workers=int(stage2.get("num_workers", stage1.get("num_workers", 2))),
+                collate_fn=collate_fn,
+            )
+
     model = Stage2Module()
 
     if args.stage1_ckpt:
@@ -156,7 +193,8 @@ def train(args: argparse.Namespace) -> None:
 
     accelerator = "gpu" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
     devices = max(1, int(args.devices)) if accelerator == "gpu" else 1
-    trainer = pl.Trainer(
+
+    trainer_kwargs = dict(
         accelerator=accelerator,
         devices=devices,
         max_steps=max_steps,
@@ -165,7 +203,26 @@ def train(args: argparse.Namespace) -> None:
         enable_checkpointing=False,
         logger=False,
     )
-    trainer.fit(model, dataloader)
+    checkpoint_callback = None
+    if dev_dataloader is not None:
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=str(checkpoint_dir),
+            monitor="val/auc",
+            mode="max",
+            save_top_k=1,
+            filename="stage2_best_auc",
+        )
+        trainer_kwargs["callbacks"] = [checkpoint_callback]
+        trainer_kwargs["enable_checkpointing"] = True
+        trainer_kwargs["val_check_interval"] = int(validation.get("val_check_interval", 1000))
+
+    trainer = pl.Trainer(**trainer_kwargs)
+    trainer.fit(model, dataloader, val_dataloaders=dev_dataloader)
+
+    if checkpoint_callback is not None and checkpoint_callback.best_model_path:
+        best_state = torch.load(checkpoint_callback.best_model_path, map_location="cpu")["state_dict"]
+        model.load_state_dict(best_state)
+        print(f"Loaded best Stage II weights from {checkpoint_callback.best_model_path}")
 
     global_step = int(trainer.global_step)
     ckpt_path = checkpoint_dir / f"stage2_step{global_step:06d}.pt"
