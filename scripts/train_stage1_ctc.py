@@ -17,6 +17,7 @@ from dma_kws.jsonl import read_jsonl
 from dma_kws.metrics import collapse_ctc, edit_distance
 from dma_kws.nn import build_encoder
 from dma_kws.phonemes import PhonemeVocabulary
+from dma_kws.runlog import build_loggers
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,7 +110,10 @@ def train(args: argparse.Namespace) -> None:
             encoder_out, encoder_mask = self.encoder(batch["feats"], batch["feat_lengths"])
             encoder_lens = encoder_mask.squeeze(1).sum(1)
             loss, _ = self.ctc(encoder_out, encoder_lens, batch["targets"], batch["target_lengths"])
-            self.log("train_loss", loss, prog_bar=True, batch_size=batch["feats"].size(0))
+            batch_size = batch["feats"].size(0)
+            self.log("train/loss", loss, on_step=True, prog_bar=True, batch_size=batch_size)
+            lr = self.optimizers().param_groups[0]["lr"]
+            self.log("train/lr", lr, on_step=True, prog_bar=True, batch_size=batch_size)
             return loss
 
         def on_validation_epoch_start(self):
@@ -186,6 +190,9 @@ def train(args: argparse.Namespace) -> None:
             validation_cfg.get("check_val_every_n_epoch", 1)
         )
 
+    log_dir = stage1.get("log_dir", Path(paths["exp_root"]) / "stage1_phoneme_ctc" / "logs")
+    loggers = build_loggers(log_dir, str(stage1.get("run_name", "stage1_phoneme_ctc")))
+
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=max(1, int(args.devices)),
@@ -193,6 +200,7 @@ def train(args: argparse.Namespace) -> None:
         max_steps=max_steps if max_steps else -1,
         gradient_clip_val=float(stage1.get("gradient_clip_val", 1.0)),
         log_every_n_steps=int(stage1.get("log_interval", 10)),
+        logger=loggers,
         callbacks=callbacks,
         **trainer_kwargs,
     )

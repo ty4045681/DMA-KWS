@@ -16,6 +16,7 @@ from dma_kws.config import load_config, require_sections
 from dma_kws.jsonl import read_jsonl
 from dma_kws.nn import build_encoder
 from dma_kws.phonemes import PhonemeVocabulary
+from dma_kws.runlog import build_loggers
 
 
 def parse_args() -> argparse.Namespace:
@@ -132,7 +133,9 @@ def train(args: argparse.Namespace) -> None:
         def training_step(self, batch, batch_idx):
             logits = self(batch["feats"], batch["feat_lengths"], batch["anchors"], batch["anchor_lengths"])
             loss = F.binary_cross_entropy_with_logits(logits, batch["labels"])
-            self.log("train_loss", loss, prog_bar=True)
+            self.log("train/loss", loss, on_step=True, prog_bar=True)
+            lr = self.optimizers().param_groups[0]["lr"]
+            self.log("train/lr", lr, on_step=True, prog_bar=True)
             return loss
 
         def validation_step(self, batch, batch_idx):
@@ -194,6 +197,9 @@ def train(args: argparse.Namespace) -> None:
     accelerator = "gpu" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
     devices = max(1, int(args.devices)) if accelerator == "gpu" else 1
 
+    log_dir = stage2.get("log_dir", Path(paths["exp_root"]) / "stage2_qbyt" / "logs")
+    loggers = build_loggers(log_dir, str(stage2.get("run_name", "stage2_qbyt")))
+
     trainer_kwargs = dict(
         accelerator=accelerator,
         devices=devices,
@@ -201,7 +207,7 @@ def train(args: argparse.Namespace) -> None:
         gradient_clip_val=float(stage2.get("gradient_clip_val", 1.0)),
         log_every_n_steps=int(stage2.get("log_interval", 10)),
         enable_checkpointing=False,
-        logger=False,
+        logger=loggers,
     )
     checkpoint_callback = None
     if dev_dataloader is not None:

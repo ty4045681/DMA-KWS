@@ -10,6 +10,7 @@ pyarrow
 soundfile
 tqdm
 pytorch-lightning
+tensorboard
 torchmetrics
 transformers
 huggingface_hub
