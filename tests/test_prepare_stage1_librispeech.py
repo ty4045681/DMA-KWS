@@ -53,5 +53,6 @@ def test_prepare_parquet_split_writes_manifest_and_audio_cache(tmp_path, monkeyp
             "text": "HELLO WORLD",
             "normalized_text": "hello world",
             "phonemes": ["HH", "AH", "L", "OW"],
+            "phonemes_g2p": "HH AH L OW",
         }
     ]

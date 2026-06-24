@@ -1,0 +1,189 @@
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from dma_kws.stage2.dataset import LibriPhraseTrainDataset
+from dma_kws.stage2.prepare_paper import (
+    PARQUET_COLUMNS,
+    build_clips_npy,
+    build_distances_npy,
+    compute_hard_negatives_from_phonemes,
+    convert_aggregated_to_paper_parquet,
+    resolve_fbank_rel_path,
+    slug_from_ngram,
+)
+
+
+class _FakeTokenizer:
+    def tokenize(self, text: str):
+        tokens = text.split()
+        ids = [hash(token) % 100 + 1 for token in tokens]
+        return tokens, ids
+
+
+def _synthetic_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ngram": ["hello world", "hello word", "goodbye"],
+            "ngram_g2p": ["HH AH L OW W ER L D", "HH AH L OW W ER D", "G UH D B AY"],
+            "clips": [
+                [{"audio_path": "LP-100/hello world/a.wav"}, {"audio_path": "LP-100/hello world/b.wav"}],
+                [{"audio_path": "LP-100/hello word/c.wav"}],
+                [{"audio_path": "LP-100/goodbye/d.wav"}],
+            ],
+        }
+    )
+
+
+def _mock_audio() -> dict[str, tuple[np.ndarray, int]]:
+    return {
+        "hello world/a.wav": (np.linspace(-0.1, 0.1, 1600, dtype=np.float32), 16000),
+        "hello world/b.wav": (np.linspace(-0.2, 0.2, 1600, dtype=np.float32), 16000),
+        "hello word/c.wav": (np.linspace(-0.15, 0.15, 1600, dtype=np.float32), 16000),
+        "goodbye/d.wav": (np.linspace(-0.05, 0.05, 1600, dtype=np.float32), 16000),
+    }
+
+
+def _fake_compute_fbank(_waveform_path, fbank_out_path, *, waveform, sample_rate, **_kwargs):
+    del sample_rate
+    fbank_out_path = Path(fbank_out_path)
+    fbank_out_path.parent.mkdir(parents=True, exist_ok=True)
+    frames = max(1, len(waveform) // 160)
+    feat = np.full((frames, 80), 0.5, dtype=np.float32)
+    np.save(fbank_out_path, feat)
+    return str(fbank_out_path)
+
+
+def test_slug_and_fbank_path_rewrite():
+    assert slug_from_ngram("Hello World!") == "hello_world"
+    assert resolve_fbank_rel_path("LP-100/hello/a.wav") == "LP-100-fbank/hello/a.npy"
+    assert resolve_fbank_rel_path("LP-460/hello/a.wav") == "LP-460-fbank/hello/a.npy"
+
+
+def test_build_clips_and_distances_npy_roundtrip(tmp_path):
+    clips = [{"audio_path": "LP-100/hello/a.wav"}, {"audio_path": "LP-100/hello/b.wav"}]
+    clips_path = tmp_path / "clips-2-hello.npy"
+    build_clips_npy(clips, clips_path)
+    loaded = np.load(clips_path, allow_pickle=True)
+    assert len(loaded) == 2
+    assert loaded[0]["audio_path"] == "LP-100/hello/a.wav"
+
+    build_distances_npy([], tmp_path / "dist-0-hello.npy")
+    empty = np.load(tmp_path / "dist-0-hello.npy", allow_pickle=True)
+    assert len(empty) == 0
+
+    hard = [{"ngram": "hello word"}]
+    build_distances_npy(hard, tmp_path / "dist-1-hello.npy")
+    loaded_hard = np.load(tmp_path / "dist-1-hello.npy", allow_pickle=True)
+    assert loaded_hard[0]["ngram"] == "hello word"
+
+
+def test_compute_hard_negatives_prefers_small_edit_distance():
+    candidates = [
+        ("hello world", "HH AH L OW W ER L D"),
+        ("hello word", "HH AH L OW W ER D"),
+        ("goodbye", "G UH D B AY"),
+    ]
+    hard = compute_hard_negatives_from_phonemes(
+        "hello world",
+        "HH AH L OW W ER L D",
+        candidates,
+        top_k=1,
+    )
+    assert [item["ngram"] for item in hard] == ["hello word"]
+
+
+def test_convert_aggregated_to_paper_parquet_writes_expected_layout(tmp_path):
+    processed = tmp_path / "processed" / "stage2_qbyt"
+    clips_dir = processed / "clips"
+    distances_dir = processed / "distances"
+    fbank_dir = tmp_path / "features" / "fbank"
+
+    paper_df, stats = convert_aggregated_to_paper_parquet(
+        _synthetic_df(),
+        clips_dir=clips_dir,
+        distances_dir=distances_dir,
+        fbank_dir=fbank_dir,
+        audio_by_rel=_mock_audio(),
+        compute_fbank=_fake_compute_fbank,
+    )
+
+    assert list(paper_df.columns) == PARQUET_COLUMNS
+    assert stats["anchors"] == 3
+    assert stats["missing_audio"] == 0
+    assert stats["fbank_written"] == 4
+
+    hello_row = paper_df.loc[paper_df["ngram"] == "hello world"].iloc[0]
+    assert hello_row["clips_file"].endswith("clips-2-hello_world.npy")
+    assert hello_row["distances_file"].endswith("dist-2-hello_world.npy")
+
+    clips = np.load(hello_row["clips_file"], allow_pickle=True)
+    assert clips[0]["audio_path"] == "LP-100/hello world/a.wav"
+
+    distances = np.load(hello_row["distances_file"], allow_pickle=True)
+    assert distances[0]["ngram"] == "hello word"
+    assert len(distances) == 2
+
+    for clip in clips:
+        fbank_path = fbank_dir / resolve_fbank_rel_path(clip["audio_path"])
+        assert fbank_path.exists()
+        feat = np.load(fbank_path)
+        assert feat.shape[1] == 80
+
+
+def test_distances_npy_works_with_dataset_get_hard_negative(tmp_path):
+    processed = tmp_path / "processed" / "stage2_qbyt"
+    clips_dir = processed / "clips"
+    distances_dir = processed / "distances"
+    fbank_dir = tmp_path / "features" / "fbank"
+
+    paper_df, _stats = convert_aggregated_to_paper_parquet(
+        _synthetic_df(),
+        clips_dir=clips_dir,
+        distances_dir=distances_dir,
+        fbank_dir=fbank_dir,
+        audio_by_rel=_mock_audio(),
+        compute_fbank=_fake_compute_fbank,
+    )
+
+    dataset = LibriPhraseTrainDataset(
+        wav_dir=str(fbank_dir),
+        tokenizer=_FakeTokenizer(),
+        df=paper_df,
+        sample_lens=1,
+        seed=0,
+    )
+
+    hello_idx = dataset.anchor2idx["hello world"]
+    distances_file = paper_df.loc[paper_df["ngram"] == "hello world", "distances_file"].iloc[0]
+    distances = np.load(distances_file, allow_pickle=True)
+    assert any(entry["ngram"] == "hello word" for entry in distances)
+
+    hard_neg = {"ngram": "hello word"}
+
+    negative_wav, negative_g2p, negative = dataset.get_hard_negative(hard_neg)
+    assert negative == "hello word"
+    assert negative_g2p == "HH AH L OW W ER D"
+    assert "audio_path" in negative_wav
+    assert negative_wav["audio_path"] == "LP-100/hello word/c.wav"
+
+    # Ensure dataset can load the corresponding fbank for the hard negative clip.
+    sample = dataset[hello_idx]
+    assert sample["feat"].shape[1] == 80
+
+
+def test_convert_respects_limit_anchors(tmp_path):
+    processed = tmp_path / "processed" / "stage2_qbyt"
+    paper_df, stats = convert_aggregated_to_paper_parquet(
+        _synthetic_df(),
+        clips_dir=processed / "clips",
+        distances_dir=processed / "distances",
+        fbank_dir=tmp_path / "features" / "fbank",
+        audio_by_rel=_mock_audio(),
+        limit_anchors=1,
+        compute_fbank=_fake_compute_fbank,
+    )
+    assert len(paper_df) == 1
+    assert stats["anchors"] == 1

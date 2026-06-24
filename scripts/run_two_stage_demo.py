@@ -13,11 +13,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dma_kws.audio import extract_fbank, load_audio
-from dma_kws.config import load_config, require_sections
+from dma_kws.config import get_tokenizer_config, load_config, require_sections
 from dma_kws.g2p import make_g2p, text_to_phonemes
 from dma_kws.nn import build_encoder
-from dma_kws.phonemes import PhonemeVocabulary
-from dma_kws.stage1.candidates import PhonemeFrame, find_keyword_candidates
+from dma_kws.stage1.streaming_search import build_keyword_context_graph, decode_keyword_candidates
+from dma_kws.tokenizer import load_char_tokenizer, tokenize_phoneme_string
+
+NUM_EMBEDS = 73
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,7 +29,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2-ckpt", required=True, help="Stage II checkpoint produced by train_stage2_qbyt.py")
     parser.add_argument("--audio", required=True, help="Input audio path")
     parser.add_argument("--keyword", required=True, help="Keyword text")
-    parser.add_argument("--vocab", default="", help="Override phoneme vocab path")
     parser.add_argument("--device", default="cuda", help="cuda or cpu")
     return parser.parse_args()
 
@@ -96,19 +97,25 @@ def run(args: argparse.Namespace) -> None:
         sys.path.insert(0, str(qbyt_root))
     from model import QbyT
     from models.ctc import CTC
+    from models.search import ctc_greedy_search
 
     config = load_config(args.config)
-    require_sections(config, ["paths", "stage1", "stage2", "demo"])
-    paths = config["paths"]
+    require_sections(config, ["paths", "stage1", "stage2", "demo", "tokenizer"])
     stage1 = config["stage1"]
     stage2 = config["stage2"]
     demo = config["demo"]
 
-    vocab_path = Path(args.vocab) if args.vocab else Path(paths["processed_root"]) / "stage1_phoneme_ctc" / "phoneme_vocab.txt"
-    vocab = PhonemeVocabulary.read(vocab_path)
+    tokenizer_cfg = get_tokenizer_config(config)
+    dict_path = Path(tokenizer_cfg["dict_path"])
+    if not dict_path.is_absolute():
+        dict_path = PROJECT_ROOT / dict_path
+    split_with_space = tokenizer_cfg.get("split_with_space", " ")
+    tokenizer = load_char_tokenizer(dict_path, split_with_space=split_with_space)
+
     g2p = make_g2p()
     keyword_phonemes = text_to_phonemes(g2p, args.keyword)
-    keyword_ids = vocab.encode(keyword_phonemes)
+    keyword_g2p_text = " ".join(keyword_phonemes)
+    keyword_ids = tokenize_phoneme_string(tokenizer, keyword_g2p_text)
 
     sample_rate = int(stage1.get("sample_rate", 16000))
     num_mel_bins = int(stage1.get("input_dim", 80))
@@ -119,7 +126,7 @@ def run(args: argparse.Namespace) -> None:
         def __init__(self):
             super().__init__()
             self.encoder = build_encoder(stage1, output_dim=encoder_dim)
-            self.ctc = CTC(len(vocab.token_to_id), encoder_dim, blank_id=0)
+            self.ctc = CTC(NUM_EMBEDS, encoder_dim, blank_id=0)
 
         def forward(self, feats, feat_lengths):
             encoder_out, encoder_mask = self.encoder(feats, feat_lengths)
@@ -132,7 +139,7 @@ def run(args: argparse.Namespace) -> None:
             self.encoder = build_encoder(stage1, output_dim=stage2_encoder_dim)
             self.qbyt = QbyT(
                 encoder_output_size=stage2_encoder_dim,
-                num_embeds=len(vocab.token_to_id),
+                num_embeds=NUM_EMBEDS,
                 embed_dim=int(stage2.get("qbyt_embed_dim", 128)),
                 post_num_layers=int(stage2.get("qbyt_layers", 2)),
             )
@@ -140,7 +147,12 @@ def run(args: argparse.Namespace) -> None:
         def forward(self, feats, feat_lengths, anchors, anchor_lengths):
             encoder_out, encoder_mask = self.encoder(feats, feat_lengths)
             encoder_lens = encoder_mask.squeeze(1).sum(1)
-            logits, _ = self.qbyt(encoder_out, anchors, encoder_lens, anchor_lengths)
+            logits, _ = self.qbyt(
+                encoder_out,
+                anchors,
+                speech_lengths=encoder_lens,
+                text_lengths=anchor_lengths,
+            )
             return torch.sigmoid(logits)
 
     def load_state(model, ckpt_path: str):
@@ -162,33 +174,21 @@ def run(args: argparse.Namespace) -> None:
     stage1_model = load_state(Stage1Model(), args.stage1_ckpt)
     with torch.no_grad():
         log_probs, mask = stage1_model(feat.to(device), feat_lengths.to(device))
-    token_ids = log_probs.argmax(dim=-1).squeeze(0).cpu().tolist()
-    valid_len = int(mask.squeeze(1).sum(1).item())
+    encoder_lens = mask.squeeze(1).sum(1).to(torch.long)
 
-    decoded_frames: list[PhonemeFrame] = []
-    previous = 0
+    context_graph = build_keyword_context_graph(keyword_ids, tokenizer.symbol_table)
     output_frame_shift_sec = 0.04
-    for index, token_id in enumerate(token_ids[:valid_len]):
-        if token_id == 0 or token_id == previous:
-            previous = token_id
-            continue
-        phoneme = vocab.id_to_token.get(token_id, "<unk>")
-        decoded_frames.append(
-            PhonemeFrame(
-                phoneme=phoneme,
-                start_sec=index * output_frame_shift_sec,
-                end_sec=(index + 1) * output_frame_shift_sec,
-                log_score=float(log_probs[0, index, token_id].cpu().item()),
-            )
-        )
-        previous = token_id
-
-    candidates = find_keyword_candidates(
-        decoded_frames,
-        keyword_phonemes,
+    candidates = decode_keyword_candidates(
+        log_probs,
+        encoder_lens,
+        context_graph,
+        frame_shift_sec=output_frame_shift_sec,
         margin_sec=float(demo.get("stage1_candidate_margin_sec", 0.15)),
-        max_insertions=int(demo.get("max_stage1_insertions", 2)),
+        symbol_table=tokenizer.symbol_table,
     )
+
+    greedy_results = ctc_greedy_search(log_probs, encoder_lens, blank_id=0)
+    decoded_phonemes = tokenizer.ids2tokens(greedy_results[0].tokens)
 
     stage2_model = load_state(Stage2Model(), args.stage2_ckpt)
     stage2_scores = []
@@ -239,7 +239,7 @@ def run(args: argparse.Namespace) -> None:
         "audio": args.audio,
         "keyword": args.keyword,
         "keyword_phonemes": keyword_phonemes,
-        "decoded_phonemes": [frame.phoneme for frame in decoded_frames],
+        "decoded_phonemes": decoded_phonemes,
         "stage1_candidates": [candidate.__dict__ for candidate in candidates],
         "stage2_scores": stage2_scores,
         "threshold": threshold,

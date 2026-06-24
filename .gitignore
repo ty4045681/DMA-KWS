@@ -16,8 +16,12 @@ env/
 .vscode/
 .idea/
 
-# Local data and experiment outputs
-data/
+# Local data and experiment outputs (keep vendored dict under data/dict/)
+data/*
+!data/dict/
+data/dict/*
+!data/dict/lang_char.txt
+!data/dict/README.md
 exp/
 outputs/
 checkpoints/

@@ -7,26 +7,26 @@ This repository contains code for a two-stage keyword spotting pipeline:
 1. **Stage I**: phoneme CTC decoding to find candidate keyword regions.
 2. **Stage II**: QbyT phoneme matching to verify each candidate.
 
-> Current training scripts are optimized for a **small-scale real training demo** first: train both stages yourself on LibriSpeech-100 / LibriPhrase-100, get a real two-stage demo running, then scale to larger LibriPhrase/GigaPhrase settings.
+> The repository uses a **single training recipe** aligned with the paper/main codebase. `configs/demo_librispeech100.yaml` is a **scale-only smoke preset** (LibriSpeech-100 / LibriPhrase-100, fewer steps) — same architecture, losses, negative mining, tokenizer, and streaming Stage I search as the paper configs. It does **not** define a separate demo algorithm.
 
 ---
 
 ## What is implemented now
 
-The current runnable path is:
+The runnable path (demo and paper share the same code):
 
 ```text
-LibriSpeech train-clean-100
-  -> Stage I phoneme manifest/vocab
+LibriSpeech
+  -> Stage I CharTokenizer manifest (data/dict/lang_char.txt)
   -> Stage I Conformer + CTC training
 
-LibriPhrase-100 style phrase data
-  -> Stage II positive/negative phrase pairs
-  -> Stage II Conformer + QbyT training
+LibriPhrase (paper-format parquet + precomputed fbank .npy)
+  -> Stage II utt_loss + seq_loss, random + hard negatives
+  -> Stage II Conformer + QbyT training (init -> avg -> finetune)
 
 input audio + keyword text
-  -> Stage I candidate regions
-  -> Stage II QbyT scores
+  -> Stage I prefix beam + ContextGraph candidates
+  -> Stage II QbyT verification
   -> detected / not detected
 ```
 
@@ -34,13 +34,17 @@ Main entry points:
 
 ```text
 scripts/prepare_stage1_librispeech.py
+scripts/prepare_stage1_fbank.py
 scripts/train_stage1_ctc.py
-scripts/prepare_stage2_libriphrase.py
+scripts/average_checkpoints.py
+scripts/prepare_stage2_paper.py
 scripts/train_stage2_qbyt.py
+scripts/train_stage2_recipe.py
+scripts/eval_stage2_libriphrase.py
 scripts/run_two_stage_demo.py
 ```
 
-The first version uses **offline** Stage I decoding. Streaming search and paper-scale reproduction can be added after the small training pipeline is stable.
+Paper-scale configs: `configs/paper_ls460.yaml`, `configs/paper_ls_gs1460.yaml`. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
 
 ---
 
@@ -116,12 +120,7 @@ export NLTK_DATA=/path/to/nltk_data
 Check lightweight local tests and script entry points:
 
 ```bash
-python3 -m pytest tests -q
-python3 scripts/prepare_stage1_librispeech.py --help
-python3 scripts/train_stage1_ctc.py --help
-python3 scripts/prepare_stage2_libriphrase.py --help
-python3 scripts/train_stage2_qbyt.py --help
-python3 scripts/run_two_stage_demo.py --help
+bash scripts/run_smoke.sh
 ```
 
 ---
@@ -221,7 +220,7 @@ snapshot_download(
 PY
 ```
 
-The Stage II preparation reads two kinds of files from the download:
+The Stage II preparation script reads two kinds of files from the download:
 
 1. An **aggregated** parquet for phrase metadata — at least columns:
 
@@ -234,10 +233,9 @@ The Stage II preparation reads two kinds of files from the download:
    `aggregated_segments_with_g2p.parquet`.
 
 2. The **decoded** audio shards `LP-100-decoded-*.parquet` (columns
-   `audio_rel`, `audio`, `sampling_rate`, ...). The script extracts only the
-   clips actually referenced by the pairs and writes them as float32 `.npy`
-   files under `<processed_root>/stage2_qbyt/audio/`. No loose `.wav` files
-   are needed.
+   `audio_rel`, `audio`, `sampling_rate`, ...). The script extracts referenced
+   clips, writes per-phrase `clips` / `distances` `.npy` shards, and computes
+   80-dim fbank `.npy` files under `<feature_root>/fbank/`.
 
 Inspect columns if needed:
 
@@ -268,8 +266,9 @@ Expected outputs:
 ```text
 /data/dma-kws/processed/stage1_phoneme_ctc/train.jsonl
 /data/dma-kws/processed/stage1_phoneme_ctc/dev.jsonl
-/data/dma-kws/processed/stage1_phoneme_ctc/phoneme_vocab.txt
 ```
+
+Manifests include `phonemes_g2p` targets for Wenet `CharTokenizer` (`data/dict/lang_char.txt`).
 
 If the smoke run works, prepare the full LibriSpeech-100 split:
 
@@ -326,7 +325,14 @@ Notes:
 
 - The script uses `g2p_en` to convert English transcripts to ARPAbet-like phonemes.
 - Stress markers such as `AH0` are normalized to `AH`.
-- The phoneme vocabulary produced here is reused by Stage II.
+- Stage I and Stage II share the Wenet CharTokenizer vocabulary at `data/dict/lang_char.txt`.
+
+Optional: precompute Stage I fbank features for faster training (reads the JSONL manifests above):
+
+```bash
+python3 scripts/prepare_stage1_fbank.py \
+  --config configs/demo_librispeech100.yaml
+```
 
 ---
 
@@ -361,6 +367,16 @@ Example:
 ls /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/*.pt
 ```
 
+Optionally average the last few checkpoints before Stage II init or demo inference:
+
+```bash
+python3 scripts/average_checkpoints.py \
+  --input-dir /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints \
+  --pattern "*.pt" \
+  --last-k 10 \
+  --output /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/avg_10.pt
+```
+
 If you hit out-of-memory, reduce these values in `configs/demo_librispeech100.yaml`:
 
 ```yaml
@@ -371,60 +387,36 @@ stage1:
 
 ---
 
-## 6. Stage II: prepare QbyT pairs
+## 6. Stage II: prepare training data
 
-Pick the aggregated LibriPhrase parquet with phrase metadata and G2P, and specify the decoded audio root:
+Stage II training uses the **paper pipeline** (`LibriPhraseTrainDataset`): a parquet with columns `ngram`, `ngram_g2p`, `clips_file`, `distances_file`, plus precomputed fbank `.npy` under `features/fbank/`. This is the same format as the paper configs — the demo differs only in dataset size and step counts.
 
-```bash
-LP_AGG=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p.parquet
-```
+Prepare that layout with `scripts/prepare_stage2_paper.py`. Training reads the paper parquet paths from `stage2.parquet_file` and `stage2.wav_dir` in your config (defaults under `/data/dma-kws/processed/stage2_qbyt/` and `/data/dma-kws/features/fbank/`).
 
-Smoke pair preparation:
+Smoke example (adjust paths to your LibriPhrase-100 download):
 
 ```bash
-python3 scripts/prepare_stage2_libriphrase.py \
+python3 scripts/prepare_stage2_paper.py \
   --config configs/demo_librispeech100.yaml \
-  --input-parquet "$LP_AGG" \
-  --decoded-parquet-root /data/dma-kws/raw/LibriPhrase-100 \
   --limit-anchors 50
 ```
 
-The `--decoded-parquet-root` defaults to `paths.libriphrase100_root`, so it can be omitted if the decoded shards live there.
-
-Full first run on the selected parquet:
-
-```bash
-python3 scripts/prepare_stage2_libriphrase.py \
-  --config configs/demo_librispeech100.yaml \
-  --input-parquet "$LP_AGG" \
-  --decoded-parquet-root /data/dma-kws/raw/LibriPhrase-100
-```
-
-Expected output:
+Expected outputs:
 
 ```text
-/data/dma-kws/processed/stage2_qbyt/train.jsonl
+/data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet
+/data/dma-kws/processed/stage2_qbyt/clips/
+/data/dma-kws/processed/stage2_qbyt/distances/
+/data/dma-kws/features/fbank/LP-100-fbank/
 ```
 
-The generated file contains pair records like:
-
-```json
-{
-  "anchor_text": "hello world",
-  "anchor_phonemes": ["HH", "AH", "L", "OW", "W", "ER", "L", "D"],
-  "wav_path": "relative/audio/path.npy",
-  "sample_rate": 16000,
-  "label": 1
-}
-```
-
-Note: `wav_path` points to `.npy` waveforms (float32) produced by the preparation script, relative to `<processed_root>/stage2_qbyt`. The trainer loads these `.npy` files and no longer reads `.wav` from `libriphrase100_root`.
+Training consumes the paper parquet + fbank layout directly via `LibriPhraseTrainDataset` (random + hard negatives, utt + seq loss).
 
 ---
 
 ## 7. Stage II: train QbyT verifier
 
-Use the Stage I checkpoint to initialize the Stage II encoder if possible:
+Optionally initialize from a Stage I checkpoint:
 
 ```bash
 STAGE1_CKPT=/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/stage1_epoch000_step000020.pt
@@ -436,7 +428,7 @@ Smoke training run:
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
   --config configs/demo_librispeech100.yaml \
   --devices 2 \
-  --stage1-ckpt "$STAGE1_CKPT" \
+  --init-checkpoint "$STAGE1_CKPT" \
   --limit-steps 20
 ```
 
@@ -446,7 +438,7 @@ Full first run:
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
   --config configs/demo_librispeech100.yaml \
   --devices 2 \
-  --stage1-ckpt "$STAGE1_CKPT"
+  --init-checkpoint "$STAGE1_CKPT"
 ```
 
 Checkpoints are saved under:
@@ -671,7 +663,7 @@ that directory before running the preparation scripts.
 
 ### Stage II parquet columns do not match
 
-Check columns:
+Check columns on your source aggregated parquet:
 
 ```bash
 python3 - <<'PY'
@@ -682,7 +674,7 @@ print(df.columns)
 PY
 ```
 
-The current preparation script supports `ngram`, `clips`, and optional `ngram_g2p`. If your HuggingFace dump has different column names, add a small converter or adapt `scripts/prepare_stage2_libriphrase.py`.
+The preparation script expects `ngram`, `clips`, and optional `ngram_g2p`. If your HuggingFace dump has different column names, add a small converter or adapt `scripts/prepare_stage2_paper.py`.
 
 ### Training is too slow or OOM
 
@@ -709,13 +701,13 @@ Recommended first target: **LibriSpeech train-clean-100 + LibriPhrase-100**.
 
 ---
 
-## Notes on paper reproduction
+## Paper reproduction
 
-The original README reports LibriPhrase hard-set performance of 97.85% AUC and 6.13% EER. The scripts in this branch are intended to get a real two-stage training/demo pipeline running first. To approach paper-scale results, next steps include:
+For full-scale reproduction (LibriSpeech-460, LibriPhrase-460, GigaPhrase-1460 finetune, hard/easy eval), follow **[docs/paper-reproduction.md](docs/paper-reproduction.md)**.
 
-1. scale Stage I beyond LibriSpeech-100;
-2. scale Stage II to LibriPhrase-460 / GigaPhrase-1000;
-3. improve hard-negative mining;
-4. add checkpoint averaging;
-5. add streaming Stage I candidate search;
-6. add full LibriPhrase hard/easy evaluation scripts.
+Key points:
+
+- **Same recipe as demo** — architecture, utt+seq loss, hard negatives, CharTokenizer, streaming Stage I search, checkpoint averaging, and LibriPhrase eval are all implemented.
+- **Scale-only demo** — `demo_librispeech100.yaml` uses smaller data and fewer steps; it validates the pipeline but does not produce paper metrics.
+- **Paper metrics** require the full recipe chain on LibriPhrase-460 hard eval: init → avg → finetune → `eval_stage2_libriphrase.py --split hard`.
+- Reported paper numbers: **97.85% AUC**, **6.13% EER** on LibriPhrase hard (target: within 1% absolute of main logs).

@@ -15,7 +15,8 @@ from typing import Iterable
 
 from dma_kws.config import load_config, require_sections
 from dma_kws.g2p import make_g2p, text_to_phonemes
-from dma_kws.phonemes import PhonemeVocabulary, normalize_english_text
+from dma_kws.phonemes import normalize_english_text
+from dma_kws.stage1.wenet_ctc import phonemes_to_g2p_string
 from dma_kws.stage1.librispeech import (
     ParquetAudioUtterance,
     iter_librispeech_parquet_utterances,
@@ -84,6 +85,7 @@ def prepare_split(
                 "text": utt.text,
                 "normalized_text": normalize_english_text(utt.text),
                 "phonemes": phones,
+                "phonemes_g2p": phonemes_to_g2p_string(phones),
             }
             writer.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
@@ -134,6 +136,7 @@ def prepare_parquet_split(
                 "text": utt.text,
                 "normalized_text": normalize_english_text(utt.text),
                 "phonemes": phones,
+                "phonemes_g2p": phonemes_to_g2p_string(phones),
             }
             writer.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
@@ -222,10 +225,10 @@ def main() -> None:
             limit=args.limit,
         )
 
-    vocab = PhonemeVocabulary.build(train_phones)
-    vocab_path = output_dir / "phoneme_vocab.txt"
-    vocab.write(vocab_path)
-    print(f"Wrote vocab of size {len(vocab.token_to_id)} to {vocab_path}")
+    print(
+        "Stage I targets use Wenet CharTokenizer dict from config tokenizer.dict_path "
+        f"(e.g. data/dict/lang_char.txt). Manifests include phonemes_g2p for training."
+    )
 
 
 if __name__ == "__main__":

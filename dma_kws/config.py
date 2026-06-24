@@ -35,3 +35,12 @@ def require_sections(config: dict[str, Any], sections: Iterable[str]) -> None:
     if missing:
         joined = ", ".join(missing)
         raise ValueError(f"Missing required config sections: {joined}")
+
+
+def get_tokenizer_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the tokenizer section from a loaded config."""
+    require_sections(config, ["tokenizer"])
+    tokenizer = config["tokenizer"]
+    if not isinstance(tokenizer, dict):
+        raise ValueError("Config section 'tokenizer' must be a mapping")
+    return tokenizer

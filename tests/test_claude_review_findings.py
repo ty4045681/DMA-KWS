@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from dma_kws.g2p import clean_phoneme_tokens, text_to_phonemes
 from scripts import prepare_stage1_librispeech as prepare_stage1
-from scripts import prepare_stage2_libriphrase as prepare_stage2
 from scripts import run_two_stage_demo as demo
 
 
@@ -151,5 +151,5 @@ def test_stage2_text_to_phonemes_filters_tokens_that_become_empty():
             assert text == "hello"
             return ["HH0", " ", "", "1", "OW1"]
 
-    assert prepare_stage2.text_to_phonemes(FakeG2P(), "HELLO") == ["HH", "OW"]
-    assert prepare_stage2.clean_phoneme_tokens(["AH0", "", "2", "  ", "L"]) == ["AH", "L"]
+    assert text_to_phonemes(FakeG2P(), "HELLO") == ["HH", "OW"]
+    assert clean_phoneme_tokens(["AH0", "", "2", "  ", "L"]) == ["AH", "L"]

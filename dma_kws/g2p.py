@@ -1,8 +1,8 @@
 """Grapheme-to-phoneme helpers shared across DMA-KWS scripts.
 
 Consolidates the near-identical ``make_g2p`` / ``text_to_phonemes`` /
-``clean_phoneme_tokens`` copies in prepare_stage1_librispeech.py,
-prepare_stage2_libriphrase.py, and run_two_stage_demo.py.
+``clean_phoneme_tokens`` copies in prepare_stage1_librispeech.py
+and run_two_stage_demo.py.
 """
 
 from __future__ import annotations

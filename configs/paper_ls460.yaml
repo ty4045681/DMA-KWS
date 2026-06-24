@@ -1,7 +1,7 @@
 paths:
   data_root: /data/dma-kws
   librispeech_root: /data/dma-kws/raw/LibriSpeech
-  libriphrase100_root: /data/dma-kws/raw/LibriPhrase-100
+  libriphrase460_root: /data/dma-kws/raw/LibriPhrase-460
   processed_root: /data/dma-kws/processed
   feature_root: /data/dma-kws/features
   exp_root: /data/dma-kws/exp
@@ -12,11 +12,11 @@ tokenizer:
 
 training:
   seed: 2025
-  recipe: init-ls-100
+  recipe: init-ls-460
 
 stage1:
   train_splits:
-    - train-clean-100
+    - train-clean-460
   dev_splits:
     - dev-clean
   sample_rate: 16000
@@ -30,8 +30,8 @@ stage1:
   max_train_steps: 0
   num_workers: 4
   learning_rate: 0.001
-  warmup_steps: 0
-  total_scheduler_steps: 0
+  warmup_steps: 2500
+  total_scheduler_steps: 50000
   dropout_rate: 0.1
   positional_dropout_rate: 0.1
   attention_dropout_rate: 0.0
@@ -44,7 +44,7 @@ stage1:
   run_name: stage1_phoneme_ctc
   checkpoint_avg:
     enabled: true
-    last_k: 3
+    last_k: 10
     pattern: "*.ckpt"
     output_name: avg_10.ckpt
   validation:
@@ -61,29 +61,35 @@ stage2:
   wav_dir: /data/dma-kws/features/fbank
   negative_ratio: 1
   hard_negative_ratio: 1
-  sample_lens: 5000
-  batch_size_per_gpu: 128
+  sample_lens: 100000000
+  batch_size_per_gpu: 512
   max_steps: 50000
-  num_workers: 4
+  num_workers: 16
   learning_rate: 0.0005
   warmup_steps: 2500
   total_scheduler_steps: 50000
-  accumulate_grad_batches: 1
-  strategy: auto
+  accumulate_grad_batches: 2
+  strategy: ddp
   gradient_clip_val: 1.0
   log_interval: 10
   val_check_interval: 1000
   freeze_encoder: false
-  checkpoint_dir: /data/dma-kws/exp/stage2_qbyt/checkpoints
-  log_dir: /data/dma-kws/exp/stage2_qbyt/logs
-  run_name: stage2_qbyt
+  checkpoint_dir: /data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460
+  log_dir: /data/dma-kws/exp/stage2_qbyt/logs/init-ls-460
+  run_name: init-ls-460
+  dev:
+    eval_parquet: ""
+    holdout_anchor_fraction: 0.1
+    seed: 2025
   validation:
-    batch_size: 128
+    dev_manifest: ""
+    batch_size: 256
     val_check_interval: 1000
   eval:
-    test_dir: /data/dma-kws/raw/LibriPhrase-100/eval
-    batch_size: 64
+    test_dir: /data/dma-kws/raw/LibriPhrase-460/eval
     split: hard
+    aggregate_csv: evaluation_set/test_all_phrase.csv
+    batch_size: 256
   checkpoint:
     every_n_train_steps: 1000
     save_top_k: -1
