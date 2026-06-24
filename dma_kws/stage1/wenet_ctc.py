@@ -21,6 +21,7 @@ from dma_kws.nn import build_encoder
 from dma_kws.runlog import build_loggers
 from dma_kws.tokenizer import load_char_tokenizer, tokenize_phoneme_string
 from dma_kws.training.checkpoint_avg import average_lightning_checkpoints
+from dma_kws.training.resume import resolve_resume_path
 from dma_kws.training.scheduler import build_cosine_warmup_optimizer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -229,6 +230,7 @@ class Stage1TrainArgs:
     device: str = "cuda"
     devices: int = 1
     limit_steps: int = 0
+    resume_from: str = ""
 
 
 def _resolve_dict_path(config: dict[str, Any]) -> Path:
@@ -397,12 +399,12 @@ def run_stage1_training(config: dict[str, Any], args: Stage1TrainArgs) -> None:
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    from pytorch_lightning.callbacks import ModelCheckpoint
+
     callbacks = []
     checkpoint_callback = None
     trainer_kwargs: dict[str, Any] = {}
     if dev_dataloader is not None:
-        from pytorch_lightning.callbacks import ModelCheckpoint
-
         avg_cfg = stage1.get("checkpoint_avg", {}) or {}
         save_all = bool(avg_cfg.get("enabled", False))
         checkpoint_callback = ModelCheckpoint(
@@ -411,10 +413,19 @@ def run_stage1_training(config: dict[str, Any], args: Stage1TrainArgs) -> None:
             mode="min",
             save_top_k=1 if not save_all else -1,
             filename="stage1_{epoch:03d}_{val_per:.4f}",
+            save_last=True,
         )
         callbacks.append(checkpoint_callback)
         trainer_kwargs["check_val_every_n_epoch"] = int(
             validation_cfg.get("check_val_every_n_epoch", 1)
+        )
+    else:
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=str(checkpoint_dir),
+                save_last=True,
+                save_top_k=0,
+            )
         )
 
     log_dir = stage1.get("log_dir", Path(paths["exp_root"]) / "stage1_phoneme_ctc" / "logs")
@@ -432,10 +443,12 @@ def run_stage1_training(config: dict[str, Any], args: Stage1TrainArgs) -> None:
         **trainer_kwargs,
     )
 
+    resume_path = resolve_resume_path(args.resume_from, checkpoint_dir)
+
     if dev_dataloader is not None:
-        trainer.fit(model, dataloader, dev_dataloader)
+        trainer.fit(model, dataloader, dev_dataloader, ckpt_path=resume_path)
     else:
-        trainer.fit(model, dataloader)
+        trainer.fit(model, dataloader, ckpt_path=resume_path)
 
     if checkpoint_callback is not None and checkpoint_callback.best_model_path:
         best_state = torch.load(checkpoint_callback.best_model_path, map_location="cpu")

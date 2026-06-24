@@ -23,6 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="cuda or cpu")
     parser.add_argument("--devices", type=int, default=1, help="Number of devices for the Lightning Trainer")
     parser.add_argument("--limit-steps", type=int, default=0, help="Optional training step cap for smoke runs")
+    parser.add_argument(
+        "--resume-from",
+        default="",
+        help='Resume full training state from a checkpoint path, or "last" to use <checkpoint_dir>/last.ckpt',
+    )
     return parser.parse_args()
 
 
@@ -37,6 +42,7 @@ def main() -> None:
             device=args.device,
             devices=args.devices,
             limit_steps=args.limit_steps,
+            resume_from=args.resume_from,
         ),
     )
 

@@ -33,4 +33,5 @@ def build_stage2_checkpoint_callback(config: dict[str, Any], recipe: str) -> Mod
         save_top_k=save_top_k,
         save_on_train_epoch_end=False,
         every_n_train_steps=every_n_train_steps,
+        save_last=True,
     )

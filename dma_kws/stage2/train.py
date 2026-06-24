@@ -21,6 +21,7 @@ class Stage2TrainArgs:
 
     init_checkpoint: str = ""
     resume_checkpoint: str = ""
+    resume_from: str = ""
     device: str = "cuda"
     devices: int = 1
     limit_steps: int = 0
@@ -95,6 +96,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     from dma_kws.stage2.dataset import LibriPhraseTrainDataset
     from dma_kws.stage2.module import Stage2LightningModule
     from dma_kws.tokenizer import load_char_tokenizer
+    from dma_kws.training import resolve_resume_path
     from dma_kws.training.checkpoint_callback import build_stage2_checkpoint_callback
     from dma_kws.training.ddp import build_trainer_kwargs
 
@@ -154,7 +156,24 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     init_checkpoint = args.init_checkpoint or stage2.get("init_checkpoint", "")
     freeze_encoder = bool(stage2.get("freeze_encoder", False))
 
-    if resume_checkpoint:
+    limit_steps = args.limit_steps or None
+    checkpoint_dir = Path(stage2.get("checkpoint_dir", Path(paths["exp_root"]) / "stage2_qbyt" / "checkpoints"))
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    resume_path = resolve_resume_path(args.resume_from, checkpoint_dir)
+
+    if resume_path is not None:
+        if resume_checkpoint or init_checkpoint:
+            print(
+                "Resuming full training state via ckpt_path; ignoring "
+                "init_checkpoint/resume_checkpoint weight init (ckpt_path restores full state)."
+            )
+        model = Stage2LightningModule(
+            config,
+            vocab_size=vocab_size,
+            freeze_encoder=freeze_encoder,
+        )
+    elif resume_checkpoint:
         model = Stage2LightningModule.load_from_checkpoint(
             resume_checkpoint,
             config=config,
@@ -168,10 +187,6 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
             freeze_encoder=freeze_encoder,
             init_checkpoint=init_checkpoint or None,
         )
-
-    limit_steps = args.limit_steps or None
-    checkpoint_dir = Path(stage2.get("checkpoint_dir", Path(paths["exp_root"]) / "stage2_qbyt" / "checkpoints"))
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     accelerator = "gpu" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
     devices = max(1, int(args.devices)) if accelerator == "gpu" else 1
@@ -189,7 +204,12 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         logger=loggers,
         **trainer_kwargs,
     )
-    trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
+    trainer.fit(
+        model,
+        train_dataloaders=train_dataloader,
+        val_dataloaders=val_dataloader,
+        ckpt_path=resume_path,
+    )
 
     global_step = int(trainer.global_step)
     ckpt_path = checkpoint_dir / f"stage2_step{global_step:06d}.pt"

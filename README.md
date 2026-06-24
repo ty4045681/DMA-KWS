@@ -355,6 +355,17 @@ CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage1_ctc.py \
   --devices 2
 ```
 
+Resume an interrupted run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage1_ctc.py \
+  --config configs/demo_librispeech100.yaml \
+  --devices 2 \
+  --resume-from last
+```
+
+`--resume-from last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt` and continues to the configured limit. Pass an explicit `.ckpt` path instead of `last` to resume from a specific checkpoint. If the original run used `--limit-steps`, pass the same value again on resume.
+
 Checkpoints are saved under:
 
 ```text
@@ -440,6 +451,17 @@ CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
   --devices 2 \
   --init-checkpoint "$STAGE1_CKPT"
 ```
+
+Resume an interrupted run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
+  --config configs/demo_librispeech100.yaml \
+  --devices 2 \
+  --resume-from last
+```
+
+`--resume-from last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt`, or pass an explicit `.ckpt` path. If the original run used `--limit-steps`, pass the same value again on resume. This is a true Lightning resume of an interrupted run and is distinct from `--init-checkpoint` / `stage2.resume_checkpoint`, which only load weights to seed a fresh finetune recipe.
 
 Checkpoints are saved under:
 
