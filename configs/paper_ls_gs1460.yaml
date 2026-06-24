@@ -1,11 +1,11 @@
 paths:
-  data_root: /data/dma-kws
-  librispeech_root: /data/dma-kws/raw/LibriSpeech
-  libriphrase460_root: /data/dma-kws/raw/LibriPhrase-460
-  libriphrase_gs1460_root: /data/dma-kws/raw/LibriPhrase-GS-1460
-  processed_root: /data/dma-kws/processed
-  feature_root: /data/dma-kws/features
-  exp_root: /data/dma-kws/exp
+  data_root: data/dma-kws
+  librispeech_root: data/dma-kws/raw/LibriSpeech
+  libriphrase460_root: data/dma-kws/raw/LibriPhrase-460
+  libriphrase_gs1460_root: data/dma-kws/raw/LibriPhrase-GS-1460
+  processed_root: data/dma-kws/processed
+  feature_root: data/dma-kws/features
+  exp_root: data/dma-kws/exp
 
 tokenizer:
   dict_path: data/dict/lang_char.txt
@@ -38,8 +38,8 @@ stage1:
   cnn_module_kernel: 3
   gradient_clip_val: 1.0
   log_interval: 10
-  checkpoint_dir: /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints
-  log_dir: /data/dma-kws/exp/stage1_phoneme_ctc/logs
+  checkpoint_dir: data/dma-kws/exp/stage1_phoneme_ctc/checkpoints
+  log_dir: data/dma-kws/exp/stage1_phoneme_ctc/logs
   run_name: stage1_phoneme_ctc
   validation:
     dev_manifest: ""
@@ -51,10 +51,10 @@ stage2:
   encoder_output_dim: 144
   qbyt_embed_dim: 128
   qbyt_layers: 2
-  init_checkpoint: /data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460/avg_10.ckpt
-  resume_checkpoint: /data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460/avg_10.ckpt
-  parquet_file: /data/dma-kws/processed/stage2_qbyt/ls-gs-1460/processed_data.parquet
-  wav_dir: /data/dma-kws/features/fbank
+  init_checkpoint: data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460/avg_10.ckpt
+  resume_checkpoint: data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460/avg_10.ckpt
+  parquet_file: data/dma-kws/processed/stage2_qbyt/ls-gs-1460/processed_data.parquet
+  wav_dir: data/dma-kws/features/fbank
   negative_ratio: 1
   hard_negative_ratio: 100
   sample_lens: 100000000
@@ -70,8 +70,8 @@ stage2:
   log_interval: 10
   val_check_interval: 1000
   freeze_encoder: false
-  checkpoint_dir: /data/dma-kws/exp/stage2_qbyt/checkpoints/ft-ls-gs-1460
-  log_dir: /data/dma-kws/exp/stage2_qbyt/logs/ft-ls-gs-1460
+  checkpoint_dir: data/dma-kws/exp/stage2_qbyt/checkpoints/ft-ls-gs-1460
+  log_dir: data/dma-kws/exp/stage2_qbyt/logs/ft-ls-gs-1460
   run_name: ft-ls-gs-1460
   dev:
     eval_parquet: ""
