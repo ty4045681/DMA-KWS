@@ -2,9 +2,17 @@
 #
 # Prerequisites:
 #   1. Set WENET_CMVN_FILE and WENET_ASR_CHECKPOINT to your Wenet training artifacts.
-#   2. Prepare LibriPhrase stage2 parquet + fbank features (same as paper_ls460.yaml).
-#   3. Wenet checkpoint should be a .pt file whose state dict contains encoder.* keys
+#   2. Wenet checkpoint should be a .pt file whose state dict contains encoder.* keys
 #      (e.g. model_dir/avg_10.pt or model_dir/step_247499.pt).
+#   3. Preprocess raw LibriPhrase-100 into paper-format parquet + fbank npy. The raw
+#      aggregated parquet only has ngram/clips/distances; training needs clips_file/
+#      distances_file columns produced by the prepare script:
+#        python scripts/prepare_stage2_paper.py \
+#          --config configs/wenet_asr_stage2.yaml \
+#          --input-parquet data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
+#          --decoded-parquet-root data/dma-kws/raw/LibriPhrase-100
+#      This writes processed/stage2_qbyt/ (parquet + clips/ + distances/) and
+#      features/fbank/LP-100-fbank/.
 #
 # Usage:
 #   export WENET_CMVN_FILE=/path/to/global_cmvn
@@ -18,7 +26,7 @@
 paths:
   data_root: data/dma-kws
   librispeech_root: data/dma-kws/raw/LibriSpeech
-  libriphrase460_root: data/dma-kws/raw/LibriPhrase-460
+  libriphrase100_root: data/dma-kws/raw/LibriPhrase-100
   processed_root: data/dma-kws/processed
   feature_root: data/dma-kws/features
   exp_root: data/dma-kws/exp
@@ -87,7 +95,10 @@ stage2:
     batch_size: 256
     val_check_interval: 1000
   eval:
-    test_dir: data/dma-kws/raw/LibriPhrase-460/eval
+    # Official LibriPhrase eval set (evaluation_set/libriphrase_diffspk_all_*word.csv).
+    # Not included in the raw LibriPhrase-100 training dir; point this at wherever
+    # your eval CSVs + fbank .npy live once located.
+    test_dir: data/dma-kws/raw/LibriPhrase-100/eval
     split: hard
     aggregate_csv: evaluation_set/test_all_phrase.csv
     batch_size: 256
