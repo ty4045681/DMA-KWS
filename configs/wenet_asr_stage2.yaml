@@ -1,0 +1,101 @@
+# Stage II QbyT training initialized from a Wenet ASR Conformer encoder.
+#
+# Prerequisites:
+#   1. Set WENET_CMVN_FILE and WENET_ASR_CHECKPOINT to your Wenet training artifacts.
+#   2. Prepare LibriPhrase stage2 parquet + fbank features (same as paper_ls460.yaml).
+#   3. Wenet checkpoint should be a .pt file whose state dict contains encoder.* keys
+#      (e.g. model_dir/avg_10.pt or model_dir/step_247499.pt).
+#
+# Usage:
+#   export WENET_CMVN_FILE=/path/to/global_cmvn
+#   export WENET_ASR_CHECKPOINT=/path/to/wenet_asr.pt
+#   python scripts/train_stage2_qbyt.py --config configs/wenet_asr_stage2.yaml
+#
+# Override init checkpoint without editing this file:
+#   python scripts/train_stage2_qbyt.py --config configs/wenet_asr_stage2.yaml \
+#     --init-checkpoint /path/to/wenet_asr.pt
+
+paths:
+  data_root: data/dma-kws
+  librispeech_root: data/dma-kws/raw/LibriSpeech
+  libriphrase460_root: data/dma-kws/raw/LibriPhrase-460
+  processed_root: data/dma-kws/processed
+  feature_root: data/dma-kws/features
+  exp_root: data/dma-kws/exp
+
+tokenizer:
+  dict_path: data/dict/lang_char.txt
+  split_with_space: " "
+
+training:
+  seed: 2025
+  recipe: wenet-asr-init
+
+# Encoder architecture must match the Wenet ASR training yaml (encoder_conf + cmvn).
+stage1:
+  sample_rate: 16000
+  input_dim: 80
+  encoder_output_dim: 144
+  attention_heads: 4
+  linear_units: 576
+  num_blocks: 6
+  dropout_rate: 0.03
+  positional_dropout_rate: 0.03
+  attention_dropout_rate: 0.1
+  cnn_module_kernel: 3
+  causal: true
+  cnn_module_norm: layer_norm
+  use_dynamic_chunk: true
+  use_dynamic_left_chunk: true
+  gradient_checkpointing: true
+  cmvn: global_cmvn
+  cmvn_conf:
+    cmvn_file: ${WENET_CMVN_FILE}
+    is_json_cmvn: true
+
+stage2:
+  encoder_output_dim: 144
+  qbyt_embed_dim: 128
+  qbyt_layers: 2
+  init_checkpoint: ${WENET_ASR_CHECKPOINT}
+  parquet_file: data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet
+  wav_dir: data/dma-kws/features/fbank
+  negative_ratio: 1
+  hard_negative_ratio: 1
+  sample_lens: 100000000
+  batch_size_per_gpu: 512
+  max_steps: 50000
+  num_workers: 16
+  learning_rate: 0.0005
+  warmup_steps: 2500
+  total_scheduler_steps: 50000
+  accumulate_grad_batches: 2
+  strategy: ddp
+  gradient_clip_val: 1.0
+  log_interval: 10
+  val_check_interval: 1000
+  freeze_encoder: false
+  checkpoint_dir: data/dma-kws/exp/stage2_qbyt/checkpoints/wenet-asr-init
+  log_dir: data/dma-kws/exp/stage2_qbyt/logs/wenet-asr-init
+  run_name: wenet-asr-init
+  dev:
+    eval_parquet: ""
+    holdout_anchor_fraction: 0.1
+    seed: 2025
+  validation:
+    dev_manifest: ""
+    batch_size: 256
+    val_check_interval: 1000
+  eval:
+    test_dir: data/dma-kws/raw/LibriPhrase-460/eval
+    split: hard
+    aggregate_csv: evaluation_set/test_all_phrase.csv
+    batch_size: 256
+  checkpoint:
+    every_n_train_steps: 1000
+    save_top_k: -1
+
+demo:
+  stage1_candidate_margin_sec: 0.15
+  max_stage1_insertions: 2
+  qbyt_threshold: 0.5

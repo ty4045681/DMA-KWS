@@ -36,6 +36,8 @@ def _extract_state_dict(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:
         return checkpoint["state_dict"]
     if "model_state_dict" in checkpoint:
         return checkpoint["model_state_dict"]
+    if "model" in checkpoint and isinstance(checkpoint["model"], dict):
+        return checkpoint["model"]
     return checkpoint
 
 
