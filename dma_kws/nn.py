@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def build_encoder(stage1_cfg: dict, *, output_dim: int):
+def build_encoder(stage1_cfg: dict[str, Any], *, output_dim: int):
     """Build a ConformerEncoder from the ``stage1`` config section.
 
     Every kwarg and its default mirrors the previously copy-pasted blocks; only
@@ -31,6 +32,8 @@ def build_encoder(stage1_cfg: dict, *, output_dim: int):
             "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
         ) from exc
 
+    from dma_kws.cmvn import build_global_cmvn
+
     return ConformerEncoder(
         input_size=int(stage1_cfg.get("input_dim", 80)),
         output_size=output_dim,
@@ -45,4 +48,10 @@ def build_encoder(stage1_cfg: dict, *, output_dim: int):
         pos_enc_layer_type="rel_pos",
         selfattention_layer_type="rel_selfattn",
         cnn_module_kernel=int(stage1_cfg.get("cnn_module_kernel", 3)),
+        causal=bool(stage1_cfg.get("causal", False)),
+        cnn_module_norm=str(stage1_cfg.get("cnn_module_norm", "batch_norm")),
+        use_dynamic_chunk=bool(stage1_cfg.get("use_dynamic_chunk", False)),
+        use_dynamic_left_chunk=bool(stage1_cfg.get("use_dynamic_left_chunk", False)),
+        gradient_checkpointing=bool(stage1_cfg.get("gradient_checkpointing", False)),
+        global_cmvn=build_global_cmvn(stage1_cfg),
     )
