@@ -1,8 +1,6 @@
 paths:
-  data_root: data/dma-kws
   librispeech_root: data/dma-kws/raw/LibriSpeech
   libriphrase460_root: data/dma-kws/raw/LibriPhrase-460
-  libriphrase_gs1460_root: data/dma-kws/raw/LibriPhrase-GS-1460
   processed_root: data/dma-kws/processed
   feature_root: data/dma-kws/features
   exp_root: data/dma-kws/exp
@@ -73,12 +71,7 @@ stage2:
   checkpoint_dir: data/dma-kws/exp/stage2_qbyt/checkpoints/ft-ls-gs-1460
   log_dir: data/dma-kws/exp/stage2_qbyt/logs/ft-ls-gs-1460
   run_name: ft-ls-gs-1460
-  dev:
-    eval_parquet: ""
-    holdout_anchor_fraction: 0.1
-    seed: 2025
   validation:
-    dev_manifest: ""
     batch_size: 256
     val_check_interval: 1000
   checkpoint:
@@ -87,5 +80,4 @@ stage2:
 
 demo:
   stage1_candidate_margin_sec: 0.15
-  max_stage1_insertions: 2
   qbyt_threshold: 0.5

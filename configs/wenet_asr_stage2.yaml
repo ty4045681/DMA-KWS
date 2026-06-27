@@ -27,7 +27,6 @@
 #     --init-checkpoint /path/to/wenet_asr.pt
 
 paths:
-  data_root: data/dma-kws
   librispeech_root: data/dma-kws/raw/LibriSpeech
   libriphrase100_root: data/dma-kws/raw/LibriPhrase-100
   processed_root: data/dma-kws/processed
@@ -96,12 +95,7 @@ stage2:
   checkpoint_dir: data/dma-kws/exp/stage2_qbyt/checkpoints/wenet-asr-init
   log_dir: data/dma-kws/exp/stage2_qbyt/logs/wenet-asr-init
   run_name: wenet-asr-init
-  dev:
-    eval_parquet: ""
-    holdout_anchor_fraction: 0.1
-    seed: 2025
   validation:
-    dev_manifest: ""
     batch_size: 256
     val_check_interval: 1000
   eval:
@@ -118,5 +112,4 @@ stage2:
 
 demo:
   stage1_candidate_margin_sec: 0.15
-  max_stage1_insertions: 2
   qbyt_threshold: 0.5
