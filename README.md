@@ -38,13 +38,29 @@ scripts/prepare_stage1_fbank.py
 scripts/train_stage1_ctc.py
 scripts/average_checkpoints.py
 scripts/prepare_stage2_paper.py
+scripts/prepare_stage2_eval_fbank.py   # precompute LibriPhrase eval fbank .npy for Stage II validation
 scripts/train_stage2_qbyt.py
 scripts/train_stage2_recipe.py
 scripts/eval_stage2_libriphrase.py
 scripts/run_two_stage_demo.py
 ```
 
-Paper-scale configs: `configs/paper_ls460.yaml`, `configs/paper_ls_gs1460.yaml`. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
+Paper-scale configs: `configs/paper_ls460.yaml`, `configs/paper_ls_gs1460.yaml`. Wenet ASR encoder init preset: `configs/wenet_asr_stage2.yaml`. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
+
+### Shared `fbank` config
+
+Stage I/II prep scripts read a top-level `fbank:` section for shared Kaldi fbank settings (mel bins, frame length/shift, dither, window type). Example:
+
+```yaml
+fbank:
+  num_mel_bins: 80
+  frame_length: 25
+  frame_shift: 10
+  dither: 0.1
+  window_type: povey
+```
+
+Eval-only overrides (e.g. `dither: 0.0` for deterministic validation features) can go under `stage2.eval.fbank:` without changing training prep.
 
 ---
 
@@ -404,12 +420,33 @@ Stage II training uses the **paper pipeline** (`LibriPhraseTrainDataset`): a par
 
 Prepare that layout with `scripts/prepare_stage2_paper.py`. Training reads the paper parquet paths from `stage2.parquet_file` and `stage2.wav_dir` in your config (defaults under `/data/dma-kws/processed/stage2_qbyt/` and `/data/dma-kws/features/fbank/`).
 
-Smoke example (adjust paths to your LibriPhrase-100 download):
+Pass the **aggregated** LibriPhrase parquet explicitly with `--input-parquet`. Use
+`aggregated_segments_with_g2p_distance.parquet` (includes per-clip G2P distances for hard negatives) — **not**
+`aggregated_segments_by_ngram.parquet`.
+
+Demo smoke run:
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   --config configs/demo_librispeech100.yaml \
+  --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
   --limit-anchors 50
+```
+
+Full demo prep (drop `--limit-anchors`):
+
+```bash
+python3 scripts/prepare_stage2_paper.py \
+  --config configs/demo_librispeech100.yaml \
+  --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
+```
+
+Same input parquet for the Wenet-init recipe:
+
+```bash
+python3 scripts/prepare_stage2_paper.py \
+  --config configs/wenet_asr_stage2.yaml \
+  --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
 ```
 
 Expected outputs:
@@ -421,7 +458,40 @@ Expected outputs:
 /data/dma-kws/features/fbank/LP-100-fbank/
 ```
 
+Fbank parameters (`num_mel_bins`, `frame_length`, `frame_shift`, etc.) are read from the top-level `fbank:` block in your config YAML.
+
 Training consumes the paper parquet + fbank layout directly via `LibriPhraseTrainDataset` (random + hard negatives, utt + seq loss).
+
+### LibriPhrase eval data (required for validation)
+
+Stage II training runs LibriPhrase validation on a schedule (`stage2.validation.val_check_interval`). You need the official eval set under `stage2.eval.test_dir` (default `/data/dma-kws/raw/LibriPhrase-100/eval`). It is **not** included in the LibriPhrase-100 training download.
+
+Expected layout:
+
+```text
+<test_dir>/
+  evaluation_set/libriphrase_diffspk_all_1word.csv
+  evaluation_set/libriphrase_diffspk_all_2word.csv
+  evaluation_set/libriphrase_diffspk_all_3word.csv
+  evaluation_set/libriphrase_diffspk_all_4word.csv
+  train-other-500/train-other-500/<spk>/<chap>/*.wav
+```
+
+Validation reads fbank `.npy` files co-located next to each `.wav`, not the wav files directly. Precompute them with `scripts/prepare_stage2_eval_fbank.py` (uses the same `fbank:` settings as training prep):
+
+```bash
+python3 scripts/prepare_stage2_eval_fbank.py \
+  --config configs/demo_librispeech100.yaml \
+  --from-csv
+```
+
+```bash
+python3 scripts/prepare_stage2_eval_fbank.py \
+  --config configs/wenet_asr_stage2.yaml \
+  --from-csv
+```
+
+`--from-csv` converts only wav files referenced by the eval CSV `anchor` / `comparison` columns (faster than scanning all wav under `test_dir`). Each `train-other-500/.../clip.wav` gets a sibling `clip.npy`. Smoke test with `--limit 100`.
 
 ---
 
@@ -482,6 +552,55 @@ stage2:
   batch_size_per_gpu: 64
   num_workers: 2
 ```
+
+---
+
+## 7b. Stage II: initialize from external Wenet ASR encoder
+
+Alternative to Stage I init: seed the Stage II Conformer encoder from a pretrained Wenet ASR checkpoint. Use `configs/wenet_asr_stage2.yaml`.
+
+Prerequisites:
+
+- A Wenet ASR `.pt` checkpoint whose state dict contains `encoder.*` weights (for example `model_dir/avg_10.pt` or `model_dir/step_247499.pt`).
+- The matching `global_cmvn` JSON file from the same Wenet training run.
+- `stage1` encoder settings in the config must match the Wenet ASR training yaml (`causal`, `cnn_module_norm`, `cmvn`, block sizes, and related fields). Mismatches show up as high missing/unexpected counts at startup.
+
+Set environment variables referenced in the config:
+
+```bash
+export WENET_CMVN_FILE=/path/to/global_cmvn
+export WENET_ASR_CHECKPOINT=/path/to/wenet_asr.pt
+```
+
+Full data prep and training chain:
+
+```bash
+python3 scripts/prepare_stage2_paper.py \
+  --config configs/wenet_asr_stage2.yaml \
+  --input-parquet data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
+  --decoded-parquet-root data/dma-kws/raw/LibriPhrase-100
+
+python3 scripts/prepare_stage2_eval_fbank.py \
+  --config configs/wenet_asr_stage2.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
+  --config configs/wenet_asr_stage2.yaml \
+  --devices 2
+```
+
+Override the init checkpoint without editing the yaml:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
+  --config configs/wenet_asr_stage2.yaml \
+  --devices 2 \
+  --init-checkpoint /path/to/wenet_asr.pt
+```
+
+Notes:
+
+- QbyT still uses the phoneme CharTokenizer at `data/dict/lang_char.txt` (same as the paper recipe). This path does **not** switch to Wenet BPE/subword tokenization.
+- On startup, look for `Loaded encoder weights from ...: missing=N unexpected=M`. Both counts should be low (ideally zero). High values usually mean the encoder yaml does not match the Wenet checkpoint or the checkpoint path is wrong.
 
 ---
 
@@ -709,6 +828,20 @@ Start with smoke flags:
 ```
 
 Then increase data/steps gradually.
+
+### `LibriPhrase eval data is required`
+
+Stage II validation reads LibriPhrase eval wav/CSV files under `stage2.eval.test_dir`. The raw LibriPhrase-100 training download does not include these. Set `stage2.eval.test_dir` in your config to wherever you store the official eval set (CSVs such as `evaluation_set/libriphrase_diffspk_all_*word.csv` and the corresponding wav tree), then download or symlink the eval assets before training.
+
+### `FileNotFoundError` for `.npy` during validation
+
+Validation expects precomputed fbank `.npy` next to eval wav files. Run:
+
+```bash
+python3 scripts/prepare_stage2_eval_fbank.py --config configs/wenet_asr_stage2.yaml
+```
+
+Use `--from-csv` to convert only wav files referenced by the eval CSVs, or point `--test-dir` at your eval root if it differs from the config.
 
 ---
 
