@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dma_kws.config import load_config, require_sections
+from dma_kws.config import get_fbank_config, load_config, require_sections
 from dma_kws.stage1.prepare_fbank import prepare_manifest_fbank
 
 
@@ -73,7 +73,7 @@ def main() -> None:
     )
 
     sample_rate = int(stage1.get("sample_rate", 16000))
-    num_mel_bins = int(stage1.get("input_dim", 80))
+    fbank_cfg = get_fbank_config(config)
 
     for label, manifest in (("train", train_manifest), ("dev", dev_manifest)):
         if not manifest.exists():
@@ -86,7 +86,8 @@ def main() -> None:
             output_manifest_path=manifest,
             audio_root=audio_root if audio_root.exists() else None,
             sample_rate=sample_rate,
-            num_mel_bins=num_mel_bins,
+            num_mel_bins=fbank_cfg.num_mel_bins,
+            dither=fbank_cfg.dither,
             limit=args.limit,
             skip_existing=not args.no_skip_existing,
         )

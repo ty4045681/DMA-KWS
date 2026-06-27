@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from functools import partial
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -13,10 +14,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 
-from dma_kws.config import load_config, require_sections
+from dma_kws.config import fbank_kwargs, get_fbank_config, load_config, require_sections
 from dma_kws.stage2.pairs import clip_to_audio_rel, iter_decoded_audio_rows
 from dma_kws.stage2.prepare_paper import (
     OUTPUT_PARQUET_NAME,
+    compute_fbank_for_clip,
     convert_aggregated_to_paper_parquet,
     parse_clips,
 )
@@ -126,6 +128,9 @@ def main() -> None:
     decoded_parquet_paths = find_decoded_parquets(decoded_root)
     audio_by_rel = load_decoded_audio(decoded_parquet_paths, needed_keys)
 
+    fbank_cfg = get_fbank_config(config)
+    compute_fbank_fn = partial(compute_fbank_for_clip, **fbank_kwargs(fbank_cfg))
+
     paper_df, stats = convert_aggregated_to_paper_parquet(
         df,
         clips_dir=clips_dir,
@@ -133,6 +138,7 @@ def main() -> None:
         fbank_dir=fbank_dir,
         audio_by_rel=audio_by_rel,
         limit_anchors=args.limit_anchors,
+        compute_fbank=compute_fbank_fn,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)

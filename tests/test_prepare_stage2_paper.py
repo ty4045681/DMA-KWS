@@ -1,9 +1,11 @@
 from pathlib import Path
+from functools import partial
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from dma_kws.config import FbankConfig, fbank_kwargs
 from dma_kws.stage2.dataset import LibriPhraseTrainDataset
 from dma_kws.stage2.prepare_paper import (
     PARQUET_COLUMNS,
@@ -131,6 +133,43 @@ def test_convert_aggregated_to_paper_parquet_writes_expected_layout(tmp_path):
         assert fbank_path.exists()
         feat = np.load(fbank_path)
         assert feat.shape[1] == 80
+
+
+def test_convert_aggregated_forwards_bound_fbank_kwargs(tmp_path):
+    seen_kwargs: list[dict] = []
+
+    def capture(waveform_path, fbank_out_path, *, waveform, sample_rate, **kwargs):
+        del waveform_path, sample_rate
+        seen_kwargs.append(kwargs)
+        return _fake_compute_fbank(
+            "ignored",
+            fbank_out_path,
+            waveform=waveform,
+            sample_rate=16000,
+        )
+
+    bound_compute = partial(
+        capture,
+        **fbank_kwargs(FbankConfig(dither=0.0, frame_shift=8, num_mel_bins=64)),
+    )
+
+    convert_aggregated_to_paper_parquet(
+        _synthetic_df().head(1),
+        clips_dir=tmp_path / "clips",
+        distances_dir=tmp_path / "distances",
+        fbank_dir=tmp_path / "fbank",
+        audio_by_rel=_mock_audio(),
+        compute_fbank=bound_compute,
+    )
+
+    assert len(seen_kwargs) == 2
+    assert seen_kwargs[0] == {
+        "num_mel_bins": 64,
+        "frame_length": 25,
+        "frame_shift": 8,
+        "dither": 0.0,
+        "window_type": "povey",
+    }
 
 
 def test_distances_npy_works_with_dataset_get_hard_negative(tmp_path):

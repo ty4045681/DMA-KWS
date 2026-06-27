@@ -13,6 +13,9 @@
 #          --decoded-parquet-root data/dma-kws/raw/LibriPhrase-100
 #      This writes processed/stage2_qbyt/ (parquet + clips/ + distances/) and
 #      features/fbank/LP-100-fbank/.
+#   4. Precompute eval fbank .npy next to LibriPhrase eval wav files:
+#        python scripts/prepare_stage2_eval_fbank.py --config configs/wenet_asr_stage2.yaml
+#      Eval wav/npy must live under stage2.eval.test_dir (e.g. eval/train-other-500/...).
 #
 # Usage:
 #   export WENET_CMVN_FILE=/path/to/global_cmvn
@@ -34,6 +37,13 @@ paths:
 tokenizer:
   dict_path: data/dict/lang_char.txt
   split_with_space: " "
+
+fbank:
+  num_mel_bins: 80
+  frame_length: 25
+  frame_shift: 10
+  dither: 0.1
+  window_type: povey
 
 training:
   seed: 2025
