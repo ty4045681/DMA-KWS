@@ -8,6 +8,7 @@ from typing import Any
 
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 import torchmetrics
 
 from dma_kws.nn import build_encoder
@@ -166,6 +167,8 @@ class Stage2LightningModule(pl.LightningModule):
         logits, _ = self(batch["feat"], batch["feat_lengths"], batch["anchor"])
         preds = torch.sigmoid(logits)
         labels = batch["label"].int()
+        utt_loss = F.binary_cross_entropy_with_logits(logits, labels.float())
+        self.log("val/utt_loss", utt_loss, prog_bar=True, on_epoch=True)
         self.auc_metric.update(preds, labels)
         self.eer_metric.update(preds, labels)
 
@@ -198,10 +201,5 @@ class Stage2LightningModule(pl.LightningModule):
         self.eer_metric.reset()
 
     def configure_optimizers(self) -> dict:
-        stage2 = self._stage2_cfg
-        lr = float(stage2.get("learning_rate", 1e-3))
-        warmup_steps = int(stage2.get("warmup_steps", 2500))
-        total_steps = int(stage2.get("total_scheduler_steps", stage2.get("max_steps", 50000)))
-
         optim_module = self.qbyt if self.freeze_encoder else self
-        return build_cosine_warmup_optimizer(optim_module, lr, warmup_steps, total_steps)
+        return build_cosine_warmup_optimizer(optim_module, self._stage2_cfg)

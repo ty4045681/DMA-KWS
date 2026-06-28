@@ -12,30 +12,106 @@ the version), matching the paper's ``lightning_logs/{name}/version_0`` layout.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 
-def build_loggers(log_dir: str | Path, run_name: str) -> list:
+def build_loggers(
+    log_dir: str | Path,
+    run_name: str,
+    *,
+    config: dict[str, Any] | None = None,
+) -> list:
     """Return Lightning loggers for a training run.
 
-    Always includes a ``CSVLogger`` (no extra dependency) that writes
-    ``metrics.csv`` + ``hparams.yaml``. Adds a ``TensorBoardLogger`` mirroring
-    the paper when the ``tensorboard`` package is installed; if it is missing we
-    skip TensorBoard rather than crash, so loss recording still works.
+    When ``config`` is provided, reads ``stage2.logging.backends`` to choose
+    CSV, TensorBoard, W&B, and/or Trackio loggers. Defaults to
+    ``[csv, tensorboard]`` (backward compatible with Stage I call sites that
+    omit ``config``).
 
-    pytorch_lightning is imported lazily so this module stays importable (and
-    unit-testable) in environments without torch installed.
+    pytorch_lightning is imported lazily so this module stays importable in
+    environments without torch installed.
     """
     from pytorch_lightning.loggers import CSVLogger
 
     log_dir = str(log_dir)
-    loggers: list = [CSVLogger(save_dir=log_dir, name=run_name)]
-    try:
-        from pytorch_lightning.loggers import TensorBoardLogger
+    stage2 = (config or {}).get("stage2", {}) or {}
+    logging_cfg = stage2.get("logging", {}) or {}
+    backends = [str(b).lower() for b in logging_cfg.get("backends", ["csv", "tensorboard"])]
 
-        loggers.append(TensorBoardLogger(save_dir=log_dir, name=run_name))
-    except (ImportError, ModuleNotFoundError):
-        print(
-            "tensorboard not installed; recording loss/metrics to CSV only. "
-            "Install tensorboard for TensorBoard event logs."
-        )
+    loggers: list = []
+
+    if "csv" in backends:
+        loggers.append(CSVLogger(save_dir=log_dir, name=run_name))
+
+    if "tensorboard" in backends:
+        try:
+            from pytorch_lightning.loggers import TensorBoardLogger
+
+            loggers.append(TensorBoardLogger(save_dir=log_dir, name=run_name))
+        except (ImportError, ModuleNotFoundError):
+            print(
+                "tensorboard not installed; skipping TensorBoard logger. "
+                "Install tensorboard for TensorBoard event logs."
+            )
+
+    if "wandb" in backends:
+        try:
+            from pytorch_lightning.loggers import WandbLogger
+
+            wandb_cfg = logging_cfg.get("wandb", {}) or {}
+            loggers.append(
+                WandbLogger(
+                    save_dir=log_dir,
+                    name=run_name,
+                    project=str(wandb_cfg.get("project", "dma-kws")),
+                    mode=str(wandb_cfg.get("mode", "online")),
+                )
+            )
+        except (ImportError, ModuleNotFoundError):
+            print("wandb not installed; skipping W&B logger. Install wandb to enable.")
+
+    if "trackio" in backends:
+        trackio_logger = _build_trackio_logger(log_dir, run_name, logging_cfg.get("trackio", {}) or {})
+        if trackio_logger is not None:
+            loggers.append(trackio_logger)
+
+    if not loggers:
+        loggers.append(CSVLogger(save_dir=log_dir, name=run_name))
+
     return loggers
+
+
+def _build_trackio_logger(log_dir: str | Path, run_name: str, trackio_cfg: dict[str, Any]):
+    """Return a thin Lightning logger backed by Trackio, or None if unavailable."""
+    try:
+        import trackio
+        from pytorch_lightning.loggers import Logger
+    except (ImportError, ModuleNotFoundError):
+        print("trackio not installed; skipping Trackio logger. Install trackio to enable.")
+        return None
+
+    project = str(trackio_cfg.get("project", "dma-kws"))
+
+    class TrackioLogger(Logger):
+        def __init__(self) -> None:
+            super().__init__()
+            self._run = trackio.init(project=project, name=run_name, dir=str(log_dir))
+
+        @property
+        def name(self) -> str:
+            return "trackio"
+
+        @property
+        def version(self) -> str:
+            return str(getattr(self._run, "id", run_name))
+
+        def log_hyperparams(self, params: dict[str, Any]) -> None:
+            trackio.config.update(params)
+
+        def log_metrics(self, metrics: dict[str, float], step: int | None = None) -> None:
+            payload = dict(metrics)
+            if step is not None:
+                payload["step"] = step
+            trackio.log(payload)
+
+    return TrackioLogger()

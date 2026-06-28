@@ -9,9 +9,13 @@ pandas
 pyarrow
 soundfile
 tqdm
-pytorch-lightning
+pytorch-lightning>=2.5  # WeightAveraging callback for optional Stage II EMA
 tensorboard
 torchmetrics
 transformers
 huggingface_hub
 openai-whisper
+rich  # RichProgressBar / run summary for Stage II console output
+# Optional dashboard backends (install on the training machine as needed):
+#   pip install wandb
+#   pip install trackio

@@ -63,6 +63,26 @@ stage2:
   warmup_steps: 2500
   total_scheduler_steps: 100000
   accumulate_grad_batches: 2
+  # ---- Stage II 训练优化（均为可选项，默认保持向后兼容）----
+  precision: bf16-mixed        # 安全提速；CPU 自动回退 32-true
+  dataloader:
+    pin_memory: true           # 锁页内存，加速 H2D 拷贝
+    persistent_workers: true   # 仅在 num_workers>0 生效
+    prefetch_factor: 4         # 每个 worker 预取批数；仅 num_workers>0 生效
+  optimizer: adam              # adam(默认,等价现状) | adamw
+  weight_decay: 0.0            # 用 adamw 时建议 0.01
+  ema:
+    enabled: false             # 开启后用 Lightning WeightAveraging 做权重 EMA
+    decay: 0.999               # EMA 衰减系数
+    start_step: 0              # 从该 step 起累计 EMA
+  console:
+    rich: true                 # Rich 控制台进度/参数表；未装 rich 自动回退 tqdm
+    device_stats: false        # 记录设备占用到 dashboard
+    throughput: false          # 记录吞吐(样本/秒)到 dashboard
+  logging:
+    backends: [csv, tensorboard]   # 可加 wandb / trackio
+    wandb: { project: dma-kws, mode: online }   # backends 含 wandb 时生效
+    trackio: { project: dma-kws }               # backends 含 trackio 时生效
   strategy: ddp
   gradient_clip_val: 1.0
   log_interval: 10

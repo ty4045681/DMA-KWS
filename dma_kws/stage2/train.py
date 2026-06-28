@@ -41,6 +41,7 @@ def _build_val_dataloader(config: dict[str, Any], tokenizer: Any) -> Any:
     from dma_kws.config import get_tokenizer_config
     from dma_kws.stage2.collate import test_collate_fn
     from dma_kws.stage2.dataset import LibriPhraseEvalDataset, resolve_stage2_eval_paths
+    from dma_kws.training.loaders import build_loader_kwargs
 
     stage2 = config["stage2"]
     eval_cfg = stage2.get("eval", {}) or {}
@@ -69,13 +70,17 @@ def _build_val_dataloader(config: dict[str, Any], tokenizer: Any) -> Any:
             f"{_EVAL_MISSING_MSG} Eval split {split!r} is empty under {test_dir}."
         )
 
+    num_workers = eval_paths["num_workers"]
+    loader_kwargs = build_loader_kwargs(num_workers, stage2.get("dataloader", {}) or {})
+
     return DataLoader(
         val_dataset,
         batch_size=eval_paths["batch_size"],
         shuffle=False,
-        num_workers=eval_paths["num_workers"],
+        num_workers=num_workers,
         collate_fn=test_collate_fn,
         drop_last=True,
+        **loader_kwargs,
     )
 
 
@@ -97,8 +102,9 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     from dma_kws.stage2.module import Stage2LightningModule
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training import resolve_resume_path
-    from dma_kws.training.checkpoint_callback import build_stage2_checkpoint_callback
+    from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
     from dma_kws.training.ddp import build_trainer_kwargs
+    from dma_kws.training.loaders import build_loader_kwargs
 
     require_sections(config, ["paths", "stage1", "stage2", "tokenizer", "training"])
     paths = config["paths"]
@@ -141,6 +147,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
 
     batch_size = int(stage2.get("batch_size_per_gpu", 64))
     num_workers = int(stage2.get("num_workers", stage1.get("num_workers", 2)))
+    loader_kwargs = build_loader_kwargs(num_workers, stage2.get("dataloader", {}) or {})
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -148,6 +155,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         num_workers=num_workers,
         collate_fn=train_collate_fn,
         drop_last=True,
+        **loader_kwargs,
     )
 
     val_dataloader = _build_val_dataloader(config, tokenizer)
@@ -191,16 +199,46 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     accelerator = "gpu" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
     devices = max(1, int(args.devices)) if accelerator == "gpu" else 1
 
+    if accelerator == "gpu":
+        torch.set_float32_matmul_precision("high")
+
     log_dir = stage2.get("log_dir", Path(paths["exp_root"]) / "stage2_qbyt" / "logs")
-    loggers = build_loggers(log_dir, str(stage2.get("run_name", "stage2_qbyt")))
+    run_name = str(stage2.get("run_name", "stage2_qbyt"))
+    loggers = build_loggers(log_dir, run_name, config=config)
 
     recipe = str(training.get("recipe", ""))
-    checkpoint_callback = build_stage2_checkpoint_callback(config, recipe)
+    callbacks = build_stage2_callbacks(config, recipe)
 
-    trainer_kwargs = build_trainer_kwargs(config, devices, limit_steps=limit_steps)
+    trainer_kwargs = build_trainer_kwargs(
+        config,
+        devices,
+        limit_steps=limit_steps,
+        accelerator=accelerator,
+    )
+
+    param_counts = {
+        "encoder": sum(p.numel() for p in model.encoder.parameters()),
+        "qbyt": sum(p.numel() for p in model.qbyt.parameters()),
+        "total": sum(p.numel() for p in model.parameters()),
+    }
+    print_run_summary(
+        config=config,
+        devices=devices,
+        accelerator=accelerator,
+        train_samples=len(train_dataset),
+        val_samples=len(val_dataloader.dataset),
+        param_counts=param_counts,
+        paths={
+            "parquet": parquet_file,
+            "wav_dir": wav_dir,
+            "checkpoint_dir": checkpoint_dir,
+            "log_dir": log_dir,
+        },
+    )
+
     trainer = pl.Trainer(
         accelerator=accelerator,
-        callbacks=[checkpoint_callback],
+        callbacks=callbacks,
         logger=loggers,
         **trainer_kwargs,
     )

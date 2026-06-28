@@ -5,16 +5,31 @@ from __future__ import annotations
 from typing import Any
 
 
+def resolve_precision(stage2: dict[str, Any], accelerator: str) -> str:
+    """Resolve Lightning ``precision`` from config and accelerator.
+
+    GPU defaults to ``bf16-mixed``; CPU falls back to ``32-true``. An explicit
+    ``stage2.precision`` value always wins.
+    """
+    explicit = stage2.get("precision")
+    if explicit:
+        return str(explicit)
+    if accelerator == "cpu":
+        return "32-true"
+    return "bf16-mixed"
+
+
 def build_trainer_kwargs(
     config: dict[str, Any],
     devices: int,
     limit_steps: int | None = None,
+    accelerator: str = "gpu",
 ) -> dict[str, Any]:
     """Build keyword arguments for ``pytorch_lightning.Trainer`` from config.
 
     Reads ``stage2`` fields: strategy, accumulate_grad_batches, gradient_clip_val,
-    val_check_interval, max_steps, and log_interval. Uses DDP when ``strategy`` is
-    ``ddp`` and ``devices`` > 1; otherwise ``auto``.
+    val_check_interval, max_steps, log_interval, and precision. Uses DDP when
+    ``strategy`` is ``ddp`` and ``devices`` > 1; otherwise ``auto``.
     """
     stage2 = config.get("stage2", {})
     validation = stage2.get("validation", {}) or {}
@@ -38,4 +53,5 @@ def build_trainer_kwargs(
         "gradient_clip_val": float(stage2.get("gradient_clip_val", 1.0)),
         "val_check_interval": val_check_interval,
         "log_every_n_steps": int(stage2.get("log_interval", 10)),
+        "precision": resolve_precision(stage2, accelerator),
     }

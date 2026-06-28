@@ -1,4 +1,4 @@
-from dma_kws.training.ddp import build_trainer_kwargs
+from dma_kws.training.ddp import build_trainer_kwargs, resolve_precision
 
 
 def _stage2_config(**overrides):
@@ -51,3 +51,26 @@ def test_build_trainer_kwargs_limit_steps_overrides_max_steps():
     kwargs = build_trainer_kwargs(_stage2_config(max_steps=50000), devices=1, limit_steps=20)
 
     assert kwargs["max_steps"] == 20
+
+
+def test_build_trainer_kwargs_includes_precision_for_gpu():
+    kwargs = build_trainer_kwargs(_stage2_config(), devices=4, accelerator="gpu")
+
+    assert kwargs["precision"] == "bf16-mixed"
+
+
+def test_build_trainer_kwargs_includes_precision_for_cpu():
+    kwargs = build_trainer_kwargs(_stage2_config(), devices=1, accelerator="cpu")
+
+    assert kwargs["precision"] == "32-true"
+
+
+def test_build_trainer_kwargs_precision_override():
+    kwargs = build_trainer_kwargs(
+        _stage2_config(precision="16-mixed"),
+        devices=1,
+        accelerator="gpu",
+    )
+
+    assert kwargs["precision"] == "16-mixed"
+    assert resolve_precision({"precision": "16-mixed"}, "gpu") == "16-mixed"
