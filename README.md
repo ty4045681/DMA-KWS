@@ -465,6 +465,21 @@ If `paths.gigaphrase1000_root` is set in your config, you can omit `--decoded-pa
 Use `--output-subdir stage2_qbyt/gp1000` (or `stage2.prep.output_subdir` in config) to avoid
 overwriting LibriPhrase outputs.
 
+Parallelism and console output (defaults in `configs/prep/default.yaml`):
+
+- `prep.num_workers` — parallel decoded-parquet shard scans and fbank extraction. `0` = auto (`min(8, cpu_count())`); `1` = serial (debug).
+- `prep.use_rich` — Rich tables and multi-task progress bars in an interactive terminal; falls back to plain `print` / `tqdm` when stdout is not a TTY.
+
+```bash
+# Full prep with explicit parallelism
+python3 scripts/prepare_stage2_paper.py \
+  +experiment=wenet_asr_stage2 \
+  --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
+  prep.num_workers=4
+```
+
+The script prints staged progress (plan → load parquet → scan decoded shards → build anchors / fbank → summary) and a final stats table (`anchors`, `fbank_written`, `fbank_skipped`, `missing_audio`, …).
+
 Expected outputs:
 
 ```text

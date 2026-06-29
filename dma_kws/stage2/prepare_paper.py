@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -179,6 +181,54 @@ def _resolve_g2p(row: dict[str, Any], g2p: Any | None) -> tuple[str, list[str]]:
     return " ".join(phonemes), phonemes
 
 
+@dataclass(frozen=True)
+class _FbankJob:
+    audio_path: str
+    fbank_path: Path
+    waveform: np.ndarray
+    sample_rate: int
+
+
+def _run_fbank_job(job: _FbankJob, compute_fbank: Callable[..., str]) -> str:
+    import torch
+
+    torch.set_num_threads(1)
+    return compute_fbank(
+        job.audio_path,
+        job.fbank_path,
+        waveform=job.waveform,
+        sample_rate=job.sample_rate,
+    )
+
+
+def _compute_fbank_jobs(
+    jobs: list[_FbankJob],
+    *,
+    compute_fbank: Callable[..., str],
+    num_workers: int = 1,
+    on_progress: Callable[[str, int], None] | None = None,
+) -> int:
+    if not jobs:
+        return 0
+
+    if num_workers <= 1:
+        for job in jobs:
+            _run_fbank_job(job, compute_fbank)
+            if on_progress is not None:
+                on_progress("fbank", 1)
+        return len(jobs)
+
+    written = 0
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_run_fbank_job, job, compute_fbank) for job in jobs]
+        for future in as_completed(futures):
+            future.result()
+            written += 1
+            if on_progress is not None:
+                on_progress("fbank", 1)
+    return written
+
+
 def convert_aggregated_to_paper_parquet(
     df,
     *,
@@ -190,6 +240,8 @@ def convert_aggregated_to_paper_parquet(
     hard_negative_top_k: int = DEFAULT_HARD_NEGATIVE_TOP_K,
     g2p: Any | None = None,
     compute_fbank: Callable[..., str] = compute_fbank_for_clip,
+    num_workers: int = 1,
+    on_progress: Callable[[str, int], None] | None = None,
 ) -> tuple[Any, dict[str, int]]:
     """Convert aggregated LibriPhrase parquet rows to paper-format metadata.
 
@@ -218,9 +270,19 @@ def convert_aggregated_to_paper_parquet(
         if limit_anchors and len(pending) >= limit_anchors:
             break
 
-    stats = {"anchors": 0, "missing_audio": 0, "fbank_written": 0}
+    stats = {
+        "anchors": 0,
+        "missing_audio": 0,
+        "fbank_written": 0,
+        "fbank_skipped": 0,
+        "clips_total": 0,
+    }
 
     candidate_pairs = [(item["ngram"], item["ngram_g2p"]) for item in pending]
+    fbank_jobs: list[_FbankJob] = []
+
+    if on_progress is not None:
+        on_progress("anchor_total", len(pending))
 
     for item in pending:
         ngram = item["ngram"]
@@ -241,12 +303,14 @@ def convert_aggregated_to_paper_parquet(
         distances_file = build_distances_npy(hard_negatives, distances_path)
 
         for clip in clips:
+            stats["clips_total"] += 1
             audio_path = clip["audio_path"]
             audio_rel = clip_to_audio_rel(audio_path)
             fbank_rel = resolve_fbank_rel_path(audio_path)
             fbank_path = fbank_dir / fbank_rel
 
             if fbank_path.exists():
+                stats["fbank_skipped"] += 1
                 continue
 
             audio_entry = audio_by_rel.get(audio_rel)
@@ -255,13 +319,14 @@ def convert_aggregated_to_paper_parquet(
                 continue
 
             waveform, sample_rate = audio_entry
-            compute_fbank(
-                audio_path,
-                fbank_path,
-                waveform=waveform,
-                sample_rate=sample_rate,
+            fbank_jobs.append(
+                _FbankJob(
+                    audio_path=audio_path,
+                    fbank_path=fbank_path,
+                    waveform=waveform,
+                    sample_rate=sample_rate,
+                )
             )
-            stats["fbank_written"] += 1
 
         rows.append(
             {
@@ -272,6 +337,18 @@ def convert_aggregated_to_paper_parquet(
             }
         )
         stats["anchors"] += 1
+        if on_progress is not None:
+            on_progress("anchor", 1)
+
+    if on_progress is not None:
+        on_progress("fbank_total", len(fbank_jobs))
+
+    stats["fbank_written"] = _compute_fbank_jobs(
+        fbank_jobs,
+        compute_fbank=compute_fbank,
+        num_workers=num_workers,
+        on_progress=on_progress,
+    )
 
     paper_df = pd.DataFrame(rows, columns=PARQUET_COLUMNS)
     return paper_df, stats

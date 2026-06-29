@@ -83,6 +83,23 @@ def clip_to_audio_rel(clip_path: str, *, dataset_id: str | None = None) -> str:
     return clip_path
 
 
+def scan_decoded_parquet_shard(
+    parquet_path: Path,
+    needed_keys: set[str],
+    *,
+    read_parquet: Callable[[Path], Any],
+) -> dict[str, tuple[Any, int]]:
+    """Extract matching audio rows from a single decoded parquet shard."""
+    found: dict[str, tuple[Any, int]] = {}
+    for audio_rel, audio, sample_rate in iter_decoded_audio_rows(
+        [parquet_path],
+        needed_keys,
+        read_parquet=read_parquet,
+    ):
+        found[audio_rel] = (audio, sample_rate)
+    return found
+
+
 def iter_decoded_audio_rows(
     parquet_paths: Iterable[Path],
     needed_keys: set[str],

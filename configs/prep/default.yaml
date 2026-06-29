@@ -11,6 +11,8 @@ decoded_parquet_root: ""
 dataset_root: ""
 output_subdir: ""
 limit_anchors: 0
+num_workers: 0
+use_rich: true
 train_manifest: ""
 dev_manifest: ""
 fbank_root: ""
