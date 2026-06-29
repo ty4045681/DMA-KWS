@@ -18,7 +18,7 @@ STAGE2_DATASETS: dict[str, dict[str, str]] = {
     },
     "GP-1000": {
         "clip_prefix": "GP-1000/",
-        "decoded_glob": "GP-1000-decoded-*.parquet",
+        "decoded_glob": "LP-100-decoded-*.parquet",
         "config_root_key": "gigaphrase1000_root",
     },
 }
