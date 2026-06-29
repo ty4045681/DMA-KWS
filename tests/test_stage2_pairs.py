@@ -1,6 +1,12 @@
 from pathlib import Path
 
-from dma_kws.stage2.pairs import clip_to_audio_rel, iter_decoded_audio_rows
+from dma_kws.stage2.pairs import (
+    clip_to_audio_rel,
+    decoded_glob_for_dataset,
+    infer_dataset_id,
+    iter_decoded_audio_rows,
+    resolve_data_root,
+)
 
 
 def test_clip_to_audio_rel_strips_lp100_prefix():
@@ -9,6 +15,36 @@ def test_clip_to_audio_rel_strips_lp100_prefix():
 
 def test_clip_to_audio_rel_without_prefix_is_identity():
     assert clip_to_audio_rel("missus_rachel/103-1240-0000_000.wav") == "missus_rachel/103-1240-0000_000.wav"
+
+
+def test_clip_to_audio_rel_strips_gp1000_prefix():
+    assert clip_to_audio_rel("GP-1000/hello world/a.wav") == "hello world/a.wav"
+
+
+def test_clip_to_audio_rel_strips_lp460_prefix():
+    assert clip_to_audio_rel("LP-460/hello world/a.wav") == "hello world/a.wav"
+
+
+def test_infer_dataset_id_from_clips():
+    assert infer_dataset_id(["GP-1000/foo/bar.wav"]) == "GP-1000"
+    assert infer_dataset_id(["LP-460/foo/bar.wav"]) == "LP-460"
+    assert infer_dataset_id(["LP-100/foo/bar.wav"]) == "LP-100"
+    assert infer_dataset_id(["foo/bar.wav"]) is None
+
+
+def test_decoded_glob_for_dataset():
+    assert decoded_glob_for_dataset("GP-1000") == "GP-1000-decoded-*.parquet"
+    assert decoded_glob_for_dataset(None) == "LP-100-decoded-*.parquet"
+
+
+def test_resolve_data_root_from_config():
+    paths = {
+        "libriphrase100_root": "/data/LibriPhrase-100",
+        "gigaphrase1000_root": "/data/GigaPhrase-1000",
+    }
+    assert resolve_data_root(paths, "GP-1000") == Path("/data/GigaPhrase-1000")
+    assert resolve_data_root(paths, "LP-100") == Path("/data/LibriPhrase-100")
+    assert resolve_data_root(paths, None) is None
 
 
 class _FakeDF:

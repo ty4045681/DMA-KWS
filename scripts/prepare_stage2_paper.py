@@ -15,7 +15,13 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 
 from dma_kws.config import fbank_kwargs, get_fbank_config, load_config, require_sections
-from dma_kws.stage2.pairs import clip_to_audio_rel, iter_decoded_audio_rows
+from dma_kws.stage2.pairs import (
+    clip_to_audio_rel,
+    decoded_glob_for_dataset,
+    infer_dataset_id,
+    iter_decoded_audio_rows,
+    resolve_data_root,
+)
 from dma_kws.stage2.prepare_paper import (
     OUTPUT_PARQUET_NAME,
     compute_fbank_for_clip,
@@ -31,7 +37,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoded-parquet-root",
         default="",
-        help="Directory or file with LP-100-decoded-*.parquet shards",
+        help="Directory or file with decoded-parquet shards",
+    )
+    parser.add_argument(
+        "--dataset-root",
+        default="",
+        help="Alias for --decoded-parquet-root (dataset-specific decoded shard root)",
+    )
+    parser.add_argument(
+        "--output-subdir",
+        default="",
+        help="Subdirectory under paths.processed_root for paper parquet output "
+        "(default: stage2_qbyt, or stage2.prep.output_subdir from config)",
     )
     parser.add_argument("--limit-anchors", type=int, default=0, help="Optional anchor cap for smoke runs")
     parser.add_argument("--seed", type=int, default=2025, help="Reserved for future deterministic sampling")
@@ -45,11 +62,18 @@ def find_default_parquet(root: Path) -> Path:
     return matches[0]
 
 
-def find_decoded_parquets(root: Path) -> list[Path]:
+def find_decoded_parquets(root: Path, *, decoded_glob: str | None = None) -> list[Path]:
     if root.is_file():
         return [root]
-    matches = sorted(root.rglob("LP-100-decoded-*.parquet"))
-    if not matches:
+    glob_pattern = decoded_glob or "LP-100-decoded-*.parquet"
+    matches = sorted(root.rglob(glob_pattern))
+    if not matches and decoded_glob:
+        print(
+            f"WARNING: No shards matching {glob_pattern!r} under {root}; "
+            "falling back to *.parquet (may include unrelated files)"
+        )
+        matches = sorted(root.rglob("*.parquet"))
+    elif not matches:
         matches = sorted(root.rglob("*.parquet"))
     if not matches:
         raise SystemExit(f"No decoded parquet shards found under {root}")
@@ -62,7 +86,25 @@ def _read_parquet(path: Path):
     return pd.read_parquet(path)
 
 
-def collect_needed_audio_keys(df, *, limit_anchors: int = 0) -> set[str]:
+def iter_clip_audio_paths(df, *, limit_anchors: int = 0):
+    count = 0
+    for _, row in df.iterrows():
+        clips = parse_clips(row.get("clips"))
+        if not clips:
+            continue
+        for clip in clips:
+            yield clip["audio_path"]
+        count += 1
+        if limit_anchors and count >= limit_anchors:
+            break
+
+
+def collect_needed_audio_keys(
+    df,
+    *,
+    limit_anchors: int = 0,
+    dataset_id: str | None = None,
+) -> set[str]:
     needed: set[str] = set()
     count = 0
     for _, row in df.iterrows():
@@ -70,11 +112,38 @@ def collect_needed_audio_keys(df, *, limit_anchors: int = 0) -> set[str]:
         if not clips:
             continue
         for clip in clips:
-            needed.add(clip_to_audio_rel(clip["audio_path"]))
+            needed.add(clip_to_audio_rel(clip["audio_path"], dataset_id=dataset_id))
         count += 1
         if limit_anchors and count >= limit_anchors:
             break
     return needed
+
+
+def resolve_decoded_root(
+    args: argparse.Namespace,
+    config: dict,
+    paths: dict,
+    dataset_id: str | None,
+) -> Path:
+    if args.decoded_parquet_root:
+        return Path(args.decoded_parquet_root)
+    if args.dataset_root:
+        return Path(args.dataset_root)
+    stage2_prep = (config.get("stage2") or {}).get("prep") or {}
+    if stage2_prep.get("data_root"):
+        return Path(stage2_prep["data_root"])
+    if dataset_id:
+        root = resolve_data_root(paths, dataset_id)
+        if root is not None:
+            return root
+    return Path(paths["libriphrase100_root"])
+
+
+def resolve_output_subdir(args: argparse.Namespace, config: dict) -> str:
+    if args.output_subdir:
+        return args.output_subdir
+    stage2_prep = (config.get("stage2") or {}).get("prep") or {}
+    return stage2_prep.get("output_subdir", "stage2_qbyt")
 
 
 def load_decoded_audio(
@@ -114,18 +183,32 @@ def main() -> None:
     processed_root = Path(paths["processed_root"])
     feature_root = Path(paths.get("feature_root", processed_root.parent / "features"))
 
-    output_dir = processed_root / "stage2_qbyt"
+    output_subdir = resolve_output_subdir(args, config)
+    output_dir = processed_root / output_subdir
     clips_dir = output_dir / "clips"
     distances_dir = output_dir / "distances"
     fbank_dir = feature_root / "fbank"
     output_parquet = output_dir / OUTPUT_PARQUET_NAME
 
     df = pd.read_parquet(input_path)
-    needed_keys = collect_needed_audio_keys(df, limit_anchors=args.limit_anchors)
+    dataset_id = infer_dataset_id(iter_clip_audio_paths(df, limit_anchors=args.limit_anchors))
+    if dataset_id:
+        print(f"Detected dataset: {dataset_id}")
+    else:
+        print("Detected dataset: unknown (using LP-100 defaults)")
 
-    libriphrase_root = Path(paths["libriphrase100_root"])
-    decoded_root = Path(args.decoded_parquet_root) if args.decoded_parquet_root else libriphrase_root
-    decoded_parquet_paths = find_decoded_parquets(decoded_root)
+    needed_keys = collect_needed_audio_keys(
+        df,
+        limit_anchors=args.limit_anchors,
+        dataset_id=dataset_id,
+    )
+
+    decoded_root = resolve_decoded_root(args, config, paths, dataset_id)
+    decoded_glob = decoded_glob_for_dataset(dataset_id) if dataset_id else "LP-100-decoded-*.parquet"
+    print(f"Using decoded glob: {decoded_glob}")
+    decoded_parquet_paths = find_decoded_parquets(decoded_root, decoded_glob=decoded_glob)
+    print(f"Found {len(decoded_parquet_paths)} shards under {decoded_root}")
+
     audio_by_rel = load_decoded_audio(decoded_parquet_paths, needed_keys)
 
     fbank_cfg = get_fbank_config(config)

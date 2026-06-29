@@ -7,6 +7,7 @@ import pytest
 
 from dma_kws.config import FbankConfig, fbank_kwargs
 from dma_kws.stage2.dataset import LibriPhraseTrainDataset
+from scripts.prepare_stage2_paper import find_decoded_parquets
 from dma_kws.stage2.prepare_paper import (
     PARQUET_COLUMNS,
     build_clips_npy,
@@ -39,6 +40,30 @@ def _synthetic_df() -> pd.DataFrame:
     )
 
 
+def _synthetic_gp1000_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ngram": ["hello world", "hello word"],
+            "ngram_g2p": ["HH AH L OW W ER L D", "HH AH L OW W ER D"],
+            "clips": [
+                [
+                    {"audio_path": "GP-1000/hello world/a.wav"},
+                    {"audio_path": "GP-1000/hello world/b.wav"},
+                ],
+                [{"audio_path": "GP-1000/hello word/c.wav"}],
+            ],
+        }
+    )
+
+
+def _mock_gp1000_audio() -> dict[str, tuple[np.ndarray, int]]:
+    return {
+        "hello world/a.wav": (np.linspace(-0.1, 0.1, 1600, dtype=np.float32), 16000),
+        "hello world/b.wav": (np.linspace(-0.2, 0.2, 1600, dtype=np.float32), 16000),
+        "hello word/c.wav": (np.linspace(-0.15, 0.15, 1600, dtype=np.float32), 16000),
+    }
+
+
 def _mock_audio() -> dict[str, tuple[np.ndarray, int]]:
     return {
         "hello world/a.wav": (np.linspace(-0.1, 0.1, 1600, dtype=np.float32), 16000),
@@ -62,6 +87,32 @@ def test_slug_and_fbank_path_rewrite():
     assert slug_from_ngram("Hello World!") == "hello_world"
     assert resolve_fbank_rel_path("LP-100/hello/a.wav") == "LP-100-fbank/hello/a.npy"
     assert resolve_fbank_rel_path("LP-460/hello/a.wav") == "LP-460-fbank/hello/a.npy"
+    assert resolve_fbank_rel_path("GP-1000/hello/a.wav") == "GP-1000-fbank/hello/a.npy"
+
+
+def test_find_decoded_parquets_uses_dataset_glob(tmp_path):
+    root = tmp_path / "gp1000"
+    root.mkdir()
+    gp_shard = root / "GP-1000-decoded-0000.parquet"
+    gp_shard.write_bytes(b"")
+    other = root / "aggregated_segments.parquet"
+    other.write_bytes(b"")
+
+    matches = find_decoded_parquets(root, decoded_glob="GP-1000-decoded-*.parquet")
+    assert matches == [gp_shard]
+
+
+def test_find_decoded_parquets_falls_back_when_glob_misses(tmp_path, capsys):
+    root = tmp_path / "mixed"
+    root.mkdir()
+    fallback = root / "only.parquet"
+    fallback.write_bytes(b"")
+
+    matches = find_decoded_parquets(root, decoded_glob="GP-1000-decoded-*.parquet")
+    assert matches == [fallback]
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.out
+    assert "GP-1000-decoded-*.parquet" in captured.out
 
 
 def test_build_clips_and_distances_npy_roundtrip(tmp_path):
@@ -133,6 +184,35 @@ def test_convert_aggregated_to_paper_parquet_writes_expected_layout(tmp_path):
         assert fbank_path.exists()
         feat = np.load(fbank_path)
         assert feat.shape[1] == 80
+
+
+def test_convert_gp1000_writes_gp1000_fbank_layout(tmp_path):
+    processed = tmp_path / "processed" / "stage2_qbyt"
+    clips_dir = processed / "clips"
+    distances_dir = processed / "distances"
+    fbank_dir = tmp_path / "features" / "fbank"
+
+    paper_df, stats = convert_aggregated_to_paper_parquet(
+        _synthetic_gp1000_df(),
+        clips_dir=clips_dir,
+        distances_dir=distances_dir,
+        fbank_dir=fbank_dir,
+        audio_by_rel=_mock_gp1000_audio(),
+        compute_fbank=_fake_compute_fbank,
+    )
+
+    assert stats["anchors"] == 2
+    assert stats["missing_audio"] == 0
+    assert stats["fbank_written"] == 3
+
+    hello_row = paper_df.loc[paper_df["ngram"] == "hello world"].iloc[0]
+    clips = np.load(hello_row["clips_file"], allow_pickle=True)
+    assert clips[0]["audio_path"] == "GP-1000/hello world/a.wav"
+
+    for clip in clips:
+        fbank_path = fbank_dir / resolve_fbank_rel_path(clip["audio_path"])
+        assert "GP-1000-fbank" in str(fbank_path)
+        assert fbank_path.exists()
 
 
 def test_convert_aggregated_forwards_bound_fbank_kwargs(tmp_path):

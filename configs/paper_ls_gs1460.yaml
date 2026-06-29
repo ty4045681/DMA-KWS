@@ -1,6 +1,7 @@
 paths:
   librispeech_root: data/dma-kws/raw/LibriSpeech
   libriphrase460_root: data/dma-kws/raw/LibriPhrase-460
+  gigaphrase1000_root: data/dma-kws/raw/GigaPhrase-1000
   processed_root: data/dma-kws/processed
   feature_root: data/dma-kws/features
   exp_root: data/dma-kws/exp
@@ -46,6 +47,8 @@ stage1:
     num_decode_batches: 0
 
 stage2:
+  prep:
+    output_subdir: ls-gs-1460
   encoder_output_dim: 144
   qbyt_embed_dim: 128
   qbyt_layers: 2

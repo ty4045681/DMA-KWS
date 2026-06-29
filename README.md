@@ -449,6 +449,19 @@ python3 scripts/prepare_stage2_paper.py \
   --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
 ```
 
+GigaPhrase-1000 (clips use `GP-1000/` prefix; dataset is auto-detected from the parquet):
+
+```bash
+python3 scripts/prepare_stage2_paper.py \
+  --config configs/wenet_asr_stage2.yaml \
+  --input-parquet /data/dma-kws/raw/GigaPhrase-1000/aggregated_segments_with_g2p_distance.parquet \
+  --decoded-parquet-root /data/dma-kws/raw/GigaPhrase-1000
+```
+
+If `paths.gigaphrase1000_root` is set in your config, you can omit `--decoded-parquet-root`.
+Use `--output-subdir stage2_qbyt/gp1000` (or `stage2.prep.output_subdir` in config) to avoid
+overwriting LibriPhrase outputs.
+
 Expected outputs:
 
 ```text
