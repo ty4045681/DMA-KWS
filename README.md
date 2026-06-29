@@ -38,6 +38,7 @@ scripts/prepare_stage1_fbank.py
 scripts/train_stage1_ctc.py
 scripts/average_checkpoints.py
 scripts/prepare_stage2_paper.py
+scripts/prepare_stage2_libriphrase.py  # alias for prepare_stage2_paper.py
 scripts/prepare_stage2_eval_fbank.py   # precompute LibriPhrase eval fbank .npy for Stage II validation
 scripts/train_stage2_qbyt.py
 scripts/train_stage2_recipe.py
@@ -241,20 +242,16 @@ PY
 
 The Stage II preparation script reads two kinds of files from the download:
 
-1. An **aggregated** parquet for phrase metadata — at least columns:
-
-   ```text
-   ngram
-   clips
-   ```
-
-   and optionally `ngram_g2p` (skips on-the-fly G2P if present). Recommended:
-   `aggregated_segments_with_g2p.parquet`.
+1. An **aggregated** parquet for phrase metadata — columns `ngram`, `clips`, and
+   per-clip hard-negative distances. Use
+   `aggregated_segments_with_g2p_distance.parquet` (required for hard-negative
+   mining). Optionally `ngram_g2p` is present (skips on-the-fly G2P if missing).
 
 2. The **decoded** audio shards `LP-100-decoded-*.parquet` (columns
-   `audio_rel`, `audio`, `sampling_rate`, ...). The script extracts referenced
-   clips, writes per-phrase `clips` / `distances` `.npy` shards, and computes
-   80-dim fbank `.npy` files under `<feature_root>/fbank/`.
+   `audio_rel`, `audio`, `sampling_rate`, ...). The script loads referenced
+   clips from these shards, writes per-phrase `clips` / `distances` `.npy` under
+   `processed/stage2_qbyt/clips/` and `processed/stage2_qbyt/distances/`, and
+   computes 80-dim fbank `.npy` files under `features/fbank/LP-100-fbank/`.
 
 Inspect columns if needed:
 
@@ -277,7 +274,7 @@ Run a smoke preparation first:
 ```bash
 python3 scripts/prepare_stage1_librispeech.py \
   +experiment=demo_librispeech100 \
-  --limit 100
+  prep.limit=100
 ```
 
 Expected outputs:
@@ -310,24 +307,24 @@ prepare the training manifest directly from those shards:
 ```bash
 python3 scripts/prepare_stage1_librispeech.py \
   +experiment=demo_librispeech100 \
-  --limit 100 \
-  --input-format hf-parquet \
-  --parquet-root /home/h00513998/librispeech_train_clean_360 \
-  --parquet-split train-clean-360 \
-  --dev-parquet-root /home/h00513998/librispeech_dev_clean \
-  --dev-parquet-split dev-clean
+  prep.limit=100 \
+  prep.input_format=hf-parquet \
+  prep.parquet_root=/home/h00513998/librispeech_train_clean_360 \
+  prep.parquet_split=train-clean-360 \
+  prep.dev_parquet_root=/home/h00513998/librispeech_dev_clean \
+  prep.dev_parquet_split=dev-clean
 ```
 
-Remove `--limit 100` for the full run after the smoke run completes:
+Remove `prep.limit=100` for the full run after the smoke run completes:
 
 ```bash
 python3 scripts/prepare_stage1_librispeech.py \
   +experiment=demo_librispeech100 \
-  --input-format hf-parquet \
-  --parquet-root /home/h00513998/librispeech_train_clean_360 \
-  --parquet-split train-clean-360 \
-  --dev-parquet-root /home/h00513998/librispeech_dev_clean \
-  --dev-parquet-split dev-clean
+  prep.input_format=hf-parquet \
+  prep.parquet_root=/home/h00513998/librispeech_train_clean_360 \
+  prep.parquet_split=train-clean-360 \
+  prep.dev_parquet_root=/home/h00513998/librispeech_dev_clean \
+  prep.dev_parquet_split=dev-clean
 ```
 
 This mode extracts `audio.bytes` from the parquet records into:
@@ -337,7 +334,7 @@ This mode extracts `audio.bytes` from the parquet records into:
 ```
 
 and writes `train.jsonl` / `dev.jsonl` with `wav_path` values pointing at the extracted audio files. If you omit
-`--dev-parquet-root`, `paths.librispeech_root` must contain the configured dev split in the official LibriSpeech
+`prep.dev_parquet_root`, `paths.librispeech_root` must contain the configured dev split in the official LibriSpeech
 directory layout; otherwise the script stops instead of silently writing an empty dev manifest.
 
 Notes:
@@ -383,7 +380,7 @@ CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage1_ctc.py \
   run.resume_from=last
 ```
 
-`run.resume_from=last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt` and continues to the configured limit. Pass an explicit `.ckpt` path instead of `last` to resume from a specific checkpoint. If the original run used `--limit-steps`, pass the same value again on resume.
+`run.resume_from=last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt` and continues to the configured limit. Pass an explicit `.ckpt` path instead of `last` to resume from a specific checkpoint. If the original run used `run.limit_steps`, pass the same value again on resume.
 
 Checkpoints are saved under:
 
@@ -401,10 +398,10 @@ Optionally average the last few checkpoints before Stage II init or demo inferen
 
 ```bash
 python3 scripts/average_checkpoints.py \
-  --input-dir /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints \
-  --pattern "*.pt" \
-  --last-k 10 \
-  --output /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/avg_10.pt
+  prep.input_dir=/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints \
+  prep.pattern="*.pt" \
+  prep.last_k=10 \
+  prep.output=/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/avg_10.pt
 ```
 
 If you hit out-of-memory, reduce these values in `+experiment=demo_librispeech100`:
@@ -421,27 +418,33 @@ stage1:
 
 Stage II training uses the **paper pipeline** (`LibriPhraseTrainDataset`): a parquet with columns `ngram`, `ngram_g2p`, `clips_file`, `distances_file`, plus precomputed fbank `.npy` under `features/fbank/`. This is the same format as the paper configs — the demo differs only in dataset size and step counts.
 
-Prepare that layout with `scripts/prepare_stage2_paper.py`. Training reads the paper parquet paths from `stage2.parquet_file` and `stage2.wav_dir` in your config (defaults under `/data/dma-kws/processed/stage2_qbyt/` and `/data/dma-kws/features/fbank/`).
+Prepare that layout with `scripts/prepare_stage2_paper.py` (or the identical alias `scripts/prepare_stage2_libriphrase.py`). Training reads the paper parquet paths from `stage2.parquet_file` and `stage2.wav_dir` in your config (defaults under `/data/dma-kws/processed/stage2_qbyt/` and `/data/dma-kws/features/fbank/`).
 
-Pass the **aggregated** LibriPhrase parquet explicitly with `--input-parquet`. Use
+**Hydra prep overrides:** All preparation scripts share the `prep:` group from `configs/prep/default.yaml`. Override any leaf on the command line with dotlist syntax, e.g. `prep.input_parquet=/path/to/file.parquet prep.limit_anchors=50`. Keys not set on the CLI use the yaml defaults (often empty / zero meaning “all” or “auto”).
+
+Pass the **aggregated** LibriPhrase parquet explicitly with `prep.input_parquet`. Use
 `aggregated_segments_with_g2p_distance.parquet` (includes per-clip G2P distances for hard negatives) — **not**
 `aggregated_segments_by_ngram.parquet`.
+
+### Hard negatives and G2P
+
+Hard-negative mining requires the distance parquet above (`distances` column per anchor). If `ngram_g2p` is missing from the aggregated parquet, the prep script runs on-the-fly G2P via `g2p_en`. When per-anchor `distances` is empty, it falls back to phoneme edit-distance confusables within the anchor set (top-5 by default).
 
 Demo smoke run:
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=demo_librispeech100 \
-  --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
-  --limit-anchors 50
+  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
+  prep.limit_anchors=50
 ```
 
-Full demo prep (drop `--limit-anchors`):
+Full demo prep (omit `prep.limit_anchors` or set `prep.limit_anchors=0`):
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=demo_librispeech100 \
-  --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
+  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
 ```
 
 Same input parquet for the Wenet-init recipe:
@@ -449,36 +452,52 @@ Same input parquet for the Wenet-init recipe:
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=wenet_asr_stage2 \
-  --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
+  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
 ```
 
-GigaPhrase-1000 (clips use `GP-1000/` prefix; dataset is auto-detected from the parquet):
+GigaPhrase-1000 (clips use `GP-1000/` prefix; dataset is auto-detected from clip paths in `pairs.py`):
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=wenet_asr_stage2 \
-  --input-parquet /data/dma-kws/raw/GigaPhrase-1000/aggregated_segments_with_g2p_distance.parquet \
-  --decoded-parquet-root /data/dma-kws/raw/GigaPhrase-1000
+  prep.input_parquet=/data/dma-kws/raw/GigaPhrase-1000/aggregated_segments_with_g2p_distance.parquet \
+  prep.decoded_parquet_root=/data/dma-kws/raw/GigaPhrase-1000
 ```
 
-If `paths.gigaphrase1000_root` is set in your config, you can omit `--decoded-parquet-root`.
-Use `--output-subdir stage2_qbyt/gp1000` (or `stage2.prep.output_subdir` in config) to avoid
+If `paths.gigaphrase1000_root` is set in your config, you can omit `prep.decoded_parquet_root`.
+Use `prep.output_subdir=stage2_qbyt/gp1000` (or `stage2.prep.output_subdir` in config) to avoid
 overwriting LibriPhrase outputs.
+
+LibriPhrase-460 (paper scale; auto-detected from `LP-460/` clip prefixes, decoded shards `LP-460-decoded-*.parquet`, config root `paths.libriphrase460_root`):
+
+```bash
+python3 scripts/prepare_stage2_paper.py \
+  +experiment=paper_ls460 \
+  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-460/aggregated_segments_with_g2p_distance.parquet
+```
+
+Set `paths.libriphrase460_root` in `+experiment=paper_ls460` (or pass `prep.decoded_parquet_root=...`) if the decoded shards are not under the default path. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full paper prep and training chain (`train_stage2_recipe.py`, `eval_stage2_libriphrase.py`).
 
 Parallelism and console output (defaults in `configs/prep/default.yaml`):
 
-- `prep.num_workers` — parallel decoded-parquet shard scans and fbank extraction. `0` = auto (`min(8, cpu_count())`); `1` = serial (debug).
-- `prep.use_rich` — Rich tables and multi-task progress bars in an interactive terminal; falls back to plain `print` / `tqdm` when stdout is not a TTY.
+- `prep.num_workers` — parallel decoded-parquet shard scans and fbank extraction. `0` = auto (`min(8, cpu_count())`); `1` = serial (useful for debugging).
+- `prep.use_rich` — Rich tables and multi-task progress bars when stdout is a TTY; falls back to plain `print` / `tqdm` when redirected or non-interactive (even if `prep.use_rich=true`).
 
 ```bash
 # Full prep with explicit parallelism
 python3 scripts/prepare_stage2_paper.py \
   +experiment=wenet_asr_stage2 \
-  --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
+  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
   prep.num_workers=4
 ```
 
-The script prints staged progress (plan → load parquet → scan decoded shards → build anchors / fbank → summary) and a final stats table (`anchors`, `fbank_written`, `fbank_skipped`, `missing_audio`, …).
+The script prints staged progress (plan → load parquet → scan decoded shards → build anchors / fbank → summary) and a final stats table. Key fields: `anchors`, `clips_total`, `fbank_written`, `fbank_skipped`, `missing_audio` (clips without decoded audio at fbank time), `missing_in_decoded` (referenced clip keys not found in decoded parquet shards).
+
+### Operational notes
+
+- Referenced decoded audio for the current anchor set is held in memory during prep; full runs with `prep.limit_anchors=0` on LP-460 need sufficient RAM.
+- Fbank extraction skips existing `.npy` files by default — safe for incremental reruns after fixing a subset of clips.
+- Use `prep.num_workers=1` when debugging shard scans or reproducing ordering issues.
 
 Expected outputs:
 
@@ -508,21 +527,28 @@ Expected layout:
   train-other-500/train-other-500/<spk>/<chap>/*.wav
 ```
 
-Validation reads fbank `.npy` files co-located next to each `.wav`, not the wav files directly. Precompute them with `scripts/prepare_stage2_eval_fbank.py` (uses the same `fbank:` settings as training prep):
+Validation reads fbank `.npy` files co-located next to each `.wav`, not the wav files directly. Precompute them with `scripts/prepare_stage2_eval_fbank.py` (uses the same `fbank:` settings as training prep; eval dither defaults come from `stage2.eval.fbank` when set):
 
 ```bash
 python3 scripts/prepare_stage2_eval_fbank.py \
   +experiment=demo_librispeech100 \
-  --from-csv
+  prep.from_csv=true
 ```
 
 ```bash
 python3 scripts/prepare_stage2_eval_fbank.py \
   +experiment=wenet_asr_stage2 \
-  --from-csv
+  prep.from_csv=true
 ```
 
-`--from-csv` converts only wav files referenced by the eval CSV `anchor` / `comparison` columns (faster than scanning all wav under `test_dir`). Each `train-other-500/.../clip.wav` gets a sibling `clip.npy`. Smoke test with `--limit 100`.
+`prep.from_csv=true` converts only wav files referenced by the eval CSV `anchor` / `comparison` columns (faster than scanning all wav under `test_dir`). Each `train-other-500/.../clip.wav` gets a sibling `clip.npy`.
+
+Useful overrides (also in `configs/prep/default.yaml`):
+
+- `prep.test_dir=/path` — eval root when it differs from `stage2.eval.test_dir` in config.
+- `prep.limit=100` — smoke test (first N wav paths only).
+- `prep.log_interval=1000` — progress print frequency.
+- `prep.no_skip_existing=true` — recompute fbank even when `.npy` already exists (default skips existing files for incremental reruns).
 
 ---
 
@@ -562,7 +588,7 @@ CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
   run.resume_from=last
 ```
 
-`run.resume_from=last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt`, or pass an explicit `.ckpt` path. If the original run used `--limit-steps`, pass the same value again on resume. This is a true Lightning resume of an interrupted run and is distinct from `--init-checkpoint` / `stage2.resume_checkpoint`, which only load weights to seed a fresh finetune recipe.
+`run.resume_from=last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt`, or pass an explicit `.ckpt` path. If the original run used `run.limit_steps`, pass the same value again on resume. This is a true Lightning resume of an interrupted run and is distinct from `run.init_checkpoint` / `stage2.resume_checkpoint`, which only load weights to seed a fresh finetune recipe.
 
 Checkpoints are saved under:
 
@@ -608,11 +634,12 @@ Full data prep and training chain:
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=wenet_asr_stage2 \
-  --input-parquet data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
-  --decoded-parquet-root data/dma-kws/raw/LibriPhrase-100
+  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
+  prep.decoded_parquet_root=/data/dma-kws/raw/LibriPhrase-100
 
 python3 scripts/prepare_stage2_eval_fbank.py \
-  +experiment=wenet_asr_stage2
+  +experiment=wenet_asr_stage2 \
+  prep.from_csv=true
 
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
   +experiment=wenet_asr_stage2 \
@@ -647,10 +674,10 @@ KEYWORD="hello world"
 
 python3 scripts/run_two_stage_demo.py \
   +experiment=demo_librispeech100 \
-  --stage1-ckpt "$STAGE1_CKPT" \
-  --stage2-ckpt "$STAGE2_CKPT" \
-  --audio "$AUDIO" \
-  --keyword "$KEYWORD"
+  prep.stage1_ckpt="$STAGE1_CKPT" \
+  prep.stage2_ckpt="$STAGE2_CKPT" \
+  prep.audio="$AUDIO" \
+  prep.keyword="$KEYWORD"
 ```
 
 Output is JSON:
@@ -850,12 +877,12 @@ The preparation script expects `ngram`, `clips`, and optional `ngram_g2p`. If yo
 
 ### Training is too slow or OOM
 
-Start with smoke flags:
+Start with smoke overrides:
 
 ```bash
---limit 100
+prep.limit=100
 run.limit_steps=20
---limit-anchors 100
+prep.limit_anchors=100
 ```
 
 Then increase data/steps gradually.
@@ -869,10 +896,10 @@ Stage II validation reads LibriPhrase eval wav/CSV files under `stage2.eval.test
 Validation expects precomputed fbank `.npy` next to eval wav files. Run:
 
 ```bash
-python3 scripts/prepare_stage2_eval_fbank.py +experiment=wenet_asr_stage2
+python3 scripts/prepare_stage2_eval_fbank.py +experiment=wenet_asr_stage2 prep.from_csv=true
 ```
 
-Use `--from-csv` to convert only wav files referenced by the eval CSVs, or point `--test-dir` at your eval root if it differs from the config.
+Use `prep.from_csv=true` to convert only wav files referenced by the eval CSVs, or set `prep.test_dir=/path` if your eval root differs from the config.
 
 ---
 
@@ -895,5 +922,5 @@ Key points:
 
 - **Same recipe as demo** — architecture, utt+seq loss, hard negatives, CharTokenizer, streaming Stage I search, checkpoint averaging, and LibriPhrase eval are all implemented.
 - **Scale-only demo** — `demo_librispeech100.yaml` uses smaller data and fewer steps; it validates the pipeline but does not produce paper metrics.
-- **Paper metrics** require the full recipe chain on LibriPhrase-460 hard eval: init → avg → finetune → `eval_stage2_libriphrase.py --split hard`.
+- **Paper metrics** require the full recipe chain on LibriPhrase-460 hard eval: init → avg → finetune → `eval_stage2_libriphrase.py` with `prep.split=hard` (see [docs/paper-reproduction.md](docs/paper-reproduction.md) for `train_stage2_recipe.py` and eval commands).
 - Reported paper numbers: **97.85% AUC**, **6.13% EER** on LibriPhrase hard (target: within 1% absolute of main logs).

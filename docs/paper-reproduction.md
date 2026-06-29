@@ -80,15 +80,18 @@ Required artifacts:
 - `aggregated_segments_with_g2p_distance.parquet` — training metadata with `ngram`, `ngram_g2p`, `clips_file`, `distances_file` columns
 - Per-phrase `clips_file` and `distances_file` `.npy` shards referenced by the parquet
 - `eval/evaluation_set/*.csv` and `eval/evaluation_set/test_all_phrase.csv` for hard/easy splits
-- Precomputed fbank features under `features/fbank/` (see §3)
+- Decoded audio parquet shards (`LP-460-decoded-*.parquet`) if you will run full Stage II prep (see §3)
+- Precomputed fbank features under `features/fbank/LP-460-fbank/` (see §3), or generate them with `prepare_stage2_paper.py`
 
-Symlink or copy the aggregated parquet to the path expected by config:
+**Option A — copy upstream parquet** (when clips, distances, and fbank shards are already in place):
 
 ```bash
 mkdir -p /data/dma-kws/processed/stage2_qbyt
 cp /data/dma-kws/raw/LibriPhrase-460/aggregated_segments_with_g2p_distance.parquet \
    /data/dma-kws/processed/stage2_qbyt/
 ```
+
+**Option B — full prep from decoded shards:** run `scripts/prepare_stage2_paper.py` as in §3 to build the paper parquet, clip/distance `.npy` shards, and `LP-460-fbank/` features.
 
 ### 1.3 GigaPhrase / LS-GS-1460 (Stage II finetune)
 
@@ -112,7 +115,7 @@ Place the finetune parquet at:
 
 ## 2. Stage I: phoneme CTC (self-trained)
 
-Stage I uses Wenet-aligned **CharTokenizer** targets (`data/dict/lang_char.txt`), ConformerEncoder (80→144, 6 blocks), and CTC loss. **Train Stage I yourself** on LibriSpeech; do not use external author checkpoints (e.g. `/nvme01/.../avg_10.pt`). The averaged Stage I checkpoint from your run initializes Stage II when using `frozen-wenet-encoder` or `--init-checkpoint`.
+Stage I uses Wenet-aligned **CharTokenizer** targets (`data/dict/lang_char.txt`), ConformerEncoder (80→144, 6 blocks), and CTC loss. **Train Stage I yourself** on LibriSpeech; do not use external author checkpoints (e.g. `/nvme01/.../avg_10.pt`). The averaged Stage I checkpoint from your run initializes Stage II when using `frozen-wenet-encoder` or `run.init_checkpoint`.
 
 ### Prepare manifests + optional offline fbank
 
@@ -186,19 +189,58 @@ features/fbank/LP-460-fbank/<clip>.npy
 features/fbank/GP-1000-fbank/<clip>.npy
 ```
 
-These must be produced with the same Kaldi fbank settings as `dma_kws/stage2/features.py` (80 mel bins, 25 ms frame / 10 ms shift, Povey window). For LibriPhrase-460 you can download precomputed shards from HuggingFace, or generate them from decoded audio using `scripts/prepare_stage2_paper.py` (LibriPhrase-100 demo) or the Wenet/main feature extraction pipeline.
+These must be produced with the same Kaldi fbank settings as `dma_kws/stage2/features.py` (80 mel bins, 25 ms frame / 10 ms shift, Povey window). Set `stage2.wav_dir` in config (default: `/data/dma-kws/features/fbank`).
 
-Set `stage2.wav_dir` in config (default: `/data/dma-kws/features/fbank`).
+Prepare the paper layout with `scripts/prepare_stage2_paper.py`. Pass the **aggregated** LibriPhrase parquet explicitly via `prep.input_parquet` — use `aggregated_segments_with_g2p_distance.parquet` (per-clip G2P distances for hard negatives), **not** `aggregated_segments_by_ngram.parquet`. Dataset ID (`LP-460`, `GP-1000`, etc.) and decoded-parquet glob are auto-detected from clip paths via `dma_kws/stage2/pairs.py`.
 
-For the LibriPhrase-100 smoke demo, run:
+### LibriPhrase-460 (paper init)
+
+```bash
+python3 scripts/prepare_stage2_paper.py \
+  +experiment=paper_ls460 \
+  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-460/aggregated_segments_with_g2p_distance.parquet \
+  paths.libriphrase460_root=/data/dma-kws/raw/LibriPhrase-460
+```
+
+When `paths.libriphrase460_root` is already set in `paper_ls460.yaml`, you can omit it. To point at decoded shards explicitly:
+
+```bash
+python3 scripts/prepare_stage2_paper.py \
+  +experiment=paper_ls460 \
+  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-460/aggregated_segments_with_g2p_distance.parquet \
+  prep.decoded_parquet_root=/data/dma-kws/raw/LibriPhrase-460
+```
+
+For large runs, enable parallel decoded-shard scans and fbank extraction:
+
+```bash
+python3 scripts/prepare_stage2_paper.py \
+  +experiment=paper_ls460 \
+  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-460/aggregated_segments_with_g2p_distance.parquet \
+  prep.decoded_parquet_root=/data/dma-kws/raw/LibriPhrase-460 \
+  prep.num_workers=4
+```
+
+Expected outputs:
+
+```text
+/data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet
+/data/dma-kws/processed/stage2_qbyt/clips/
+/data/dma-kws/processed/stage2_qbyt/distances/
+/data/dma-kws/features/fbank/LP-460-fbank/
+```
+
+GigaPhrase-1000 uses the same script with `GP-1000/` clip prefixes; set `paths.gigaphrase1000_root` or `prep.decoded_parquet_root` accordingly (see README §6).
+
+### LibriPhrase-100 smoke demo
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=demo_librispeech100 \
-  --limit-anchors 100
+  prep.limit_anchors=100
 ```
 
-This writes `processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet` plus `clips/`, `distances/`, and fbank `.npy` shards under `features/fbank/`.
+This writes the same layout under `processed/stage2_qbyt/` with `features/fbank/LP-100-fbank/`.
 
 ---
 
@@ -209,7 +251,6 @@ Recipe: LibriPhrase-460, random + hard negatives (1:1), `utt_loss + seq_loss`, A
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 scripts/train_stage2_recipe.py \
   +experiment=paper_ls460 \
-  training.recipe=init-ls-460 +experiment=paper_ls460 \
   run.devices=4
 ```
 
@@ -242,7 +283,6 @@ Finetune from averaged init checkpoint on LS+GigaPhrase-1460 with hard-negative 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 scripts/train_stage2_recipe.py \
   +experiment=paper_ls_gs1460 \
-  training.recipe=ft-ls-gs-1460 +experiment=paper_ls_gs1460 \
   run.devices=4
 ```
 
@@ -257,12 +297,12 @@ Train QbyT only (~187k params) with **your** averaged Stage I encoder frozen (no
 ```bash
 python3 scripts/train_stage2_recipe.py \
   +experiment=paper_ls460 \
-  --recipe frozen-wenet-encoder \
+  training.recipe=frozen-wenet-encoder \
   run.devices=4 \
   run.init_checkpoint=/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/avg_10.ckpt
 ```
 
-If `--init-checkpoint` is omitted, the recipe resolves `stage1.checkpoint_avg` output under your `exp_root`.
+If `run.init_checkpoint` is omitted, the recipe resolves `stage1.checkpoint_avg` output under your `exp_root`.
 
 ## 6. Evaluation: LibriPhrase hard / easy
 
@@ -271,8 +311,8 @@ Evaluate on the official LibriPhrase-460 eval splits (AUC / EER):
 ```bash
 python3 scripts/eval_stage2_libriphrase.py \
   +experiment=paper_ls460 \
-  --checkpoint /data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460/avg_10.ckpt \
-  --split hard
+  prep.checkpoint=/data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460/avg_10.ckpt \
+  prep.split=hard
 ```
 
 Splits: `easy`, `hard`, or `all`. Example output:
@@ -295,10 +335,10 @@ STAGE2_CKPT=/data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460/avg_10.ckpt
 
 python3 scripts/run_two_stage_demo.py \
   +experiment=paper_ls460 \
-  --stage1-ckpt "$STAGE1_CKPT" \
-  --stage2-ckpt "$STAGE2_CKPT" \
-  --audio /path/to/test.wav \
-  --keyword "hello world"
+  prep.stage1_ckpt="$STAGE1_CKPT" \
+  prep.stage2_ckpt="$STAGE2_CKPT" \
+  prep.audio=/path/to/test.wav \
+  prep.keyword="hello world"
 ```
 
 ---
@@ -326,7 +366,7 @@ LibriSpeech-460 + LibriPhrase-460 + GigaPhrase
   → Stage II prep (prepare_stage2_paper.py) + fbank features
   → init-ls-460 (50k steps) → avg_10.ckpt
   → ft-ls-gs-1460 (100k steps, hard neg 100:1) → avg_10.ckpt
-  → eval_stage2_libriphrase.py --split hard
+  → eval_stage2_libriphrase.py prep.split=hard
   → run_two_stage_demo.py (streaming Stage I)
 ```
 
