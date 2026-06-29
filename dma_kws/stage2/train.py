@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from dma_kws.pathing import PROJECT_ROOT, resolve_dict_path
+from dma_kws.training.device import resolve_accelerator_and_devices
+from dma_kws.training.loaders import build_loader_kwargs
 
 _EVAL_MISSING_MSG = (
     "LibriPhrase eval data is required for Stage II validation. "
@@ -41,7 +43,6 @@ def _build_val_dataloader(config: dict[str, Any], tokenizer: Any) -> Any:
     from dma_kws.config import get_tokenizer_config
     from dma_kws.stage2.collate import test_collate_fn
     from dma_kws.stage2.dataset import LibriPhraseEvalDataset, resolve_stage2_eval_paths
-    from dma_kws.training.loaders import build_loader_kwargs
 
     stage2 = config["stage2"]
     eval_cfg = stage2.get("eval", {}) or {}
@@ -104,7 +105,6 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     from dma_kws.training import resolve_resume_path
     from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
     from dma_kws.training.ddp import build_trainer_kwargs
-    from dma_kws.training.loaders import build_loader_kwargs
 
     require_sections(config, ["paths", "stage1", "stage2", "tokenizer", "training"])
     paths = config["paths"]
@@ -126,9 +126,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     if not parquet_file.exists():
         raise SystemExit(f"Stage II parquet not found: {parquet_file}")
 
-    dict_path = Path(tokenizer_cfg["dict_path"])
-    if not dict_path.is_absolute():
-        dict_path = PROJECT_ROOT / dict_path
+    dict_path = resolve_dict_path(config)
     tokenizer = load_char_tokenizer(dict_path, split_with_space=tokenizer_cfg.get("split_with_space", " "))
     vocab_size = len(tokenizer._symbol_table)
 
@@ -196,8 +194,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
             init_checkpoint=init_checkpoint or None,
         )
 
-    accelerator = "gpu" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
-    devices = max(1, int(args.devices)) if accelerator == "gpu" else 1
+    accelerator, devices = resolve_accelerator_and_devices(args.device, args.devices)
 
     if accelerator == "gpu":
         torch.set_float32_matmul_precision("high")

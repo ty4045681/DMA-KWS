@@ -1,0 +1,8 @@
+device: cuda
+devices: 1
+limit_steps: 0
+resume_from: ""
+init_checkpoint: ""
+resume_checkpoint: ""
+train_manifest: ""
+dev_manifest: ""

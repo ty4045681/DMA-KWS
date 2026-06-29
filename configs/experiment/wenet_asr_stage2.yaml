@@ -1,0 +1,29 @@
+# @package _global_
+defaults:
+  - override /paths: default
+  - override /stage1: encoder_only
+
+paths:
+  libriphrase100_root: data/dma-kws/raw/LibriPhrase-100
+  gigaphrase1000_root: data/dma-kws/raw/GigaPhrase-1000
+
+training:
+  recipe: wenet-asr-init
+
+stage2:
+  init_checkpoint: ${oc.env:WENET_ASR_CHECKPOINT,""}
+  parquet_file: data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet
+  wav_dir: data/dma-kws/features/fbank
+  hard_negative_ratio: 1
+  sample_lens: 100000000
+  batch_size_per_gpu: 512
+  max_steps: 50000
+  num_workers: 16
+  accumulate_grad_batches: 2
+  strategy: ddp
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/wenet-asr-init
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/wenet-asr-init
+  run_name: wenet-asr-init
+  eval:
+    test_dir: data/dma-kws/raw/LibriPhrase-100/eval
+    batch_size: 256

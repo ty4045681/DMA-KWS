@@ -3,34 +3,23 @@
 
 from __future__ import annotations
 
-import argparse
 import json
-import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
 from dma_kws.audio import extract_fbank, load_audio
-from dma_kws.config import get_tokenizer_config, load_config, require_sections
+from dma_kws.config import get_tokenizer_config, require_sections
 from dma_kws.g2p import make_g2p, text_to_phonemes
+from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.nn import build_encoder
+from dma_kws.pathing import ensure_qbyt_on_path, resolve_dict_path
 from dma_kws.stage1.streaming_search import build_keyword_context_graph, decode_keyword_candidates
 from dma_kws.tokenizer import load_char_tokenizer, tokenize_phoneme_string
+from dma_kws.training.device import resolve_accelerator
 
 NUM_EMBEDS = 73
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, help="Path to YAML config")
-    parser.add_argument("--stage1-ckpt", required=True, help="Stage I checkpoint produced by train_stage1_ctc.py")
-    parser.add_argument("--stage2-ckpt", required=True, help="Stage II checkpoint produced by train_stage2_qbyt.py")
-    parser.add_argument("--audio", required=True, help="Input audio path")
-    parser.add_argument("--keyword", required=True, help="Keyword text")
-    parser.add_argument("--device", default="cuda", help="cuda or cpu")
-    return parser.parse_args()
 
 
 def num_fbank_frames(
@@ -84,7 +73,7 @@ def load_model_state(model, ckpt_path: str, load_fn):
     return model
 
 
-def run(args: argparse.Namespace) -> None:
+def run(cfg: DictConfig) -> None:
     try:
         import torch
     except ImportError as exc:
@@ -92,35 +81,44 @@ def run(args: argparse.Namespace) -> None:
             "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
         ) from exc
 
-    qbyt_root = PROJECT_ROOT / "qbyt"
-    if str(qbyt_root) not in sys.path:
-        sys.path.insert(0, str(qbyt_root))
+    ensure_qbyt_on_path()
     from model import QbyT
     from models.ctc import CTC
     from models.search import ctc_greedy_search
 
-    config = load_config(args.config)
+    config = resolved_config(cfg)
     require_sections(config, ["paths", "stage1", "stage2", "demo", "tokenizer"])
+    prep = OmegaConf.to_container(cfg.prep, resolve=True)
+    if not isinstance(prep, dict):
+        prep = {}
+    run_cfg = cfg.run
+
     stage1 = config["stage1"]
     stage2 = config["stage2"]
     demo = config["demo"]
 
+    stage1_ckpt = str(prep.get("stage1_ckpt", ""))
+    stage2_ckpt = str(prep.get("stage2_ckpt", ""))
+    audio_path = str(prep.get("audio", ""))
+    keyword = str(prep.get("keyword", ""))
+    if not all([stage1_ckpt, stage2_ckpt, audio_path, keyword]):
+        raise SystemExit("prep.stage1_ckpt, prep.stage2_ckpt, prep.audio, and prep.keyword are required")
+
     tokenizer_cfg = get_tokenizer_config(config)
-    dict_path = Path(tokenizer_cfg["dict_path"])
-    if not dict_path.is_absolute():
-        dict_path = PROJECT_ROOT / dict_path
+    dict_path = resolve_dict_path(config)
     split_with_space = tokenizer_cfg.get("split_with_space", " ")
     tokenizer = load_char_tokenizer(dict_path, split_with_space=split_with_space)
 
     g2p = make_g2p()
-    keyword_phonemes = text_to_phonemes(g2p, args.keyword)
+    keyword_phonemes = text_to_phonemes(g2p, keyword)
     keyword_g2p_text = " ".join(keyword_phonemes)
     keyword_ids = tokenize_phoneme_string(tokenizer, keyword_g2p_text)
 
     sample_rate = int(stage1.get("sample_rate", 16000))
     num_mel_bins = int(stage1.get("input_dim", 80))
     encoder_dim = int(stage1.get("encoder_output_dim", 144))
-    device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    accelerator, _ = resolve_accelerator(str(run_cfg.device))
+    device = torch.device(accelerator if accelerator == "cpu" else "cuda")
 
     class Stage1Model(torch.nn.Module):
         def __init__(self):
@@ -162,7 +160,7 @@ def run(args: argparse.Namespace) -> None:
             raise SystemExit(f"Checkpoint {ckpt_path} is incompatible with the model architecture: {exc}") from exc
         return model.to(device).eval()
 
-    waveform, sample_rate = load_audio(args.audio, sample_rate=sample_rate)
+    waveform, sample_rate = load_audio(audio_path, sample_rate=sample_rate)
     feat = extract_fbank(
         waveform,
         num_mel_bins=num_mel_bins,
@@ -171,7 +169,7 @@ def run(args: argparse.Namespace) -> None:
     ).unsqueeze(0)
     feat_lengths = torch.tensor([feat.size(1)], dtype=torch.long)
 
-    stage1_model = load_state(Stage1Model(), args.stage1_ckpt)
+    stage1_model = load_state(Stage1Model(), stage1_ckpt)
     with torch.no_grad():
         log_probs, mask = stage1_model(feat.to(device), feat_lengths.to(device))
     encoder_lens = mask.squeeze(1).sum(1).to(torch.long)
@@ -190,7 +188,7 @@ def run(args: argparse.Namespace) -> None:
     greedy_results = ctc_greedy_search(log_probs, encoder_lens, blank_id=0)
     decoded_phonemes = tokenizer.ids2tokens(greedy_results[0].tokens)
 
-    stage2_model = load_state(Stage2Model(), args.stage2_ckpt)
+    stage2_model = load_state(Stage2Model(), stage2_ckpt)
     stage2_scores = []
     anchor = torch.tensor([keyword_ids], dtype=torch.long).to(device)
     anchor_lengths = torch.tensor([len(keyword_ids)], dtype=torch.long).to(device)
@@ -236,8 +234,8 @@ def run(args: argparse.Namespace) -> None:
 
     threshold = float(demo.get("qbyt_threshold", 0.5))
     result = {
-        "audio": args.audio,
-        "keyword": args.keyword,
+        "audio": audio_path,
+        "keyword": keyword,
         "keyword_phonemes": keyword_phonemes,
         "decoded_phonemes": decoded_phonemes,
         "stage1_candidates": [candidate.__dict__ for candidate in candidates],
@@ -248,8 +246,9 @@ def run(args: argparse.Namespace) -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def main() -> None:
-    run(parse_args())
+@hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="config")
+def main(cfg: DictConfig) -> None:
+    run(cfg)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ This repository contains code for a two-stage keyword spotting pipeline:
 1. **Stage I**: phoneme CTC decoding to find candidate keyword regions.
 2. **Stage II**: QbyT phoneme matching to verify each candidate.
 
-> The repository uses a **single training recipe** aligned with the paper/main codebase. `configs/demo_librispeech100.yaml` is a **scale-only smoke preset** (LibriSpeech-100 / LibriPhrase-100, fewer steps) — same architecture, losses, negative mining, tokenizer, and streaming Stage I search as the paper configs. It does **not** define a separate demo algorithm.
+> The repository uses a **single training recipe** aligned with the paper/main codebase. `+experiment=demo_librispeech100` is a **scale-only smoke preset** (LibriSpeech-100 / LibriPhrase-100, fewer steps) — same architecture, losses, negative mining, tokenizer, and streaming Stage I search as the paper configs. It does **not** define a separate demo algorithm.
 
 ---
 
@@ -45,7 +45,9 @@ scripts/eval_stage2_libriphrase.py
 scripts/run_two_stage_demo.py
 ```
 
-Paper-scale configs: `configs/paper_ls460.yaml`, `configs/paper_ls_gs1460.yaml`. Wenet ASR encoder init preset: `configs/wenet_asr_stage2.yaml`. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
+Paper-scale configs: `+experiment=paper_ls460`, `+experiment=paper_ls_gs1460`. Wenet ASR encoder init preset: `+experiment=wenet_asr_stage2`. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
+
+Configs use [Hydra](https://hydra.cc/): base groups live under `configs/` (paths, stage1, stage2, …) and experiments are overlays in `configs/experiment/`. Select one with `+experiment=<name>` and override any leaf with dotlist syntax, e.g. `run.devices=2 run.limit_steps=20 stage2.learning_rate=0.001`.
 
 ### Shared `fbank` config
 
@@ -92,10 +94,11 @@ Install CUDA PyTorch/torchaudio according to your server CUDA driver. Example fo
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Then install the project Python dependencies:
+Then install the project in editable mode and Python dependencies:
 
 ```bash
 pip install -r requirements.txt
+pip install -e .
 ```
 
 The requirements include `soundfile` for FLAC decoding support and `openai-whisper` for the vendored QbyT/Wenet
@@ -146,7 +149,7 @@ bash scripts/run_smoke.sh
 Default config:
 
 ```text
-configs/demo_librispeech100.yaml
+configs/experiment/demo_librispeech100.yaml
 ```
 
 By default it expects this layout:
@@ -163,7 +166,7 @@ By default it expects this layout:
 └── exp/
 ```
 
-If your data root is not `/data/dma-kws`, edit `configs/demo_librispeech100.yaml` and update the `paths:` section before running scripts.
+If your data root is not `/data/dma-kws`, edit `+experiment=demo_librispeech100` and update the `paths:` section before running scripts.
 
 Create directories:
 
@@ -273,7 +276,7 @@ Run a smoke preparation first:
 
 ```bash
 python3 scripts/prepare_stage1_librispeech.py \
-  --config configs/demo_librispeech100.yaml \
+  +experiment=demo_librispeech100 \
   --limit 100
 ```
 
@@ -290,7 +293,7 @@ If the smoke run works, prepare the full LibriSpeech-100 split:
 
 ```bash
 python3 scripts/prepare_stage1_librispeech.py \
-  --config configs/demo_librispeech100.yaml
+  +experiment=demo_librispeech100
 ```
 
 If your LibriSpeech data was downloaded from HuggingFace as parquet shards, for example:
@@ -306,7 +309,7 @@ prepare the training manifest directly from those shards:
 
 ```bash
 python3 scripts/prepare_stage1_librispeech.py \
-  --config configs/demo_librispeech100.yaml \
+  +experiment=demo_librispeech100 \
   --limit 100 \
   --input-format hf-parquet \
   --parquet-root /home/h00513998/librispeech_train_clean_360 \
@@ -319,7 +322,7 @@ Remove `--limit 100` for the full run after the smoke run completes:
 
 ```bash
 python3 scripts/prepare_stage1_librispeech.py \
-  --config configs/demo_librispeech100.yaml \
+  +experiment=demo_librispeech100 \
   --input-format hf-parquet \
   --parquet-root /home/h00513998/librispeech_train_clean_360 \
   --parquet-split train-clean-360 \
@@ -347,7 +350,7 @@ Optional: precompute Stage I fbank features for faster training (reads the JSONL
 
 ```bash
 python3 scripts/prepare_stage1_fbank.py \
-  --config configs/demo_librispeech100.yaml
+  +experiment=demo_librispeech100
 ```
 
 ---
@@ -358,29 +361,29 @@ Smoke training run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage1_ctc.py \
-  --config configs/demo_librispeech100.yaml \
-  --devices 2 \
-  --limit-steps 20
+  +experiment=demo_librispeech100 \
+  run.devices=2 \
+  run.limit_steps=20
 ```
 
 Full first run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage1_ctc.py \
-  --config configs/demo_librispeech100.yaml \
-  --devices 2
+  +experiment=demo_librispeech100 \
+  run.devices=2
 ```
 
 Resume an interrupted run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage1_ctc.py \
-  --config configs/demo_librispeech100.yaml \
-  --devices 2 \
-  --resume-from last
+  +experiment=demo_librispeech100 \
+  run.devices=2 \
+  run.resume_from=last
 ```
 
-`--resume-from last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt` and continues to the configured limit. Pass an explicit `.ckpt` path instead of `last` to resume from a specific checkpoint. If the original run used `--limit-steps`, pass the same value again on resume.
+`run.resume_from=last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt` and continues to the configured limit. Pass an explicit `.ckpt` path instead of `last` to resume from a specific checkpoint. If the original run used `--limit-steps`, pass the same value again on resume.
 
 Checkpoints are saved under:
 
@@ -404,7 +407,7 @@ python3 scripts/average_checkpoints.py \
   --output /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/avg_10.pt
 ```
 
-If you hit out-of-memory, reduce these values in `configs/demo_librispeech100.yaml`:
+If you hit out-of-memory, reduce these values in `+experiment=demo_librispeech100`:
 
 ```yaml
 stage1:
@@ -428,7 +431,7 @@ Demo smoke run:
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
-  --config configs/demo_librispeech100.yaml \
+  +experiment=demo_librispeech100 \
   --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
   --limit-anchors 50
 ```
@@ -437,7 +440,7 @@ Full demo prep (drop `--limit-anchors`):
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
-  --config configs/demo_librispeech100.yaml \
+  +experiment=demo_librispeech100 \
   --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
 ```
 
@@ -445,7 +448,7 @@ Same input parquet for the Wenet-init recipe:
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
-  --config configs/wenet_asr_stage2.yaml \
+  +experiment=wenet_asr_stage2 \
   --input-parquet /data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
 ```
 
@@ -453,7 +456,7 @@ GigaPhrase-1000 (clips use `GP-1000/` prefix; dataset is auto-detected from the 
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
-  --config configs/wenet_asr_stage2.yaml \
+  +experiment=wenet_asr_stage2 \
   --input-parquet /data/dma-kws/raw/GigaPhrase-1000/aggregated_segments_with_g2p_distance.parquet \
   --decoded-parquet-root /data/dma-kws/raw/GigaPhrase-1000
 ```
@@ -494,13 +497,13 @@ Validation reads fbank `.npy` files co-located next to each `.wav`, not the wav 
 
 ```bash
 python3 scripts/prepare_stage2_eval_fbank.py \
-  --config configs/demo_librispeech100.yaml \
+  +experiment=demo_librispeech100 \
   --from-csv
 ```
 
 ```bash
 python3 scripts/prepare_stage2_eval_fbank.py \
-  --config configs/wenet_asr_stage2.yaml \
+  +experiment=wenet_asr_stage2 \
   --from-csv
 ```
 
@@ -520,31 +523,31 @@ Smoke training run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
-  --config configs/demo_librispeech100.yaml \
-  --devices 2 \
-  --init-checkpoint "$STAGE1_CKPT" \
-  --limit-steps 20
+  +experiment=demo_librispeech100 \
+  run.devices=2 \
+  run.init_checkpoint="$STAGE1_CKPT" \
+  run.limit_steps=20
 ```
 
 Full first run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
-  --config configs/demo_librispeech100.yaml \
-  --devices 2 \
-  --init-checkpoint "$STAGE1_CKPT"
+  +experiment=demo_librispeech100 \
+  run.devices=2 \
+  run.init_checkpoint="$STAGE1_CKPT"
 ```
 
 Resume an interrupted run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
-  --config configs/demo_librispeech100.yaml \
-  --devices 2 \
-  --resume-from last
+  +experiment=demo_librispeech100 \
+  run.devices=2 \
+  run.resume_from=last
 ```
 
-`--resume-from last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt`, or pass an explicit `.ckpt` path. If the original run used `--limit-steps`, pass the same value again on resume. This is a true Lightning resume of an interrupted run and is distinct from `--init-checkpoint` / `stage2.resume_checkpoint`, which only load weights to seed a fresh finetune recipe.
+`run.resume_from=last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt`, or pass an explicit `.ckpt` path. If the original run used `--limit-steps`, pass the same value again on resume. This is a true Lightning resume of an interrupted run and is distinct from `--init-checkpoint` / `stage2.resume_checkpoint`, which only load weights to seed a fresh finetune recipe.
 
 Checkpoints are saved under:
 
@@ -570,7 +573,7 @@ stage2:
 
 ## 7b. Stage II: initialize from external Wenet ASR encoder
 
-Alternative to Stage I init: seed the Stage II Conformer encoder from a pretrained Wenet ASR checkpoint. Use `configs/wenet_asr_stage2.yaml`.
+Alternative to Stage I init: seed the Stage II Conformer encoder from a pretrained Wenet ASR checkpoint. Use `+experiment=wenet_asr_stage2`.
 
 Prerequisites:
 
@@ -589,25 +592,25 @@ Full data prep and training chain:
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
-  --config configs/wenet_asr_stage2.yaml \
+  +experiment=wenet_asr_stage2 \
   --input-parquet data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
   --decoded-parquet-root data/dma-kws/raw/LibriPhrase-100
 
 python3 scripts/prepare_stage2_eval_fbank.py \
-  --config configs/wenet_asr_stage2.yaml
+  +experiment=wenet_asr_stage2
 
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
-  --config configs/wenet_asr_stage2.yaml \
-  --devices 2
+  +experiment=wenet_asr_stage2 \
+  run.devices=2
 ```
 
 Override the init checkpoint without editing the yaml:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
-  --config configs/wenet_asr_stage2.yaml \
-  --devices 2 \
-  --init-checkpoint /path/to/wenet_asr.pt
+  +experiment=wenet_asr_stage2 \
+  run.devices=2 \
+  run.init_checkpoint=/path/to/wenet_asr.pt
 ```
 
 Notes:
@@ -628,7 +631,7 @@ AUDIO=/path/to/test.wav
 KEYWORD="hello world"
 
 python3 scripts/run_two_stage_demo.py \
-  --config configs/demo_librispeech100.yaml \
+  +experiment=demo_librispeech100 \
   --stage1-ckpt "$STAGE1_CKPT" \
   --stage2-ckpt "$STAGE2_CKPT" \
   --audio "$AUDIO" \
@@ -836,7 +839,7 @@ Start with smoke flags:
 
 ```bash
 --limit 100
---limit-steps 20
+run.limit_steps=20
 --limit-anchors 100
 ```
 
@@ -851,7 +854,7 @@ Stage II validation reads LibriPhrase eval wav/CSV files under `stage2.eval.test
 Validation expects precomputed fbank `.npy` next to eval wav files. Run:
 
 ```bash
-python3 scripts/prepare_stage2_eval_fbank.py --config configs/wenet_asr_stage2.yaml
+python3 scripts/prepare_stage2_eval_fbank.py +experiment=wenet_asr_stage2
 ```
 
 Use `--from-csv` to convert only wav files referenced by the eval CSVs, or point `--test-dir` at your eval root if it differs from the config.

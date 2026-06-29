@@ -3,22 +3,19 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields, replace
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+from omegaconf import DictConfig, OmegaConf
 
+from dma_kws.configs.schema import DMAKWSConfig, FbankConfig
 
-@dataclass(frozen=True)
-class FbankConfig:
-    """Shared Kaldi fbank feature extraction settings."""
-
-    num_mel_bins: int = 80
-    frame_length: int = 25
-    frame_shift: int = 10
-    dither: float = 0.1
-    window_type: str = "povey"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_DIR = PROJECT_ROOT / "configs"
 
 
 def _expand_value(value: Any) -> Any:
@@ -31,14 +28,53 @@ def _expand_value(value: Any) -> Any:
     return value
 
 
+def _schema_defaults() -> DictConfig:
+    return OmegaConf.structured(DMAKWSConfig)
+
+
+def compose_config(
+    experiment: str | None = None,
+    overrides: Iterable[str] = (),
+) -> DictConfig:
+    """Compose a validated config via Hydra (groups + optional experiment overlay)."""
+    GlobalHydra.instance().clear()
+    override_list = list(overrides)
+    if experiment:
+        override_list.insert(0, f"+experiment={experiment}")
+    with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+        return compose(config_name="config", overrides=override_list)
+
+
+def _merge_with_schema(cfg: DictConfig) -> DictConfig:
+    base = OmegaConf.create(OmegaConf.to_container(_schema_defaults(), resolve=False))
+    OmegaConf.set_struct(base, False)
+    return OmegaConf.merge(base, cfg)
+
+
+def config_to_dict(cfg: DictConfig) -> dict[str, Any]:
+    """Resolve a composed DictConfig to a plain dict with env/user expansion."""
+    merged = _merge_with_schema(cfg)
+    container = OmegaConf.to_container(merged, resolve=True)
+    if not isinstance(container, dict):
+        raise ValueError("Config must resolve to a mapping")
+    return _expand_value(container)
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
-    """Load a YAML config file and expand env/user markers in string values."""
+    """Load a YAML config file merged onto schema defaults (backward compatible)."""
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
     if not isinstance(data, dict):
         raise ValueError(f"Config must be a mapping at top level: {config_path}")
-    return _expand_value(data)
+
+    base = OmegaConf.create(OmegaConf.to_container(_schema_defaults(), resolve=False))
+    OmegaConf.set_struct(base, False)
+    merged = OmegaConf.merge(base, OmegaConf.create(data))
+    container = OmegaConf.to_container(merged, resolve=False)
+    if not isinstance(container, dict):
+        raise ValueError(f"Config must resolve to a mapping: {config_path}")
+    return _expand_value(container)
 
 
 def require_sections(config: dict[str, Any], sections: Iterable[str]) -> None:

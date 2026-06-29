@@ -3,50 +3,42 @@
 
 from __future__ import annotations
 
-import argparse
-import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
+from dma_kws.hydra_app import CONFIG_DIR
 from dma_kws.training.checkpoint_avg import average_lightning_checkpoints
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-dir", required=True, type=Path, help="Directory containing checkpoints")
-    parser.add_argument(
-        "--pattern",
-        default="*.ckpt",
-        help='Glob pattern for checkpoint files (default: "*.ckpt")',
-    )
-    parser.add_argument(
-        "--last-k",
-        type=int,
-        default=10,
-        help="Number of most recent checkpoints to average (default: 10)",
-    )
-    parser.add_argument("--output", required=True, type=Path, help="Output checkpoint path")
-    return parser.parse_args()
+@hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="config")
+def main(cfg: DictConfig) -> None:
+    prep = OmegaConf.to_container(cfg.prep, resolve=True)
+    if not isinstance(prep, dict):
+        prep = {}
 
-
-def main() -> None:
-    args = parse_args()
-    if args.last_k <= 0:
-        raise SystemExit("--last-k must be positive")
-
-    input_dir = args.input_dir
+    input_dir = Path(str(prep.get("input_dir", "")))
+    if not input_dir:
+        raise SystemExit("prep.input_dir is required")
     if not input_dir.is_dir():
         raise SystemExit(f"Input directory not found: {input_dir}")
 
-    candidates = sorted(input_dir.glob(args.pattern))
-    if not candidates:
-        raise SystemExit(f"No checkpoints matched pattern {args.pattern!r} in {input_dir}")
+    last_k = int(prep.get("last_k", 10))
+    if last_k <= 0:
+        raise SystemExit("prep.last_k must be positive")
 
-    selected = candidates[-args.last_k :]
-    output_path = average_lightning_checkpoints(selected, args.output)
+    output = Path(str(prep.get("output", "")))
+    if not output:
+        raise SystemExit("prep.output is required")
+
+    pattern = str(prep.get("pattern", "*.ckpt"))
+    candidates = sorted(input_dir.glob(pattern))
+    if not candidates:
+        raise SystemExit(f"No checkpoints matched pattern {pattern!r} in {input_dir}")
+
+    selected = candidates[-last_k:]
+    output_path = average_lightning_checkpoints(selected, output)
     print(f"Averaged {len(selected)} checkpoints -> {output_path}")
 
 

@@ -3,18 +3,16 @@
 
 from __future__ import annotations
 
-import argparse
-import sys
 from functools import partial
 from pathlib import Path
+from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
+import hydra
 import numpy as np
+from omegaconf import DictConfig, OmegaConf
 
-from dma_kws.config import fbank_kwargs, get_fbank_config, load_config, require_sections
+from dma_kws.config import fbank_kwargs, get_fbank_config, require_sections
+from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.stage2.pairs import (
     clip_to_audio_rel,
     decoded_glob_for_dataset,
@@ -30,35 +28,10 @@ from dma_kws.stage2.prepare_paper import (
 )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, help="Path to YAML config")
-    parser.add_argument("--input-parquet", default="", help="Aggregated LibriPhrase parquet")
-    parser.add_argument(
-        "--decoded-parquet-root",
-        default="",
-        help="Directory or file with decoded-parquet shards",
-    )
-    parser.add_argument(
-        "--dataset-root",
-        default="",
-        help="Alias for --decoded-parquet-root (dataset-specific decoded shard root)",
-    )
-    parser.add_argument(
-        "--output-subdir",
-        default="",
-        help="Subdirectory under paths.processed_root for paper parquet output "
-        "(default: stage2_qbyt, or stage2.prep.output_subdir from config)",
-    )
-    parser.add_argument("--limit-anchors", type=int, default=0, help="Optional anchor cap for smoke runs")
-    parser.add_argument("--seed", type=int, default=2025, help="Reserved for future deterministic sampling")
-    return parser.parse_args()
-
-
 def find_default_parquet(root: Path) -> Path:
     matches = sorted(root.rglob("*.parquet"))
     if not matches:
-        raise SystemExit(f"No parquet files found under {root}; pass --input-parquet explicitly")
+        raise SystemExit(f"No parquet files found under {root}; pass prep.input_parquet explicitly")
     return matches[0]
 
 
@@ -120,15 +93,15 @@ def collect_needed_audio_keys(
 
 
 def resolve_decoded_root(
-    args: argparse.Namespace,
+    prep: dict[str, Any],
     config: dict,
     paths: dict,
     dataset_id: str | None,
 ) -> Path:
-    if args.decoded_parquet_root:
-        return Path(args.decoded_parquet_root)
-    if args.dataset_root:
-        return Path(args.dataset_root)
+    if prep.get("decoded_parquet_root"):
+        return Path(prep["decoded_parquet_root"])
+    if prep.get("dataset_root"):
+        return Path(prep["dataset_root"])
     stage2_prep = (config.get("stage2") or {}).get("prep") or {}
     if stage2_prep.get("data_root"):
         return Path(stage2_prep["data_root"])
@@ -139,9 +112,9 @@ def resolve_decoded_root(
     return Path(paths["libriphrase100_root"])
 
 
-def resolve_output_subdir(args: argparse.Namespace, config: dict) -> str:
-    if args.output_subdir:
-        return args.output_subdir
+def resolve_output_subdir(prep: dict[str, Any], config: dict) -> str:
+    if prep.get("output_subdir"):
+        return str(prep["output_subdir"])
     stage2_prep = (config.get("stage2") or {}).get("prep") or {}
     return stage2_prep.get("output_subdir", "stage2_qbyt")
 
@@ -167,23 +140,31 @@ def load_decoded_audio(
     return audio_by_rel
 
 
-def main() -> None:
-    args = parse_args()
+@hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="config")
+def main(cfg: DictConfig) -> None:
     try:
         import pandas as pd
     except ImportError as exc:
         raise SystemExit("Missing dependency pandas/pyarrow. Install with: pip install pandas pyarrow") from exc
 
-    _ = args.seed  # reserved
-    config = load_config(args.config)
+    config = resolved_config(cfg)
     require_sections(config, ["paths"])
-    paths = config["paths"]
+    prep = OmegaConf.to_container(cfg.prep, resolve=True)
+    if not isinstance(prep, dict):
+        prep = {}
 
-    input_path = Path(args.input_parquet) if args.input_parquet else find_default_parquet(Path(paths["libriphrase100_root"]))
+    paths = config["paths"]
+    limit_anchors = int(prep.get("limit_anchors", 0))
+
+    input_path = (
+        Path(prep["input_parquet"])
+        if prep.get("input_parquet")
+        else find_default_parquet(Path(paths["libriphrase100_root"]))
+    )
     processed_root = Path(paths["processed_root"])
     feature_root = Path(paths.get("feature_root", processed_root.parent / "features"))
 
-    output_subdir = resolve_output_subdir(args, config)
+    output_subdir = resolve_output_subdir(prep, config)
     output_dir = processed_root / output_subdir
     clips_dir = output_dir / "clips"
     distances_dir = output_dir / "distances"
@@ -191,7 +172,7 @@ def main() -> None:
     output_parquet = output_dir / OUTPUT_PARQUET_NAME
 
     df = pd.read_parquet(input_path)
-    dataset_id = infer_dataset_id(iter_clip_audio_paths(df, limit_anchors=args.limit_anchors))
+    dataset_id = infer_dataset_id(iter_clip_audio_paths(df, limit_anchors=limit_anchors))
     if dataset_id:
         print(f"Detected dataset: {dataset_id}")
     else:
@@ -199,11 +180,11 @@ def main() -> None:
 
     needed_keys = collect_needed_audio_keys(
         df,
-        limit_anchors=args.limit_anchors,
+        limit_anchors=limit_anchors,
         dataset_id=dataset_id,
     )
 
-    decoded_root = resolve_decoded_root(args, config, paths, dataset_id)
+    decoded_root = resolve_decoded_root(prep, config, paths, dataset_id)
     decoded_glob = decoded_glob_for_dataset(dataset_id) if dataset_id else "LP-100-decoded-*.parquet"
     print(f"Using decoded glob: {decoded_glob}")
     decoded_parquet_paths = find_decoded_parquets(decoded_root, decoded_glob=decoded_glob)
@@ -220,7 +201,7 @@ def main() -> None:
         distances_dir=distances_dir,
         fbank_dir=fbank_dir,
         audio_by_rel=audio_by_rel,
-        limit_anchors=args.limit_anchors,
+        limit_anchors=limit_anchors,
         compute_fbank=compute_fbank_fn,
     )
 

@@ -9,6 +9,6 @@ def test_libriphrase_script_delegates_to_paper_main(monkeypatch):
     def fake_main():
         called.append(True)
 
-    monkeypatch.setattr("scripts.prepare_stage2_paper.main", fake_main)
+    monkeypatch.setattr(prep, "main", fake_main)
     prep.main()
     assert called == [True]

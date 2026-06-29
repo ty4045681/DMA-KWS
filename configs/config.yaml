@@ -1,0 +1,15 @@
+defaults:
+  - paths: default
+  - tokenizer: default
+  - training: default
+  - fbank: default
+  - stage1: default
+  - stage2: default
+  - demo: default
+  - run: default
+  - prep: default
+  - _self_
+
+hydra:
+  job:
+    chdir: false

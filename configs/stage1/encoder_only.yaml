@@ -1,0 +1,16 @@
+# Wenet ASR encoder variant (no CTC training sections).
+defaults:
+  - default
+
+dropout_rate: 0.03
+positional_dropout_rate: 0.03
+attention_dropout_rate: 0.1
+causal: true
+cnn_module_norm: layer_norm
+use_dynamic_chunk: true
+use_dynamic_left_chunk: true
+gradient_checkpointing: true
+cmvn: global_cmvn
+cmvn_conf:
+  cmvn_file: ${oc.env:WENET_CMVN_FILE,""}
+  is_json_cmvn: true

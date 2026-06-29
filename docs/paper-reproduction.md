@@ -15,9 +15,9 @@ Configs:
 
 | Config | Purpose |
 |--------|---------|
-| `configs/paper_ls460.yaml` | Stage II init on LibriPhrase-460 (`init-ls-460`, 50k steps) |
-| `configs/paper_ls_gs1460.yaml` | Stage II finetune on LS+GigaPhrase-1460 (`ft-ls-gs-1460`, 100k steps) |
-| `configs/demo_librispeech100.yaml` | Same recipe, smaller data — smoke only |
+| `+experiment=paper_ls460` | Stage II init on LibriPhrase-460 (`init-ls-460`, 50k steps) |
+| `+experiment=paper_ls_gs1460` | Stage II finetune on LS+GigaPhrase-1460 (`ft-ls-gs-1460`, 100k steps) |
+| `+experiment=demo_librispeech100` | Same recipe, smaller data — smoke only |
 
 Edit the `paths:` section in each YAML if your data root is not `/data/dma-kws`.
 
@@ -92,7 +92,7 @@ cp /data/dma-kws/raw/LibriPhrase-460/aggregated_segments_with_g2p_distance.parqu
 
 ### 1.3 GigaPhrase / LS-GS-1460 (Stage II finetune)
 
-Download the LibriPhrase + GigaSpeech combined finetune set referenced in `configs/paper_ls_gs1460.yaml`:
+Download the LibriPhrase + GigaSpeech combined finetune set referenced in `+experiment=paper_ls_gs1460`:
 
 ```bash
 hf download ZhiqiAi/GigaPhrase-1000 \
@@ -119,7 +119,7 @@ Stage I uses Wenet-aligned **CharTokenizer** targets (`data/dict/lang_char.txt`)
 In-repo prep (recommended — no external Wenet submodule):
 
 ```bash
-bash scripts/prepare_stage1_wenet.sh --config configs/paper_ls460.yaml
+bash scripts/prepare_stage1_wenet.sh +experiment=paper_ls460
 ```
 
 This runs:
@@ -138,21 +138,21 @@ Outputs:
 Manifest-only prep (online fbank at train time):
 
 ```bash
-python3 scripts/prepare_stage1_librispeech.py --config configs/paper_ls460.yaml
+python3 scripts/prepare_stage1_librispeech.py +experiment=paper_ls460
 ```
 
 Fbank-only (after manifests exist):
 
 ```bash
-python3 scripts/prepare_stage1_fbank.py --config configs/paper_ls460.yaml
+python3 scripts/prepare_stage1_fbank.py +experiment=paper_ls460
 ```
 
 ### Train Stage I
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 scripts/train_stage1_ctc.py \
-  --config configs/paper_ls460.yaml \
-  --devices 4
+  +experiment=paper_ls460 \
+  run.devices=4
 ```
 
 Checkpoints: `/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/`
@@ -194,7 +194,7 @@ For the LibriPhrase-100 smoke demo, run:
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
-  --config configs/demo_librispeech100.yaml \
+  +experiment=demo_librispeech100 \
   --limit-anchors 100
 ```
 
@@ -208,17 +208,17 @@ Recipe: LibriPhrase-460, random + hard negatives (1:1), `utt_loss + seq_loss`, A
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 scripts/train_stage2_recipe.py \
-  --config configs/paper_ls460.yaml \
-  --recipe init-ls-460 \
-  --devices 4
+  +experiment=paper_ls460 \
+  training.recipe=init-ls-460 +experiment=paper_ls460 \
+  run.devices=4
 ```
 
 Equivalent direct entry point:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 scripts/train_stage2_qbyt.py \
-  --config configs/paper_ls460.yaml \
-  --devices 4
+  +experiment=paper_ls460 \
+  run.devices=4
 ```
 
 Checkpoints: `/data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460/`
@@ -241,9 +241,9 @@ Finetune from averaged init checkpoint on LS+GigaPhrase-1460 with hard-negative 
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 scripts/train_stage2_recipe.py \
-  --config configs/paper_ls_gs1460.yaml \
-  --recipe ft-ls-gs-1460 \
-  --devices 4
+  +experiment=paper_ls_gs1460 \
+  training.recipe=ft-ls-gs-1460 +experiment=paper_ls_gs1460 \
+  run.devices=4
 ```
 
 `paper_ls_gs1460.yaml` sets `stage2.init_checkpoint` to the averaged init weights. Checkpoints: `/data/dma-kws/exp/stage2_qbyt/checkpoints/ft-ls-gs-1460/`
@@ -256,10 +256,10 @@ Train QbyT only (~187k params) with **your** averaged Stage I encoder frozen (no
 
 ```bash
 python3 scripts/train_stage2_recipe.py \
-  --config configs/paper_ls460.yaml \
+  +experiment=paper_ls460 \
   --recipe frozen-wenet-encoder \
-  --devices 4 \
-  --init-checkpoint /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/avg_10.ckpt
+  run.devices=4 \
+  run.init_checkpoint=/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/avg_10.ckpt
 ```
 
 If `--init-checkpoint` is omitted, the recipe resolves `stage1.checkpoint_avg` output under your `exp_root`.
@@ -270,7 +270,7 @@ Evaluate on the official LibriPhrase-460 eval splits (AUC / EER):
 
 ```bash
 python3 scripts/eval_stage2_libriphrase.py \
-  --config configs/paper_ls460.yaml \
+  +experiment=paper_ls460 \
   --checkpoint /data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460/avg_10.ckpt \
   --split hard
 ```
@@ -294,7 +294,7 @@ STAGE1_CKPT=/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/avg_10.ckpt
 STAGE2_CKPT=/data/dma-kws/exp/stage2_qbyt/checkpoints/init-ls-460/avg_10.ckpt
 
 python3 scripts/run_two_stage_demo.py \
-  --config configs/paper_ls460.yaml \
+  +experiment=paper_ls460 \
   --stage1-ckpt "$STAGE1_CKPT" \
   --stage2-ckpt "$STAGE2_CKPT" \
   --audio /path/to/test.wav \
@@ -313,7 +313,7 @@ Paper-reported LibriPhrase **hard** split (from original README / main logs):
 
 Acceptance criterion for this alignment work: reproduced AUC/EER within **1% absolute** of main on the same config and data.
 
-Small-scale presets (`demo_librispeech100.yaml`, `--limit-steps 20`) verify the pipeline runs but will **not** match these numbers.
+Small-scale presets (`demo_librispeech100.yaml`, `run.limit_steps=20`) verify the pipeline runs but will **not** match these numbers.
 
 ---
 

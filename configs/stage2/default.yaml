@@ -1,0 +1,55 @@
+encoder_output_dim: 144
+qbyt_embed_dim: 128
+qbyt_layers: 2
+negative_ratio: 1
+learning_rate: 0.0005
+warmup_steps: 2500
+total_scheduler_steps: 50000
+accumulate_grad_batches: 1
+precision: bf16-mixed
+optimizer: adam
+weight_decay: 0.0
+strategy: auto
+gradient_clip_val: 1.0
+log_interval: 10
+val_check_interval: 1000
+freeze_encoder: false
+checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints
+log_dir: ${paths.exp_root}/stage2_qbyt/logs
+run_name: stage2_qbyt
+
+dataloader:
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+
+ema:
+  enabled: false
+  decay: 0.999
+  start_step: 0
+
+console:
+  rich: true
+  device_stats: false
+  throughput: false
+
+logging:
+  backends: [csv, tensorboard]
+  wandb:
+    project: dma-kws
+    mode: online
+  trackio:
+    project: dma-kws
+
+validation:
+  batch_size: 256
+  val_check_interval: 1000
+
+eval:
+  split: hard
+  aggregate_csv: evaluation_set/test_all_phrase.csv
+  batch_size: 256
+
+checkpoint:
+  every_n_train_steps: 1000
+  save_top_k: -1

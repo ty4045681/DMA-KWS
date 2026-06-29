@@ -6,6 +6,15 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Python build artifacts
+*.egg-info/
+build/
+dist/
+
+# Hydra run outputs
+outputs/
+multirun/
+
 # Virtual environments
 .venv/
 venv/

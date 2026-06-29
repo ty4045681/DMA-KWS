@@ -33,7 +33,7 @@ def test_infer_dataset_id_from_clips():
 
 
 def test_decoded_glob_for_dataset():
-    assert decoded_glob_for_dataset("GP-1000") == "GP-1000-decoded-*.parquet"
+    assert decoded_glob_for_dataset("GP-1000") == "LP-100-decoded-*.parquet"
     assert decoded_glob_for_dataset(None) == "LP-100-decoded-*.parquet"
 
 

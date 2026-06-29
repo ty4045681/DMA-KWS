@@ -1,0 +1,28 @@
+sample_rate: 16000
+input_dim: 80
+encoder_output_dim: 144
+attention_heads: 4
+linear_units: 576
+num_blocks: 6
+dropout_rate: 0.1
+positional_dropout_rate: 0.1
+attention_dropout_rate: 0.0
+ctc_dropout: 0.0
+cnn_module_kernel: 3
+gradient_clip_val: 1.0
+log_interval: 10
+checkpoint_dir: ${paths.exp_root}/stage1_phoneme_ctc/checkpoints
+log_dir: ${paths.exp_root}/stage1_phoneme_ctc/logs
+run_name: stage1_phoneme_ctc
+
+checkpoint_avg:
+  enabled: false
+  last_k: 10
+  pattern: "*.ckpt"
+  output_name: avg_10.ckpt
+
+validation:
+  dev_manifest: ""
+  batch_size: 48
+  check_val_every_n_epoch: 1
+  num_decode_batches: 0

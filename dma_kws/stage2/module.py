@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,34 +11,17 @@ import torch.nn.functional as F
 import torchmetrics
 
 from dma_kws.nn import build_encoder
+from dma_kws.pathing import ensure_qbyt_on_path
 from dma_kws.stage2.losses import compute_stage2_losses
+from dma_kws.training.checkpoint_io import extract_state_dict
 from dma_kws.training.scheduler import build_cosine_warmup_optimizer
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-
-def _ensure_qbyt_on_path() -> None:
-    qbyt_root = PROJECT_ROOT / "qbyt"
-    qbyt_path = str(qbyt_root)
-    if qbyt_path not in sys.path:
-        sys.path.insert(0, qbyt_path)
 
 
 def _load_qbyt():
-    _ensure_qbyt_on_path()
+    ensure_qbyt_on_path()
     from model import QbyT
 
     return QbyT
-
-
-def _extract_state_dict(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:
-    if "state_dict" in checkpoint:
-        return checkpoint["state_dict"]
-    if "model_state_dict" in checkpoint:
-        return checkpoint["model_state_dict"]
-    if "model" in checkpoint and isinstance(checkpoint["model"], dict):
-        return checkpoint["model"]
-    return checkpoint
 
 
 def _split_submodule_state(
@@ -102,7 +84,7 @@ class Stage2LightningModule(pl.LightningModule):
 
     def _load_init_checkpoint(self, checkpoint_path: Path) -> None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        state = _extract_state_dict(checkpoint)
+        state = extract_state_dict(checkpoint)
 
         encoder_state = _split_submodule_state(state, "encoder")
         qbyt_state = _split_submodule_state(state, "qbyt")

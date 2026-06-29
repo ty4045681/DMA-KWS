@@ -1,0 +1,4 @@
+librispeech_root: data/dma-kws/raw/LibriSpeech
+processed_root: data/dma-kws/processed
+feature_root: data/dma-kws/features
+exp_root: data/dma-kws/exp

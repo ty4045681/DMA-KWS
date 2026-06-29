@@ -109,6 +109,44 @@ def build_stage2_callbacks(config: dict[str, Any], recipe: str) -> list[Any]:
     return callbacks
 
 
+def build_stage1_callbacks(
+    config: dict[str, Any],
+    *,
+    checkpoint_dir: Path,
+    has_validation: bool,
+) -> tuple[list[Any], Any | None]:
+    """Build checkpoint callbacks for Stage I training."""
+    from pytorch_lightning.callbacks import ModelCheckpoint
+
+    stage1 = config.get("stage1", {})
+    validation_cfg = stage1.get("validation", {}) or {}
+    callbacks: list[Any] = []
+    checkpoint_callback = None
+
+    if has_validation:
+        avg_cfg = stage1.get("checkpoint_avg", {}) or {}
+        save_all = bool(avg_cfg.get("enabled", False))
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=str(checkpoint_dir),
+            monitor="val/per",
+            mode="min",
+            save_top_k=1 if not save_all else -1,
+            filename="stage1_{epoch:03d}_{val_per:.4f}",
+            save_last=True,
+        )
+        callbacks.append(checkpoint_callback)
+    else:
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=str(checkpoint_dir),
+                save_last=True,
+                save_top_k=0,
+            )
+        )
+
+    return callbacks, checkpoint_callback
+
+
 def print_run_summary(
     *,
     config: dict[str, Any],

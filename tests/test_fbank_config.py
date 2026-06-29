@@ -4,10 +4,11 @@ import pytest
 
 from dma_kws.config import (
     FbankConfig,
+    compose_config,
+    config_to_dict,
     fbank_kwargs,
     get_eval_fbank_config,
     get_fbank_config,
-    load_config,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +31,7 @@ def test_fbank_config_uses_stage1_input_dim_when_fbank_missing():
 
 
 def test_fbank_config_yaml_overrides_top_level_section():
-    config = load_config(REPO_ROOT / "configs" / "wenet_asr_stage2.yaml")
+    config = config_to_dict(compose_config("wenet_asr_stage2"))
 
     cfg = get_fbank_config(config)
 
@@ -44,7 +45,7 @@ def test_fbank_config_yaml_overrides_top_level_section():
 
 
 def test_fbank_config_falls_back_to_stage1_input_dim_in_paper_config():
-    config = load_config(REPO_ROOT / "configs" / "paper_ls460.yaml")
+    config = config_to_dict(compose_config("paper_ls460"))
 
     cfg = get_fbank_config(config)
 

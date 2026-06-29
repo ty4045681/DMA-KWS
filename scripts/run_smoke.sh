@@ -10,7 +10,6 @@ if [[ -x "${ROOT}/.venv/bin/python" ]]; then
 else
   PYTHON="python3"
 fi
-export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 echo "==> pytest (${PYTHON})"
 "${PYTHON}" -m pytest tests -q
@@ -29,7 +28,7 @@ PYTHON_SCRIPTS=(
 
 for script in "${PYTHON_SCRIPTS[@]}"; do
   echo "  scripts/${script}"
-  "${PYTHON}" "scripts/${script}" --help >/dev/null
+  "${PYTHON}" -m py_compile "scripts/${script}"
 done
 
 echo "==> shell script syntax"

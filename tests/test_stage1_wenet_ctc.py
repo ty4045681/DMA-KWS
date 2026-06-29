@@ -60,8 +60,8 @@ def _mock_encoder_output(feat: torch.Tensor, feat_lengths: torch.Tensor):
 @pytest.fixture
 def patched_module(monkeypatch):
     fake_encoder = MagicMock(side_effect=_mock_encoder_output)
-    monkeypatch.setattr("dma_kws.stage1.wenet_ctc.build_encoder", lambda *_args, **_kwargs: fake_encoder)
-    monkeypatch.setattr("dma_kws.stage1.wenet_ctc._load_ctc", lambda: _FakeCTC)
+    monkeypatch.setattr("dma_kws.stage1.module.build_encoder", lambda *_args, **_kwargs: fake_encoder)
+    monkeypatch.setattr("dma_kws.stage1.module._load_ctc", lambda: _FakeCTC)
     return Stage1LightningModule(_minimal_config(), vocab_size=73)
 
 
@@ -113,8 +113,8 @@ def test_export_stage1_encoder_pt_roundtrip(tmp_path, monkeypatch):
             super().__init__()
             self.dummy = nn.Parameter(torch.zeros(1))
 
-    monkeypatch.setattr("dma_kws.stage1.wenet_ctc.build_encoder", lambda *_a, **_k: fake_encoder)
-    monkeypatch.setattr("dma_kws.stage1.wenet_ctc._load_ctc", lambda: _FakeCTC)
+    monkeypatch.setattr("dma_kws.stage1.module.build_encoder", lambda *_a, **_k: fake_encoder)
+    monkeypatch.setattr("dma_kws.stage1.module._load_ctc", lambda: _FakeCTC)
 
     from dma_kws.stage1.wenet_ctc import Stage1LightningModule, export_stage1_encoder_pt
 

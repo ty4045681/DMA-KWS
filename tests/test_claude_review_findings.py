@@ -54,55 +54,54 @@ def test_demo_load_model_state_requires_exact_checkpoint_keys():
 
 
 def test_stage1_hf_parquet_requires_non_empty_dev_source(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        "\n".join(
-            [
-                "paths:",
-                f"  librispeech_root: {tmp_path / 'missing-librispeech'}",
-                f"  processed_root: {tmp_path / 'processed'}",
-                "stage1:",
-                "  train_splits: [train-clean-100]",
-                "  dev_splits: [dev-clean]",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    config = {
+        "paths": {
+            "librispeech_root": str(tmp_path / "missing-librispeech"),
+            "processed_root": str(tmp_path / "processed"),
+        },
+        "stage1": {
+            "train_splits": ["train-clean-100"],
+            "dev_splits": ["dev-clean"],
+        },
+    }
+    prep = {
+        "limit": 0,
+        "input_format": "hf-parquet",
+        "parquet_root": str(tmp_path / "train.parquet"),
+        "parquet_split": "",
+        "parquet_audio_dir": "",
+        "dev_parquet_root": "",
+        "dev_parquet_split": "",
+        "dev_parquet_audio_dir": "",
+    }
     monkeypatch.setattr(prepare_stage1, "make_g2p", lambda: object())
     monkeypatch.setattr(prepare_stage1, "prepare_parquet_split", lambda **kwargs: ["HH"])
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "prepare_stage1_librispeech.py",
-            "--config",
-            str(config_path),
-            "--input-format",
-            "hf-parquet",
-            "--parquet-root",
-            str(tmp_path / "train.parquet"),
-        ],
-    )
 
     with pytest.raises(SystemExit, match="--dev-parquet-root"):
-        prepare_stage1.main()
+        prepare_stage1.run_prepare_stage1_librispeech(config, prep)
 
 
 def test_stage1_hf_parquet_can_prepare_dev_from_parquet(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        "\n".join(
-            [
-                "paths:",
-                f"  librispeech_root: {tmp_path / 'missing-librispeech'}",
-                f"  processed_root: {tmp_path / 'processed'}",
-                "stage1:",
-                "  train_splits: [train-clean-100]",
-                "  dev_splits: [dev-clean]",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    config = {
+        "paths": {
+            "librispeech_root": str(tmp_path / "missing-librispeech"),
+            "processed_root": str(tmp_path / "processed"),
+        },
+        "stage1": {
+            "train_splits": ["train-clean-100"],
+            "dev_splits": ["dev-clean"],
+        },
+    }
+    prep = {
+        "limit": 0,
+        "input_format": "hf-parquet",
+        "parquet_root": str(tmp_path / "train.parquet"),
+        "parquet_split": "",
+        "parquet_audio_dir": "",
+        "dev_parquet_root": str(tmp_path / "dev.parquet"),
+        "dev_parquet_split": "dev-clean",
+        "dev_parquet_audio_dir": "",
+    }
     calls = []
 
     def fake_prepare_parquet_split(**kwargs):
@@ -111,25 +110,8 @@ def test_stage1_hf_parquet_can_prepare_dev_from_parquet(tmp_path, monkeypatch):
 
     monkeypatch.setattr(prepare_stage1, "make_g2p", lambda: object())
     monkeypatch.setattr(prepare_stage1, "prepare_parquet_split", fake_prepare_parquet_split)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "prepare_stage1_librispeech.py",
-            "--config",
-            str(config_path),
-            "--input-format",
-            "hf-parquet",
-            "--parquet-root",
-            str(tmp_path / "train.parquet"),
-            "--dev-parquet-root",
-            str(tmp_path / "dev.parquet"),
-            "--dev-parquet-split",
-            "dev-clean",
-        ],
-    )
 
-    prepare_stage1.main()
+    prepare_stage1.run_prepare_stage1_librispeech(config, prep)
 
     assert [call["output_path"].name for call in calls] == ["train.jsonl", "dev.jsonl"]
     assert calls[1]["split"] == "dev-clean"

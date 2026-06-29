@@ -1,0 +1,5 @@
+num_mel_bins: 80
+frame_length: 25
+frame_shift: 10
+dither: 0.1
+window_type: povey

@@ -8,23 +8,14 @@ SystemExit on a missing torch install is preserved.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from dma_kws.pathing import ensure_qbyt_on_path
 
 
 def build_encoder(stage1_cfg: dict[str, Any], *, output_dim: int):
-    """Build a ConformerEncoder from the ``stage1`` config section.
-
-    Every kwarg and its default mirrors the previously copy-pasted blocks; only
-    ``output_size`` is overridden per call via ``output_dim`` (Stage I uses its
-    own encoder dim, Stage II its own).
-    """
-    qbyt_root = PROJECT_ROOT / "qbyt"
-    if str(qbyt_root) not in sys.path:
-        sys.path.insert(0, str(qbyt_root))
+    """Build a ConformerEncoder from the ``stage1`` config section."""
+    ensure_qbyt_on_path()
     try:
         from models.encoder import ConformerEncoder
     except ImportError as exc:

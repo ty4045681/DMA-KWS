@@ -1,0 +1,40 @@
+# @package _global_
+defaults:
+  - override /paths: default
+
+paths:
+  libriphrase100_root: data/dma-kws/raw/LibriPhrase-100
+
+training:
+  recipe: init-ls-100
+
+stage1:
+  train_splits:
+    - train-clean-100
+  dev_splits:
+    - dev-clean
+  batch_size_per_gpu: 48
+  max_epochs: 30
+  max_train_steps: 0
+  num_workers: 4
+  learning_rate: 0.001
+  warmup_steps: 0
+  total_scheduler_steps: 0
+  checkpoint_avg:
+    enabled: true
+    last_k: 3
+    output_name: avg_10.ckpt
+
+stage2:
+  parquet_file: data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet
+  wav_dir: data/dma-kws/features/fbank
+  hard_negative_ratio: 1
+  sample_lens: 5000
+  batch_size_per_gpu: 128
+  max_steps: 50000
+  num_workers: 4
+  validation:
+    batch_size: 128
+  eval:
+    test_dir: data/dma-kws/raw/LibriPhrase-100/eval
+    batch_size: 64

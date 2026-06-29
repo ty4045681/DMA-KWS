@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - paper_ls460
+
+training:
+  recipe: frozen-wenet-encoder
+
+stage2:
+  freeze_encoder: true
+  run_name: frozen-wenet-encoder
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/frozen-wenet-encoder
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/frozen-wenet-encoder
