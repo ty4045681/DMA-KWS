@@ -6,7 +6,14 @@ import pytest
 
 from dma_kws.stage2.pairs import scan_decoded_parquet_shard
 from dma_kws.stage2.prep_console import resolve_num_workers
-from dma_kws.stage2.prepare_paper import _compute_fbank_jobs, _FbankJob, convert_aggregated_to_paper_parquet
+from dma_kws.stage2.prepare_paper import (
+    _compute_fbank_jobs,
+    _FbankJob,
+    build_anchor_metadata,
+    convert_aggregated_to_paper_parquet,
+    resolve_fbank_rel_path,
+    stream_fbank_from_decoded,
+)
 from scripts.prepare_stage2_paper import load_decoded_audio
 
 
@@ -123,3 +130,80 @@ def test_convert_parallel_fbank_preserves_layout(tmp_path):
     assert stats["fbank_written"] == 4
     assert stats["fbank_skipped"] == 0
     assert stats["clips_total"] == 4
+
+
+def test_streaming_fbank_matches_in_memory_path(tmp_path):
+    from tests.test_prepare_stage2_paper import _fake_compute_fbank, _mock_audio, _synthetic_df
+
+    df = _synthetic_df()
+    audio = _mock_audio()
+
+    # One decoded shard per clip, so streaming must release memory between shards.
+    shard_paths = []
+    for index, (audio_rel, (waveform, sr)) in enumerate(audio.items()):
+        shard = pd.DataFrame(
+            {"audio_rel": [audio_rel], "audio": [waveform], "sampling_rate": [sr]}
+        )
+        path = tmp_path / f"decoded-{index:04d}.parquet"
+        shard.to_parquet(path, index=False)
+        shard_paths.append(path)
+
+    clips_dir = tmp_path / "clips"
+    distances_dir = tmp_path / "distances"
+    fbank_dir = tmp_path / "fbank"
+
+    paper_df, fbank_targets, stats = build_anchor_metadata(
+        df,
+        clips_dir=clips_dir,
+        distances_dir=distances_dir,
+        fbank_dir=fbank_dir,
+    )
+    assert stats["anchors"] == 3
+    assert stats["clips_total"] == 4
+    assert len(fbank_targets) == 4
+
+    written, missing = stream_fbank_from_decoded(
+        shard_paths,
+        fbank_targets,
+        read_parquet=pd.read_parquet,
+        compute_fbank=_fake_compute_fbank,
+        num_workers=2,
+    )
+    assert written == 4
+    assert missing == 0
+
+    for _, row in paper_df.iterrows():
+        for clip in np.load(row["clips_file"], allow_pickle=True):
+            assert (fbank_dir / resolve_fbank_rel_path(clip["audio_path"])).exists()
+
+
+def test_streaming_fbank_reports_missing_audio(tmp_path):
+    from tests.test_prepare_stage2_paper import _fake_compute_fbank, _synthetic_df
+
+    df = _synthetic_df()
+    # Decoded shard only contains one of the referenced clips.
+    shard = pd.DataFrame(
+        {
+            "audio_rel": ["hello world/a.wav"],
+            "audio": [np.linspace(-0.1, 0.1, 1600, dtype=np.float32)],
+            "sampling_rate": [16000],
+        }
+    )
+    shard_path = tmp_path / "decoded-0000.parquet"
+    shard.to_parquet(shard_path, index=False)
+
+    _paper_df, fbank_targets, _stats = build_anchor_metadata(
+        df,
+        clips_dir=tmp_path / "clips",
+        distances_dir=tmp_path / "distances",
+        fbank_dir=tmp_path / "fbank",
+    )
+
+    written, missing = stream_fbank_from_decoded(
+        [shard_path],
+        fbank_targets,
+        read_parquet=pd.read_parquet,
+        compute_fbank=_fake_compute_fbank,
+    )
+    assert written == 1
+    assert missing == len(fbank_targets) - 1

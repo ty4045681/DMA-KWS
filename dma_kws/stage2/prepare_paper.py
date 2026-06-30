@@ -229,33 +229,39 @@ def _compute_fbank_jobs(
     return written
 
 
-def convert_aggregated_to_paper_parquet(
+@dataclass(frozen=True)
+class FbankTarget:
+    """A fbank file that still needs to be computed for a given decoded clip."""
+
+    audio_path: str
+    fbank_path: Path
+
+
+def build_anchor_metadata(
     df,
     *,
     clips_dir: Path,
     distances_dir: Path,
     fbank_dir: Path,
-    audio_by_rel: dict[str, tuple[np.ndarray, int]] | None = None,
     limit_anchors: int = 0,
     hard_negative_top_k: int = DEFAULT_HARD_NEGATIVE_TOP_K,
     g2p: Any | None = None,
-    compute_fbank: Callable[..., str] = compute_fbank_for_clip,
-    num_workers: int = 1,
     on_progress: Callable[[str, int], None] | None = None,
-) -> tuple[Any, dict[str, int]]:
-    """Convert aggregated LibriPhrase parquet rows to paper-format metadata.
+) -> tuple[Any, dict[str, FbankTarget], dict[str, int]]:
+    """Write paper-format anchor metadata without touching any audio.
 
-    Returns ``(paper_df, stats)`` where ``stats`` counts missing clips/audio/fbank.
+    Returns ``(paper_df, fbank_targets, stats)`` where ``fbank_targets`` maps each
+    still-missing decoded ``audio_rel`` to the clip/fbank paths needed to produce
+    it. Audio is never loaded here, so memory stays bounded regardless of dataset
+    size; fbank computation is handled separately (see ``stream_fbank_from_decoded``).
     """
     import pandas as pd
 
     clips_dir = Path(clips_dir)
     distances_dir = Path(distances_dir)
     fbank_dir = Path(fbank_dir)
-    audio_by_rel = audio_by_rel or {}
 
     rows: list[dict[str, str]] = []
-    anchor_g2p_by_ngram: dict[str, str] = {}
     pending: list[dict[str, Any]] = []
 
     for _, row in df.iterrows():
@@ -265,7 +271,6 @@ def convert_aggregated_to_paper_parquet(
             continue
 
         g2p_text, _phonemes = _resolve_g2p(row, g2p)
-        anchor_g2p_by_ngram[text] = g2p_text
         pending.append({"ngram": text, "ngram_g2p": g2p_text, "clips": clips, "distances": parse_distances(row.get("distances"))})
         if limit_anchors and len(pending) >= limit_anchors:
             break
@@ -279,7 +284,7 @@ def convert_aggregated_to_paper_parquet(
     }
 
     candidate_pairs = [(item["ngram"], item["ngram_g2p"]) for item in pending]
-    fbank_jobs: list[_FbankJob] = []
+    fbank_targets: dict[str, FbankTarget] = {}
 
     if on_progress is not None:
         on_progress("anchor_total", len(pending))
@@ -306,27 +311,13 @@ def convert_aggregated_to_paper_parquet(
             stats["clips_total"] += 1
             audio_path = clip["audio_path"]
             audio_rel = clip_to_audio_rel(audio_path)
-            fbank_rel = resolve_fbank_rel_path(audio_path)
-            fbank_path = fbank_dir / fbank_rel
+            fbank_path = fbank_dir / resolve_fbank_rel_path(audio_path)
 
             if fbank_path.exists():
                 stats["fbank_skipped"] += 1
                 continue
 
-            audio_entry = audio_by_rel.get(audio_rel)
-            if audio_entry is None:
-                stats["missing_audio"] += 1
-                continue
-
-            waveform, sample_rate = audio_entry
-            fbank_jobs.append(
-                _FbankJob(
-                    audio_path=audio_path,
-                    fbank_path=fbank_path,
-                    waveform=waveform,
-                    sample_rate=sample_rate,
-                )
-            )
+            fbank_targets[audio_rel] = FbankTarget(audio_path=audio_path, fbank_path=fbank_path)
 
         rows.append(
             {
@@ -340,6 +331,129 @@ def convert_aggregated_to_paper_parquet(
         if on_progress is not None:
             on_progress("anchor", 1)
 
+    paper_df = pd.DataFrame(rows, columns=PARQUET_COLUMNS)
+    return paper_df, fbank_targets, stats
+
+
+def stream_fbank_from_decoded(
+    decoded_parquet_paths: Iterable[Path],
+    fbank_targets: dict[str, FbankTarget],
+    *,
+    read_parquet: Callable[[Path], Any],
+    compute_fbank: Callable[..., str] = compute_fbank_for_clip,
+    num_workers: int = 1,
+    on_progress: Callable[[str, int], None] | None = None,
+    on_shard_done: Callable[[Path, int], None] | None = None,
+) -> tuple[int, int]:
+    """Compute fbank features by streaming decoded shards one at a time.
+
+    Each shard is read, filtered to rows whose ``audio_rel`` is still needed,
+    turned into fbank ``.npy`` files, then released before the next shard is read.
+    Peak memory is therefore bounded by a single decoded shard rather than the
+    full dataset. Returns ``(fbank_written, missing_audio)``.
+    """
+    if on_progress is not None:
+        on_progress("fbank_total", len(fbank_targets))
+
+    remaining: set[str] = set(fbank_targets)
+    written = 0
+
+    for parquet_path in decoded_parquet_paths:
+        if not remaining:
+            if on_shard_done is not None:
+                on_shard_done(parquet_path, 0)
+            continue
+
+        frame = read_parquet(parquet_path)
+        matched = frame[frame["audio_rel"].isin(remaining)]
+
+        jobs: list[_FbankJob] = []
+        for audio_rel, audio, sample_rate in zip(
+            matched["audio_rel"], matched["audio"], matched["sampling_rate"]
+        ):
+            audio_rel = str(audio_rel)
+            if audio_rel not in remaining:
+                continue
+            remaining.discard(audio_rel)
+            target = fbank_targets[audio_rel]
+            array = np.asarray(audio, dtype=np.float32)
+            if array.ndim != 1:
+                raise SystemExit(
+                    f"Expected mono 1-D audio for {audio_rel}, got shape {array.shape}"
+                )
+            jobs.append(
+                _FbankJob(
+                    audio_path=target.audio_path,
+                    fbank_path=target.fbank_path,
+                    waveform=array,
+                    sample_rate=int(sample_rate),
+                )
+            )
+
+        shard_written = _compute_fbank_jobs(
+            jobs,
+            compute_fbank=compute_fbank,
+            num_workers=num_workers,
+            on_progress=on_progress,
+        )
+        written += shard_written
+        if on_shard_done is not None:
+            on_shard_done(parquet_path, shard_written)
+        del frame, matched, jobs
+
+    return written, len(remaining)
+
+
+def convert_aggregated_to_paper_parquet(
+    df,
+    *,
+    clips_dir: Path,
+    distances_dir: Path,
+    fbank_dir: Path,
+    audio_by_rel: dict[str, tuple[np.ndarray, int]] | None = None,
+    limit_anchors: int = 0,
+    hard_negative_top_k: int = DEFAULT_HARD_NEGATIVE_TOP_K,
+    g2p: Any | None = None,
+    compute_fbank: Callable[..., str] = compute_fbank_for_clip,
+    num_workers: int = 1,
+    on_progress: Callable[[str, int], None] | None = None,
+) -> tuple[Any, dict[str, int]]:
+    """Convert aggregated parquet rows to paper-format metadata using in-memory audio.
+
+    Returns ``(paper_df, stats)`` where ``stats`` counts missing clips/audio/fbank.
+    Suitable for small datasets/tests where all referenced audio fits in
+    ``audio_by_rel``; large datasets should use ``build_anchor_metadata`` plus
+    ``stream_fbank_from_decoded`` to avoid materializing every waveform at once.
+    """
+    audio_by_rel = audio_by_rel or {}
+
+    paper_df, fbank_targets, stats = build_anchor_metadata(
+        df,
+        clips_dir=clips_dir,
+        distances_dir=distances_dir,
+        fbank_dir=fbank_dir,
+        limit_anchors=limit_anchors,
+        hard_negative_top_k=hard_negative_top_k,
+        g2p=g2p,
+        on_progress=on_progress,
+    )
+
+    fbank_jobs: list[_FbankJob] = []
+    for audio_rel, target in fbank_targets.items():
+        audio_entry = audio_by_rel.get(audio_rel)
+        if audio_entry is None:
+            stats["missing_audio"] += 1
+            continue
+        waveform, sample_rate = audio_entry
+        fbank_jobs.append(
+            _FbankJob(
+                audio_path=target.audio_path,
+                fbank_path=target.fbank_path,
+                waveform=waveform,
+                sample_rate=sample_rate,
+            )
+        )
+
     if on_progress is not None:
         on_progress("fbank_total", len(fbank_jobs))
 
@@ -350,5 +464,4 @@ def convert_aggregated_to_paper_parquet(
         on_progress=on_progress,
     )
 
-    paper_df = pd.DataFrame(rows, columns=PARQUET_COLUMNS)
     return paper_df, stats

@@ -25,9 +25,11 @@ from dma_kws.stage2.pairs import (
 from dma_kws.stage2.prep_console import Stage2PrepReporter, resolve_num_workers
 from dma_kws.stage2.prepare_paper import (
     OUTPUT_PARQUET_NAME,
+    build_anchor_metadata,
     compute_fbank_for_clip,
     convert_aggregated_to_paper_parquet,
     parse_clips,
+    stream_fbank_from_decoded,
 )
 
 
@@ -248,67 +250,74 @@ def main(cfg: DictConfig) -> None:
     reporter.info(f"Decoded glob: {decoded_glob}")
     reporter.info(f"Found {len(decoded_parquet_paths)} decoded parquet shards")
 
-    reporter.section("Load decoded audio")
-    with reporter.track("Scan decoded parquet shards", total=len(decoded_parquet_paths)) as shard_bar:
-        audio_by_rel = load_decoded_audio(
-            decoded_parquet_paths,
-            needed_keys,
-            num_workers=num_workers,
-            on_shard_done=lambda _path, _hits: shard_bar.update(1) if shard_bar is not None else None,
-        )
-    reporter.info(f"Loaded {len(audio_by_rel)} / {len(needed_keys)} referenced clips into memory")
-
     fbank_cfg = get_fbank_config(config)
     compute_fbank_fn = partial(compute_fbank_for_clip, **fbank_kwargs(fbank_cfg))
 
-    reporter.section("Convert to paper format")
-    with reporter.tasks() as tasks:
-        anchor_task = tasks.add("Build anchor metadata")
-        fbank_task = tasks.add("Compute fbank features")
+    reporter.section("Build anchor metadata")
+    with reporter.track("Build anchor metadata", total=None) as anchor_bar:
 
-        def on_progress(stage: str, value: int) -> None:
-            if stage == "anchor_total":
-                tasks.set_total(anchor_task, value)
-            elif stage == "anchor":
-                tasks.advance(anchor_task, value)
-            elif stage == "fbank_total":
-                tasks.set_total(fbank_task, value)
-            elif stage == "fbank":
-                tasks.advance(fbank_task, value)
+        def on_anchor(stage: str, value: int) -> None:
+            if stage == "anchor_total" and anchor_bar is not None:
+                anchor_bar.set_total(value)
+            elif stage == "anchor" and anchor_bar is not None:
+                anchor_bar.update(value)
 
-        paper_df, stats = convert_aggregated_to_paper_parquet(
+        paper_df, fbank_targets, stats = build_anchor_metadata(
             df,
             clips_dir=clips_dir,
             distances_dir=distances_dir,
             fbank_dir=fbank_dir,
-            audio_by_rel=audio_by_rel,
             limit_anchors=limit_anchors,
-            compute_fbank=compute_fbank_fn,
-            num_workers=num_workers,
-            on_progress=on_progress,
+            on_progress=on_anchor,
         )
+    reporter.info(
+        f"Prepared {stats['anchors']} anchors; {len(fbank_targets)} fbank files to compute "
+        f"({stats['fbank_skipped']} already present)"
+    )
 
     reporter.section("Write output")
     output_dir.mkdir(parents=True, exist_ok=True)
     paper_df.to_parquet(output_parquet, index=False)
+    del paper_df
 
-    missing = needed_keys - set(audio_by_rel)
+    reporter.section("Compute fbank (streaming decoded shards)")
+    with reporter.tasks() as tasks:
+        shard_task = tasks.add("Scan decoded parquet shards", total=len(decoded_parquet_paths))
+        fbank_task = tasks.add("Compute fbank features", total=len(fbank_targets))
+
+        def on_fbank(stage: str, value: int) -> None:
+            if stage == "fbank_total":
+                tasks.set_total(fbank_task, value)
+            elif stage == "fbank":
+                tasks.advance(fbank_task, value)
+
+        fbank_written, missing = stream_fbank_from_decoded(
+            decoded_parquet_paths,
+            fbank_targets,
+            read_parquet=_read_parquet,
+            compute_fbank=compute_fbank_fn,
+            num_workers=num_workers,
+            on_progress=on_fbank,
+            on_shard_done=lambda _path, _hits: tasks.advance(shard_task, 1),
+        )
+    stats["fbank_written"] = fbank_written
+    stats["missing_audio"] = missing
+
     reporter.print_stats(
         [
             ("anchors", str(stats["anchors"])),
             ("clips_total", str(stats["clips_total"])),
             ("fbank_written", str(stats["fbank_written"])),
             ("fbank_skipped", str(stats["fbank_skipped"])),
-            ("missing_audio", str(stats["missing_audio"])),
-            ("missing_in_decoded", str(len(missing))),
+            ("missing_in_decoded", str(missing)),
             ("output_parquet", str(output_parquet)),
         ]
     )
 
     if missing:
         reporter.warn(
-            f"{len(missing)} referenced clips were not found in decoded parquet "
-            f"({stats['missing_audio']} fbank files skipped)"
+            f"{missing} referenced clips were not found in decoded parquet "
+            "(their fbank files were skipped)"
         )
 
     reporter.done("Stage II paper prep complete.")
