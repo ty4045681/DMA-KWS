@@ -2,12 +2,67 @@
 
 **DMA-KWS**: Effective User-defined Keyword Spotting with Dual-stage Matching, Multi-modal Enrollment, and Continual Adaptation.
 
-This repository contains code for a two-stage keyword spotting pipeline:
+This repository implements a two-stage keyword spotting pipeline with a **single algorithm and shared codebase**. Scale differences between the small demo and paper reproduction come from Hydra experiment presets and dataset size, not separate implementations.
 
-1. **Stage I**: phoneme CTC decoding to find candidate keyword regions.
-2. **Stage II**: QbyT phoneme matching to verify each candidate.
+1. **Stage I** (training + inference): phoneme CTC decoding proposes candidate keyword spans in audio.
+2. **Stage II** (training + inference): QbyT phoneme matching verifies each candidate.
 
-> The repository uses a **single training recipe** aligned with the paper/main codebase. `+experiment=demo_librispeech100` is a **scale-only smoke preset** (LibriSpeech-100 / LibriPhrase-100, fewer steps) — same architecture, losses, negative mining, tokenizer, and streaming Stage I search as the paper configs. It does **not** define a separate demo algorithm.
+### Terminology
+
+| Term | Meaning |
+|------|---------|
+| **experiment** | Hydra config overlay selected on the CLI, e.g. `+experiment=demo_librispeech100` |
+| **recipe** | `training.recipe` label for multi-phase Stage II chains: `init-ls-460`, `ft-ls-gs-1460`, `frozen-wenet-encoder`, `wenet-asr-init` |
+| **demo preset** | Scale-only experiment (`demo_librispeech100`) — same algorithm as the paper, smaller data and step counts |
+
+Do not overload "recipe" to mean the whole codebase; the repo is one shared pipeline with multiple experiment/recipe presets.
+
+### Path conventions
+
+Defaults in `configs/paths/default.yaml` are **repo-relative** paths such as `data/dma-kws/raw`, `data/dma-kws/processed`, etc. Run scripts from the repository root so these resolve correctly.
+
+```text
+data/dma-kws/
+├── raw/
+│   ├── LibriSpeech/
+│   └── LibriPhrase-100/
+├── processed/
+├── features/
+└── exp/
+```
+
+On a shared server you may mount data at `/data/dma-kws`. Override without editing yaml:
+
+```bash
+python3 scripts/train_stage1_ctc.py +experiment=demo_librispeech100 \
+  paths.processed_root=/data/dma-kws/processed \
+  paths.exp_root=/data/dma-kws/exp
+```
+
+Or edit `paths:` in `configs/experiment/<name>.yaml` or `configs/paths/default.yaml`. `+experiment=...` is a **CLI selector**, not a file you edit in place.
+
+### Stage II training scripts
+
+| Script | Use |
+|--------|-----|
+| `scripts/train_stage2_qbyt.py` | Demo single-phase training and Wenet ASR encoder init (`wenet_asr_stage2`, §7b) |
+| `scripts/train_stage2_recipe.py` | Paper multi-phase chain only: `init-ls-460`, `ft-ls-gs-1460`, `frozen-wenet-encoder` |
+
+For the full paper chain (init → avg → finetune → eval), see [docs/paper-reproduction.md](docs/paper-reproduction.md).
+
+### Checkpoints and resume
+
+| Config key | Format | Purpose |
+|------------|--------|---------|
+| `run.resume_from` | Lightning `.ckpt` | Full training-state resume (weights, optimizer, scheduler, step) |
+| `run.init_checkpoint` / `stage2.init_checkpoint` | Exported `.pt` | Weight-only seed for a **new** run (e.g. Stage I encoder → Stage II, or external Wenet ASR) |
+| `stage2.resume_checkpoint` | `.ckpt` or exported weights | Weight seed for finetune from prior Stage II average (`avg_10.ckpt`) |
+
+Exported weight files use names like `stage1_step000020.pt` and `stage2_step000020.pt`. Stage I training also writes `stage1_avg.pt` when `stage1.checkpoint_avg.enabled=true` (demo default).
+
+`scripts/average_checkpoints.py` averages Lightning checkpoints — use `prep.pattern="*.ckpt"` for checkpoint directories. Demo Stage I auto-averages to `avg_10.ckpt` and exports `stage1_avg.pt` at end of training.
+
+If you started a smoke run with `run.limit_steps=20`, pass the same limit again when resuming with `run.resume_from=last`.
 
 ---
 
@@ -15,24 +70,35 @@ This repository contains code for a two-stage keyword spotting pipeline:
 
 The runnable path (demo and paper share the same code):
 
+**Training**
+
 ```text
 LibriSpeech
-  -> Stage I CharTokenizer manifest (data/dict/lang_char.txt)
+  -> Stage I CharTokenizer manifest (phoneme vocabulary in data/dict/lang_char.txt)
   -> Stage I Conformer + CTC training
 
 LibriPhrase (paper-format parquet + precomputed fbank .npy)
   -> Stage II utt_loss + seq_loss, random + hard negatives
-  -> Stage II Conformer + QbyT training (init -> avg -> finetune)
+  -> Stage II Conformer + QbyT training
+     demo: single phase (train_stage2_qbyt.py)
+     paper: init -> avg -> finetune chain only (train_stage2_recipe.py)
+```
 
+**Inference** (requires both stages)
+
+```text
 input audio + keyword text
-  -> Stage I prefix beam + ContextGraph candidates
-  -> Stage II QbyT verification
+  -> Stage I prefix beam + ContextGraph: propose phoneme-span candidates
+  -> Stage II QbyT verification: score each candidate
   -> detected / not detected
 ```
+
+`+experiment=wenet_asr_stage2` seeds the Stage II **encoder** from an external Wenet ASR checkpoint; two-stage **inference** still needs a Stage I CTC model for candidate proposal. That preset is distinct from `frozen-wenet-encoder` (`configs/experiment/frozen_wenet_encoder.yaml`), which freezes a **self-trained** Stage I encoder during paper-scale Stage II — see [docs/paper-reproduction.md](docs/paper-reproduction.md).
 
 Main entry points:
 
 ```text
+scripts/prepare_stage1_wenet.sh        # Stage I manifest + fbank prep chain
 scripts/prepare_stage1_librispeech.py
 scripts/prepare_stage1_fbank.py
 scripts/train_stage1_ctc.py
@@ -41,13 +107,15 @@ scripts/prepare_stage2_paper.py
 scripts/recompute_stage2_distances.py  # phoneme hard-negative distances from g2p parquet
 scripts/prepare_stage2_libriphrase.py  # alias for prepare_stage2_paper.py
 scripts/prepare_stage2_eval_fbank.py   # precompute LibriPhrase eval fbank .npy for Stage II validation
-scripts/train_stage2_qbyt.py
-scripts/train_stage2_recipe.py
+scripts/train_stage2_qbyt.py           # demo + wenet-asr-init (single phase)
+scripts/train_stage2_recipe.py         # paper multi-phase chain only
 scripts/eval_stage2_libriphrase.py
 scripts/run_two_stage_demo.py
 ```
 
-Paper-scale configs: `+experiment=paper_ls460`, `+experiment=paper_ls_gs1460`. Wenet ASR encoder init preset: `+experiment=wenet_asr_stage2`. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
+The repo vendors the Wenet toolkit under `wenet/` for encoder/tokenizer utilities. The legacy `qbyt/` reference scripts are not used by the Hydra training pipeline.
+
+Paper-scale configs: `+experiment=paper_ls460`, `+experiment=paper_ls_gs1460`, `+experiment=frozen_wenet_encoder`. Wenet ASR encoder init preset: `+experiment=wenet_asr_stage2`. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
 
 Configs use [Hydra](https://hydra.cc/): base groups live under `configs/` (paths, stage1, stage2, …) and experiments are overlays in `configs/experiment/`. Select one with `+experiment=<name>` and override any leaf with dotlist syntax, e.g. `run.devices=2 run.limit_steps=20 stage2.learning_rate=0.001`.
 
@@ -90,22 +158,20 @@ conda create -n dma-kws python=3.10 -y
 conda activate dma-kws
 ```
 
-Install CUDA PyTorch/torchaudio according to your server CUDA driver. Example for CUDA 12.1 wheels:
+Install CUDA PyTorch/torchaudio **first**, according to your server CUDA driver, before the project requirements. Example for CUDA 12.1 wheels:
 
 ```bash
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Then install the project in editable mode and Python dependencies:
+Then install the project in editable mode and remaining Python dependencies:
 
 ```bash
 pip install -r requirements.txt
 pip install -e .
 ```
 
-The requirements include `soundfile` for FLAC decoding support and `openai-whisper` for the vendored QbyT/Wenet
-encoder utilities. On some Linux/conda systems, `torchaudio` may still need system audio libraries for `.flac`
-files; install them before training if `torchaudio.load()` cannot read LibriSpeech audio:
+`requirements.txt` includes `pandas`, `pyarrow`, and `rapidfuzz` for Stage II data preparation, plus `g2p_en` for phoneme G2P in both stages. `soundfile` supports FLAC decoding; `openai-whisper` is used by the vendored QbyT/Wenet encoder utilities. On some Linux/conda systems, `torchaudio` may still need system audio libraries for `.flac` files; install them before training if `torchaudio.load()` cannot read LibriSpeech audio:
 
 ```bash
 conda install -c conda-forge libsndfile ffmpeg -y
@@ -148,16 +214,12 @@ bash scripts/run_smoke.sh
 
 ## 2. Prepare data directories
 
-Default config:
+Default experiment: `configs/experiment/demo_librispeech100.yaml` (select with `+experiment=demo_librispeech100`).
+
+By default it expects this layout relative to the repo root (see `configs/paths/default.yaml`):
 
 ```text
-configs/experiment/demo_librispeech100.yaml
-```
-
-By default it expects this layout:
-
-```text
-/data/dma-kws/
+data/dma-kws/
 ├── raw/
 │   ├── LibriSpeech/
 │   │   ├── train-clean-100/
@@ -168,12 +230,12 @@ By default it expects this layout:
 └── exp/
 ```
 
-If your data root is not `/data/dma-kws`, edit `+experiment=demo_librispeech100` and update the `paths:` section before running scripts.
+If your data lives elsewhere, override on the CLI (`paths.processed_root=...`, etc.) or edit `paths:` in `configs/experiment/<name>.yaml` or `configs/paths/default.yaml`.
 
 Create directories:
 
 ```bash
-mkdir -p /data/dma-kws/raw /data/dma-kws/processed /data/dma-kws/features /data/dma-kws/exp
+mkdir -p data/dma-kws/raw data/dma-kws/processed data/dma-kws/features data/dma-kws/exp
 ```
 
 ---
@@ -190,7 +252,7 @@ Download at least:
 Example:
 
 ```bash
-cd /data/dma-kws/raw
+cd data/dma-kws/raw
 mkdir -p LibriSpeech
 cd LibriSpeech
 
@@ -204,8 +266,8 @@ tar -xzf dev-clean.tar.gz --strip-components=1
 After extraction, verify:
 
 ```bash
-ls /data/dma-kws/raw/LibriSpeech/train-clean-100
-ls /data/dma-kws/raw/LibriSpeech/dev-clean
+ls data/dma-kws/raw/LibriSpeech/train-clean-100
+ls data/dma-kws/raw/LibriSpeech/dev-clean
 ```
 
 ### 3.2 LibriPhrase-100 for Stage II
@@ -224,7 +286,7 @@ python3 -m pip install -U "huggingface_hub"
 
 hf download ZhiqiAi/LibriPhrase-100 \
   --repo-type dataset \
-  --local-dir /data/dma-kws/raw/LibriPhrase-100
+  --local-dir data/dma-kws/raw/LibriPhrase-100
 ```
 
 Fallback if the `hf` command is still unavailable after upgrading:
@@ -236,7 +298,7 @@ from huggingface_hub import snapshot_download
 snapshot_download(
     repo_id="ZhiqiAi/LibriPhrase-100",
     repo_type="dataset",
-    local_dir="/data/dma-kws/raw/LibriPhrase-100",
+    local_dir="data/dma-kws/raw/LibriPhrase-100",
 )
 PY
 ```
@@ -261,7 +323,7 @@ Inspect columns if needed:
 ```bash
 python3 - <<'PY'
 import pandas as pd
-path = '/data/dma-kws/raw/LibriPhrase-100/path/to/file.parquet'
+path = 'data/dma-kws/raw/LibriPhrase-100/path/to/file.parquet'
 df = pd.read_parquet(path)
 print(df.columns)
 print(df.head(1))
@@ -283,11 +345,11 @@ python3 scripts/prepare_stage1_librispeech.py \
 Expected outputs:
 
 ```text
-/data/dma-kws/processed/stage1_phoneme_ctc/train.jsonl
-/data/dma-kws/processed/stage1_phoneme_ctc/dev.jsonl
+data/dma-kws/processed/stage1_phoneme_ctc/train.jsonl
+data/dma-kws/processed/stage1_phoneme_ctc/dev.jsonl
 ```
 
-Manifests include `phonemes_g2p` targets for Wenet `CharTokenizer` (`data/dict/lang_char.txt`).
+Manifests include `phonemes_g2p` targets for Wenet `CharTokenizer` — a phoneme vocabulary over `data/dict/lang_char.txt` (ARPAbet-like symbols; stress markers such as `AH0` are normalized to `AH` everywhere).
 
 If the smoke run works, prepare the full LibriSpeech-100 split:
 
@@ -333,7 +395,7 @@ python3 scripts/prepare_stage1_librispeech.py \
 This mode extracts `audio.bytes` from the parquet records into:
 
 ```text
-/data/dma-kws/processed/stage1_phoneme_ctc/audio/train-clean-360/
+data/dma-kws/processed/stage1_phoneme_ctc/audio/train-clean-360/
 ```
 
 and writes `train.jsonl` / `dev.jsonl` with `wav_path` values pointing at the extracted audio files. If you omit
@@ -343,8 +405,8 @@ directory layout; otherwise the script stops instead of silently writing an empt
 Notes:
 
 - The script uses `g2p_en` to convert English transcripts to ARPAbet-like phonemes.
-- Stress markers such as `AH0` are normalized to `AH`.
-- Stage I and Stage II share the Wenet CharTokenizer vocabulary at `data/dict/lang_char.txt`.
+- Stress markers such as `AH0` are normalized to `AH` in manifests and downstream G2P.
+- Stage I and Stage II share the Wenet CharTokenizer phoneme vocabulary at `data/dict/lang_char.txt`.
 
 Optional: precompute Stage I fbank features for faster training (reads the JSONL manifests above):
 
@@ -374,13 +436,14 @@ CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage1_ctc.py \
   run.devices=2
 ```
 
-Resume an interrupted run:
+Resume an interrupted run (re-pass `run.limit_steps` if the original run was a smoke test):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage1_ctc.py \
   +experiment=demo_librispeech100 \
   run.devices=2 \
-  run.resume_from=last
+  run.resume_from=last \
+  run.limit_steps=20
 ```
 
 `run.resume_from=last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt` and continues to the configured limit. Pass an explicit `.ckpt` path instead of `last` to resume from a specific checkpoint. If the original run used `run.limit_steps`, pass the same value again on resume.
@@ -388,31 +451,35 @@ CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage1_ctc.py \
 Checkpoints are saved under:
 
 ```text
-/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/
+data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/
 ```
 
-Example:
+Lightning checkpoints use `.ckpt` (including `last.ckpt`). After training, exported encoder weights are written as `stage1_step{step:06d}.pt` and, when averaging is enabled, `stage1_avg.pt`.
+
+Examples:
 
 ```bash
-ls /data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/*.pt
+ls data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/*.ckpt
+ls data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/stage1_avg.pt
 ```
 
-Optionally average the last few checkpoints before Stage II init or demo inference:
+Optionally average the last few Lightning checkpoints before Stage II init or demo inference:
 
 ```bash
 python3 scripts/average_checkpoints.py \
-  prep.input_dir=/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints \
-  prep.pattern="*.pt" \
+  +experiment=demo_librispeech100 \
+  prep.input_dir=data/dma-kws/exp/stage1_phoneme_ctc/checkpoints \
+  prep.pattern="*.ckpt" \
   prep.last_k=10 \
-  prep.output=/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/avg_10.pt
+  prep.output=data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/avg_10.ckpt
 ```
 
-If you hit out-of-memory, reduce these values in `+experiment=demo_librispeech100`:
+Demo config enables auto-averaging at end of Stage I training (`stage1.checkpoint_avg`), producing `avg_10.ckpt` and `stage1_avg.pt` without a separate averaging step.
 
-```yaml
-stage1:
-  batch_size_per_gpu: 24
-  num_workers: 2
+If you hit out-of-memory, reduce batch size via CLI override (demo defaults are 48 per GPU):
+
+```bash
+python3 scripts/train_stage1_ctc.py +experiment=demo_librispeech100 stage1.batch_size_per_gpu=24 stage1.num_workers=2
 ```
 
 ---
@@ -421,13 +488,11 @@ stage1:
 
 Stage II training uses the **paper pipeline** (`LibriPhraseTrainDataset`): a parquet with columns `ngram`, `ngram_g2p`, `clips_file`, `distances_file`, plus precomputed fbank `.npy` under `features/fbank/`. This is the same format as the paper configs — the demo differs only in dataset size and step counts.
 
-Prepare that layout with `scripts/prepare_stage2_paper.py` (or the identical alias `scripts/prepare_stage2_libriphrase.py`). Training reads the paper parquet paths from `stage2.parquet_file` and `stage2.wav_dir` in your config (defaults under `/data/dma-kws/processed/stage2_qbyt/` and `/data/dma-kws/features/fbank/`).
+Prepare that layout with `scripts/prepare_stage2_paper.py` (or the identical alias `scripts/prepare_stage2_libriphrase.py`). Training reads the paper parquet paths from `stage2.parquet_file` and `stage2.wav_dir` in your config (defaults under `data/dma-kws/processed/stage2_qbyt/` and `data/dma-kws/features/fbank/`).
 
 **Hydra prep overrides:** All preparation scripts share the `prep:` group from `configs/prep/default.yaml`. Override any leaf on the command line with dotlist syntax, e.g. `prep.input_parquet=/path/to/file.parquet prep.limit_anchors=50`. Keys not set on the CLI use the yaml defaults (often empty / zero meaning “all” or “auto”).
 
-Pass the **aggregated** LibriPhrase parquet explicitly with `prep.input_parquet`. Use
-`aggregated_segments_with_g2p_distance.parquet` (includes per-clip G2P distances for hard negatives) — **not**
-`aggregated_segments_by_ngram.parquet`.
+Pass the **aggregated** LibriPhrase parquet explicitly with `prep.input_parquet`. If omitted, `prepare_stage2_paper.py` auto-finds `aggregated_segments_with_g2p*.parquet` under `paths.libriphrase100_root` only — for `+experiment=paper_ls460` you must pass `prep.input_parquet` explicitly. Use `aggregated_segments_with_g2p_distance.parquet` (includes per-clip G2P distances for hard negatives) — **not** `aggregated_segments_by_ngram.parquet`.
 
 ### Hard negatives and G2P
 
@@ -439,15 +504,15 @@ config: `prep.recompute_distances` in `configs/prep/default.yaml`):
 ```bash
 python3 scripts/recompute_stage2_distances.py \
   +experiment=demo_librispeech100 \
-  prep.recompute_distances.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p.parquet
+  prep.recompute_distances.input_parquet=data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p.parquet
 ```
 
 Default output is alongside the input with the `_g2p_distance.parquet` suffix. Pass
 that file to `prepare_stage2_paper.py` via `prep.input_parquet`. Useful overrides:
 `prep.recompute_distances.output_parquet`, `top_k` (default 100), `block_size`,
-`workers` (-1 = auto), `strip_stress` (default true). When `input_parquet` is unset,
+`workers` (-1 = auto), `strip_stress` (default true). When `prep.recompute_distances.input_parquet` is unset,
 the script looks for `aggregated_segments_with_g2p.parquet` under
-`paths.libriphrase460_root` / `paths.libriphrase100_root`.
+`paths.libriphrase460_root`, `paths.libriphrase100_root`, or `paths.libriphrase_root`.
 
 If `ngram_g2p` is missing from the aggregated parquet, `prepare_stage2_paper.py` runs
 on-the-fly G2P via `g2p_en`. When per-anchor `distances` is empty, it falls back to
@@ -458,7 +523,7 @@ Demo smoke run:
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=demo_librispeech100 \
-  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
+  prep.input_parquet=data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
   prep.limit_anchors=50
 ```
 
@@ -467,7 +532,7 @@ Full demo prep (omit `prep.limit_anchors` or set `prep.limit_anchors=0`):
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=demo_librispeech100 \
-  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
+  prep.input_parquet=data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
 ```
 
 Same input parquet for the Wenet-init recipe:
@@ -475,60 +540,60 @@ Same input parquet for the Wenet-init recipe:
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=wenet_asr_stage2 \
-  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
+  prep.input_parquet=data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
 ```
 
-GigaPhrase-1000 (clips use `GP-1000/` prefix; dataset is auto-detected from clip paths in `pairs.py`):
+GigaPhrase-1000 (clips use `GP-1000/` prefix; decoded shards `GP-1000-decoded-*.parquet` under the gigaphrase root; dataset is auto-detected from clip paths in `pairs.py`):
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=wenet_asr_stage2 \
-  prep.input_parquet=/data/dma-kws/raw/GigaPhrase-1000/aggregated_segments_with_g2p_distance.parquet \
-  prep.decoded_parquet_root=/data/dma-kws/raw/GigaPhrase-1000
+  prep.input_parquet=data/dma-kws/raw/GigaPhrase-1000/aggregated_segments_with_g2p_distance.parquet \
+  prep.decoded_parquet_root=data/dma-kws/raw/GigaPhrase-1000
 ```
 
 If `paths.gigaphrase1000_root` is set in your config, you can omit `prep.decoded_parquet_root`.
 Use `prep.output_subdir=stage2_qbyt/gp1000` (or `stage2.prep.output_subdir` in config) to avoid
-overwriting LibriPhrase outputs.
+overwriting LibriPhrase outputs. When you change `prep.output_subdir`, also set `stage2.parquet_file` to the new parquet path and verify `stage2.wav_dir` still points at your fbank tree.
 
 LibriPhrase-460 (paper scale; auto-detected from `LP-460/` clip prefixes, decoded shards `LP-460-decoded-*.parquet`, config root `paths.libriphrase460_root`):
 
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=paper_ls460 \
-  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-460/aggregated_segments_with_g2p_distance.parquet
+  prep.input_parquet=data/dma-kws/raw/LibriPhrase-460/aggregated_segments_with_g2p_distance.parquet
 ```
 
 Set `paths.libriphrase460_root` in `+experiment=paper_ls460` (or pass `prep.decoded_parquet_root=...`) if the decoded shards are not under the default path. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full paper prep and training chain (`train_stage2_recipe.py`, `eval_stage2_libriphrase.py`).
 
 Parallelism and console output (defaults in `configs/prep/default.yaml`):
 
-- `prep.num_workers` — parallel decoded-parquet shard scans and fbank extraction. `0` = auto (`min(8, cpu_count())`); `1` = serial (useful for debugging).
+- `prep.num_workers` — parallelizes fbank extraction **within** each decoded shard via `stream_fbank_from_decoded()`; shards are scanned **serially** (one shard in memory at a time). `0` = auto (`min(8, cpu_count())`); `1` = serial fbank jobs (useful for debugging).
 - `prep.use_rich` — Rich tables and multi-task progress bars when stdout is a TTY; falls back to plain `print` / `tqdm` when redirected or non-interactive (even if `prep.use_rich=true`).
 
 ```bash
 # Full prep with explicit parallelism
 python3 scripts/prepare_stage2_paper.py \
   +experiment=wenet_asr_stage2 \
-  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
+  prep.input_parquet=data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
   prep.num_workers=4
 ```
 
-The script prints staged progress (plan → load parquet → scan decoded shards → build anchors / fbank → summary) and a final stats table. Key fields: `anchors`, `clips_total`, `fbank_written`, `fbank_skipped`, `missing_audio` (clips without decoded audio at fbank time), `missing_in_decoded` (referenced clip keys not found in decoded parquet shards).
+The script prints staged progress (plan → load parquet → scan decoded shards → build anchors / fbank → summary) and a final stats table. Key fields: `anchors`, `clips_total`, `fbank_written`, `fbank_skipped`, `missing_in_decoded` (referenced clip keys not found in decoded parquet shards during streaming fbank).
 
 ### Operational notes
 
-- Referenced decoded audio for the current anchor set is held in memory during prep; full runs with `prep.limit_anchors=0` on LP-460 need sufficient RAM.
+- Fbank uses `stream_fbank_from_decoded()` — decoded shards are processed one at a time, so peak memory is bounded by a single shard, not the full anchor set.
 - Fbank extraction skips existing `.npy` files by default — safe for incremental reruns after fixing a subset of clips.
-- Use `prep.num_workers=1` when debugging shard scans or reproducing ordering issues.
+- Use `prep.num_workers=1` when debugging fbank parallelism or reproducing ordering issues within a shard.
 
 Expected outputs:
 
 ```text
-/data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet
-/data/dma-kws/processed/stage2_qbyt/clips/
-/data/dma-kws/processed/stage2_qbyt/distances/
-/data/dma-kws/features/fbank/LP-100-fbank/
+data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet
+data/dma-kws/processed/stage2_qbyt/clips/
+data/dma-kws/processed/stage2_qbyt/distances/
+data/dma-kws/features/fbank/LP-100-fbank/
 ```
 
 Fbank parameters (`num_mel_bins`, `frame_length`, `frame_shift`, etc.) are read from the top-level `fbank:` block in your config YAML.
@@ -537,7 +602,7 @@ Training consumes the paper parquet + fbank layout directly via `LibriPhraseTrai
 
 ### LibriPhrase eval data (required for validation)
 
-Stage II training runs LibriPhrase validation on a schedule (`stage2.validation.val_check_interval`). You need the official eval set under `stage2.eval.test_dir` (default `/data/dma-kws/raw/LibriPhrase-100/eval`). It is **not** included in the LibriPhrase-100 training download.
+Stage II training runs LibriPhrase validation on a schedule (`stage2.validation.val_check_interval`). You need the official eval set under `stage2.eval.test_dir` (default `data/dma-kws/raw/LibriPhrase-100/eval`). It is **not** included in the LibriPhrase-100 training download — obtain it from the LibriPhrase-460 Hugging Face eval assets or symlink a shared eval tree. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for LP-460 hard eval used in paper metrics.
 
 Expected layout:
 
@@ -550,7 +615,9 @@ Expected layout:
   train-other-500/train-other-500/<spk>/<chap>/*.wav
 ```
 
-Validation reads fbank `.npy` files co-located next to each `.wav`, not the wav files directly. Precompute them with `scripts/prepare_stage2_eval_fbank.py` (uses the same `fbank:` settings as training prep; eval dither defaults come from `stage2.eval.fbank` when set):
+`stage2.eval.split` defaults to `hard`; validation CSVs must include the columns expected for that split. Training reads `stage2.eval.test_dir` — `prep.test_dir` applies only to `prepare_stage2_eval_fbank.py`.
+
+Validation reads fbank `.npy` files as **siblings** of each `.wav` (same directory), not under `features/fbank/`. Precompute them with `scripts/prepare_stage2_eval_fbank.py` (uses the same `fbank:` settings as training prep; eval dither defaults come from `stage2.eval.fbank` when set). Recommend `prep.from_csv=true` (default `false` walks every wav under `test_dir`):
 
 ```bash
 python3 scripts/prepare_stage2_eval_fbank.py \
@@ -564,11 +631,11 @@ python3 scripts/prepare_stage2_eval_fbank.py \
   prep.from_csv=true
 ```
 
-`prep.from_csv=true` converts only wav files referenced by the eval CSV `anchor` / `comparison` columns (faster than scanning all wav under `test_dir`). Each `train-other-500/.../clip.wav` gets a sibling `clip.npy`.
+`prep.from_csv=true` converts only wav files referenced by the eval CSV `anchor` / `comparison` columns (faster than scanning all wav under `test_dir`). Each `train-other-500/.../clip.wav` gets a sibling `clip.npy` in the same folder.
 
 Useful overrides (also in `configs/prep/default.yaml`):
 
-- `prep.test_dir=/path` — eval root when it differs from `stage2.eval.test_dir` in config.
+- `prep.test_dir=/path` — eval root for the prep script when it differs from `stage2.eval.test_dir` in config.
 - `prep.limit=100` — smoke test (first N wav paths only).
 - `prep.log_interval=1000` — progress print frequency.
 - `prep.no_skip_existing=true` — recompute fbank even when `.npy` already exists (default skips existing files for incremental reruns).
@@ -577,10 +644,11 @@ Useful overrides (also in `configs/prep/default.yaml`):
 
 ## 7. Stage II: train QbyT verifier
 
-Optionally initialize from a Stage I checkpoint:
+Use `scripts/train_stage2_qbyt.py` for the demo single-phase run. Optionally initialize from a Stage I exported weight file:
 
 ```bash
-STAGE1_CKPT=/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/stage1_epoch000_step000020.pt
+STAGE1_CKPT=data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/stage1_step000020.pt
+# or: stage1_avg.pt / avg_10.ckpt converted via training export
 ```
 
 Smoke training run:
@@ -608,36 +676,42 @@ Resume an interrupted run:
 CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
   +experiment=demo_librispeech100 \
   run.devices=2 \
-  run.resume_from=last
+  run.resume_from=last \
+  run.limit_steps=20
 ```
 
-`run.resume_from=last` restores the full training state (weights + optimizer + scheduler + step/epoch) from `<checkpoint_dir>/last.ckpt`, or pass an explicit `.ckpt` path. If the original run used `run.limit_steps`, pass the same value again on resume. This is a true Lightning resume of an interrupted run and is distinct from `run.init_checkpoint` / `stage2.resume_checkpoint`, which only load weights to seed a fresh finetune recipe.
+`run.resume_from=last` restores the full training state from `<checkpoint_dir>/last.ckpt`, or pass an explicit `.ckpt` path. If the original run used `run.limit_steps`, pass the same value again on resume. This is distinct from `run.init_checkpoint` / `stage2.resume_checkpoint`, which only load weights to seed a fresh finetune recipe.
 
 Checkpoints are saved under:
 
 ```text
-/data/dma-kws/exp/stage2_qbyt/checkpoints/
+data/dma-kws/exp/stage2_qbyt/checkpoints/
 ```
+
+Lightning checkpoints use `.ckpt`; exported weights are written as `stage2_step{step:06d}.pt`.
 
 Example:
 
 ```bash
-ls /data/dma-kws/exp/stage2_qbyt/checkpoints/*.pt
+ls data/dma-kws/exp/stage2_qbyt/checkpoints/*.ckpt
+ls data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step000020.pt
 ```
 
-If you hit out-of-memory, reduce:
+If you hit out-of-memory, reduce batch size via CLI override (demo default is 128 per GPU):
 
-```yaml
-stage2:
-  batch_size_per_gpu: 64
-  num_workers: 2
+```bash
+python3 scripts/train_stage2_qbyt.py +experiment=demo_librispeech100 stage2.batch_size_per_gpu=64 stage2.num_workers=2
 ```
+
+For the paper multi-phase chain (`init-ls-460` → avg → `ft-ls-gs-1460`), use `scripts/train_stage2_recipe.py` — see [docs/paper-reproduction.md](docs/paper-reproduction.md).
 
 ---
 
 ## 7b. Stage II: initialize from external Wenet ASR encoder
 
-Alternative to Stage I init: seed the Stage II Conformer encoder from a pretrained Wenet ASR checkpoint. Use `+experiment=wenet_asr_stage2`.
+Alternative to Stage I init: seed the Stage II Conformer **encoder** from a pretrained Wenet ASR checkpoint. Use `+experiment=wenet_asr_stage2` with `scripts/train_stage2_qbyt.py` (single phase). Two-stage **inference** still requires a separately trained Stage I CTC model for candidate proposal.
+
+This is distinct from `+experiment=frozen_wenet_encoder` (`configs/experiment/frozen_wenet_encoder.yaml`), which freezes a self-trained Stage I encoder during the paper `frozen-wenet-encoder` recipe — see [docs/paper-reproduction.md](docs/paper-reproduction.md).
 
 Prerequisites:
 
@@ -657,8 +731,8 @@ Full data prep and training chain:
 ```bash
 python3 scripts/prepare_stage2_paper.py \
   +experiment=wenet_asr_stage2 \
-  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
-  prep.decoded_parquet_root=/data/dma-kws/raw/LibriPhrase-100
+  prep.input_parquet=data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet \
+  prep.decoded_parquet_root=data/dma-kws/raw/LibriPhrase-100
 
 python3 scripts/prepare_stage2_eval_fbank.py \
   +experiment=wenet_asr_stage2 \
@@ -668,6 +742,8 @@ CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
   +experiment=wenet_asr_stage2 \
   run.devices=2
 ```
+
+Checkpoints are written under `data/dma-kws/exp/stage2_qbyt/checkpoints/wenet-asr-init/`.
 
 Override the init checkpoint without editing the yaml:
 
@@ -690,8 +766,8 @@ Notes:
 After both stages have checkpoints:
 
 ```bash
-STAGE1_CKPT=/data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/stage1_epoch000_step000020.pt
-STAGE2_CKPT=/data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step000020.pt
+STAGE1_CKPT=data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/stage1_step000020.pt
+STAGE2_CKPT=data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step000020.pt
 AUDIO=/path/to/test.wav
 KEYWORD="hello world"
 
@@ -700,7 +776,15 @@ python3 scripts/run_two_stage_demo.py \
   prep.stage1_ckpt="$STAGE1_CKPT" \
   prep.stage2_ckpt="$STAGE2_CKPT" \
   prep.audio="$AUDIO" \
-  prep.keyword="$KEYWORD"
+  prep.keyword="$KEYWORD" \
+  demo.qbyt_threshold=0.6
+```
+
+The decision threshold defaults to `0.5` in config; override on the CLI as above or in yaml:
+
+```yaml
+demo:
+  qbyt_threshold: 0.5
 ```
 
 Output is JSON:
@@ -732,13 +816,6 @@ Output is JSON:
 }
 ```
 
-The decision threshold is configurable:
-
-```yaml
-demo:
-  qbyt_threshold: 0.5
-```
-
 ---
 
 ## Troubleshooting
@@ -749,7 +826,7 @@ Run scripts from the repository root:
 
 ```bash
 cd /path/to/DMA-KWS
-python3 scripts/prepare_stage1_librispeech.py --help
+python3 scripts/prepare_stage1_librispeech.py +experiment=demo_librispeech100 --help
 ```
 
 ### `Missing torch/torchaudio`
@@ -900,19 +977,27 @@ The preparation script expects `ngram`, `clips`, and optional `ngram_g2p`. If yo
 
 ### Training is too slow or OOM
 
-Start with smoke overrides:
+Start with smoke overrides on the relevant script (always include `+experiment=...`):
 
 ```bash
-prep.limit=100
-run.limit_steps=20
-prep.limit_anchors=100
+# Stage I prep
+python3 scripts/prepare_stage1_librispeech.py +experiment=demo_librispeech100 prep.limit=100
+
+# Stage II prep
+python3 scripts/prepare_stage2_paper.py +experiment=demo_librispeech100 prep.limit_anchors=50
+
+# Stage I train
+python3 scripts/train_stage1_ctc.py +experiment=demo_librispeech100 run.limit_steps=20 run.devices=1
+
+# Stage II train
+python3 scripts/train_stage2_qbyt.py +experiment=demo_librispeech100 run.limit_steps=20 stage2.batch_size_per_gpu=64
 ```
 
-Then increase data/steps gradually.
+Then increase data and step limits gradually. Demo defaults are `stage1.batch_size_per_gpu=48` and `stage2.batch_size_per_gpu=128`.
 
 ### `LibriPhrase eval data is required`
 
-Stage II validation reads LibriPhrase eval wav/CSV files under `stage2.eval.test_dir`. The raw LibriPhrase-100 training download does not include these. Set `stage2.eval.test_dir` in your config to wherever you store the official eval set (CSVs such as `evaluation_set/libriphrase_diffspk_all_*word.csv` and the corresponding wav tree), then download or symlink the eval assets before training.
+Stage II validation reads LibriPhrase eval wav/CSV files under `stage2.eval.test_dir`. The raw LibriPhrase-100 training download does not include eval assets. Obtain them from LibriPhrase-460 Hugging Face eval files or symlink a shared eval tree; set `stage2.eval.test_dir` in your config. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for LP-460 hard eval used in paper metrics. The demo preset validates on LP-100 eval; paper metrics require LP-460 hard eval.
 
 ### `FileNotFoundError` for `.npy` during validation
 
@@ -943,7 +1028,8 @@ For full-scale reproduction (LibriSpeech-460, LibriPhrase-460, GigaPhrase-1460 f
 
 Key points:
 
-- **Same recipe as demo** — architecture, utt+seq loss, hard negatives, CharTokenizer, streaming Stage I search, checkpoint averaging, and LibriPhrase eval are all implemented.
-- **Scale-only demo** — `demo_librispeech100.yaml` uses smaller data and fewer steps; it validates the pipeline but does not produce paper metrics.
-- **Paper metrics** require the full recipe chain on LibriPhrase-460 hard eval: init → avg → finetune → `eval_stage2_libriphrase.py` with `prep.split=hard` (see [docs/paper-reproduction.md](docs/paper-reproduction.md) for `train_stage2_recipe.py` and eval commands).
+- **Same algorithm as demo** — architecture, utt+seq loss, hard negatives, CharTokenizer phoneme vocabulary, streaming Stage I search, checkpoint averaging, and LibriPhrase eval are all implemented in the shared codebase.
+- **Demo preset** — `+experiment=demo_librispeech100` uses smaller data and fewer steps; it validates the pipeline on LP-100 eval but does not produce paper metrics.
+- **Paper metrics** require the full recipe chain on LibriPhrase-460 hard eval: `init-ls-460` → avg → `ft-ls-gs-1460` via `train_stage2_recipe.py`, then `eval_stage2_libriphrase.py` with `prep.split=hard` (see [docs/paper-reproduction.md](docs/paper-reproduction.md)).
+- **`frozen-wenet-encoder`** — optional paper recipe with `stage2.freeze_encoder=true` (`+experiment=frozen_wenet_encoder`); distinct from external Wenet ASR init (`wenet_asr_stage2`).
 - Reported paper numbers: **97.85% AUC**, **6.13% EER** on LibriPhrase hard (target: within 1% absolute of main logs).
