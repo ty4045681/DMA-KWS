@@ -38,6 +38,7 @@ scripts/prepare_stage1_fbank.py
 scripts/train_stage1_ctc.py
 scripts/average_checkpoints.py
 scripts/prepare_stage2_paper.py
+scripts/recompute_stage2_distances.py  # phoneme hard-negative distances from g2p parquet
 scripts/prepare_stage2_libriphrase.py  # alias for prepare_stage2_paper.py
 scripts/prepare_stage2_eval_fbank.py   # precompute LibriPhrase eval fbank .npy for Stage II validation
 scripts/train_stage2_qbyt.py
@@ -243,9 +244,11 @@ PY
 The Stage II preparation script reads two kinds of files from the download:
 
 1. An **aggregated** parquet for phrase metadata — columns `ngram`, `clips`, and
-   per-clip hard-negative distances. Use
-   `aggregated_segments_with_g2p_distance.parquet` (required for hard-negative
-   mining). Optionally `ngram_g2p` is present (skips on-the-fly G2P if missing).
+   (for hard negatives) per-anchor `distances` plus `ngram_g2p`. Use
+   `aggregated_segments_with_g2p_distance.parquet` when the download includes it.
+   If you only have `aggregated_segments_with_g2p.parquet` (`ngram`, `clips`,
+   `ngram_g2p`), run `scripts/recompute_stage2_distances.py` first (see §6) to add
+   phoneme-level hard-negative distances before `prepare_stage2_paper.py`.
 
 2. The **decoded** audio shards `LP-100-decoded-*.parquet` (columns
    `audio_rel`, `audio`, `sampling_rate`, ...). The script loads referenced
@@ -428,7 +431,27 @@ Pass the **aggregated** LibriPhrase parquet explicitly with `prep.input_parquet`
 
 ### Hard negatives and G2P
 
-Hard-negative mining requires the distance parquet above (`distances` column per anchor). If `ngram_g2p` is missing from the aggregated parquet, the prep script runs on-the-fly G2P via `g2p_en`. When per-anchor `distances` is empty, it falls back to phoneme edit-distance confusables within the anchor set (top-5 by default).
+Hard-negative mining requires a `distances` column per anchor. When your raw download
+has `aggregated_segments_with_g2p.parquet` but no `distances` column, recompute them
+first with `scripts/recompute_stage2_distances.py` (helper: `dma_kws/stage2/distances.py`;
+config: `prep.recompute_distances` in `configs/prep/default.yaml`):
+
+```bash
+python3 scripts/recompute_stage2_distances.py \
+  +experiment=demo_librispeech100 \
+  prep.recompute_distances.input_parquet=/data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p.parquet
+```
+
+Default output is alongside the input with the `_g2p_distance.parquet` suffix. Pass
+that file to `prepare_stage2_paper.py` via `prep.input_parquet`. Useful overrides:
+`prep.recompute_distances.output_parquet`, `top_k` (default 100), `block_size`,
+`workers` (-1 = auto), `strip_stress` (default true). When `input_parquet` is unset,
+the script looks for `aggregated_segments_with_g2p.parquet` under
+`paths.libriphrase460_root` / `paths.libriphrase100_root`.
+
+If `ngram_g2p` is missing from the aggregated parquet, `prepare_stage2_paper.py` runs
+on-the-fly G2P via `g2p_en`. When per-anchor `distances` is empty, it falls back to
+phoneme edit-distance confusables within the anchor set (top-5 by default).
 
 Demo smoke run:
 

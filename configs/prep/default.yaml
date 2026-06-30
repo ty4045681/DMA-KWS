@@ -32,3 +32,11 @@ stage1_ckpt: ""
 stage2_ckpt: ""
 audio: ""
 keyword: ""
+
+recompute_distances:
+  input_parquet: ""
+  output_parquet: ""
+  top_k: 100
+  block_size: 1000
+  workers: -1
+  strip_stress: true

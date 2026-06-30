@@ -17,6 +17,7 @@ transformers
 huggingface_hub
 openai-whisper
 rich  # RichProgressBar / run summary for Stage II console output
+rapidfuzz  # phoneme-level hard-negative distance recompute for Stage II prep
 # Optional dashboard backends (install on the training machine as needed):
 #   pip install wandb
 #   pip install trackio

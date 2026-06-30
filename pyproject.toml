@@ -24,6 +24,7 @@ dependencies = [
     "huggingface_hub",
     "openai-whisper",
     "rich",
+    "rapidfuzz",
 ]
 
 [project.optional-dependencies]
