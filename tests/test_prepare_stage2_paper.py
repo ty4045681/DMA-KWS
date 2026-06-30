@@ -7,7 +7,7 @@ import pytest
 
 from dma_kws.config import FbankConfig, fbank_kwargs
 from dma_kws.stage2.dataset import LibriPhraseTrainDataset
-from scripts.prepare_stage2_paper import find_decoded_parquets
+from scripts.prepare_stage2_paper import collect_needed_audio_keys, find_decoded_parquets
 from dma_kws.stage2.prepare_paper import (
     PARQUET_COLUMNS,
     build_clips_npy,
@@ -61,6 +61,34 @@ def _mock_gp1000_audio() -> dict[str, tuple[np.ndarray, int]]:
         "hello world/a.wav": (np.linspace(-0.1, 0.1, 1600, dtype=np.float32), 16000),
         "hello world/b.wav": (np.linspace(-0.2, 0.2, 1600, dtype=np.float32), 16000),
         "hello word/c.wav": (np.linspace(-0.15, 0.15, 1600, dtype=np.float32), 16000),
+    }
+
+
+def _synthetic_mixed_gp_lp460_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ngram": ["tomatoes"],
+            "ngram_g2p": ["T AH M EY T OW Z"],
+            "clips": [
+                [
+                    {"audio_path": "GP-1000/tomatoes/AUD0000001043_S0000775_000.wav"},
+                    {"audio_path": "LP-460/tomatoes/1963-142776-0033_012.wav"},
+                ],
+            ],
+        }
+    )
+
+
+def _mock_mixed_gp_lp460_audio() -> dict[str, tuple[np.ndarray, int]]:
+    return {
+        "tomatoes/AUD0000001043_S0000775_000.wav": (
+            np.linspace(-0.1, 0.1, 1600, dtype=np.float32),
+            16000,
+        ),
+        "tomatoes/1963-142776-0033_012.wav": (
+            np.linspace(-0.2, 0.2, 1600, dtype=np.float32),
+            16000,
+        ),
     }
 
 
@@ -213,6 +241,48 @@ def test_convert_gp1000_writes_gp1000_fbank_layout(tmp_path):
         fbank_path = fbank_dir / resolve_fbank_rel_path(clip["audio_path"])
         assert "GP-1000-fbank" in str(fbank_path)
         assert fbank_path.exists()
+
+
+def test_convert_mixed_gp1000_lp460_prefix_writes_both_fbank_layouts(tmp_path):
+    processed = tmp_path / "processed" / "stage2_qbyt"
+    clips_dir = processed / "clips"
+    distances_dir = processed / "distances"
+    fbank_dir = tmp_path / "features" / "fbank"
+
+    paper_df, stats = convert_aggregated_to_paper_parquet(
+        _synthetic_mixed_gp_lp460_df(),
+        clips_dir=clips_dir,
+        distances_dir=distances_dir,
+        fbank_dir=fbank_dir,
+        audio_by_rel=_mock_mixed_gp_lp460_audio(),
+        compute_fbank=_fake_compute_fbank,
+    )
+
+    assert stats["anchors"] == 1
+    assert stats["missing_audio"] == 0
+    assert stats["fbank_written"] == 2
+
+    tomatoes_row = paper_df.loc[paper_df["ngram"] == "tomatoes"].iloc[0]
+    clips = np.load(tomatoes_row["clips_file"], allow_pickle=True)
+    assert clips[0]["audio_path"] == "GP-1000/tomatoes/AUD0000001043_S0000775_000.wav"
+    assert clips[1]["audio_path"] == "LP-460/tomatoes/1963-142776-0033_012.wav"
+
+    gp_fbank = fbank_dir / resolve_fbank_rel_path(clips[0]["audio_path"])
+    lp_fbank = fbank_dir / resolve_fbank_rel_path(clips[1]["audio_path"])
+    assert "GP-1000-fbank" in str(gp_fbank)
+    assert "LP-460-fbank" in str(lp_fbank)
+    assert gp_fbank.exists()
+    assert lp_fbank.exists()
+
+
+def test_collect_needed_audio_keys_strips_per_clip_prefix():
+    needed = collect_needed_audio_keys(_synthetic_mixed_gp_lp460_df())
+    assert needed == {
+        "tomatoes/AUD0000001043_S0000775_000.wav",
+        "tomatoes/1963-142776-0033_012.wav",
+    }
+    assert not any(key.startswith("GP-1000/") for key in needed)
+    assert not any(key.startswith("LP-460/") for key in needed)
 
 
 def test_convert_aggregated_forwards_bound_fbank_kwargs(tmp_path):

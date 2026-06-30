@@ -79,7 +79,6 @@ def collect_needed_audio_keys(
     df,
     *,
     limit_anchors: int = 0,
-    dataset_id: str | None = None,
 ) -> set[str]:
     needed: set[str] = set()
     count = 0
@@ -88,7 +87,7 @@ def collect_needed_audio_keys(
         if not clips:
             continue
         for clip in clips:
-            needed.add(clip_to_audio_rel(clip["audio_path"], dataset_id=dataset_id))
+            needed.add(clip_to_audio_rel(clip["audio_path"]))
         count += 1
         if limit_anchors and count >= limit_anchors:
             break
@@ -239,11 +238,7 @@ def main(cfg: DictConfig) -> None:
     dataset_label = dataset_id or "unknown (LP-100 defaults)"
     reporter.info(f"Detected dataset: {dataset_label}")
 
-    needed_keys = collect_needed_audio_keys(
-        df,
-        limit_anchors=limit_anchors,
-        dataset_id=dataset_id,
-    )
+    needed_keys = collect_needed_audio_keys(df, limit_anchors=limit_anchors)
     reporter.info(f"Collected {len(needed_keys)} unique clip audio keys")
 
     decoded_root = resolve_decoded_root(prep, config, paths, dataset_id)
