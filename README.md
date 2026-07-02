@@ -906,7 +906,21 @@ python3 scripts/run_two_stage_demo.py \
 
 With the default `phoneme_ctc` locator, also pass `prep.stage1_ckpt=...`.
 
-Batch evaluation from a manifest CSV (`audio_path`, `keyword`, optional `label`):
+Batch evaluation reads a manifest with columns `audio_path`, `keyword`, and optional `label`. Both CSV and JSONL are supported; relative `audio_path` values are resolved against the manifest's own directory.
+
+Step 1 (optional): generate a manifest from a folder of audio that all share one keyword. Pass `prep.label=1` to mark them all as positives (enables precision/recall/f1 in the summary), or omit it to leave the manifest unlabeled.
+
+```bash
+python3 scripts/prepare_two_stage_manifest.py \
+  prep.input_dir=/path/to/audio_folder \
+  prep.keyword="hey eva" \
+  prep.output=/path/manifest.csv \
+  prep.label=1
+```
+
+Extra options: `prep.recursive=false` limits scanning to the top-level directory, `prep.manifest_format=jsonl` (or a `.jsonl` output suffix) writes JSONL, and `prep.limit=N` caps the number of files for a quick smoke run. The scanner picks up `.wav`, `.flac`, `.mp3`, and `.m4a` files.
+
+Step 2: run the two-stage pipeline over the manifest.
 
 ```bash
 python3 scripts/eval_two_stage_kws.py \

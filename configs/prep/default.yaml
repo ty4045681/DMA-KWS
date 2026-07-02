@@ -34,6 +34,9 @@ stage1_ckpt: ""
 stage2_ckpt: ""
 audio: ""
 keyword: ""
+recursive: true
+manifest_format: auto
+label: ""
 
 recompute_distances:
   input_parquet: ""

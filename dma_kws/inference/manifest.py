@@ -1,13 +1,15 @@
-"""Manifest loading for batch two-stage evaluation."""
+"""Manifest loading and generation for batch two-stage evaluation."""
 
 from __future__ import annotations
 
 import csv
 import json
 from pathlib import Path
+from typing import Iterable, Sequence
 
 
 _REQUIRED_COLUMNS = ("audio_path", "keyword")
+_DEFAULT_AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a")
 
 
 def _normalize_row(row: dict[str, str], base_dir: Path | None) -> dict:
@@ -61,3 +63,104 @@ def load_manifest(path: str | Path) -> list[dict]:
         return rows
 
     raise ValueError(f"Unsupported manifest format: {manifest_path.suffix}")
+
+
+def iter_audio_files(
+    input_dir: str | Path,
+    *,
+    extensions: Iterable[str] = _DEFAULT_AUDIO_EXTENSIONS,
+    recursive: bool = True,
+) -> list[Path]:
+    """Return sorted audio files under ``input_dir`` filtered by ``extensions``."""
+    directory = Path(input_dir)
+    if not directory.is_dir():
+        raise NotADirectoryError(f"Audio input directory not found: {directory}")
+
+    allowed = {ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in extensions}
+    walker = directory.rglob("*") if recursive else directory.glob("*")
+    return sorted(
+        path for path in walker if path.is_file() and path.suffix.lower() in allowed
+    )
+
+
+def build_manifest_rows(
+    audio_paths: Sequence[str | Path],
+    keyword: str,
+    *,
+    label: int | None = None,
+    manifest_dir: str | Path | None = None,
+    relative: bool = True,
+) -> list[dict]:
+    """Build manifest rows for a single keyword shared across all audio files.
+
+    When ``relative`` is set and ``manifest_dir`` is provided, ``audio_path`` is
+    written relative to the manifest directory so it round-trips through
+    :func:`load_manifest` (which resolves relative paths against the manifest's
+    parent). Paths that cannot be made relative fall back to absolute.
+    """
+    if not keyword:
+        raise ValueError("keyword is required to build manifest rows")
+
+    base_dir = Path(manifest_dir).resolve() if manifest_dir is not None else None
+    rows: list[dict] = []
+    for audio_path in audio_paths:
+        resolved = Path(audio_path).resolve()
+        if relative and base_dir is not None:
+            try:
+                written_path = str(resolved.relative_to(base_dir))
+            except ValueError:
+                written_path = str(resolved)
+        else:
+            written_path = str(resolved)
+
+        row: dict = {"audio_path": written_path, "keyword": keyword}
+        if label is not None:
+            row["label"] = int(label)
+        rows.append(row)
+    return rows
+
+
+def write_manifest(
+    path: str | Path,
+    rows: Sequence[dict],
+    *,
+    manifest_format: str = "auto",
+) -> Path:
+    """Write manifest ``rows`` to ``path`` as CSV or JSONL.
+
+    ``manifest_format`` of ``"auto"`` infers the format from the file suffix.
+    """
+    manifest_path = Path(path)
+    if not rows:
+        raise ValueError("Cannot write an empty manifest")
+
+    resolved_format = manifest_format.lower()
+    if resolved_format == "auto":
+        suffix = manifest_path.suffix.lower()
+        if suffix == ".csv":
+            resolved_format = "csv"
+        elif suffix == ".jsonl":
+            resolved_format = "jsonl"
+        else:
+            raise ValueError(f"Cannot infer manifest format from suffix: {manifest_path.suffix}")
+
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if resolved_format == "jsonl":
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return manifest_path
+
+    if resolved_format == "csv":
+        fieldnames = ["audio_path", "keyword"]
+        if any("label" in row for row in rows):
+            fieldnames.append("label")
+        with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        return manifest_path
+
+    raise ValueError(f"Unsupported manifest format: {manifest_format}")
