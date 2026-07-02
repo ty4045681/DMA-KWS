@@ -93,6 +93,14 @@ input audio + keyword text
   -> detected / not detected
 ```
 
+**Stage II-only clip inference** is also available for pre-cropped keyword clips:
+
+```text
+keyword clip + keyword text
+  -> Stage II QbyT verification: score the full clip as one candidate
+  -> detected / not detected
+```
+
 Default Stage I is the trained phoneme-CTC model. You can swap it for external locators (Zipformer sherpa-onnx, WeKws+Wenet ASR) that only provide `start_sec`/`end_sec`; Stage II still uses this repo's Conformer+QbyT encoder — see [External locator](#external-locator-zipformer--wekwswenet).
 
 `+experiment=wenet_asr_stage2` seeds the Stage II **encoder** from an external Wenet ASR checkpoint; with the default `phoneme_ctc` locator, inference also needs a Stage I CTC checkpoint (`prep.stage1_ckpt`). That preset is distinct from `frozen-wenet-encoder` (`configs/experiment/frozen_wenet_encoder.yaml`), which freezes a **self-trained** Stage I encoder during paper-scale Stage II — see [docs/paper-reproduction.md](docs/paper-reproduction.md).
@@ -112,6 +120,8 @@ scripts/prepare_stage2_eval_fbank.py   # precompute LibriPhrase eval fbank .npy 
 scripts/train_stage2_qbyt.py           # demo + wenet-asr-init (single phase)
 scripts/train_stage2_recipe.py         # paper multi-phase chain only
 scripts/eval_stage2_libriphrase.py
+scripts/run_stage2_demo.py             # Stage II-only single clip inference
+scripts/eval_stage2_clips.py           # Stage II-only batch clip eval (manifest)
 scripts/eval_two_stage_kws.py
 scripts/run_two_stage_demo.py
 ```
@@ -867,6 +877,68 @@ Output is JSON:
   "detected": true
 }
 ```
+
+---
+
+## 8b. Stage II-only clip inference
+
+Use this path when each input audio file is already a cropped keyword clip and you want to test the Stage II QbyT verifier without any Stage I locator. This is useful for LibriPhrase-style positive clips, Stage II ablations, and quick checkpoint smoke tests when no Stage I checkpoint is available.
+
+This is not keyword localization. If you pass a long utterance, the script scores the whole utterance against the keyword text; it does not search for the keyword inside the utterance.
+
+| Script | Input | Output |
+|--------|-------|--------|
+| `scripts/eval_stage2_libriphrase.py` | LibriPhrase anchor/comparison pairs with precomputed fbank | AUC/EER benchmark metrics |
+| `scripts/run_two_stage_demo.py` / `scripts/eval_two_stage_kws.py` | Long audio + keyword, with a Stage I locator | Candidate spans plus Stage II scores |
+| `scripts/run_stage2_demo.py` / `scripts/eval_stage2_clips.py` | Pre-cropped keyword clips + keyword | Full-clip `qbyt_score` and detected flag |
+
+Single clip:
+
+```bash
+python3 scripts/run_stage2_demo.py \
+  +experiment=wenet_asr_stage2 \
+  prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step050000.pt \
+  prep.audio=/path/keyword_clip.wav \
+  prep.keyword="hey eva" \
+  demo.qbyt_threshold=0.5
+```
+
+Only `prep.stage2_ckpt`, `prep.audio`, and `prep.keyword` are required. Do not pass `prep.stage1_ckpt` or `+locator=...`; this path bypasses Stage I entirely.
+
+Output is JSON:
+
+```json
+{
+  "audio": "/path/keyword_clip.wav",
+  "keyword": "hey eva",
+  "keyword_phonemes": ["HH", "EY", "IY", "V", "AH"],
+  "clip_span_sec": {
+    "start_sec": 0.0,
+    "end_sec": 1.23
+  },
+  "qbyt_score": 0.87,
+  "threshold": 0.5,
+  "detected": true,
+  "skipped": false
+}
+```
+
+Batch evaluation uses the same manifest format as the two-stage batch runner: `audio_path`, `keyword`, and optional `label`. In this mode, each `audio_path` must point to a cropped clip.
+
+```bash
+python3 scripts/prepare_two_stage_manifest.py \
+  prep.input_dir=/path/to/keyword_clips \
+  prep.keyword="hey eva" \
+  prep.output=/path/stage2_clip_manifest.csv \
+  prep.label=1
+
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step050000.pt
+```
+
+Default output directory: `outputs/eval_stage2_clips` (`prep.stage2_clip_output_dir`). Override with `prep.output_dir=/path/to/output` if needed. The script writes `results.jsonl` with per-clip scores and `summary.json` with accuracy, precision, recall, f1, auc, and eer when labels are present.
 
 ---
 

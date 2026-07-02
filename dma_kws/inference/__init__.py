@@ -3,6 +3,7 @@
 __all__ = [
     "KeywordLocator",
     "build_locator",
+    "Stage2ClipRunner",
     "Stage2Verifier",
     "TwoStageKWSPipeline",
 ]
@@ -17,6 +18,10 @@ def __getattr__(name: str):
         from dma_kws.inference.stage2_verifier import Stage2Verifier
 
         return Stage2Verifier
+    if name == "Stage2ClipRunner":
+        from dma_kws.inference.stage2_clip import Stage2ClipRunner
+
+        return Stage2ClipRunner
     if name == "TwoStageKWSPipeline":
         from dma_kws.inference.pipeline import TwoStageKWSPipeline
 

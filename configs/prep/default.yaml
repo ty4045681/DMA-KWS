@@ -1,5 +1,6 @@
 manifest: ""
 output_dir: outputs/eval_two_stage_kws
+stage2_clip_output_dir: outputs/eval_stage2_clips
 limit: 0
 input_format: librispeech-dir
 parquet_root: ""
