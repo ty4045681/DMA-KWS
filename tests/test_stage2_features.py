@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from dma_kws.stage2.features import FeatureExtractor
+from dma_kws.stage2.features import FeatureExtractor, compute_fbank, waveform_to_fbank
 
 
 def _write_noise_list(path: Path) -> None:
@@ -72,3 +72,42 @@ def test_speed_perturb_preserves_waveform_shape(monkeypatch, tmp_path):
 
     assert unchanged.shape == waveform.shape
     assert torch.equal(unchanged, waveform)
+
+
+def test_waveform_to_fbank_matches_compute_fbank():
+    waveform = torch.randn(1, 16000)
+    kwargs = {
+        "sample_rate": 16000,
+        "num_mel_bins": 80,
+        "frame_length": 25,
+        "frame_shift": 10,
+        "dither": 0.0,
+        "window_type": "povey",
+    }
+
+    direct = compute_fbank(
+        {"wav": waveform, "sample_rate": 16000, "key": "test"},
+        **{key: value for key, value in kwargs.items() if key != "sample_rate"},
+    )["feat"]
+    via_helper = waveform_to_fbank(waveform, **kwargs)
+
+    assert torch.equal(direct, via_helper)
+
+
+def test_waveform_to_fbank_accepts_1d_waveform():
+    waveform = torch.randn(16000)
+    feat = waveform_to_fbank(waveform, sample_rate=16000, dither=0.0)
+
+    assert feat.ndim == 2
+    assert feat.size(1) == 80
+
+
+def test_waveform_to_fbank_differs_from_extract_fbank():
+    from dma_kws.audio import extract_fbank
+
+    waveform = torch.randn(1, 16000)
+    legacy = extract_fbank(waveform, num_mel_bins=80, sample_rate=16000, dither=0.0)
+    aligned = waveform_to_fbank(waveform, sample_rate=16000, dither=0.0)
+
+    assert not torch.allclose(legacy, aligned)
+    assert (legacy - aligned).abs().mean() > 0.1

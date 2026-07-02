@@ -55,6 +55,30 @@ def compute_fbank(
     return sample
 
 
+def waveform_to_fbank(
+    waveform: torch.Tensor,
+    *,
+    sample_rate: int,
+    num_mel_bins: int = DEFAULT_NUM_MEL_BINS,
+    frame_length: int = DEFAULT_FRAME_LENGTH,
+    frame_shift: int = DEFAULT_FRAME_SHIFT,
+    dither: float = DEFAULT_DITHER,
+    window_type: str = "povey",
+) -> torch.Tensor:
+    """Compute Wenet-aligned fbank features from a mono waveform tensor."""
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    sample = compute_fbank(
+        {"wav": waveform, "sample_rate": sample_rate, "key": ""},
+        num_mel_bins=num_mel_bins,
+        frame_length=frame_length,
+        frame_shift=frame_shift,
+        dither=dither,
+        window_type=window_type,
+    )
+    return sample["feat"]
+
+
 class FeatureExtractor:
     """Load raw wav, optionally augment, and compute 80-dim fbank features."""
 

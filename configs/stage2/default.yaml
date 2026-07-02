@@ -46,6 +46,8 @@ validation:
   val_check_interval: 1000
 
 eval:
+  fbank:
+    dither: 0.0
   split: hard
   aggregate_csv: evaluation_set/test_all_phrase.csv
   batch_size: 256

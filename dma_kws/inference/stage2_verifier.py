@@ -8,11 +8,12 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from dma_kws.audio import extract_fbank
+from dma_kws.config import FbankConfig, fbank_kwargs, get_eval_fbank_config
 from dma_kws.inference.audio_utils import has_min_fbank_frames
 from dma_kws.nn import build_encoder
 from dma_kws.pathing import ensure_qbyt_on_path
 from dma_kws.stage1.candidates import KeywordCandidate
+from dma_kws.stage2.features import waveform_to_fbank
 
 NUM_EMBEDS = 73
 
@@ -33,6 +34,7 @@ class Stage2Verifier:
         stage1_cfg: Mapping[str, Any],
         stage2_cfg: Mapping[str, Any],
         demo_cfg: Mapping[str, Any],
+        fbank_cfg: FbankConfig,
         stage2_ckpt: str,
         device,
     ) -> None:
@@ -49,7 +51,7 @@ class Stage2Verifier:
         self._torch = torch
         self._demo_cfg = dict(demo_cfg)
         self._device = device
-        self._num_mel_bins = int(stage1_cfg.get("input_dim", 80))
+        self._fbank_kwargs = fbank_kwargs(fbank_cfg)
         stage2_encoder_dim = int(stage2_cfg.get("encoder_output_dim", 144))
 
         class Stage2Model(torch.nn.Module):
@@ -99,10 +101,13 @@ class Stage2Verifier:
         if not stage2_ckpt:
             raise SystemExit("prep.stage2_ckpt is required for Stage II verification")
 
+        fbank_cfg = get_eval_fbank_config(dict(config))
+
         return cls(
             stage1_cfg=stage1_cfg,
             stage2_cfg=stage2_cfg,
             demo_cfg=demo_cfg,
+            fbank_cfg=fbank_cfg,
             stage2_ckpt=stage2_ckpt,
             device=device,
         )
@@ -133,11 +138,10 @@ class Stage2Verifier:
             ):
                 continue
             candidate_wave = waveform[:, start:end]
-            candidate_feat = extract_fbank(
+            candidate_feat = waveform_to_fbank(
                 candidate_wave,
-                num_mel_bins=self._num_mel_bins,
                 sample_rate=sample_rate,
-                dither=0.0,
+                **self._fbank_kwargs,
             ).unsqueeze(0)
             candidate_lens = torch.tensor([candidate_feat.size(1)], dtype=torch.long)
             with torch.no_grad():
