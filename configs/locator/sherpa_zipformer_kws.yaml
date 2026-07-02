@@ -1,0 +1,10 @@
+type: sherpa_kws
+tokens: ""
+encoder: ""
+decoder: ""
+joiner: ""
+keywords_threshold: 0.25
+modeling_unit: cjkchar
+tail_padding_sec: 0.66
+provider: cpu
+num_threads: 2

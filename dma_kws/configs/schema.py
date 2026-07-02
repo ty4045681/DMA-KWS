@@ -222,9 +222,66 @@ class Stage2Config:
 
 
 @dataclass
+class WekwsWenetLocatorConfig:
+    config: str = ""
+    checkpoint: str = ""
+    symbol_table: str = ""
+    cmvn: str = ""
+    bpe_model: str = ""
+    threshold: float = 0.0
+    min_frames: int = 5
+    max_frames: int = 250
+    chunk_seconds: float = 0.3
+    decoding_chunk_size: int = 16
+    score_beam_size: int = 3
+    path_beam_size: int = 20
+    gpu: int = -1
+
+
+@dataclass
+class SherpaKwsLocatorConfig:
+    tokens: str = ""
+    encoder: str = ""
+    decoder: str = ""
+    joiner: str = ""
+    keywords_threshold: float = 0.25
+    modeling_unit: str = "cjkchar"
+    tail_padding_sec: float = 0.66
+    provider: str = "cpu"
+    num_threads: int = 2
+
+
+@dataclass
+class IcefallPtLocatorConfig:
+    root: str = ""
+    decode_script: str = ""
+    checkpoint: str = ""
+
+
+@dataclass
+class LocatorConfig:
+    type: str = "phoneme_ctc"
+    frame_shift_sec: float = 0.04
+    tokens: str = ""
+    encoder: str = ""
+    decoder: str = ""
+    joiner: str = ""
+    keywords_threshold: float = 0.25
+    modeling_unit: str = "cjkchar"
+    tail_padding_sec: float = 0.66
+    provider: str = "cpu"
+    num_threads: int = 2
+    wekws: WekwsWenetLocatorConfig = field(default_factory=WekwsWenetLocatorConfig)
+    root: str = ""
+    decode_script: str = ""
+    checkpoint: str = ""
+
+
+@dataclass
 class DemoConfig:
     stage1_candidate_margin_sec: float = 0.15
     qbyt_threshold: float = 0.5
+    min_stage2_fbank_frames: int = 7
 
 
 @dataclass
@@ -249,6 +306,7 @@ class DMAKWSConfig:
     stage2: Stage2Config = field(default_factory=Stage2Config)
     demo: DemoConfig = field(default_factory=DemoConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    locator: LocatorConfig = field(default_factory=LocatorConfig)
 
 
 def register_configs() -> None:

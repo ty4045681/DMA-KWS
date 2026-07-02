@@ -1,0 +1,2 @@
+type: phoneme_ctc
+frame_shift_sec: 0.04

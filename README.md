@@ -84,16 +84,18 @@ LibriPhrase (paper-format parquet + precomputed fbank .npy)
      paper: init -> avg -> finetune chain only (train_stage2_recipe.py)
 ```
 
-**Inference** (requires both stages)
+**Inference** (Stage II required; Stage I locator swappable)
 
 ```text
 input audio + keyword text
-  -> Stage I prefix beam + ContextGraph: propose phoneme-span candidates
-  -> Stage II QbyT verification: score each candidate
+  -> Stage I locator: propose keyword time spans (default: phoneme CTC + ContextGraph)
+  -> Stage II QbyT verification: score each candidate on cropped audio
   -> detected / not detected
 ```
 
-`+experiment=wenet_asr_stage2` seeds the Stage II **encoder** from an external Wenet ASR checkpoint; two-stage **inference** still needs a Stage I CTC model for candidate proposal. That preset is distinct from `frozen-wenet-encoder` (`configs/experiment/frozen_wenet_encoder.yaml`), which freezes a **self-trained** Stage I encoder during paper-scale Stage II — see [docs/paper-reproduction.md](docs/paper-reproduction.md).
+Default Stage I is the trained phoneme-CTC model. You can swap it for external locators (Zipformer sherpa-onnx, WeKws+Wenet ASR) that only provide `start_sec`/`end_sec`; Stage II still uses this repo's Conformer+QbyT encoder — see [External locator](#external-locator-zipformer--wekwswenet).
+
+`+experiment=wenet_asr_stage2` seeds the Stage II **encoder** from an external Wenet ASR checkpoint; with the default `phoneme_ctc` locator, inference also needs a Stage I CTC checkpoint (`prep.stage1_ckpt`). That preset is distinct from `frozen-wenet-encoder` (`configs/experiment/frozen_wenet_encoder.yaml`), which freezes a **self-trained** Stage I encoder during paper-scale Stage II — see [docs/paper-reproduction.md](docs/paper-reproduction.md).
 
 Main entry points:
 
@@ -110,6 +112,7 @@ scripts/prepare_stage2_eval_fbank.py   # precompute LibriPhrase eval fbank .npy 
 scripts/train_stage2_qbyt.py           # demo + wenet-asr-init (single phase)
 scripts/train_stage2_recipe.py         # paper multi-phase chain only
 scripts/eval_stage2_libriphrase.py
+scripts/eval_two_stage_kws.py
 scripts/run_two_stage_demo.py
 ```
 
@@ -150,28 +153,77 @@ CPU/Mac local runs are useful for code checks, but not for realistic training.
 
 ## 1. Clone and create environment
 
+Requires **Python ≥ 3.10**.
+
 ```bash
 git clone https://github.com/ty4045681/DMA-KWS.git
 cd DMA-KWS
+```
 
+**Conda (recommended on GPU servers):**
+
+```bash
 conda create -n dma-kws python=3.10 -y
 conda activate dma-kws
 ```
 
-Install CUDA PyTorch/torchaudio **first**, according to your server CUDA driver, before the project requirements. Example for CUDA 12.1 wheels:
+**venv (local / Mac):**
 
 ```bash
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
-Then install the project in editable mode and remaining Python dependencies:
+### Install dependencies
+
+Dependencies are declared in [`pyproject.toml`](pyproject.toml) (package metadata + optional extras) and mirrored in [`requirements.txt`](requirements.txt) for the README workflow. **`torch` and `torchaudio` are not pinned** in either file — install them separately first.
+
+**Step 1 — PyTorch / torchaudio** (match your CUDA driver on GPU machines):
 
 ```bash
+# Linux + CUDA 12.1 example
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Mac or CPU-only
+pip install torch torchaudio
+```
+
+**Step 2 — project core** (pick one approach):
+
+```bash
+# README workflow: requirements.txt + editable install
+pip install -r requirements.txt
+pip install -e .
+
+# Or install core deps from pyproject.toml only
+pip install -e .
+```
+
+**Step 3 — optional extras** (from `pyproject.toml`):
+
+| Extra | Command | When you need it |
+|-------|---------|------------------|
+| `dev` | `pip install -e ".[dev]"` | Run `pytest` locally |
+| `locator` | `pip install -e ".[locator]"` | `+locator=sherpa_zipformer_kws` (sherpa-onnx) |
+| `wekws` | `pip install -e ".[wekws]"` | `+locator=wekws_wenet` (librosa for wav I/O) |
+
+Install everything at once:
+
+```bash
+pip install -e ".[dev,locator,wekws]"
+```
+
+**Minimal inference/training install:**
+
+```bash
+pip install torch torchaudio
 pip install -r requirements.txt
 pip install -e .
 ```
 
-`requirements.txt` includes `pandas`, `pyarrow`, and `rapidfuzz` for Stage II data preparation, plus `g2p_en` for phoneme G2P in both stages. `soundfile` supports FLAC decoding; `openai-whisper` is used by the vendored QbyT/Wenet encoder utilities. On some Linux/conda systems, `torchaudio` may still need system audio libraries for `.flac` files; install them before training if `torchaudio.load()` cannot read LibriSpeech audio:
+Core packages include `hydra-core`, `g2p_en`, `pandas`, `pyarrow`, `rapidfuzz` (Stage II prep), `soundfile` (FLAC), and `openai-whisper` (vendored QbyT/Wenet encoder utilities). After `pip install -e .`, scripts resolve `dma_kws` without setting `PYTHONPATH`. If you run scripts without an editable install, prefix with `PYTHONPATH=.`.
+
+On some Linux/conda systems, `torchaudio` may still need system audio libraries for `.flac` files; install them before training if `torchaudio.load()` cannot read LibriSpeech audio:
 
 ```bash
 conda install -c conda-forge libsndfile ffmpeg -y
@@ -818,15 +870,76 @@ Output is JSON:
 
 ---
 
+## External locator (Zipformer / WeKws+Wenet)
+
+Stage II verification stays on the existing Conformer+QbyT checkpoint (`prep.stage2_ckpt`). You can swap the Stage I candidate proposer with an external locator that only returns time spans; Stage II re-extracts fbank from cropped wav with its own encoder.
+
+Hydra presets live under `configs/locator/`. Select with `+locator=<name>` (default group: `phoneme_ctc` in `configs/config.yaml`).
+
+| Locator | Hydra preset | Extra install | Required overrides |
+|---------|--------------|---------------|-------------------|
+| **phoneme_ctc** (default) | `+locator=phoneme_ctc` | core only | `prep.stage1_ckpt` |
+| **sherpa_zipformer_kws** | `+locator=sherpa_zipformer_kws` | `pip install -e ".[locator]"` | `locator.tokens`, `encoder`, `decoder`, `joiner` |
+| **wekws_wenet** | `+locator=wekws_wenet` | `pip install -e ".[wekws]"` + local wekws checkout | `locator.wekws.config`, `checkpoint`, `symbol_table` |
+| **icefall_pt_kws** (optional) | `+locator=icefall_pt_kws` | core only | `locator.root`, `decode_script`, `checkpoint` |
+
+**WeKws+Wenet setup:** clone your wekws fork and point the runtime at it:
+
+```bash
+export WEKWS_ROOT=/path/to/wekws   # default in code: ~/Documents/myfork/wekws
+pip install -e ".[wekws]"
+```
+
+Single-file demo (WeKws+Wenet locator + Stage II):
+
+```bash
+python3 scripts/run_two_stage_demo.py \
+  +experiment=wenet_asr_stage2 \
+  +locator=wekws_wenet \
+  prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step050000.pt \
+  prep.audio=/path/test.wav \
+  prep.keyword="hey eva" \
+  locator.wekws.config=/path/train.yaml \
+  locator.wekws.checkpoint=/path/step247499.pt \
+  locator.wekws.symbol_table=/path/units.txt
+```
+
+With the default `phoneme_ctc` locator, also pass `prep.stage1_ckpt=...`.
+
+Batch evaluation from a manifest CSV (`audio_path`, `keyword`, optional `label`):
+
+```bash
+python3 scripts/eval_two_stage_kws.py \
+  +experiment=wenet_asr_stage2 \
+  +locator=wekws_wenet \
+  prep.manifest=/path/manifest.csv \
+  prep.output_dir=outputs/two_stage_eval \
+  prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step050000.pt \
+  locator.wekws.config=/path/train.yaml \
+  locator.wekws.checkpoint=/path/step247499.pt \
+  locator.wekws.symbol_table=/path/units.txt
+```
+
+Default output directory: `outputs/eval_two_stage_kws` (`prep.output_dir`). Writes `results.jsonl` (per-utterance detections and scores) and `summary.json` (accuracy, precision, recall, f1, auc, eer when labels are present).
+
+---
+
 ## Troubleshooting
 
 ### `ModuleNotFoundError: dma_kws`
 
-Run scripts from the repository root:
+Install the package in editable mode from the repo root:
 
 ```bash
 cd /path/to/DMA-KWS
-python3 scripts/prepare_stage1_librispeech.py +experiment=demo_librispeech100 --help
+pip install -e .
+```
+
+Or run scripts with `PYTHONPATH=.`:
+
+```bash
+cd /path/to/DMA-KWS
+PYTHONPATH=. python3 scripts/prepare_stage1_librispeech.py +experiment=demo_librispeech100 --help
 ```
 
 ### `Missing torch/torchaudio`
@@ -842,10 +955,11 @@ Use the wheel index that matches your CUDA driver.
 ### `ModuleNotFoundError: No module named 'whisper'`
 
 The vendored QbyT/Wenet encoder utilities import `whisper.tokenizer`, which is provided by the `openai-whisper`
-package. Install the project requirements after pulling the latest repo:
+package. Install core dependencies after pulling the latest repo:
 
 ```bash
 pip install -r requirements.txt
+pip install -e .
 ```
 
 If you installed a different package named `whisper`, remove it and install OpenAI Whisper:
@@ -907,11 +1021,23 @@ Then rerun the small training smoke command.
 
 ### `Missing dependency g2p_en`
 
-Install requirements:
+Install core dependencies:
 
 ```bash
 pip install -r requirements.txt
+pip install -e .
 ```
+
+### `ImportError: sherpa-onnx` or `ImportError: librosa`
+
+Install the optional locator extras:
+
+```bash
+pip install -e ".[locator]"   # sherpa-onnx for Zipformer KWS
+pip install -e ".[wekws]"     # librosa for WeKws+Wenet locator
+```
+
+For WeKws+Wenet, also set `WEKWS_ROOT` to your local wekws checkout.
 
 ### `Resource 'averaged_perceptron_tagger_eng' not found`
 

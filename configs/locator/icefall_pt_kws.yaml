@@ -1,0 +1,4 @@
+type: icefall_pt
+root: ${oc.env:ICEFALL_ROOT,""}
+decode_script: ""
+checkpoint: ""

@@ -1,3 +1,5 @@
+manifest: ""
+output_dir: outputs/eval_two_stage_kws
 limit: 0
 input_format: librispeech-dir
 parquet_root: ""

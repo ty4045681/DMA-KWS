@@ -8,6 +8,7 @@ defaults:
   - demo: default
   - run: default
   - prep: default
+  - locator: phoneme_ctc
   - _self_
 
 hydra:

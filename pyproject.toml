@@ -29,6 +29,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+locator = ["sherpa-onnx>=1.10"]
+wekws = ["librosa"]
 
 [tool.setuptools.packages.find]
 include = ["dma_kws*"]

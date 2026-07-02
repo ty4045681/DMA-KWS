@@ -1,0 +1,4 @@
+audio_path,keyword,label
+tests/fixtures/audio_a.wav,hello world,1
+tests/fixtures/audio_b.wav,hello world,0
+tests/fixtures/audio_c.wav,goodbye,0

@@ -1,2 +1,3 @@
 stage1_candidate_margin_sec: 0.15
 qbyt_threshold: 0.5
+min_stage2_fbank_frames: 7

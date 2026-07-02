@@ -1,0 +1,15 @@
+type: wekws_wenet
+wekws:
+  config: ""
+  checkpoint: ""
+  symbol_table: ""
+  cmvn: ""
+  bpe_model: ""
+  threshold: 0.0
+  min_frames: 5
+  max_frames: 250
+  chunk_seconds: 0.3
+  decoding_chunk_size: 16
+  score_beam_size: 3
+  path_beam_size: 20
+  gpu: -1

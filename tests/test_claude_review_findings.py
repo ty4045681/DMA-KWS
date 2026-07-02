@@ -5,8 +5,9 @@ from pathlib import Path
 import pytest
 
 from dma_kws.g2p import clean_phoneme_tokens, text_to_phonemes
+from dma_kws.inference import audio_utils
+from dma_kws.inference.stage2_verifier import _load_model_state as load_model_state
 from scripts import prepare_stage1_librispeech as prepare_stage1
-from scripts import run_two_stage_demo as demo
 
 
 def test_qbyt_forward_accepts_lengths_and_masks_padded_frames():
@@ -42,7 +43,7 @@ def test_demo_load_model_state_requires_exact_checkpoint_keys():
 
     model = FakeModel()
 
-    returned = demo.load_model_state(
+    returned = load_model_state(
         model,
         "checkpoint.pt",
         load_fn=lambda path, map_location: {"model_state_dict": {"weight": 1}},
@@ -121,10 +122,10 @@ def test_demo_stage2_candidate_requires_enough_fbank_frames():
     sample_rate = 16_000
     min_frames = 7
 
-    assert demo.num_fbank_frames(399, sample_rate=sample_rate) == 0
-    assert demo.min_samples_for_fbank_frames(min_frames, sample_rate=sample_rate) == 1360
-    assert not demo.has_min_fbank_frames(1359, min_frames=min_frames, sample_rate=sample_rate)
-    assert demo.has_min_fbank_frames(1360, min_frames=min_frames, sample_rate=sample_rate)
+    assert audio_utils.num_fbank_frames(399, sample_rate=sample_rate) == 0
+    assert audio_utils.min_samples_for_fbank_frames(min_frames, sample_rate=sample_rate) == 1360
+    assert not audio_utils.has_min_fbank_frames(1359, min_frames=min_frames, sample_rate=sample_rate)
+    assert audio_utils.has_min_fbank_frames(1360, min_frames=min_frames, sample_rate=sample_rate)
 
 
 def test_stage2_text_to_phonemes_filters_tokens_that_become_empty():

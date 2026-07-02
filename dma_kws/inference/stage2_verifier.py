@@ -1,0 +1,162 @@
+"""Stage II QbyT verifier.
+
+Loads a trained Stage II checkpoint and scores Stage I candidate regions with
+the QbyT query-by-text model, returning per-candidate detection scores.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping, Sequence
+
+from dma_kws.audio import extract_fbank
+from dma_kws.inference.audio_utils import has_min_fbank_frames
+from dma_kws.nn import build_encoder
+from dma_kws.pathing import ensure_qbyt_on_path
+from dma_kws.stage1.candidates import KeywordCandidate
+
+NUM_EMBEDS = 73
+
+
+def _load_model_state(model, ckpt_path: str, load_fn):
+    ckpt = load_fn(ckpt_path, map_location="cpu")
+    state = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(state, strict=True)
+    return model
+
+
+class Stage2Verifier:
+    """Verify Stage I candidates with the QbyT Stage II model."""
+
+    def __init__(
+        self,
+        *,
+        stage1_cfg: Mapping[str, Any],
+        stage2_cfg: Mapping[str, Any],
+        demo_cfg: Mapping[str, Any],
+        stage2_ckpt: str,
+        device,
+    ) -> None:
+        try:
+            import torch
+        except ImportError as exc:
+            raise SystemExit(
+                "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
+            ) from exc
+
+        ensure_qbyt_on_path()
+        from model import QbyT
+
+        self._torch = torch
+        self._demo_cfg = dict(demo_cfg)
+        self._device = device
+        self._num_mel_bins = int(stage1_cfg.get("input_dim", 80))
+        stage2_encoder_dim = int(stage2_cfg.get("encoder_output_dim", 144))
+
+        class Stage2Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = build_encoder(stage1_cfg, output_dim=stage2_encoder_dim)
+                self.qbyt = QbyT(
+                    encoder_output_size=stage2_encoder_dim,
+                    num_embeds=NUM_EMBEDS,
+                    embed_dim=int(stage2_cfg.get("qbyt_embed_dim", 128)),
+                    post_num_layers=int(stage2_cfg.get("qbyt_layers", 2)),
+                )
+
+            def forward(self, feats, feat_lengths, anchors, anchor_lengths):
+                encoder_out, encoder_mask = self.encoder(feats, feat_lengths)
+                encoder_lens = encoder_mask.squeeze(1).sum(1)
+                logits, _ = self.qbyt(
+                    encoder_out,
+                    anchors,
+                    speech_lengths=encoder_lens,
+                    text_lengths=anchor_lengths,
+                )
+                return torch.sigmoid(logits)
+
+        model = Stage2Model()
+        try:
+            _load_model_state(model, stage2_ckpt, torch.load)
+        except RuntimeError as exc:
+            raise SystemExit(
+                f"Checkpoint {stage2_ckpt} is incompatible with the model architecture: {exc}"
+            ) from exc
+        self._model = model.to(device).eval()
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any], prep: Mapping[str, Any], device) -> "Stage2Verifier":
+        stage1_cfg = config.get("stage1")
+        if not isinstance(stage1_cfg, Mapping):
+            raise ValueError("Config section 'stage1' must be a mapping")
+        stage2_cfg = config.get("stage2")
+        if not isinstance(stage2_cfg, Mapping):
+            raise ValueError("Config section 'stage2' must be a mapping")
+        demo_cfg = config.get("demo")
+        if not isinstance(demo_cfg, Mapping):
+            demo_cfg = {}
+
+        stage2_ckpt = str(prep.get("stage2_ckpt", ""))
+        if not stage2_ckpt:
+            raise SystemExit("prep.stage2_ckpt is required for Stage II verification")
+
+        return cls(
+            stage1_cfg=stage1_cfg,
+            stage2_cfg=stage2_cfg,
+            demo_cfg=demo_cfg,
+            stage2_ckpt=stage2_ckpt,
+            device=device,
+        )
+
+    def verify_candidates(
+        self,
+        waveform,
+        sample_rate: int,
+        keyword_ids: Sequence[int],
+        candidates: Sequence[KeywordCandidate],
+    ) -> list[dict]:
+        """Score each candidate region and return per-candidate results."""
+        torch = self._torch
+        anchor = torch.tensor([list(keyword_ids)], dtype=torch.long).to(self._device)
+        anchor_lengths = torch.tensor([len(keyword_ids)], dtype=torch.long).to(self._device)
+        min_stage2_fbank_frames = int(self._demo_cfg.get("min_stage2_fbank_frames", 7))
+
+        scores: list[dict] = []
+        for candidate in candidates:
+            start = max(0, int(candidate.start_sec * sample_rate))
+            end = min(waveform.size(1), int(candidate.end_sec * sample_rate))
+            if end <= start:
+                continue
+            if not has_min_fbank_frames(
+                end - start,
+                min_frames=min_stage2_fbank_frames,
+                sample_rate=sample_rate,
+            ):
+                continue
+            candidate_wave = waveform[:, start:end]
+            candidate_feat = extract_fbank(
+                candidate_wave,
+                num_mel_bins=self._num_mel_bins,
+                sample_rate=sample_rate,
+                dither=0.0,
+            ).unsqueeze(0)
+            candidate_lens = torch.tensor([candidate_feat.size(1)], dtype=torch.long)
+            with torch.no_grad():
+                score = float(
+                    self._model(
+                        candidate_feat.to(self._device),
+                        candidate_lens.to(self._device),
+                        anchor,
+                        anchor_lengths,
+                    )
+                    .cpu()
+                    .item()
+                )
+            scores.append(
+                {
+                    "start_sec": candidate.start_sec,
+                    "end_sec": candidate.end_sec,
+                    "stage1_score": candidate.stage1_score,
+                    "qbyt_score": score,
+                }
+            )
+        return scores
