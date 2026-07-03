@@ -1,0 +1,37 @@
+# @package _global_
+adapt:
+  keyword: hey eva
+  slug: ""
+  phase: tts
+  stage: all
+  data_root: ""
+  exp_root: ""
+  rank: 16
+  alpha: 32
+  lr: 4.0e-4
+  learning_rate: 4.0e-4
+  optimizer: adam
+  weight_decay: 0.0
+  warmup_steps: 100
+  max_steps: 3000
+  mix_ratio: 0.5
+  sample_lens: 3000
+  batch_size_per_gpu: 64
+  val_batch_size: 64
+  num_workers: 2
+  eval_fraction: 0.2
+  eval_seed: 2025
+  init_checkpoint: ""
+  params_file: ""
+  lora_targets:
+    - in_proj_weight
+    - out_proj.weight
+  sweep:
+    enabled: false
+    n_trials: 20
+    lambda_forget: 1.0
+    lph_subset: 2000
+    search_mix: false
+    single_phase: false
+    storage: ""
+    study_name: ""

@@ -47,8 +47,52 @@ Or edit `paths:` in `configs/experiment/<name>.yaml` or `configs/paths/default.y
 |--------|-----|
 | `scripts/train_stage2_qbyt.py` | Demo single-phase training and Wenet ASR encoder init (`wenet_asr_stage2`, §7b) |
 | `scripts/train_stage2_recipe.py` | Paper multi-phase chain only: `init-ls-460`, `ft-ls-gs-1460`, `frozen-wenet-encoder` |
+| `scripts/adapt_stage2_keyword.py` | Stage II LoRA continual adaptation for a user keyword (phoneme matcher QKV) |
+| `scripts/run_keyword_adaptation.py` | One-command prepare → sweep → train → eval for keyword adaptation |
 
 For the full paper chain (init → avg → finetune → eval), see [docs/paper-reproduction.md](docs/paper-reproduction.md).
+
+### Continual adaptation (Stage II LoRA)
+
+Paper Section III-E: freeze the full model, LoRA-tune **QbyT phoneme matcher attention QKV** on **TTS → real** data with **LibriPhrase : keyword = 1:1** anti-forgetting mix.
+
+**Data layout** (slug from `adapt.keyword`, e.g. `hey eva` → `hey_eva`):
+
+```text
+data/dma-kws/adapt/<slug>/raw/{tts,real}/{positive,negative/<neg_text_slug>}/...
+data/dma-kws/adapt/<slug>/fbank/...
+data/dma-kws/adapt/<slug>/manifests/{tts,real}_{train,eval}.csv
+```
+
+**One command** (prepare → optional Optuna sweep → TTS phase → real phase → eval report):
+
+```bash
+pip install -e '.[adapt]'   # adds optuna for sweep
+
+python3 scripts/run_keyword_adaptation.py \
+  adapt.keyword="hey eva" \
+  prep.stage2_ckpt=/path/to/stage2_si.pt \
+  adapt.stage=all
+```
+
+**Step-by-step:**
+
+```bash
+# 1. Prepare fbank + manifests
+python3 scripts/prepare_keyword_adaptation.py adapt.keyword="hey eva"
+
+# 2. Optional hyperparameter search (TPE + MedianPruner)
+python3 scripts/sweep_adapt_lora.py adapt.keyword="hey eva" prep.stage2_ckpt=/path/to/stage2_si.pt
+
+# 3. Two-phase LoRA training (real resumes TTS adapter on same SI base)
+python3 scripts/adapt_stage2_keyword.py adapt.keyword="hey eva" adapt.phase=tts prep.stage2_ckpt=/path/to/stage2_si.pt
+python3 scripts/adapt_stage2_keyword.py adapt.keyword="hey eva" adapt.phase=real prep.stage2_ckpt=/path/to/stage2_si.pt
+
+# 4. Eval: base vs adapted under exp/stage2_adapt/<slug>/reports/
+python3 scripts/run_keyword_adaptation.py adapt.keyword="hey eva" prep.stage2_ckpt=/path/to/stage2_si.pt adapt.stage=eval
+```
+
+Outputs: `exp/stage2_adapt/<slug>/adapter_<slug>.pt` (small LoRA only), `stage2_adapted.pt` (merged, loadable by `Stage2Verifier`). To adapt another wake word, change `adapt.keyword` and place data under `data/dma-kws/adapt/<new_slug>/raw/...`.
 
 ### Checkpoints and resume
 

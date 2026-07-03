@@ -1,0 +1,494 @@
+"""Stage II LoRA continual adaptation training."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pytorch_lightning as pl
+import torch
+import torch.nn.functional as F
+import torchmetrics
+
+from dma_kws.pathing import resolve_dict_path
+from dma_kws.stage2.adapt_dataset import (
+    KeywordAdaptationDataset,
+    MixedAdaptationDataset,
+    TargetKeywordValDataset,
+)
+from dma_kws.stage2.adapt_paths import adapt_data_root, phase_manifest, slugify
+from dma_kws.stage2.module import Stage2LightningModule
+from dma_kws.stage2.train import _build_val_dataloader, _resolve_path
+from dma_kws.training.lora import (
+    inject_qbyt_lora,
+    load_lora_state_dict,
+    lora_state_dict,
+    merge_lora,
+    print_lora_param_counts,
+)
+
+
+@dataclass
+class Stage2AdaptArgs:
+    """Runtime options for Stage II LoRA adaptation."""
+
+    init_checkpoint: str = ""
+    resume_checkpoint: str = ""
+    resume_from: str = ""
+    device: str = "cuda"
+    devices: int = 1
+    limit_steps: int = 0
+    params_file: str = ""
+
+
+def _adapt_section(config: dict[str, Any]) -> dict[str, Any]:
+    adapt = config.get("adapt")
+    if not isinstance(adapt, dict):
+        raise ValueError("Config section 'adapt' must be a mapping")
+    return adapt
+
+
+def _resolve_adapt_paths(config: dict[str, Any]) -> dict[str, Path]:
+    adapt = _adapt_section(config)
+    paths = config["paths"]
+    keyword = str(adapt.get("keyword", ""))
+    if not keyword:
+        raise ValueError("adapt.keyword is required")
+
+    slug = str(adapt.get("slug", "")) or slugify(keyword)
+    data_root = Path(adapt.get("data_root", "")) if adapt.get("data_root") else adapt_data_root(
+        config, keyword
+    )
+    if adapt.get("exp_root"):
+        exp_root = Path(str(adapt["exp_root"]))
+    else:
+        exp_root = Path(paths["exp_root"]) / "stage2_adapt" / slug
+    phase = str(adapt.get("phase", "tts"))
+
+    return {
+        "keyword": Path(keyword),  # type: ignore[dict-item]
+        "slug": Path(slug),  # type: ignore[dict-item]
+        "keyword_str": keyword,
+        "slug_str": slug,
+        "data_root": data_root,
+        "fbank_root": data_root / "fbank",
+        "exp_root": exp_root,
+        "phase": Path(phase),  # type: ignore[dict-item]
+        "phase_str": phase,
+        "phase_dir": exp_root / phase,
+        "adapter_path": exp_root / f"adapter_{slug}.pt",
+        "merged_path": exp_root / "stage2_adapted.pt",
+        "train_manifest": phase_manifest(data_root, phase, split="train"),
+        "eval_manifest": phase_manifest(data_root, phase, split="eval"),
+    }
+
+
+def _load_params_file(params_file: str) -> dict[str, Any]:
+    import yaml
+
+    path = Path(params_file)
+    if not path.exists():
+        raise FileNotFoundError(f"adapt params file not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"adapt params file must be a mapping: {path}")
+    return data
+
+
+def _apply_adapt_overrides(config: dict[str, Any], args: Stage2AdaptArgs) -> None:
+    if args.params_file:
+        overrides = _load_params_file(args.params_file)
+        adapt = _adapt_section(config)
+        adapt.update(overrides)
+
+
+class Stage2LoraAdaptationModule(Stage2LightningModule):
+    """Stage II module with frozen encoder/base QbyT and trainable LoRA adapters."""
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        vocab_size: int = 73,
+        init_checkpoint: str | Path | None = None,
+        lora_rank: int = 16,
+        lora_alpha: float = 32.0,
+        lora_targets: tuple[str, ...] | None = None,
+        adapter_checkpoint: str | Path | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            vocab_size=vocab_size,
+            freeze_encoder=True,
+            init_checkpoint=init_checkpoint,
+        )
+        for param in self.parameters():
+            param.requires_grad = False
+
+        inject_qbyt_lora(
+            self.qbyt,
+            rank=lora_rank,
+            alpha=lora_alpha,
+            targets=lora_targets,
+        )
+        if adapter_checkpoint:
+            state = torch.load(adapter_checkpoint, map_location="cpu")
+            adapter_state = state.get("lora_state_dict", state)
+            load_lora_state_dict(self.qbyt, adapter_state, strict=False)
+
+        print_lora_param_counts(self, prefix="Stage2 LoRA")
+
+        self._adapt_cfg = _adapt_section(config)
+        self.target_auc_metric = torchmetrics.AUROC(task="binary")
+        self.target_eer_metric = torchmetrics.classification.EER(task="binary")
+
+    def configure_optimizers(self) -> dict:
+        trainable = [param for param in self.parameters() if param.requires_grad]
+        if not trainable:
+            raise RuntimeError("No trainable LoRA parameters found")
+        adapt = self._adapt_cfg
+        optim_cfg = {
+            "optimizer": str(adapt.get("optimizer", "adam")).lower(),
+            "lr": float(adapt.get("lr", adapt.get("learning_rate", 4e-4))),
+            "weight_decay": float(adapt.get("weight_decay", 0.0)),
+            "warmup_steps": int(adapt.get("warmup_steps", 100)),
+            "total_steps": int(adapt.get("max_steps", 3000)),
+        }
+
+        import torch as torch_mod
+        from transformers import get_cosine_schedule_with_warmup
+
+        optimizer_name = optim_cfg["optimizer"]
+        if optimizer_name == "adamw":
+            optimizer = torch_mod.optim.AdamW(
+                trainable,
+                lr=optim_cfg["lr"],
+                weight_decay=optim_cfg["weight_decay"],
+            )
+        elif optimizer_name == "adam":
+            optimizer = torch_mod.optim.Adam(trainable, lr=optim_cfg["lr"])
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer_name!r}")
+
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=optim_cfg["warmup_steps"],
+            num_training_steps=optim_cfg["total_steps"],
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
+
+    def validation_step(
+        self,
+        batch: dict[str, torch.Tensor],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        logits, _ = self(batch["feat"], batch["feat_lengths"], batch["anchor"])
+        preds = torch.sigmoid(logits)
+        labels = batch["label"].int()
+
+        if dataloader_idx == 0:
+            utt_loss = F.binary_cross_entropy_with_logits(logits, labels.float())
+            self.log("val/target_utt_loss", utt_loss, prog_bar=True, on_epoch=True, add_dataloader_idx=False)
+            self.target_auc_metric.update(preds, labels)
+            self.target_eer_metric.update(preds, labels)
+        else:
+            utt_loss = F.binary_cross_entropy_with_logits(logits, labels.float())
+            self.log("val/utt_loss", utt_loss, prog_bar=True, on_epoch=True, add_dataloader_idx=False)
+            self.auc_metric.update(preds, labels)
+            self.eer_metric.update(preds, labels)
+
+    def on_validation_epoch_end(self) -> None:
+        target_auc = self.target_auc_metric.compute()
+        target_eer = self.target_eer_metric.compute()
+        self.log("val/target_auc", target_auc, prog_bar=True, sync_dist=True)
+        self.log("val/target_eer", target_eer, prog_bar=True, sync_dist=True)
+
+        lph_auc = self.auc_metric.compute()
+        lph_eer = self.eer_metric.compute()
+        self.log("val/auc", lph_auc, prog_bar=True, sync_dist=True)
+        self.log("val/eer", lph_eer, prog_bar=True, sync_dist=True)
+        self.log("val_auc", lph_auc, prog_bar=True, sync_dist=True)
+
+        self.target_auc_metric.reset()
+        self.target_eer_metric.reset()
+        self.auc_metric.reset()
+        self.eer_metric.reset()
+
+
+def _resolve_init_checkpoint(config: dict[str, Any], adapt_paths: dict[str, Any], args: Stage2AdaptArgs) -> str:
+    adapt = _adapt_section(config)
+    prep = config.get("prep", {}) or {}
+
+    init_checkpoint = (
+        args.init_checkpoint
+        or prep.get("stage2_ckpt", "")
+        or adapt.get("init_checkpoint", "")
+        or config.get("stage2", {}).get("init_checkpoint", "")
+    )
+    if not init_checkpoint:
+        raise ValueError(
+            "init_checkpoint is required for adaptation (set prep.stage2_ckpt or adapt.init_checkpoint)"
+        )
+    return str(init_checkpoint)
+
+
+def _resolve_adapter_resume(adapt_paths: dict[str, Any], phase: str) -> str | None:
+    if phase == "real":
+        tts_adapter = adapt_paths["phase_dir"].parent / "tts" / f"adapter_{adapt_paths['slug_str']}.pt"
+        if tts_adapter.exists():
+            return str(tts_adapter)
+    phase_adapter = adapt_paths["phase_dir"] / f"adapter_{adapt_paths['slug_str']}.pt"
+    if phase_adapter.exists():
+        return str(phase_adapter)
+    return None
+
+
+def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict[str, Path]:
+    """Run Stage II LoRA adaptation for the configured keyword phase."""
+    try:
+        import pytorch_lightning as pl_mod
+        from torch.utils.data import DataLoader
+    except ImportError as exc:
+        raise SystemExit(
+            "Missing torch/pytorch-lightning. Install CUDA PyTorch on the training machine first."
+        ) from exc
+
+    from dma_kws.config import get_tokenizer_config, require_sections
+    from dma_kws.runlog import build_loggers
+    from dma_kws.stage2.collate import test_collate_fn, train_collate_fn
+    from dma_kws.stage2.dataset import LibriPhraseTrainDataset
+    from dma_kws.tokenizer import load_char_tokenizer
+    from dma_kws.training import resolve_resume_path
+    from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
+    from dma_kws.training.ddp import build_trainer_kwargs
+    from dma_kws.training.device import resolve_accelerator_and_devices
+
+    _apply_adapt_overrides(config, args)
+    require_sections(config, ["paths", "stage1", "stage2", "tokenizer", "training", "adapt"])
+
+    adapt = _adapt_section(config)
+    adapt_paths = _resolve_adapt_paths(config)
+    paths = config["paths"]
+    stage1 = config["stage1"]
+    stage2 = config["stage2"]
+    training = config["training"]
+    tokenizer_cfg = get_tokenizer_config(config)
+
+    train_manifest = adapt_paths["train_manifest"]
+    eval_manifest = adapt_paths["eval_manifest"]
+    if not train_manifest.exists():
+        raise SystemExit(f"Adaptation train manifest not found: {train_manifest}")
+    if not eval_manifest.exists():
+        raise SystemExit(f"Adaptation eval manifest not found: {eval_manifest}")
+
+    dict_path = resolve_dict_path(config)
+    tokenizer = load_char_tokenizer(dict_path, split_with_space=tokenizer_cfg.get("split_with_space", " "))
+    vocab_size = len(tokenizer._symbol_table)
+
+    seed = int(training.get("seed", 2025))
+    pl_mod.seed_everything(seed, workers=True)
+
+    keyword_dataset = KeywordAdaptationDataset(
+        manifest_path=train_manifest,
+        keyword=adapt_paths["keyword_str"],
+        fbank_root=adapt_paths["fbank_root"],
+        tokenizer=tokenizer,
+        manifest_root=adapt_paths["data_root"],
+    )
+
+    processed_root = Path(paths["processed_root"])
+    feature_root = Path(paths.get("feature_root", processed_root))
+    parquet_file = _resolve_path(
+        stage2,
+        "parquet_file",
+        processed_root / "stage2_qbyt" / "aggregated_segments_with_g2p_distance.parquet",
+    )
+    wav_dir = _resolve_path(stage2, "wav_dir", feature_root / "fbank")
+
+    libri_dataset = LibriPhraseTrainDataset(
+        parquet_file=parquet_file,
+        wav_dir=wav_dir,
+        tokenizer=tokenizer,
+        negative_ratio=int(stage2.get("negative_ratio", 1)),
+        hard_negative_ratio=int(stage2.get("hard_negative_ratio", 1)),
+        sample_lens=int(adapt.get("sample_lens", stage2.get("sample_lens", 5000))),
+        seed=seed,
+    )
+
+    train_dataset = MixedAdaptationDataset(
+        keyword_dataset=keyword_dataset,
+        libri_dataset=libri_dataset,
+        mix_ratio=float(adapt.get("mix_ratio", 0.5)),
+        sample_lens=int(adapt.get("sample_lens", stage2.get("sample_lens", 5000))),
+        seed=seed,
+    )
+
+    batch_size = int(adapt.get("batch_size_per_gpu", stage2.get("batch_size_per_gpu", 64)))
+    num_workers = int(adapt.get("num_workers", stage2.get("num_workers", 2)))
+    from dma_kws.training.loaders import build_loader_kwargs
+
+    loader_kwargs = build_loader_kwargs(num_workers, stage2.get("dataloader", {}) or {})
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=train_collate_fn,
+        drop_last=True,
+        **loader_kwargs,
+    )
+
+    target_val_dataset = TargetKeywordValDataset(
+        manifest_path=eval_manifest,
+        keyword=adapt_paths["keyword_str"],
+        fbank_root=adapt_paths["fbank_root"],
+        tokenizer=tokenizer,
+        manifest_root=adapt_paths["data_root"],
+    )
+    target_val_loader = DataLoader(
+        target_val_dataset,
+        batch_size=int(adapt.get("val_batch_size", batch_size)),
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=test_collate_fn,
+        drop_last=False,
+        **loader_kwargs,
+    )
+    lph_val_loader = _build_val_dataloader(config, tokenizer)
+
+    phase = adapt_paths["phase_str"]
+    init_checkpoint = _resolve_init_checkpoint(config, adapt_paths, args)
+    adapter_resume = _resolve_adapter_resume(adapt_paths, phase)
+
+    lora_rank = int(adapt.get("rank", 16))
+    lora_alpha = float(adapt.get("alpha", 32))
+    lora_targets = tuple(adapt.get("lora_targets", ("in_proj_weight", "out_proj.weight")))
+
+    adapt_paths["phase_dir"].mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = adapt_paths["phase_dir"] / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    resume_path = resolve_resume_path(args.resume_from, checkpoint_dir)
+    if resume_path is not None:
+        model = Stage2LoraAdaptationModule(
+            config,
+            vocab_size=vocab_size,
+            init_checkpoint=init_checkpoint,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_targets=lora_targets,
+        )
+    else:
+        model = Stage2LoraAdaptationModule(
+            config,
+            vocab_size=vocab_size,
+            init_checkpoint=init_checkpoint,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_targets=lora_targets,
+            adapter_checkpoint=adapter_resume,
+        )
+
+    accelerator, devices = resolve_accelerator_and_devices(args.device, args.devices)
+    if accelerator == "gpu":
+        torch.set_float32_matmul_precision("high")
+
+    log_dir = adapt_paths["phase_dir"] / "logs"
+    run_name = f"adapt_{adapt_paths['slug_str']}_{phase}"
+    loggers = build_loggers(log_dir, run_name, config=config)
+
+    recipe = str(training.get("recipe", "adapt"))
+    callbacks = build_stage2_callbacks(config, recipe)
+
+    limit_steps = args.limit_steps or int(adapt.get("max_steps", 3000)) or None
+    trainer_kwargs = build_trainer_kwargs(
+        config,
+        devices,
+        limit_steps=limit_steps,
+        accelerator=accelerator,
+    )
+    trainer_kwargs["max_steps"] = limit_steps
+
+    print_run_summary(
+        config=config,
+        devices=devices,
+        accelerator=accelerator,
+        train_samples=len(train_dataset),
+        val_samples=len(target_val_dataset) + len(lph_val_loader.dataset),
+        param_counts=print_lora_param_counts(model),
+        paths={
+            "train_manifest": train_manifest,
+            "eval_manifest": eval_manifest,
+            "checkpoint_dir": checkpoint_dir,
+            "log_dir": log_dir,
+            "init_checkpoint": Path(init_checkpoint),
+        },
+    )
+
+    trainer = pl_mod.Trainer(
+        accelerator=accelerator,
+        callbacks=callbacks,
+        logger=loggers,
+        **trainer_kwargs,
+    )
+    trainer.fit(
+        model,
+        train_dataloaders=train_dataloader,
+        val_dataloaders=[target_val_loader, lph_val_loader],
+        ckpt_path=resume_path,
+    )
+
+    global_step = int(trainer.global_step)
+    adapter_out = adapt_paths["phase_dir"] / f"adapter_{adapt_paths['slug_str']}.pt"
+    torch.save(
+        {
+            "lora_state_dict": lora_state_dict(model.qbyt),
+            "config": config,
+            "step": global_step,
+            "keyword": adapt_paths["keyword_str"],
+            "slug": adapt_paths["slug_str"],
+            "phase": phase,
+            "rank": lora_rank,
+            "alpha": lora_alpha,
+        },
+        adapter_out,
+    )
+    print(f"Saved LoRA adapter {adapter_out}")
+
+    merge_lora(model.qbyt)
+    merged_out = adapt_paths["merged_path"]
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": config,
+            "step": global_step,
+            "keyword": adapt_paths["keyword_str"],
+            "slug": adapt_paths["slug_str"],
+            "phase": phase,
+            "tokenizer_dict_path": str(dict_path),
+            "vocab_size": vocab_size,
+        },
+        merged_out,
+    )
+    print(f"Saved merged checkpoint {merged_out}")
+
+    final_adapter = adapt_paths["adapter_path"]
+    if adapter_out.resolve() != final_adapter.resolve():
+        torch.save(torch.load(adapter_out, map_location="cpu"), final_adapter)
+        print(f"Copied adapter to {final_adapter}")
+
+    return {
+        "adapter": adapter_out,
+        "merged": merged_out,
+        "final_adapter": final_adapter,
+    }

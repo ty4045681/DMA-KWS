@@ -278,6 +278,47 @@ class LocatorConfig:
 
 
 @dataclass
+class AdaptSweepConfig:
+    enabled: bool = False
+    n_trials: int = 20
+    lambda_forget: float = 1.0
+    lph_subset: int = 2000
+    search_mix: bool = False
+    single_phase: bool = False
+    storage: str = ""
+    study_name: str = ""
+
+
+@dataclass
+class AdaptConfig:
+    keyword: str = "hey eva"
+    slug: str = ""
+    phase: str = "tts"
+    stage: str = "all"
+    data_root: str = ""
+    exp_root: str = ""
+    rank: int = 16
+    alpha: int = 32
+    lr: float = 4e-4
+    learning_rate: float = 4e-4
+    optimizer: str = "adam"
+    weight_decay: float = 0.0
+    warmup_steps: int = 100
+    max_steps: int = 3000
+    mix_ratio: float = 0.5
+    sample_lens: int = 3000
+    batch_size_per_gpu: int = 64
+    val_batch_size: int = 64
+    num_workers: int = 2
+    eval_fraction: float = 0.2
+    eval_seed: int = 2025
+    init_checkpoint: str = ""
+    params_file: str = ""
+    lora_targets: list[str] = field(default_factory=lambda: ["in_proj_weight", "out_proj.weight"])
+    sweep: AdaptSweepConfig = field(default_factory=AdaptSweepConfig)
+
+
+@dataclass
 class DemoConfig:
     stage1_candidate_margin_sec: float = 0.15
     qbyt_threshold: float = 0.5
@@ -306,6 +347,7 @@ class DMAKWSConfig:
     stage2: Stage2Config = field(default_factory=Stage2Config)
     demo: DemoConfig = field(default_factory=DemoConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    adapt: AdaptConfig = field(default_factory=AdaptConfig)
     locator: LocatorConfig = field(default_factory=LocatorConfig)
 
 

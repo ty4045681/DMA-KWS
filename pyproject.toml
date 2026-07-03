@@ -29,6 +29,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+adapt = ["optuna>=3.0"]
 locator = ["sherpa-onnx>=1.10"]
 wekws = ["librosa"]
 
