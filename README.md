@@ -6,6 +6,40 @@ This repository implements a two-stage keyword spotting pipeline with a **single
 
 1. **Stage I** (training + inference): phoneme CTC decoding proposes candidate keyword spans in audio.
 2. **Stage II** (training + inference): QbyT phoneme matching verifies each candidate.
+3. **Continual adaptation** (optional): LoRA-tune the Stage II phoneme matcher on user keyword data (TTS → real, LibriPhrase 1:1 anti-forgetting) — see [§8](#8-stage-ii-lora-continual-adaptation).
+
+## Table of contents
+
+**Overview**
+
+- [Terminology](#terminology)
+- [Path conventions](#path-conventions)
+- [Stage II training scripts](#stage-ii-training-scripts)
+- [Continual adaptation (Stage II LoRA)](#continual-adaptation-stage-ii-lora)
+- [Checkpoints and resume](#checkpoints-and-resume)
+- [What is implemented now](#what-is-implemented-now)
+- [Recommended hardware](#recommended-hardware)
+
+**Workflow**
+
+1. [Clone and create environment](#1-clone-and-create-environment)
+2. [Prepare data directories](#2-prepare-data-directories)
+3. [Download datasets](#3-download-datasets)
+4. [Stage I: prepare phoneme CTC data](#4-stage-i-prepare-phoneme-ctc-data)
+5. [Stage I: train phoneme CTC model](#5-stage-i-train-phoneme-ctc-model)
+6. [Stage II: prepare training data](#6-stage-ii-prepare-training-data)
+7. [Stage II: train QbyT verifier](#7-stage-ii-train-qbyt-verifier)
+7b. [Stage II: initialize from external Wenet ASR encoder](#7b-stage-ii-initialize-from-external-wenet-asr-encoder)
+8. [Stage II LoRA continual adaptation](#8-stage-ii-lora-continual-adaptation)
+9. [Run the two-stage demo](#9-run-the-two-stage-demo)
+10. [Stage II-only clip inference](#10-stage-ii-only-clip-inference)
+
+**Reference**
+
+- [External locator (Zipformer / WeKws+Wenet)](#external-locator-zipformer--wekwswenet)
+- [Troubleshooting](#troubleshooting)
+- [Datasets](#datasets)
+- [Paper reproduction](#paper-reproduction)
 
 ### Terminology
 
@@ -47,27 +81,19 @@ Or edit `paths:` in `configs/experiment/<name>.yaml` or `configs/paths/default.y
 |--------|-----|
 | `scripts/train_stage2_qbyt.py` | Demo single-phase training and Wenet ASR encoder init (`wenet_asr_stage2`, §7b) |
 | `scripts/train_stage2_recipe.py` | Paper multi-phase chain only: `init-ls-460`, `ft-ls-gs-1460`, `frozen-wenet-encoder` |
-| `scripts/adapt_stage2_keyword.py` | Stage II LoRA continual adaptation for a user keyword (phoneme matcher QKV) |
-| `scripts/run_keyword_adaptation.py` | One-command prepare → sweep → train → eval for keyword adaptation |
+| `scripts/adapt_stage2_keyword.py` | Stage II LoRA continual adaptation for a user keyword (phoneme matcher QKV); see [§8](#8-stage-ii-lora-continual-adaptation) |
+| `scripts/run_keyword_adaptation.py` | One-command prepare → sweep → train → eval for keyword adaptation; see [§8](#8-stage-ii-lora-continual-adaptation) |
 
 For the full paper chain (init → avg → finetune → eval), see [docs/paper-reproduction.md](docs/paper-reproduction.md).
 
 ### Continual adaptation (Stage II LoRA)
 
-Paper Section III-E: freeze the full model, LoRA-tune **QbyT phoneme matcher attention QKV** on **TTS → real** data with **LibriPhrase : keyword = 1:1** anti-forgetting mix.
+After a speaker-independent Stage II checkpoint is trained ([§7](#7-stage-ii-train-qbyt-verifier)), you can adapt the **QbyT phoneme matcher** to a user-defined wake word with LoRA (paper Section III-E): freeze the encoder and base QbyT, fine-tune matcher attention on **TTS → real** keyword data mixed 1:1 with LibriPhrase for anti-forgetting. Swap `adapt.keyword` to target another phrase without code changes.
 
-**Data layout** (slug from `adapt.keyword`, e.g. `hey eva` → `hey_eva`; default root `${paths.processed_root}/adapt/<slug>`):
-
-```text
-data/dma-kws/processed/adapt/<slug>/raw/{tts,real}/{positive,negative/<neg_text_slug>}/...
-data/dma-kws/processed/adapt/<slug>/fbank/...
-data/dma-kws/processed/adapt/<slug>/manifests/{tts,real}_{train,eval}.csv
-```
-
-**One command** (prepare → optional Optuna sweep → TTS phase → real phase → eval report):
+**Quick start:**
 
 ```bash
-pip install -e '.[adapt]'   # adds optuna for sweep
+pip install -e '.[adapt]'   # optuna for optional hyperparameter sweep
 
 python3 scripts/run_keyword_adaptation.py \
   adapt.keyword="hey eva" \
@@ -75,177 +101,7 @@ python3 scripts/run_keyword_adaptation.py \
   adapt.stage=all
 ```
 
-**Step-by-step:**
-
-```bash
-# 1. Prepare fbank + manifests
-python3 scripts/prepare_keyword_adaptation.py adapt.keyword="hey eva"
-
-# 2. Optional hyperparameter search (TPE + MedianPruner)
-python3 scripts/sweep_adapt_lora.py adapt.keyword="hey eva" prep.stage2_ckpt=/path/to/stage2_si.pt
-
-# 3. Two-phase LoRA training (real resumes TTS adapter on same SI base)
-python3 scripts/adapt_stage2_keyword.py adapt.keyword="hey eva" adapt.phase=tts prep.stage2_ckpt=/path/to/stage2_si.pt
-python3 scripts/adapt_stage2_keyword.py adapt.keyword="hey eva" adapt.phase=real prep.stage2_ckpt=/path/to/stage2_si.pt
-
-# 4. Eval: base vs adapted under exp/stage2_adapt/<slug>/reports/
-python3 scripts/run_keyword_adaptation.py adapt.keyword="hey eva" prep.stage2_ckpt=/path/to/stage2_si.pt adapt.stage=eval
-```
-
-Outputs: `exp/stage2_adapt/<slug>/adapter_<slug>.pt` (small LoRA only), `stage2_adapted.pt` (merged, loadable by `Stage2Verifier`). To adapt another wake word, change `adapt.keyword` and place data under `data/dma-kws/processed/adapt/<new_slug>/raw/...`.
-
-#### Data preparation
-
-**Prerequisites**
-
-| Item | Purpose |
-|------|---------|
-| SI Stage II checkpoint | Base weights to adapt (`prep.stage2_ckpt` or `adapt.init_checkpoint`); same format as normal Stage II export (`stage2_*.pt`) |
-| Keyword audio | TTS synthetic + real recordings, positives and confusable negatives |
-| LibriPhrase parquet + fbank | Anti-forgetting mix during training (`stage2.parquet_file`, `stage2.wav_dir`); same as standard Stage II training |
-| LibriPhrase eval (optional) | LPH hard-split monitoring during training and in `eval_report.json` |
-
-**Directory layout (recommended)**
-
-Place wav files under `raw/` using phase (`tts` / `real`), polarity, and negative phrase slug. The slug is derived automatically from `adapt.keyword` unless you override `adapt.data_root`.
-
-Example for `adapt.keyword="hey eva"`:
-
-```text
-data/dma-kws/processed/adapt/hey_eva/
-├── raw/
-│   ├── tts/
-│   │   ├── positive/              # label=1, text="hey eva"
-│   │   │   └── *.wav
-│   │   └── negative/
-│   │       ├── hey_ava/           # label=0, text="hey ava"  (folder slug → phrase)
-│   │       │   └── *.wav
-│   │       └── hey_eve/
-│   │           └── *.wav
-│   └── real/
-│       ├── positive/
-│       │   └── *.wav
-│       └── negative/
-│           └── hey_ava/
-│               └── *.wav
-├── fbank/                         # written by prepare script (mirrors raw tree, .npy)
-└── manifests/                     # written by prepare script
-    ├── tts_train.csv
-    ├── tts_eval.csv
-    ├── real_train.csv
-    └── real_eval.csv
-```
-
-**Label and text rules**
-
-| Location | `label` | `text` (G2P query) |
-|----------|---------|---------------------|
-| `*/positive/*.wav` | `1` | `adapt.keyword` exactly (e.g. `hey eva`) |
-| `*/negative/<slug>/*.wav` | `0` | folder slug with `_` → spaces (e.g. `hey_ava` → `hey ava`) |
-
-All `text` values are validated through G2P at prepare time; invalid phrases fail early.
-
-**Prepare command**
-
-Runs G2P check → Kaldi fbank (from `configs/fbank/default.yaml`, 80-dim, dither 0.1) → train/eval split:
-
-```bash
-python3 scripts/prepare_keyword_adaptation.py adapt.keyword="hey eva"
-```
-
-Useful overrides:
-
-| Override | Default | Meaning |
-|----------|---------|---------|
-| `adapt.eval_fraction` | `0.2` | Held-out fraction per phase (`tts`, `real`) |
-| `adapt.eval_seed` | `2025` | Shuffle seed for train/eval split |
-| `prep.no_skip_existing=true` | off | Recompute all fbank even if `.npy` exists |
-| `adapt.data_root=...` | `${paths.processed_root}/adapt/<slug>` | Custom data root |
-| `prep.manifest_csv=...` | — | Skip directory scan; CSV with columns `audio_path,text,label` |
-
-**Manifest columns**
-
-- **Train** (`{phase}_train.csv`): `audio_path,text,label` — `audio_path` relative to `data_root`.
-- **Eval** (`{phase}_eval.csv`): `audio_path,text,keyword,label` — used for target-word validation and `eval_stage2_clips`.
-
-**Training phase order (paper III-E)**
-
-1. `adapt.phase=tts` — LoRA on synthetic data (+ LibriPhrase 1:1 mix).
-2. `adapt.phase=real` — continue LoRA on real data; loads TTS adapter weights on top of the **same SI base checkpoint** (do not pass the merged TTS checkpoint as `prep.stage2_ckpt`).
-
-#### Config reference
-
-Defaults live in `configs/adapt/default.yaml`. Override on the CLI with `adapt.<key>=...` or `prep.<key>=...`.
-
-**Identity and paths**
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `adapt.keyword` | `hey eva` | Wake phrase; drives anchor G2P and slug |
-| `adapt.slug` | `""` | Filesystem slug override; empty → auto from keyword |
-| `adapt.data_root` | `""` | Data directory; empty → `paths.processed_root/adapt/<slug>` |
-| `adapt.exp_root` | `""` | Experiment output; empty → `paths.exp_root/stage2_adapt/<slug>` |
-| `adapt.phase` | `tts` | Training phase: `tts` or `real` |
-| `adapt.stage` | `all` | Orchestrator stage: `prepare`, `sweep`, `train`, `eval`, or `all` |
-
-**LoRA and optimizer** (paper defaults: rank 16, lr 4e-4, alpha = 2×rank)
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `adapt.rank` | `16` | LoRA rank on QbyT matcher attention |
-| `adapt.alpha` | `32` | LoRA scaling (`alpha/rank` applied to `B@A`) |
-| `adapt.lr` / `adapt.learning_rate` | `4e-4` | Adam learning rate (LoRA params only) |
-| `adapt.optimizer` | `adam` | `adam` or `adamw` |
-| `adapt.weight_decay` | `0` | Weight decay (AdamW only) |
-| `adapt.warmup_steps` | `100` | Cosine schedule warmup |
-| `adapt.max_steps` | `3000` | Training steps per phase |
-| `adapt.lora_targets` | `in_proj_weight`, `out_proj` | Attention matrices to inject LoRA |
-
-**Data mixing and loading**
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `adapt.mix_ratio` | `0.5` | Keyword : LibriPhrase sampling ratio (0.5 = 1:1 anti-forgetting) |
-| `adapt.sample_lens` | `3000` | Virtual epoch length (random resampling) |
-| `adapt.batch_size_per_gpu` | `64` | Train batch size |
-| `adapt.val_batch_size` | `64` | Target-keyword val batch size |
-| `adapt.num_workers` | `2` | DataLoader workers |
-
-**Checkpoint inputs**
-
-| Key | Description |
-|-----|-------------|
-| `prep.stage2_ckpt` | **Required** SI Stage II base checkpoint for adaptation |
-| `adapt.init_checkpoint` | Alternative to `prep.stage2_ckpt` |
-| `adapt.params_file` | YAML with sweep best params (e.g. `exp/stage2_adapt/<slug>/sweep/best_params.yaml`) |
-| `run.limit_steps` | Cap steps (smoke tests); overrides `adapt.max_steps` when set |
-
-**Optuna sweep** (`adapt.sweep.*`; install `pip install -e '.[adapt]'`)
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `adapt.sweep.enabled` | `false` | Run sweep before training in `adapt.stage=all` |
-| `adapt.sweep.n_trials` | `20` | Number of Optuna trials |
-| `adapt.sweep.lambda_forget` | `1.0` | Penalty weight: `score = target_auc − λ × max(0, lph_base − lph_adapted)` |
-| `adapt.sweep.lph_subset` | `2000` | LibriPhrase pairs for fast LPH eval during sweep |
-| `adapt.sweep.single_phase` | `false` | TTS-only trials for quick search |
-| `adapt.sweep.search_mix` | `false` | Also search `mix_ratio` |
-| `adapt.sweep.storage` | auto | SQLite path (`exp/stage2_adapt/<slug>/sweep/optuna.db`) |
-
-**Example: adapt a new wake word on a shared server**
-
-```bash
-python3 scripts/run_keyword_adaptation.py \
-  adapt.keyword="hi lumina" \
-  prep.stage2_ckpt=/data/exp/stage2_si.pt \
-  paths.processed_root=/data/dma-kws/processed \
-  paths.exp_root=/data/dma-kws/exp \
-  stage2.parquet_file=/data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet \
-  stage2.wav_dir=/data/dma-kws/features/fbank \
-  adapt.stage=all
-```
-
-Place wavs under `/data/dma-kws/processed/adapt/hi_lumina/raw/...` before running. After training, load `exp/stage2_adapt/hi_lumina/stage2_adapted.pt` in inference via `prep.stage2_ckpt=...`.
+Outputs land under `exp/stage2_adapt/<slug>/` (`adapter_<slug>.pt`, merged `stage2_adapted.pt`, eval report). Full data layout, config tables, and step-by-step commands: [§8. Stage II LoRA continual adaptation](#8-stage-ii-lora-continual-adaptation).
 
 ### Checkpoints and resume
 
@@ -279,6 +135,10 @@ LibriPhrase (paper-format parquet + precomputed fbank .npy)
   -> Stage II Conformer + QbyT training
      demo: single phase (train_stage2_qbyt.py)
      paper: init -> avg -> finetune chain only (train_stage2_recipe.py)
+
+User keyword (optional, after SI Stage II)
+  -> LoRA on QbyT matcher, TTS -> real, LibriPhrase 1:1 mix
+  -> merged stage2_adapted.pt (see §8)
 ```
 
 **Inference** (Stage II required; Stage I locator swappable)
@@ -316,6 +176,10 @@ scripts/prepare_stage2_libriphrase.py  # alias for prepare_stage2_paper.py
 scripts/prepare_stage2_eval_fbank.py   # precompute LibriPhrase eval fbank .npy for Stage II validation
 scripts/train_stage2_qbyt.py           # demo + wenet-asr-init (single phase)
 scripts/train_stage2_recipe.py         # paper multi-phase chain only
+scripts/prepare_keyword_adaptation.py  # keyword LoRA: fbank + manifests (§8)
+scripts/adapt_stage2_keyword.py        # keyword LoRA: per-phase training (§8)
+scripts/sweep_adapt_lora.py            # keyword LoRA: Optuna hyperparameter search (§8)
+scripts/run_keyword_adaptation.py      # keyword LoRA: prepare/sweep/train/eval orchestrator (§8)
 scripts/eval_stage2_libriphrase.py
 scripts/run_stage2_demo.py             # Stage II-only single clip inference
 scripts/eval_stage2_clips.py           # Stage II-only batch clip eval (manifest)
@@ -1020,7 +884,204 @@ Notes:
 
 ---
 
-## 8. Run the two-stage demo
+## 8. Stage II LoRA continual adaptation
+
+Paper Section III-E: freeze the full model, LoRA-tune **QbyT phoneme matcher attention QKV** on **TTS → real** data with **LibriPhrase : keyword = 1:1** anti-forgetting mix. Requires a trained SI Stage II checkpoint ([§7](#7-stage-ii-train-qbyt-verifier)).
+
+**Data layout** (slug from `adapt.keyword`, e.g. `hey eva` → `hey_eva`; default root `${paths.processed_root}/adapt/<slug>`):
+
+```text
+data/dma-kws/processed/adapt/<slug>/raw/{tts,real}/{positive,negative/<neg_text_slug>}/...
+data/dma-kws/processed/adapt/<slug>/fbank/...
+data/dma-kws/processed/adapt/<slug>/manifests/{tts,real}_{train,eval}.csv
+```
+
+**One command** (prepare → optional Optuna sweep → TTS phase → real phase → eval report):
+
+```bash
+pip install -e '.[adapt]'   # adds optuna for sweep
+
+python3 scripts/run_keyword_adaptation.py \
+  adapt.keyword="hey eva" \
+  prep.stage2_ckpt=/path/to/stage2_si.pt \
+  adapt.stage=all
+```
+
+**Step-by-step:**
+
+```bash
+# 1. Prepare fbank + manifests
+python3 scripts/prepare_keyword_adaptation.py adapt.keyword="hey eva"
+
+# 2. Optional hyperparameter search (TPE + MedianPruner)
+python3 scripts/sweep_adapt_lora.py adapt.keyword="hey eva" prep.stage2_ckpt=/path/to/stage2_si.pt
+
+# 3. Two-phase LoRA training (real resumes TTS adapter on same SI base)
+python3 scripts/adapt_stage2_keyword.py adapt.keyword="hey eva" adapt.phase=tts prep.stage2_ckpt=/path/to/stage2_si.pt
+python3 scripts/adapt_stage2_keyword.py adapt.keyword="hey eva" adapt.phase=real prep.stage2_ckpt=/path/to/stage2_si.pt
+
+# 4. Eval: base vs adapted under exp/stage2_adapt/<slug>/reports/
+python3 scripts/run_keyword_adaptation.py adapt.keyword="hey eva" prep.stage2_ckpt=/path/to/stage2_si.pt adapt.stage=eval
+```
+
+Outputs: `exp/stage2_adapt/<slug>/adapter_<slug>.pt` (small LoRA only), `stage2_adapted.pt` (merged, loadable by `Stage2Verifier`). To adapt another wake word, change `adapt.keyword` and place data under `data/dma-kws/processed/adapt/<new_slug>/raw/...`.
+
+### Data preparation
+
+**Prerequisites**
+
+| Item | Purpose |
+|------|---------|
+| SI Stage II checkpoint | Base weights to adapt (`prep.stage2_ckpt` or `adapt.init_checkpoint`); same format as normal Stage II export (`stage2_*.pt`) |
+| Keyword audio | TTS synthetic + real recordings, positives and confusable negatives |
+| LibriPhrase parquet + fbank | Anti-forgetting mix during training (`stage2.parquet_file`, `stage2.wav_dir`); same as standard Stage II training |
+| LibriPhrase eval (optional) | LPH hard-split monitoring during training and in `eval_report.json` |
+
+**Directory layout (recommended)**
+
+Place wav files under `raw/` using phase (`tts` / `real`), polarity, and negative phrase slug. The slug is derived automatically from `adapt.keyword` unless you override `adapt.data_root`.
+
+Example for `adapt.keyword="hey eva"`:
+
+```text
+data/dma-kws/processed/adapt/hey_eva/
+├── raw/
+│   ├── tts/
+│   │   ├── positive/              # label=1, text="hey eva"
+│   │   │   └── *.wav
+│   │   └── negative/
+│   │       ├── hey_ava/           # label=0, text="hey ava"  (folder slug → phrase)
+│   │       │   └── *.wav
+│   │       └── hey_eve/
+│   │           └── *.wav
+│   └── real/
+│       ├── positive/
+│       │   └── *.wav
+│       └── negative/
+│           └── hey_ava/
+│               └── *.wav
+├── fbank/                         # written by prepare script (mirrors raw tree, .npy)
+└── manifests/                     # written by prepare script
+    ├── tts_train.csv
+    ├── tts_eval.csv
+    ├── real_train.csv
+    └── real_eval.csv
+```
+
+**Label and text rules**
+
+| Location | `label` | `text` (G2P query) |
+|----------|---------|---------------------|
+| `*/positive/*.wav` | `1` | `adapt.keyword` exactly (e.g. `hey eva`) |
+| `*/negative/<slug>/*.wav` | `0` | folder slug with `_` → spaces (e.g. `hey_ava` → `hey ava`) |
+
+All `text` values are validated through G2P at prepare time; invalid phrases fail early.
+
+**Prepare command**
+
+Runs G2P check → Kaldi fbank (from `configs/fbank/default.yaml`, 80-dim, dither 0.1) → train/eval split:
+
+```bash
+python3 scripts/prepare_keyword_adaptation.py adapt.keyword="hey eva"
+```
+
+Useful overrides:
+
+| Override | Default | Meaning |
+|----------|---------|---------|
+| `adapt.eval_fraction` | `0.2` | Held-out fraction per phase (`tts`, `real`) |
+| `adapt.eval_seed` | `2025` | Shuffle seed for train/eval split |
+| `prep.no_skip_existing=true` | off | Recompute all fbank even if `.npy` exists |
+| `adapt.data_root=...` | `${paths.processed_root}/adapt/<slug>` | Custom data root |
+| `prep.manifest_csv=...` | — | Skip directory scan; CSV with columns `audio_path,text,label` |
+
+**Manifest columns**
+
+- **Train** (`{phase}_train.csv`): `audio_path,text,label` — `audio_path` relative to `data_root`.
+- **Eval** (`{phase}_eval.csv`): `audio_path,text,keyword,label` — used for target-word validation and `eval_stage2_clips`.
+
+**Training phase order (paper III-E)**
+
+1. `adapt.phase=tts` — LoRA on synthetic data (+ LibriPhrase 1:1 mix).
+2. `adapt.phase=real` — continue LoRA on real data; loads TTS adapter weights on top of the **same SI base checkpoint** (do not pass the merged TTS checkpoint as `prep.stage2_ckpt`).
+
+### Config reference
+
+Defaults live in `configs/adapt/default.yaml`. Override on the CLI with `adapt.<key>=...` or `prep.<key>=...`.
+
+**Identity and paths**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `adapt.keyword` | `hey eva` | Wake phrase; drives anchor G2P and slug |
+| `adapt.slug` | `""` | Filesystem slug override; empty → auto from keyword |
+| `adapt.data_root` | `""` | Data directory; empty → `paths.processed_root/adapt/<slug>` |
+| `adapt.exp_root` | `""` | Experiment output; empty → `paths.exp_root/stage2_adapt/<slug>` |
+| `adapt.phase` | `tts` | Training phase: `tts` or `real` |
+| `adapt.stage` | `all` | Orchestrator stage: `prepare`, `sweep`, `train`, `eval`, or `all` |
+
+**LoRA and optimizer** (paper defaults: rank 16, lr 4e-4, alpha = 2×rank)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `adapt.rank` | `16` | LoRA rank on QbyT matcher attention |
+| `adapt.alpha` | `32` | LoRA scaling (`alpha/rank` applied to `B@A`) |
+| `adapt.lr` / `adapt.learning_rate` | `4e-4` | Adam learning rate (LoRA params only) |
+| `adapt.optimizer` | `adam` | `adam` or `adamw` |
+| `adapt.weight_decay` | `0` | Weight decay (AdamW only) |
+| `adapt.warmup_steps` | `100` | Cosine schedule warmup |
+| `adapt.max_steps` | `3000` | Training steps per phase |
+| `adapt.lora_targets` | `in_proj_weight`, `out_proj` | Attention matrices to inject LoRA |
+
+**Data mixing and loading**
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `adapt.mix_ratio` | `0.5` | Keyword : LibriPhrase sampling ratio (0.5 = 1:1 anti-forgetting) |
+| `adapt.sample_lens` | `3000` | Virtual epoch length (random resampling) |
+| `adapt.batch_size_per_gpu` | `64` | Train batch size |
+| `adapt.val_batch_size` | `64` | Target-keyword val batch size |
+| `adapt.num_workers` | `2` | DataLoader workers |
+
+**Checkpoint inputs**
+
+| Key | Description |
+|-----|-------------|
+| `prep.stage2_ckpt` | **Required** SI Stage II base checkpoint for adaptation |
+| `adapt.init_checkpoint` | Alternative to `prep.stage2_ckpt` |
+| `adapt.params_file` | YAML with sweep best params (e.g. `exp/stage2_adapt/<slug>/sweep/best_params.yaml`) |
+| `run.limit_steps` | Cap steps (smoke tests); overrides `adapt.max_steps` when set |
+
+**Optuna sweep** (`adapt.sweep.*`; install `pip install -e '.[adapt]'`)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `adapt.sweep.enabled` | `false` | Run sweep before training in `adapt.stage=all` |
+| `adapt.sweep.n_trials` | `20` | Number of Optuna trials |
+| `adapt.sweep.lambda_forget` | `1.0` | Penalty weight: `score = target_auc − λ × max(0, lph_base − lph_adapted)` |
+| `adapt.sweep.lph_subset` | `2000` | LibriPhrase pairs for fast LPH eval during sweep |
+| `adapt.sweep.single_phase` | `false` | TTS-only trials for quick search |
+| `adapt.sweep.search_mix` | `false` | Also search `mix_ratio` |
+| `adapt.sweep.storage` | auto | SQLite path (`exp/stage2_adapt/<slug>/sweep/optuna.db`) |
+
+**Example: adapt a new wake word on a shared server**
+
+```bash
+python3 scripts/run_keyword_adaptation.py \
+  adapt.keyword="hi lumina" \
+  prep.stage2_ckpt=/data/exp/stage2_si.pt \
+  paths.processed_root=/data/dma-kws/processed \
+  paths.exp_root=/data/dma-kws/exp \
+  stage2.parquet_file=/data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet \
+  stage2.wav_dir=/data/dma-kws/features/fbank \
+  adapt.stage=all
+```
+
+Place wavs under `/data/dma-kws/processed/adapt/hi_lumina/raw/...` before running. After training, use `exp/stage2_adapt/hi_lumina/stage2_adapted.pt` as `prep.stage2_ckpt` in [§9](#9-run-the-two-stage-demo) or [§10](#10-stage-ii-only-clip-inference).
+
+---
+
+## 9. Run the two-stage demo
 
 After both stages have checkpoints:
 
@@ -1077,7 +1138,7 @@ Output is JSON:
 
 ---
 
-## 8b. Stage II-only clip inference
+## 10. Stage II-only clip inference
 
 Use this path when each input audio file is already a cropped keyword clip and you want to test the Stage II QbyT verifier without any Stage I locator. This is useful for LibriPhrase-style positive clips, Stage II ablations, and quick checkpoint smoke tests when no Stage I checkpoint is available.
 
