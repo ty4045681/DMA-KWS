@@ -4,6 +4,8 @@ import pytest
 
 from dma_kws.inference.manifest import load_manifest
 from dma_kws.inference.metrics import summarize_labeled_results
+from scripts.eval_stage2_clips import _result_record as stage2_clip_result_record
+from scripts.eval_two_stage_kws import _result_record as two_stage_result_record
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -51,3 +53,56 @@ def test_summarize_labeled_results_empty_without_labels():
     results = [{"best_qbyt_score": 0.5, "detected": True}]
 
     assert summarize_labeled_results(results, threshold=0.5) == {}
+
+
+def test_two_stage_result_record_includes_manifest_meta_for_extra_columns():
+    manifest_row = {
+        "audio_path": "/tmp/audio.wav",
+        "keyword": "hello",
+        "label": "1",
+        "speaker_id": "spk-001",
+        "source_split": "dev",
+    }
+    pipeline_result = {
+        "detected": True,
+        "best_qbyt_score": 0.91,
+        "threshold": 0.5,
+        "stage1_candidates": [],
+        "stage2_scores": [],
+    }
+
+    record = two_stage_result_record(manifest_row, pipeline_result)
+
+    assert record["audio_path"] == "/tmp/audio.wav"
+    assert record["keyword"] == "hello"
+    assert record["label"] == 1
+    assert record["manifest_meta"] == {
+        "speaker_id": "spk-001",
+        "source_split": "dev",
+    }
+
+
+def test_stage2_clip_result_record_includes_manifest_meta_for_extra_columns():
+    manifest_row = {
+        "audio_path": "/tmp/audio.wav",
+        "keyword": "hello",
+        "label": "0",
+        "speaker_id": "spk-002",
+        "utterance_id": "utt-77",
+    }
+    runner_result = {
+        "qbyt_score": 0.12,
+        "detected": False,
+        "threshold": 0.5,
+        "skipped": False,
+    }
+
+    record = stage2_clip_result_record(manifest_row, runner_result)
+
+    assert record["audio_path"] == "/tmp/audio.wav"
+    assert record["keyword"] == "hello"
+    assert record["label"] == 0
+    assert record["manifest_meta"] == {
+        "speaker_id": "spk-002",
+        "utterance_id": "utt-77",
+    }

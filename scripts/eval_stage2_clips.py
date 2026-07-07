@@ -28,6 +28,14 @@ def _result_record(manifest_row: dict, runner_result: dict) -> dict:
     }
     if "label" in manifest_row:
         record["label"] = int(manifest_row["label"])
+
+    manifest_meta = {
+        key: value
+        for key, value in manifest_row.items()
+        if key not in {"audio_path", "keyword", "label"}
+    }
+    if manifest_meta:
+        record["manifest_meta"] = manifest_meta
     return record
 
 
