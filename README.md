@@ -1222,7 +1222,7 @@ python3 scripts/eval_stage2_clips.py \
 
 In `auto_assign` mode, unmatched files are skipped when `prep.skip_unmatched=true` (default), and the script summary reports counts and examples of skipped files.
 
-Default output directory: `outputs/eval_stage2_clips` (`prep.stage2_clip_output_dir`). Override with `prep.output_dir=/path/to/output` if needed. The script writes `results.jsonl` with per-clip scores and `summary.json` with accuracy, precision, recall, f1, auc, and eer when labels are present.
+Default output directory: `outputs/eval_stage2_clips` (`prep.stage2_clip_output_dir`). Override with `prep.output_dir=/path/to/output` if needed. The script writes `results.jsonl` with per-clip scores and `summary.json` with accuracy, precision, recall, f1, auc, and eer when labels are present. If a manifest row contains extra columns beyond `audio_path`, `keyword`, and optional `label`, those key-value pairs are copied into `results.jsonl` under `manifest_meta`.
 
 ---
 
@@ -1303,7 +1303,7 @@ python3 scripts/eval_two_stage_kws.py \
   locator.wekws.symbol_table=/path/units.txt
 ```
 
-Default output directory: `outputs/eval_two_stage_kws` (`prep.output_dir`). Writes `results.jsonl` (per-utterance detections and scores) and `summary.json` (accuracy, precision, recall, f1, auc, eer when labels are present).
+Default output directory: `outputs/eval_two_stage_kws` (`prep.output_dir`). Writes `results.jsonl` (per-utterance detections and scores) and `summary.json` (accuracy, precision, recall, f1, auc, eer when labels are present). If a manifest row contains extra columns beyond `audio_path`, `keyword`, and optional `label`, those key-value pairs are copied into `results.jsonl` under `manifest_meta`.
 
 ---
 
