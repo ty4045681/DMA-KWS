@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 
 _REQUIRED_COLUMNS = ("audio_path", "keyword")
@@ -83,6 +83,69 @@ def iter_audio_files(
     )
 
 
+def normalize_keyword(value: str, *, casefold: bool = True) -> str:
+    """Normalize a keyword-like string for robust matching.
+
+    Normalization removes spaces and underscores. Matching can optionally be
+    case-insensitive via ``casefold``.
+    """
+    text = value.casefold() if casefold else value
+    return "".join(char for char in text if char not in {" ", "_"})
+
+
+def filename_keyword_candidate(audio_path: str | Path) -> str:
+    """Extract the keyword candidate from filename stem.
+
+    Rule: split stem by ``_``, drop the last segment, and join the remaining
+    segments without separators.
+    """
+    stem = Path(audio_path).stem
+    parts = [part for part in stem.split("_") if part != ""]
+    if len(parts) <= 1:
+        return ""
+    return "".join(parts[:-1])
+
+
+def _keyword_lookup(
+    keywords: Sequence[str],
+    *,
+    casefold: bool,
+) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for keyword in keywords:
+        normalized = normalize_keyword(keyword, casefold=casefold)
+        if not normalized:
+            raise ValueError("keywords must contain non-empty strings")
+        previous = lookup.get(normalized)
+        if previous is not None and previous != keyword:
+            raise ValueError(
+                f"Ambiguous keywords after normalization: '{previous}' and '{keyword}'"
+            )
+        lookup[normalized] = keyword
+    return lookup
+
+
+def match_keyword_from_filename(
+    audio_path: str | Path,
+    keywords: Sequence[str],
+    *,
+    casefold: bool = True,
+) -> str | None:
+    """Match an audio filename to one keyword from ``keywords``.
+
+    Filename candidate is extracted via :func:`filename_keyword_candidate`.
+    Keyword comparison uses :func:`normalize_keyword`.
+    """
+    if not keywords:
+        raise ValueError("keywords must not be empty")
+    lookup = _keyword_lookup(keywords, casefold=casefold)
+    candidate = filename_keyword_candidate(audio_path)
+    if not candidate:
+        return None
+    normalized_candidate = normalize_keyword(candidate, casefold=casefold)
+    return lookup.get(normalized_candidate)
+
+
 def build_manifest_rows(
     audio_paths: Sequence[str | Path],
     keyword: str,
@@ -118,6 +181,67 @@ def build_manifest_rows(
             row["label"] = int(label)
         rows.append(row)
     return rows
+
+
+def build_manifest_rows_by_filename(
+    audio_paths: Sequence[str | Path],
+    keywords: Sequence[str],
+    *,
+    keyword_labels: Mapping[str, int] | None = None,
+    manifest_dir: str | Path | None = None,
+    relative: bool = True,
+    skip_unmatched: bool = True,
+    casefold: bool = True,
+) -> tuple[list[dict], list[str]]:
+    """Build manifest rows by assigning each file a keyword from its filename.
+
+    Returns ``(rows, unmatched_paths)``. Labels are assigned by exact keyword
+    text through ``keyword_labels``.
+    """
+    if not keywords:
+        raise ValueError("keywords must not be empty")
+    if keyword_labels is None:
+        raise ValueError("keyword_labels is required for filename assignment mode")
+
+    lookup = _keyword_lookup(keywords, casefold=casefold)
+    missing_label_keywords = [keyword for keyword in lookup.values() if keyword not in keyword_labels]
+    if missing_label_keywords:
+        missing_display = ", ".join(sorted(missing_label_keywords))
+        raise ValueError(f"Missing labels for keywords: {missing_display}")
+
+    base_dir = Path(manifest_dir).resolve() if manifest_dir is not None else None
+    rows: list[dict] = []
+    unmatched: list[str] = []
+    for audio_path in audio_paths:
+        resolved = Path(audio_path).resolve()
+        candidate = filename_keyword_candidate(resolved)
+        matched_keyword = lookup.get(normalize_keyword(candidate, casefold=casefold)) if candidate else None
+        if matched_keyword is None:
+            unmatched.append(str(resolved))
+            if skip_unmatched:
+                continue
+            raise ValueError(f"No keyword matched for file: {resolved}")
+
+        if relative and base_dir is not None:
+            try:
+                written_path = str(resolved.relative_to(base_dir))
+            except ValueError:
+                written_path = str(resolved)
+        else:
+            written_path = str(resolved)
+
+        rows.append(
+            {
+                "audio_path": written_path,
+                "keyword": matched_keyword,
+                "label": int(keyword_labels[matched_keyword]),
+            }
+        )
+
+    if not rows:
+        raise ValueError("No files matched any keyword")
+
+    return rows, unmatched
 
 
 def write_manifest(

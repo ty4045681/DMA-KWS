@@ -1183,18 +1183,44 @@ Output is JSON:
 
 Batch evaluation uses the same manifest format as the two-stage batch runner: `audio_path`, `keyword`, and optional `label`. In this mode, each `audio_path` must point to a cropped clip.
 
+`scripts/prepare_two_stage_manifest.py` now supports two manifest build modes:
+
+- **single** (default): one `prep.keyword` shared by all audio files.
+- **auto_assign**: infer per-file keyword from filename, then assign labels via `prep.keyword_labels`.
+
+`auto_assign` filename rule:
+
+1. Take file stem (without extension).
+2. Split by `_`.
+3. Drop the last segment.
+4. Join remaining segments and match against `prep.keywords` after normalization (lowercase, ignore spaces/underscores).
+
+Example: `hey_eva_001.wav` -> candidate `heyeva`, matches `"hey eva"`.
+
 ```bash
+# Single keyword mode (backward-compatible)
 python3 scripts/prepare_two_stage_manifest.py \
   prep.input_dir=/path/to/keyword_clips \
   prep.keyword="hey eva" \
   prep.output=/path/stage2_clip_manifest.csv \
   prep.label=1
 
+# Multi-keyword auto assignment mode
+python3 scripts/prepare_two_stage_manifest.py \
+  prep.input_dir=/path/to/keyword_clips \
+  prep.keyword_mode=auto_assign \
+  prep.keywords='["hey eva","ok lamp","wake up"]' \
+  prep.keyword_labels='{"hey eva":1,"ok lamp":0,"wake up":1}' \
+  prep.skip_unmatched=true \
+  prep.output=/path/stage2_clip_manifest.csv
+
 python3 scripts/eval_stage2_clips.py \
   +experiment=wenet_asr_stage2 \
   prep.manifest=/path/stage2_clip_manifest.csv \
   prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step050000.pt
 ```
+
+In `auto_assign` mode, unmatched files are skipped when `prep.skip_unmatched=true` (default), and the script summary reports counts and examples of skipped files.
 
 Default output directory: `outputs/eval_stage2_clips` (`prep.stage2_clip_output_dir`). Override with `prep.output_dir=/path/to/output` if needed. The script writes `results.jsonl` with per-clip scores and `summary.json` with accuracy, precision, recall, f1, auc, and eer when labels are present.
 
@@ -1238,14 +1264,27 @@ With the default `phoneme_ctc` locator, also pass `prep.stage1_ckpt=...`.
 
 Batch evaluation reads a manifest with columns `audio_path`, `keyword`, and optional `label`. Both CSV and JSONL are supported; relative `audio_path` values are resolved against the manifest's own directory.
 
-Step 1 (optional): generate a manifest from a folder of audio that all share one keyword. Pass `prep.label=1` to mark them all as positives (enables precision/recall/f1 in the summary), or omit it to leave the manifest unlabeled.
+Step 1 (optional): generate a manifest from a folder of audio.
+
+- Use **single** mode when all files share one keyword.
+- Use **auto_assign** mode when different files map to different keywords by filename.
 
 ```bash
+# single mode
 python3 scripts/prepare_two_stage_manifest.py \
   prep.input_dir=/path/to/audio_folder \
   prep.keyword="hey eva" \
   prep.output=/path/manifest.csv \
   prep.label=1
+
+# auto_assign mode (per-keyword labels)
+python3 scripts/prepare_two_stage_manifest.py \
+  prep.input_dir=/path/to/audio_folder \
+  prep.keyword_mode=auto_assign \
+  prep.keywords='["hey eva","ok lamp"]' \
+  prep.keyword_labels='{"hey eva":1,"ok lamp":0}' \
+  prep.skip_unmatched=true \
+  prep.output=/path/manifest.csv
 ```
 
 Extra options: `prep.recursive=false` limits scanning to the top-level directory, `prep.manifest_format=jsonl` (or a `.jsonl` output suffix) writes JSONL, and `prep.limit=N` caps the number of files for a quick smoke run. The scanner picks up `.wav`, `.flac`, `.mp3`, and `.m4a` files.

@@ -35,6 +35,11 @@ stage1_ckpt: ""
 stage2_ckpt: ""
 audio: ""
 keyword: ""
+keyword_mode: single
+keywords: []
+keyword_labels: {}
+skip_unmatched: true
+match_casefold: true
 recursive: true
 manifest_format: auto
 label: ""
