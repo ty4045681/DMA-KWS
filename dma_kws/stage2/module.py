@@ -84,23 +84,55 @@ class Stage2LightningModule(pl.LightningModule):
 
     def _load_init_checkpoint(self, checkpoint_path: Path) -> None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        state = extract_state_dict(checkpoint)
+        
+        # Check if this is an icefall checkpoint (has "model" key)
+        # vs standard DMA-KWS checkpoint (has "state_dict", "model_state_dict", etc)
+        from dma_kws.training.checkpoint_io import extract_icefall_encoder_state
+        
+        is_icefall_format = "model" in checkpoint and "encoder_embed" in checkpoint.get("model", {})
+        
+        if is_icefall_format:
+            # Load from icefall Zipformer checkpoint
+            icefall_states = extract_icefall_encoder_state(checkpoint_path)
+            
+            # Check if encoder has submodules (icefall adapter has encoder_embed + encoder)
+            encoder_embed_state = icefall_states.get("encoder_embed", {})
+            encoder_state = icefall_states.get("encoder", {})
+            
+            if hasattr(self.encoder, "encoder_embed") and encoder_embed_state:
+                missing, unexpected = self.encoder.encoder_embed.load_state_dict(
+                    encoder_embed_state, strict=False
+                )
+                print(
+                    f"Loaded encoder_embed weights from {checkpoint_path}: "
+                    f"missing={len(missing)} unexpected={len(unexpected)}"
+                )
+            
+            if hasattr(self.encoder, "encoder") and encoder_state:
+                missing, unexpected = self.encoder.encoder.load_state_dict(encoder_state, strict=False)
+                print(
+                    f"Loaded encoder weights from {checkpoint_path}: "
+                    f"missing={len(missing)} unexpected={len(unexpected)}"
+                )
+        else:
+            # Standard DMA-KWS checkpoint (Lightning or custom format)
+            state = extract_state_dict(checkpoint)
+            
+            encoder_state = _split_submodule_state(state, "encoder")
+            qbyt_state = _split_submodule_state(state, "qbyt")
 
-        encoder_state = _split_submodule_state(state, "encoder")
-        qbyt_state = _split_submodule_state(state, "qbyt")
-
-        if encoder_state:
-            missing, unexpected = self.encoder.load_state_dict(encoder_state, strict=False)
-            print(
-                f"Loaded encoder weights from {checkpoint_path}: "
-                f"missing={len(missing)} unexpected={len(unexpected)}"
-            )
-        if qbyt_state:
-            missing, unexpected = self.qbyt.load_state_dict(qbyt_state, strict=False)
-            print(
-                f"Loaded QbyT weights from {checkpoint_path}: "
-                f"missing={len(missing)} unexpected={len(unexpected)}"
-            )
+            if encoder_state:
+                missing, unexpected = self.encoder.load_state_dict(encoder_state, strict=False)
+                print(
+                    f"Loaded encoder weights from {checkpoint_path}: "
+                    f"missing={len(missing)} unexpected={len(unexpected)}"
+                )
+            if qbyt_state:
+                missing, unexpected = self.qbyt.load_state_dict(qbyt_state, strict=False)
+                print(
+                    f"Loaded QbyT weights from {checkpoint_path}: "
+                    f"missing={len(missing)} unexpected={len(unexpected)}"
+                )
 
     def forward(
         self,

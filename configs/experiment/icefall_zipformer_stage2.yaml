@@ -1,0 +1,88 @@
+# @package _global_
+# Stage II training with Icefall Zipformer2 encoder (frozen)
+#
+# Usage:
+#   export ICEFALL_ROOT=/path/to/icefall
+#   export ICEFALL_CHECKPOINT=/path/to/icefall_checkpoint.pt
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2 \
+#     run.freeze_encoder=true
+#
+# This config:
+# - Uses icefall Zipformer2 encoder as Stage II encoder (instead of Wenet Conformer)
+# - Freezes encoder, trains only QbyT verifier head (~500k params vs 10M+ for full model)
+# - Trains on LibriPhrase-100 (demo) or -460 (paper scale)
+# - Loads icefall checkpoint from ICEFALL_CHECKPOINT env var
+
+defaults:
+  - override /paths: default
+  - override /stage1: icefall_zipformer
+
+paths:
+  libriphrase100_root: data/dma-kws/raw/LibriPhrase-100
+
+training:
+  recipe: icefall-zipformer-frozen
+
+stage1:
+  # All params inherited from icefall_zipformer.yaml config above
+  causal: false  # Non-causal for offline verification (full context)
+
+stage2:
+  # Encoder output dimension = max(encoder_dim) = 128 from icefall config
+  encoder_output_dim: 128
+  qbyt_embed_dim: 128  # Must match encoder_output_dim for alignment
+  qbyt_layers: 2
+
+  # Load weights from icefall KWS checkpoint
+  # Set via env var at runtime: export ICEFALL_CHECKPOINT=/path/to/checkpoint.pt
+  init_checkpoint: ${oc.env:ICEFALL_CHECKPOINT,""}
+
+  # Freeze encoder, train only QbyT
+  freeze_encoder: true
+
+  # Training hyperparams (tuned for downstream QbyT training)
+  negative_ratio: 1
+  hard_negative_ratio: 1
+  sample_lens: 5000
+  batch_size_per_gpu: 128
+  num_workers: 4
+
+  learning_rate: 0.0005
+  warmup_steps: 500
+  total_scheduler_steps: 10000
+  accumulate_grad_batches: 1
+  precision: bf16-mixed
+  optimizer: adam
+  weight_decay: 0.0
+  strategy: auto
+  gradient_clip_val: 1.0
+
+  log_interval: 10
+  val_check_interval: 500
+
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen
+  run_name: icefall-zipformer-frozen
+
+  dataloader:
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+
+  logging:
+    backends: [csv, tensorboard]
+    wandb:
+      project: dma-kws
+      mode: online
+
+  validation:
+    batch_size: 128
+    val_check_interval: 500
+
+  eval:
+    split: easy
+    batch_size: 128
+
+  checkpoint:
+    every_n_train_steps: 500
+    save_top_k: 3

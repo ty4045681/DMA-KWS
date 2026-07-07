@@ -21,6 +21,77 @@ def extract_state_dict(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:
     return checkpoint
 
 
+def extract_icefall_encoder_state(
+    checkpoint_path: Path | str,
+) -> dict[str, dict[str, torch.Tensor]]:
+    """Extract encoder weights from an icefall Zipformer KWS checkpoint.
+    
+    Icefall checkpoints are structured as:
+    {
+        "model": {
+            "encoder_embed.0.weight": ...,
+            "encoder_embed.0.bias": ...,
+            "encoder.0.self_attn.weight": ...,
+            ...
+        },
+        "optimizer": ...,
+        "scheduler": ...,
+    }
+    
+    This function extracts the encoder_embed and encoder submodule states.
+    
+    Args:
+        checkpoint_path: Path to icefall .pt checkpoint
+    
+    Returns:
+        Dict with keys "encoder_embed" and "encoder", each containing
+        state dict for those submodules (with prefixes stripped).
+    
+    Raises:
+        FileNotFoundError: If checkpoint_path doesn't exist
+        ValueError: If checkpoint doesn't contain expected structure
+    """
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Icefall checkpoint not found: {checkpoint_path}")
+    
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    
+    # Extract model state dict
+    if "model" in checkpoint and isinstance(checkpoint["model"], dict):
+        model_state = checkpoint["model"]
+    else:
+        raise ValueError(
+            f"Icefall checkpoint format not recognized. "
+            f"Expected 'model' key, got keys: {list(checkpoint.keys())}"
+        )
+    
+    # Split encoder_embed and encoder states
+    encoder_embed_state: dict[str, torch.Tensor] = {}
+    encoder_state: dict[str, torch.Tensor] = {}
+    
+    for key, value in model_state.items():
+        if key.startswith("encoder_embed."):
+            # Remove "encoder_embed." prefix
+            new_key = key[len("encoder_embed."):]
+            encoder_embed_state[new_key] = value
+        elif key.startswith("encoder."):
+            # Remove "encoder." prefix
+            new_key = key[len("encoder."):]
+            encoder_state[new_key] = value
+    
+    if not encoder_embed_state and not encoder_state:
+        raise ValueError(
+            f"No encoder_embed or encoder weights found in checkpoint. "
+            f"Available keys: {list(model_state.keys())[:10]}..."
+        )
+    
+    return {
+        "encoder_embed": encoder_embed_state,
+        "encoder": encoder_state,
+    }
+
+
 def export_model_pt(
     model: torch.nn.Module,
     output_path: Path,

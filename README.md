@@ -30,6 +30,7 @@ This repository implements a two-stage keyword spotting pipeline with a **single
 6. [Stage II: prepare training data](#6-stage-ii-prepare-training-data)
 7. [Stage II: train QbyT verifier](#7-stage-ii-train-qbyt-verifier)
 7b. [Stage II: initialize from external Wenet ASR encoder](#7b-stage-ii-initialize-from-external-wenet-asr-encoder)
+7c. [Stage II: initialize from Icefall Zipformer encoder](#7c-stage-ii-initialize-from-icefall-zipformer-encoder)
 8. [Stage II LoRA continual adaptation](#8-stage-ii-lora-continual-adaptation)
 9. [Run the two-stage demo](#9-run-the-two-stage-demo)
 10. [Stage II-only clip inference](#10-stage-ii-only-clip-inference)
@@ -46,7 +47,7 @@ This repository implements a two-stage keyword spotting pipeline with a **single
 | Term | Meaning |
 |------|---------|
 | **experiment** | Hydra config overlay selected on the CLI, e.g. `+experiment=demo_librispeech100` |
-| **recipe** | `training.recipe` label for multi-phase Stage II chains: `init-ls-460`, `ft-ls-gs-1460`, `frozen-wenet-encoder`, `wenet-asr-init` |
+| **recipe** | `training.recipe` label for multi-phase Stage II chains: `init-ls-460`, `ft-ls-gs-1460`, `frozen-wenet-encoder`, `wenet-asr-init`, `icefall-zipformer-frozen` |
 | **demo preset** | Scale-only experiment (`demo_librispeech100`) — same algorithm as the paper, smaller data and step counts |
 
 Do not overload "recipe" to mean the whole codebase; the repo is one shared pipeline with multiple experiment/recipe presets.
@@ -79,7 +80,7 @@ Or edit `paths:` in `configs/experiment/<name>.yaml` or `configs/paths/default.y
 
 | Script | Use |
 |--------|-----|
-| `scripts/train_stage2_qbyt.py` | Demo single-phase training and Wenet ASR encoder init (`wenet_asr_stage2`, §7b) |
+| `scripts/train_stage2_qbyt.py` | Demo single-phase training, Wenet ASR encoder init (`wenet_asr_stage2`, §7b), and Icefall Zipformer encoder init (`icefall_zipformer_stage2`, §7c) |
 | `scripts/train_stage2_recipe.py` | Paper multi-phase chain only: `init-ls-460`, `ft-ls-gs-1460`, `frozen-wenet-encoder` |
 | `scripts/adapt_stage2_keyword.py` | Stage II LoRA continual adaptation for a user keyword (phoneme matcher QKV); see [§8](#8-stage-ii-lora-continual-adaptation) |
 | `scripts/run_keyword_adaptation.py` | One-command prepare → sweep → train → eval for keyword adaptation; see [§8](#8-stage-ii-lora-continual-adaptation) |
@@ -162,6 +163,8 @@ Default Stage I is the trained phoneme-CTC model. You can swap it for external l
 
 `+experiment=wenet_asr_stage2` seeds the Stage II **encoder** from an external Wenet ASR checkpoint; with the default `phoneme_ctc` locator, inference also needs a Stage I CTC checkpoint (`prep.stage1_ckpt`). That preset is distinct from `frozen-wenet-encoder` (`configs/experiment/frozen_wenet_encoder.yaml`), which freezes a **self-trained** Stage I encoder during paper-scale Stage II — see [docs/paper-reproduction.md](docs/paper-reproduction.md).
 
+`+experiment=icefall_zipformer_stage2` seeds the Stage II **encoder** from an Icefall Zipformer KWS checkpoint (requires `ICEFALL_ROOT` + `ICEFALL_CHECKPOINT` env vars). The Conformer encoder is replaced by Icefall's `Zipformer2`; `freeze_encoder=true` by default so only the QbyT head is trained — see [§7c](#7c-stage-ii-initialize-from-icefall-zipformer-encoder).
+
 Main entry points:
 
 ```text
@@ -189,7 +192,7 @@ scripts/run_two_stage_demo.py
 
 The repo vendors the Wenet toolkit under `wenet/` for encoder/tokenizer utilities. The legacy `qbyt/` reference scripts are not used by the Hydra training pipeline.
 
-Paper-scale configs: `+experiment=paper_ls460`, `+experiment=paper_ls_gs1460`, `+experiment=frozen_wenet_encoder`. Wenet ASR encoder init preset: `+experiment=wenet_asr_stage2`. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
+Paper-scale configs: `+experiment=paper_ls460`, `+experiment=paper_ls_gs1460`, `+experiment=frozen_wenet_encoder`. Wenet ASR encoder init preset: `+experiment=wenet_asr_stage2`. Icefall Zipformer encoder init preset: `+experiment=icefall_zipformer_stage2`. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
 
 Configs use [Hydra](https://hydra.cc/): base groups live under `configs/` (paths, stage1, stage2, …) and experiments are overlays in `configs/experiment/`. Select one with `+experiment=<name>` and override any leaf with dotlist syntax, e.g. `run.devices=2 run.limit_steps=20 stage2.learning_rate=0.001`.
 
@@ -881,6 +884,71 @@ Notes:
 
 - QbyT still uses the phoneme CharTokenizer at `data/dict/lang_char.txt` (same as the paper recipe). This path does **not** switch to Wenet BPE/subword tokenization.
 - On startup, look for `Loaded encoder weights from ...: missing=N unexpected=M`. Both counts should be low (ideally zero). High values usually mean the encoder yaml does not match the Wenet checkpoint or the checkpoint path is wrong.
+
+---
+
+## 7c. Stage II: initialize from Icefall Zipformer encoder
+
+Alternative to Wenet Conformer: seed the Stage II encoder from a pretrained [Icefall Zipformer KWS](https://github.com/k2-fsa/icefall/tree/master/egs/gigaspeech/KWS/zipformer) checkpoint. Use `+experiment=icefall_zipformer_stage2` with `scripts/train_stage2_qbyt.py`.
+
+By default `freeze_encoder=true` — only the QbyT phoneme matcher head is trained (~500k parameters). Two-stage **inference** still requires a separately trained Stage I CTC model for candidate proposal.
+
+Prerequisites:
+
+- An Icefall Zipformer KWS `.pt` checkpoint saved by `train.py` (contains a `model` key with `encoder_embed.*` and `encoder.*` weights).
+- The Icefall repository cloned locally.
+- `stage1` encoder parameters in the config must match the Icefall checkpoint (encoder_dim, num_encoder_layers, downsampling_factor, causal, etc.).
+
+Set environment variables referenced in the config:
+
+```bash
+export ICEFALL_ROOT=/path/to/icefall          # icefall repo root
+export ICEFALL_CHECKPOINT=/path/to/checkpoint.pt  # Zipformer KWS checkpoint
+```
+
+Full data prep and training chain:
+
+```bash
+python3 scripts/prepare_stage2_paper.py \
+  +experiment=icefall_zipformer_stage2 \
+  prep.input_parquet=data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
+
+python3 scripts/prepare_stage2_eval_fbank.py \
+  +experiment=icefall_zipformer_stage2 \
+  prep.from_csv=true
+
+CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
+  +experiment=icefall_zipformer_stage2 \
+  run.devices=2
+```
+
+Checkpoints are written under `data/dma-kws/exp/stage2_qbyt/checkpoints/icefall-zipformer-frozen/`.
+
+Smoke run:
+
+```bash
+python3 scripts/train_stage2_qbyt.py \
+  +experiment=icefall_zipformer_stage2 \
+  run.limit_steps=5 \
+  run.device=cpu
+```
+
+Override the checkpoint without editing the yaml:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
+  +experiment=icefall_zipformer_stage2 \
+  run.devices=2 \
+  run.init_checkpoint=/path/to/zipformer_kws.pt
+```
+
+Notes:
+
+- The Icefall encoder adapter (`dma_kws/stage2/icefall_encoder.py`) exposes the same `forward(feat, feat_lengths) → (encoder_out, encoder_mask)` interface as the Wenet Conformer, so the rest of the Stage II training pipeline is unchanged.
+- QbyT still uses the phoneme CharTokenizer at `data/dict/lang_char.txt`.
+- Default encoder output dimension is `max(encoder_dim) = 128` (Zipformer KWS recipe default), aligned with `stage2.qbyt_embed_dim: 128` — no extra projection layer is needed.
+- `causal: false` (default in `configs/stage1/icefall_zipformer.yaml`) is recommended for offline Stage II verification; use `causal: true` only when loading a checkpoint that was pretrained with `--causal=true`.
+- On startup, look for `Loaded encoder_embed weights from ...: missing=N unexpected=M` and `Loaded encoder weights from ...`. Both counts should be low. High unexpected counts usually mean a config mismatch (wrong `encoder_dim`, `num_encoder_layers`, etc.).
 
 ---
 
