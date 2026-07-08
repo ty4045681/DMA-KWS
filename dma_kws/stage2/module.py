@@ -11,17 +11,14 @@ import torch.nn.functional as F
 import torchmetrics
 
 from dma_kws.nn import build_encoder
-from dma_kws.pathing import ensure_qbyt_on_path
+from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage2.losses import compute_stage2_losses
 from dma_kws.training.checkpoint_io import extract_state_dict
 from dma_kws.training.scheduler import build_cosine_warmup_optimizer
 
 
 def _load_qbyt():
-    ensure_qbyt_on_path()
-    from model import QbyT
-
-    return QbyT
+    return load_qbyt_class()
 
 
 def _split_submodule_state(

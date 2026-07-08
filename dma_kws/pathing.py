@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -18,6 +19,43 @@ def ensure_qbyt_on_path() -> Path:
     if qbyt_path not in sys.path:
         sys.path.insert(0, qbyt_path)
     return qbyt_root
+
+
+def load_qbyt_class() -> type[Any]:
+    """Load ``QbyT`` from vendored ``qbyt/model.py`` without module-name collisions.
+
+    This avoids ``from model import QbyT`` ambiguity when external repos (e.g. icefall)
+    also expose a top-level ``model`` module on ``sys.path``.
+    """
+    qbyt_root = ensure_qbyt_on_path()
+    qbyt_path = str(qbyt_root)
+
+    # Keep qbyt first for imports inside qbyt/model.py such as "from models...".
+    if sys.path and sys.path[0] != qbyt_path:
+        try:
+            sys.path.remove(qbyt_path)
+        except ValueError:
+            pass
+        sys.path.insert(0, qbyt_path)
+
+    model_path = qbyt_root / "model.py"
+    if not model_path.exists():
+        raise SystemExit(f"QbyT model file not found: {model_path}")
+
+    module_name = "_dma_kws_qbyt_model"
+    module = sys.modules.get(module_name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(module_name, model_path)
+        if spec is None or spec.loader is None:
+            raise SystemExit(f"Failed to load spec for {model_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+    qbyt_cls = getattr(module, "QbyT", None)
+    if qbyt_cls is None:
+        raise SystemExit(f"QbyT class not found in {model_path}")
+    return qbyt_cls
 
 
 def ensure_icefall_on_path() -> Path:

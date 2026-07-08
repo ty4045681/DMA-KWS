@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 from dma_kws.config import FbankConfig, fbank_kwargs, get_eval_fbank_config
 from dma_kws.inference.audio_utils import has_min_fbank_frames
 from dma_kws.nn import build_encoder
-from dma_kws.pathing import ensure_qbyt_on_path
+from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage1.candidates import KeywordCandidate
 from dma_kws.stage2.features import waveform_to_fbank
 
@@ -45,8 +45,7 @@ class Stage2Verifier:
                 "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
             ) from exc
 
-        ensure_qbyt_on_path()
-        from model import QbyT
+        QbyT = load_qbyt_class()
 
         self._torch = torch
         self._demo_cfg = dict(demo_cfg)
