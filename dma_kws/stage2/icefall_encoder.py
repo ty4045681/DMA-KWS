@@ -28,8 +28,8 @@ def _load_icefall_modules() -> tuple[type, type]:
     """
     ensure_icefall_on_path()
     try:
-        from subsampling import Conv2dSubsampling
-        from zipformer import Zipformer2
+        from subsampling import Conv2dSubsampling  # pyright: ignore[reportMissingImports]
+        from zipformer import Zipformer2  # pyright: ignore[reportMissingImports]
     except ImportError as exc:
         raise SystemExit(
             "Failed to import icefall Zipformer2/Conv2dSubsampling. "
@@ -89,25 +89,29 @@ class IcefallZipformerEncoder(nn.Module):
         
         Returns:
             encoder_out: Encoded features, shape (N, T', output_dim)
-            encoder_mask: Padding mask, shape (N, 1, T')
+            encoder_mask: Valid-frame mask, shape (N, 1, T')
         """
         # Stage 1: Subsampling + embedding projection
         # Conv2dSubsampling expects (N, T, C), returns (N, T_subsample, D)
-        x, x_lens = self.encoder_embed(feat)
+        x, x_lens = self.encoder_embed(feat, feat_lengths)
+
+        # icefall Zipformer2 expects (T, N, C), so follow the same layout as
+        # icefall's own AsrModel.forward_encoder before and after the encoder.
+        x = x.permute(1, 0, 2)
         
         # Stage 2: Zipformer2 encoder
-        # Returns (N, T', max_encoder_dim) and lens (N,)
+        # Returns (T', N, max_encoder_dim) and lens (N,)
         encoder_out, encoder_out_lens = self.encoder(x, x_lens)
+        encoder_out = encoder_out.permute(1, 0, 2).contiguous()
         
-        # Stage 3: Compute padding mask to match Wenet format (N, 1, T')
+        # Stage 3: Compute valid-frame mask to match the existing Wenet contract.
         # encoder_out_lens is (N,) containing actual sequence lengths after encoding
-        batch_size = encoder_out.size(0)
         max_len = encoder_out.size(1)
         device = encoder_out.device
         
-        # Create mask: False for valid positions, True for padding
+        # Create mask: True for valid positions, False for padding.
         positions = torch.arange(max_len, device=device).unsqueeze(0)  # (1, T')
-        encoder_mask = positions >= encoder_out_lens.unsqueeze(1)  # (N, T')
+        encoder_mask = positions < encoder_out_lens.unsqueeze(1)  # (N, T')
         encoder_mask = encoder_mask.unsqueeze(1)  # (N, 1, T') to match Wenet
         
         return encoder_out, encoder_mask
