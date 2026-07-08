@@ -117,3 +117,41 @@ def test_freeze_encoder_disables_encoder_gradients(monkeypatch):
     optim_param_ids = {id(param) for group in optim_cfg["optimizer"].param_groups for param in group["params"]}
     encoder_param_ids = {id(param) for param in encoder.parameters()}
     assert encoder_param_ids.isdisjoint(optim_param_ids)
+
+
+def test_load_init_checkpoint_detects_icefall_model_keys(monkeypatch, tmp_path):
+    class _FakeIcefallWrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder_embed = nn.Linear(4, 4)
+            self.encoder = nn.Linear(4, 4)
+
+        def forward(self, feat, feat_lengths):
+            batch, time = feat.shape[0], feat.shape[1]
+            encoded = torch.zeros(batch, time, 4)
+            mask = torch.ones(batch, 1, time, dtype=torch.bool)
+            return encoded, mask
+
+    fake_encoder = _FakeIcefallWrapper()
+    monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_args, **_kwargs: fake_encoder)
+    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _FakeQbyT)
+
+    module = Stage2LightningModule(_minimal_config(), vocab_size=73)
+
+    # If generic branch is used, this would be called and fail the test.
+    module.encoder.load_state_dict = MagicMock(side_effect=AssertionError("wrong checkpoint branch used"))
+
+    checkpoint = {
+        "model": {
+            "encoder_embed.weight": torch.randn_like(module.encoder.encoder_embed.weight),
+            "encoder_embed.bias": torch.randn_like(module.encoder.encoder_embed.bias),
+            "encoder.weight": torch.randn_like(module.encoder.encoder.weight),
+            "encoder.bias": torch.randn_like(module.encoder.encoder.bias),
+        }
+    }
+    ckpt_path = tmp_path / "icefall.pt"
+    torch.save(checkpoint, ckpt_path)
+
+    module._load_init_checkpoint(ckpt_path)
+
+    module.encoder.load_state_dict.assert_not_called()

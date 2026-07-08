@@ -85,8 +85,12 @@ class Stage2LightningModule(pl.LightningModule):
         # Check if this is an icefall checkpoint (has "model" key)
         # vs standard DMA-KWS checkpoint (has "state_dict", "model_state_dict", etc)
         from dma_kws.training.checkpoint_io import extract_icefall_encoder_state
-        
-        is_icefall_format = "model" in checkpoint and "encoder_embed" in checkpoint.get("model", {})
+
+        model_state = checkpoint.get("model")
+        is_icefall_format = isinstance(model_state, dict) and any(
+            key.startswith("encoder_embed.") or key.startswith("encoder.")
+            for key in model_state
+        )
         
         if is_icefall_format:
             # Load from icefall Zipformer checkpoint
