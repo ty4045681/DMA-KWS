@@ -20,15 +20,16 @@ import torch.nn as nn
 from dma_kws.pathing import ensure_icefall_on_path
 
 
-def _load_icefall_modules() -> tuple[type, type]:
+def _load_icefall_modules() -> tuple[type, type, type]:
     """Lazily import icefall Zipformer2 and Conv2dSubsampling.
     
     Returns:
-        (Conv2dSubsampling, Zipformer2) classes
+        (Conv2dSubsampling, Zipformer2, ScheduledFloat) classes
     """
     ensure_icefall_on_path()
     try:
         from subsampling import Conv2dSubsampling  # pyright: ignore[reportMissingImports]
+        from scaling import ScheduledFloat  # pyright: ignore[reportMissingImports]
         from zipformer import Zipformer2  # pyright: ignore[reportMissingImports]
     except ImportError as exc:
         raise SystemExit(
@@ -36,7 +37,7 @@ def _load_icefall_modules() -> tuple[type, type]:
             "Ensure ICEFALL_ROOT env var is set to icefall repo root "
             "and ICEFALL_ROOT/egs/gigaspeech/KWS/zipformer is in sys.path."
         ) from exc
-    return Conv2dSubsampling, Zipformer2
+    return Conv2dSubsampling, Zipformer2, ScheduledFloat
 
 
 class IcefallZipformerEncoder(nn.Module):
@@ -97,11 +98,12 @@ class IcefallZipformerEncoder(nn.Module):
 
         # icefall Zipformer2 expects (T, N, C), so follow the same layout as
         # icefall's own AsrModel.forward_encoder before and after the encoder.
+        src_key_padding_mask = _make_pad_mask(x_lens)
         x = x.permute(1, 0, 2)
         
         # Stage 2: Zipformer2 encoder
         # Returns (T', N, max_encoder_dim) and lens (N,)
-        encoder_out, encoder_out_lens = self.encoder(x, x_lens)
+        encoder_out, encoder_out_lens = self.encoder(x, x_lens, src_key_padding_mask)
         encoder_out = encoder_out.permute(1, 0, 2).contiguous()
         
         # Stage 3: Compute valid-frame mask to match the existing Wenet contract.
@@ -140,7 +142,7 @@ class IcefallZipformerEncoder(nn.Module):
             }
             encoder = IcefallZipformerEncoder.build_from_params(stage1_cfg)
         """
-        Conv2dSubsampling, Zipformer2 = _load_icefall_modules()
+        Conv2dSubsampling, Zipformer2, ScheduledFloat = _load_icefall_modules()
         
         # Parse comma-separated config strings into tuples
         def _parse_tuple(s: str | tuple) -> tuple[int, ...]:
@@ -166,11 +168,18 @@ class IcefallZipformerEncoder(nn.Module):
         # Input feature dimension (always 80 for fbank)
         input_dim = int(stage1_cfg.get("input_dim", 80))
         
+        # Match icefall's dropout behavior used in train/finetune by default.
+        use_dropout_schedule = bool(stage1_cfg.get("use_icefall_dropout_schedule", True))
+        if use_dropout_schedule:
+            dropout = ScheduledFloat((0.0, 0.3), (20000.0, 0.1))
+        else:
+            dropout = float(stage1_cfg.get("dropout_rate", 0.1))
+
         # Build Conv2dSubsampling: (N, T, 80) → (N, T//4, encoder_dim[0])
         embed_module = Conv2dSubsampling(
             in_channels=input_dim,
             out_channels=encoder_dim[0],
-            dropout=float(stage1_cfg.get("dropout_rate", 0.1)),
+            dropout=dropout,
         )
         
         # Build Zipformer2 encoder
@@ -187,7 +196,7 @@ class IcefallZipformerEncoder(nn.Module):
             num_heads=num_heads,
             feedforward_dim=feedforward_dim,
             cnn_module_kernel=cnn_module_kernel,
-            dropout=float(stage1_cfg.get("dropout_rate", 0.1)),
+            dropout=dropout,
             warmup_batches=float(stage1_cfg.get("warmup_batches", 4000.0)),
             causal=causal,
             chunk_size=chunk_size,
@@ -195,3 +204,10 @@ class IcefallZipformerEncoder(nn.Module):
         )
         
         return IcefallZipformerEncoder(embed_module, encoder_module, output_dim=output_dim)
+
+
+def _make_pad_mask(lengths: torch.Tensor) -> torch.Tensor:
+    """Create a padding mask of shape (N, T), True means masked position."""
+    max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+    positions = torch.arange(max_len, device=lengths.device).unsqueeze(0)
+    return positions >= lengths.unsqueeze(1)

@@ -1,12 +1,12 @@
 # Icefall Zipformer2 KWS encoder configuration for Stage II training
+# Aligned to icefall egs/gigaspeech/KWS zipformer finetune params.
 # Use with: +experiment=icefall_zipformer_stage2 (sets freeze_encoder=true by default)
 # 
 # Requires: export ICEFALL_ROOT=/path/to/icefall
 #
 # Key parameters:
 # - encoder_type: Must be "icefall_zipformer" for this config
-# - causal: Set to false for offline Stage II verification (recommended for accuracy)
-#   or true for streaming-compatible encoder (requires same causal setting at icefall pretraining)
+# - causal/chunk_size/left_context_frames: Must match icefall pretraining/finetune setup
 # - encoder_dim: Tuple of embedding dims per stack; output is max(encoder_dim)
 # - All other params map directly to Zipformer2 constructor
 
@@ -14,11 +14,11 @@ encoder_type: icefall_zipformer
 
 # Zipformer2 encoder stacks configuration
 # Format: comma-separated values for each of 6 encoder stacks
-num_encoder_layers: "2,4,3,2,4,3"
+num_encoder_layers: "1,1,1,1,1,1"
 encoder_dim: "128,128,128,128,128,128"
 encoder_unmasked_dim: "128,128,128,128,128,128"
 downsampling_factor: "1,2,4,8,4,2"
-feedforward_dim: "512,768,1024,1536,1024,768"
+feedforward_dim: "192,192,192,192,192,192"
 num_heads: "4,4,4,8,4,4"
 query_head_dim: "32"
 value_head_dim: "12"
@@ -29,13 +29,13 @@ cnn_module_kernel: "31,31,15,15,15,31"
 # Attention and dropout
 attention_dropout_rate: 0.0
 dropout_rate: 0.1
+use_icefall_dropout_schedule: true  # ScheduledFloat((0,0.3),(20000,0.1))
 
 # Streaming/offline mode
-# Set to false for Stage II verification (full context available)
-# Set to true if encoder was pretrained in causal/streaming mode
-causal: false
-chunk_size: "-1"  # -1 for full sequence in training
-left_context_frames: "-1"
+# Values below are from icefall KWS finetune logs and should stay consistent
+causal: true
+chunk_size: "16,32,64,-1"
+left_context_frames: "64,128,256,-1"
 
 # Warmup batches for icefall scheduler
 warmup_batches: 4000.0
