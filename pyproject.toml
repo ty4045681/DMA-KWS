@@ -32,6 +32,7 @@ dev = ["pytest>=8.0"]
 adapt = ["optuna>=3.0"]
 locator = ["sherpa-onnx>=1.10"]
 wekws = ["librosa"]
+icefall = ["lhotse==1.33.0"]
 
 [tool.setuptools.packages.find]
 include = ["dma_kws*"]

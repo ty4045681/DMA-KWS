@@ -153,4 +153,9 @@ def fbank_kwargs(cfg: FbankConfig) -> dict[str, Any]:
         "frame_shift": cfg.frame_shift,
         "dither": cfg.dither,
         "window_type": cfg.window_type,
+        "backend": cfg.backend,
+        "target_sample_rate": cfg.target_sample_rate,
+        "snip_edges": cfg.snip_edges,
+        "low_freq": cfg.low_freq,
+        "high_freq": cfg.high_freq,
     }

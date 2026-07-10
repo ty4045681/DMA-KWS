@@ -108,8 +108,14 @@ def compute_fbank_for_clip(
     frame_shift: int = 10,
     dither: float = 0.1,
     window_type: str = "povey",
+    backend: str = "torchaudio_kaldi",
+    target_sample_rate: int | None = None,
+    snip_edges: bool = True,
+    low_freq: float = 20.0,
+    high_freq: float = 0.0,
+    extractor: Any | None = None,
 ) -> str:
-    """Compute Kaldi fbank for one clip and save as ``.npy``; return output path string."""
+    """Compute fbank for one clip and save it as ``.npy``."""
     import torch
 
     from dma_kws.stage2.features import compute_fbank
@@ -118,13 +124,16 @@ def compute_fbank_for_clip(
     fbank_out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if waveform is None:
-        import torchaudio
+        import soundfile as sf
 
-        loaded, sr = torchaudio.load(str(waveform_path))
-        if loaded.shape[0] > 1:
-            loaded = loaded.mean(dim=0, keepdim=True)
+        array, sr = sf.read(
+            str(waveform_path),
+            dtype="float32",
+            always_2d=True,
+        )
+        array = np.asarray(array, dtype=np.float32).mean(axis=1)
         sample_rate = int(sr)
-        waveform_tensor = loaded
+        waveform_tensor = torch.from_numpy(array).unsqueeze(0)
     else:
         array = np.asarray(waveform, dtype=np.float32)
         if array.ndim != 1:
@@ -142,6 +151,12 @@ def compute_fbank_for_clip(
         frame_shift=frame_shift,
         dither=dither,
         window_type=window_type,
+        backend=backend,
+        target_sample_rate=target_sample_rate,
+        snip_edges=snip_edges,
+        low_freq=low_freq,
+        high_freq=high_freq,
+        extractor=extractor,
     )
     feat = sample["feat"].detach().cpu().numpy().astype(np.float32)
     np.save(fbank_out_path, feat)

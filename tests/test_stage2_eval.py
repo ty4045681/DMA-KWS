@@ -54,6 +54,15 @@ def test_resolve_eval_fbank_path_replaces_extension():
     assert path == "/data/eval/clips/sample.npy"
 
 
+def test_resolve_eval_fbank_path_uses_independent_root():
+    path = _resolve_eval_fbank_path(
+        "/data/eval",
+        "clips/sample.wav",
+        fbank_dir="/features/eval",
+    )
+    assert path == "/features/eval/clips/sample.npy"
+
+
 def test_filter_eval_split_easy_and_hard():
     df = _mock_eval_df()
 

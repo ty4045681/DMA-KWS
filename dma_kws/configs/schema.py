@@ -38,6 +38,11 @@ class FbankConfig:
     frame_shift: int = 10
     dither: float = 0.1
     window_type: str = "povey"
+    backend: str = "torchaudio_kaldi"
+    target_sample_rate: int | None = None
+    snip_edges: bool = True
+    low_freq: float = 20.0
+    high_freq: float = 0.0
 
 
 @dataclass
@@ -154,11 +159,17 @@ class Stage2EvalFbankConfig:
     frame_shift: int = 10
     dither: float = 0.1
     window_type: str = "povey"
+    backend: str = "torchaudio_kaldi"
+    target_sample_rate: int | None = None
+    snip_edges: bool = True
+    low_freq: float = 20.0
+    high_freq: float = 0.0
 
 
 @dataclass
 class Stage2EvalConfig:
     test_dir: str = ""
+    fbank_dir: str = ""
     split: str = "hard"
     aggregate_csv: str = "evaluation_set/test_all_phrase.csv"
     batch_size: int = 256

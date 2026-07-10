@@ -22,6 +22,7 @@ from dma_kws.stage2.pairs import (
     resolve_data_root,
     scan_decoded_parquet_shard,
 )
+from dma_kws.stage2.fbank import FbankExtractor
 from dma_kws.stage2.prep_console import Stage2PrepReporter, resolve_num_workers
 from dma_kws.stage2.prepare_paper import (
     OUTPUT_PARQUET_NAME,
@@ -210,12 +211,14 @@ def main(cfg: DictConfig) -> None:
     )
     processed_root = Path(paths["processed_root"])
     feature_root = Path(paths.get("feature_root", processed_root.parent / "features"))
+    stage2 = config.get("stage2") or {}
+    fbank_cfg = get_fbank_config(config)
 
     output_subdir = resolve_output_subdir(prep, config)
     output_dir = processed_root / output_subdir
     clips_dir = output_dir / "clips"
     distances_dir = output_dir / "distances"
-    fbank_dir = feature_root / "fbank"
+    fbank_dir = Path(stage2["wav_dir"]) if stage2.get("wav_dir") else feature_root / "fbank"
     output_parquet = output_dir / OUTPUT_PARQUET_NAME
 
     reporter.section("Plan")
@@ -227,6 +230,8 @@ def main(cfg: DictConfig) -> None:
             ("clips_dir", str(clips_dir)),
             ("distances_dir", str(distances_dir)),
             ("fbank_dir", str(fbank_dir)),
+            ("fbank_backend", fbank_cfg.backend),
+            ("target_sample_rate", str(fbank_cfg.target_sample_rate or "source")),
             ("limit_anchors", str(limit_anchors or "all")),
             ("num_workers", str(num_workers)),
         ]
@@ -250,8 +255,13 @@ def main(cfg: DictConfig) -> None:
     reporter.info(f"Decoded glob: {decoded_glob}")
     reporter.info(f"Found {len(decoded_parquet_paths)} decoded parquet shards")
 
-    fbank_cfg = get_fbank_config(config)
-    compute_fbank_fn = partial(compute_fbank_for_clip, **fbank_kwargs(fbank_cfg))
+    fbank_params = fbank_kwargs(fbank_cfg)
+    fbank_extractor = FbankExtractor(**fbank_params)
+    compute_fbank_fn = partial(
+        compute_fbank_for_clip,
+        extractor=fbank_extractor,
+        **fbank_params,
+    )
 
     reporter.section("Build anchor metadata")
     with reporter.track("Build anchor metadata", total=None) as anchor_bar:

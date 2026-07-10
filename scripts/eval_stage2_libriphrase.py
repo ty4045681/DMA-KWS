@@ -67,6 +67,7 @@ def main(cfg: DictConfig) -> None:
 
     dataset = LibriPhraseEvalDataset(
         test_dir=eval_paths["test_dir"],
+        fbank_dir=eval_paths["fbank_dir"],
         split=split,
         csv_files=eval_paths["csv_files"],
         aggregate_csv=eval_paths["aggregate_csv"],

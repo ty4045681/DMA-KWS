@@ -198,7 +198,7 @@ Configs use [Hydra](https://hydra.cc/): base groups live under `configs/` (paths
 
 ### Shared `fbank` config
 
-Stage I/II prep scripts read a top-level `fbank:` section for shared Kaldi fbank settings (mel bins, frame length/shift, dither, window type). Example:
+Stage I/II prep scripts read a top-level `fbank:` section for shared fbank settings. The default profile preserves the Wenet-compatible torchaudio path:
 
 ```yaml
 fbank:
@@ -207,9 +207,14 @@ fbank:
   frame_shift: 10
   dither: 0.1
   window_type: povey
+  backend: torchaudio_kaldi
+  target_sample_rate: null
+  snip_edges: true
+  low_freq: 20.0
+  high_freq: 0.0
 ```
 
-Eval-only overrides (e.g. `dither: 0.0` for deterministic validation features) can go under `stage2.eval.fbank:` without changing training prep.
+`+experiment=icefall_zipformer_stage2` overrides this group with `configs/fbank/icefall_kws.yaml`: Lhotse `Fbank`, 16 kHz, 80 mel bins, 25/10 ms frames, Povey window, `dither: 0.0`, `snip_edges: false`, and a 20 Hz to Nyquist-minus-400 Hz passband. The shared extractor applies the same profile to training prep, eval prep, and online Stage II verification. Eval-only overrides can still go under `stage2.eval.fbank:`.
 
 ---
 
@@ -280,11 +285,12 @@ pip install -e .
 | `dev` | `pip install -e ".[dev]"` | Run `pytest` locally |
 | `locator` | `pip install -e ".[locator]"` | `+locator=sherpa_zipformer_kws` (sherpa-onnx) |
 | `wekws` | `pip install -e ".[wekws]"` | `+locator=wekws_wenet` (librosa for wav I/O) |
+| `icefall` | `pip install -e ".[icefall]"` | Lhotse 1.33.0 fbank for `+experiment=icefall_zipformer_stage2` |
 
 Install everything at once:
 
 ```bash
-pip install -e ".[dev,locator,wekws]"
+pip install -e ".[dev,locator,wekws,icefall]"
 ```
 
 **Minimal inference/training install:**
@@ -669,6 +675,18 @@ python3 scripts/prepare_stage2_paper.py \
   prep.input_parquet=data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
 ```
 
+Prepare features for a frozen Icefall Zipformer KWS encoder with its matching input distribution:
+
+```bash
+pip install -e ".[icefall]"
+
+python3 scripts/prepare_stage2_paper.py \
+  +experiment=icefall_zipformer_stage2 \
+  prep.input_parquet=data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
+```
+
+This preset resamples decoded clips to 16 kHz and writes them under `data/dma-kws/features/fbank_icefall_kws/`. The separate root prevents an existing Wenet `.npy` from being reused for the frozen Zipformer encoder.
+
 GigaPhrase-1000 (clips use `GP-1000/` prefix; decoded shards `GP-1000-decoded-*.parquet` under the gigaphrase root; dataset is auto-detected from clip paths in `pairs.py`):
 
 ```bash
@@ -720,9 +738,11 @@ data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet
 data/dma-kws/processed/stage2_qbyt/clips/
 data/dma-kws/processed/stage2_qbyt/distances/
 data/dma-kws/features/fbank/LP-100-fbank/
+# Zipformer profile instead:
+data/dma-kws/features/fbank_icefall_kws/LP-100-fbank/
 ```
 
-Fbank parameters (`num_mel_bins`, `frame_length`, `frame_shift`, etc.) are read from the top-level `fbank:` block in your config YAML.
+Fbank parameters (`backend`, `target_sample_rate`, `num_mel_bins`, frame settings, and frequency bounds) are read from the top-level `fbank:` block in your config YAML. `stage2.wav_dir` is both the preparation output root and the training input root.
 
 Training consumes the paper parquet + fbank layout directly via `LibriPhraseTrainDataset` (random + hard negatives, utt + seq loss).
 
@@ -743,7 +763,7 @@ Expected layout:
 
 `stage2.eval.split` defaults to `hard`; validation CSVs must include the columns expected for that split. Training reads `stage2.eval.test_dir` — `prep.test_dir` applies only to `prepare_stage2_eval_fbank.py`.
 
-Validation reads fbank `.npy` files as **siblings** of each `.wav` (same directory), not under `features/fbank/`. Precompute them with `scripts/prepare_stage2_eval_fbank.py` (uses the same `fbank:` settings as training prep; eval dither defaults come from `stage2.eval.fbank` when set). Recommend `prep.from_csv=true` (default `false` walks every wav under `test_dir`):
+Precompute validation features with `scripts/prepare_stage2_eval_fbank.py`. When `stage2.eval.fbank_dir` is empty, each `.npy` remains next to its `.wav` for backward compatibility. When it is set, the script mirrors each WAV-relative path under that separate root, and validation reads from the same location. The Zipformer preset uses `data/dma-kws/features/fbank_icefall_kws_eval/` so old Wenet eval features cannot be reused. Recommend `prep.from_csv=true` (default `false` walks every wav under `test_dir`):
 
 ```bash
 python3 scripts/prepare_stage2_eval_fbank.py \
@@ -757,7 +777,13 @@ python3 scripts/prepare_stage2_eval_fbank.py \
   prep.from_csv=true
 ```
 
-`prep.from_csv=true` converts only wav files referenced by the eval CSV `anchor` / `comparison` columns (faster than scanning all wav under `test_dir`). Each `train-other-500/.../clip.wav` gets a sibling `clip.npy` in the same folder.
+```bash
+python3 scripts/prepare_stage2_eval_fbank.py \
+  +experiment=icefall_zipformer_stage2 \
+  prep.from_csv=true
+```
+
+`prep.from_csv=true` converts only wav files referenced by the eval CSV `anchor` / `comparison` columns. With a separate `fbank_dir`, `train-other-500/.../clip.wav` maps to `<fbank_dir>/train-other-500/.../clip.npy`; without one, it maps to a sibling `clip.npy`.
 
 Useful overrides (also in `configs/prep/default.yaml`):
 
@@ -891,12 +917,15 @@ Notes:
 
 Alternative to Wenet Conformer: seed the Stage II encoder from a pretrained [Icefall Zipformer KWS](https://github.com/k2-fsa/icefall/tree/master/egs/gigaspeech/KWS/zipformer) checkpoint. Use `+experiment=icefall_zipformer_stage2` with `scripts/train_stage2_qbyt.py`.
 
-By default `freeze_encoder=true` — only the QbyT phoneme matcher head is trained (~500k parameters). Two-stage **inference** still requires a separately trained Stage I CTC model for candidate proposal.
+The experiment selects `configs/fbank/icefall_kws.yaml`, which matches the final KWS fine-tuning input path: normalized waveform samples passed directly to Lhotse `Fbank`, without the Wenet path's `32768` scale factor or CMVN. It does not select the GigaSpeech `KaldifeatFbank` pretraining profile. Training prep, eval prep, and online verification all force non-16 kHz audio to 16 kHz before extracting features.
+
+By default `freeze_encoder=true`, so only the QbyT phoneme matcher head is trained. Two-stage **inference** still requires a separately trained Stage I CTC model for candidate proposal.
 
 Prerequisites:
 
 - An Icefall Zipformer KWS `.pt` checkpoint saved by `train.py` (contains a `model` key with `encoder_embed.*` and `encoder.*` weights).
 - The Icefall repository cloned locally.
+- The `icefall` dependency extra installed with `pip install -e ".[icefall]"`.
 - `stage1` encoder parameters in the config must match the Icefall checkpoint (encoder_dim, num_encoder_layers, downsampling_factor, causal, etc.).
 
 Set environment variables referenced in the config:
@@ -909,6 +938,8 @@ export ICEFALL_CHECKPOINT=/path/to/checkpoint.pt  # Zipformer KWS checkpoint
 Full data prep and training chain:
 
 ```bash
+pip install -e ".[icefall]"
+
 python3 scripts/prepare_stage2_paper.py \
   +experiment=icefall_zipformer_stage2 \
   prep.input_parquet=data/dma-kws/raw/LibriPhrase-100/aggregated_segments_with_g2p_distance.parquet
@@ -923,6 +954,8 @@ CUDA_VISIBLE_DEVICES=0,1 python3 scripts/train_stage2_qbyt.py \
 ```
 
 Checkpoints are written under `data/dma-kws/exp/stage2_qbyt/checkpoints/icefall-zipformer-frozen/`.
+
+The prep commands write training features under `data/dma-kws/features/fbank_icefall_kws/` and eval features under `data/dma-kws/features/fbank_icefall_kws_eval/`. Do not point `stage2.wav_dir` or `stage2.eval.fbank_dir` at a tree generated with the default Wenet profile.
 
 Smoke run:
 
@@ -947,7 +980,8 @@ Notes:
 - The Icefall encoder adapter (`dma_kws/stage2/icefall_encoder.py`) exposes the same `forward(feat, feat_lengths) → (encoder_out, encoder_mask)` interface as the Wenet Conformer, so the rest of the Stage II training pipeline is unchanged.
 - QbyT still uses the phoneme CharTokenizer at `data/dict/lang_char.txt`.
 - Default encoder output dimension is `max(encoder_dim) = 128` (Zipformer KWS recipe default), aligned with `stage2.qbyt_embed_dim: 128` — no extra projection layer is needed.
-- `causal: false` (default in `configs/stage1/icefall_zipformer.yaml`) is recommended for offline Stage II verification; use `causal: true` only when loading a checkpoint that was pretrained with `--causal=true`.
+- `causal` must match the checkpoint. The `icefall_zipformer_stage2` preset sets `causal: true` for the target KWS checkpoint; override it only when loading a checkpoint trained with `--causal=false`.
+- Online Stage II verification uses the same Hydra fbank profile as precomputation and resamples the full validation waveform before slicing candidate spans.
 - On startup, look for `Loaded encoder_embed weights from ...: missing=N unexpected=M` and `Loaded encoder weights from ...`. Both counts should be low. High unexpected counts usually mean a config mismatch (wrong `encoder_dim`, `num_encoder_layers`, etc.).
 
 ---
@@ -1578,13 +1612,13 @@ Stage II validation reads LibriPhrase eval wav/CSV files under `stage2.eval.test
 
 ### `FileNotFoundError` for `.npy` during validation
 
-Validation expects precomputed fbank `.npy` next to eval wav files. Run:
+Validation reads from `stage2.eval.fbank_dir` when configured; otherwise it expects each `.npy` next to its eval WAV. Generate features with the same experiment used for training:
 
 ```bash
 python3 scripts/prepare_stage2_eval_fbank.py +experiment=wenet_asr_stage2 prep.from_csv=true
 ```
 
-Use `prep.from_csv=true` to convert only wav files referenced by the eval CSVs, or set `prep.test_dir=/path` if your eval root differs from the config.
+For Zipformer, replace the experiment with `icefall_zipformer_stage2`; its output goes to `features/fbank_icefall_kws_eval`. Use `prep.from_csv=true` to convert only WAV files referenced by the eval CSVs, or set `prep.test_dir=/path` if your eval root differs from the config.
 
 ---
 

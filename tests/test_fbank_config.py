@@ -41,6 +41,11 @@ def test_fbank_config_yaml_overrides_top_level_section():
         frame_shift=10,
         dither=0.1,
         window_type="povey",
+        backend="torchaudio_kaldi",
+        target_sample_rate=None,
+        snip_edges=True,
+        low_freq=20.0,
+        high_freq=0.0,
     )
 
 
@@ -104,7 +109,29 @@ def test_fbank_kwargs_matches_compute_fbank_for_clip_signature():
         "frame_shift": 8,
         "dither": 0.0,
         "window_type": "povey",
+        "backend": "torchaudio_kaldi",
+        "target_sample_rate": None,
+        "snip_edges": True,
+        "low_freq": 20.0,
+        "high_freq": 0.0,
     }
+
+
+def test_icefall_zipformer_experiment_uses_kws_fbank_profile():
+    config = config_to_dict(compose_config("icefall_zipformer_stage2"))
+
+    cfg = get_fbank_config(config)
+    assert cfg.backend == "lhotse_fbank"
+    assert cfg.target_sample_rate == 16000
+    assert cfg.dither == 0.0
+    assert cfg.snip_edges is False
+    assert cfg.low_freq == 20.0
+    assert cfg.high_freq == -400.0
+    assert config["stage1"]["causal"] is True
+    assert config["stage2"]["wav_dir"].endswith("features/fbank_icefall_kws")
+    assert config["stage2"]["eval"]["fbank_dir"].endswith(
+        "features/fbank_icefall_kws_eval"
+    )
 
 
 def test_get_fbank_config_rejects_non_mapping_section():

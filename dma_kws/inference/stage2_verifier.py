@@ -13,6 +13,7 @@ from dma_kws.inference.audio_utils import has_min_fbank_frames
 from dma_kws.nn import build_encoder
 from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage1.candidates import KeywordCandidate
+from dma_kws.stage2.fbank import FbankExtractor
 from dma_kws.stage2.features import waveform_to_fbank
 
 NUM_EMBEDS = 73
@@ -51,6 +52,7 @@ class Stage2Verifier:
         self._demo_cfg = dict(demo_cfg)
         self._device = device
         self._fbank_kwargs = fbank_kwargs(fbank_cfg)
+        self._fbank_extractor = FbankExtractor(**self._fbank_kwargs)
         stage2_encoder_dim = int(stage2_cfg.get("encoder_output_dim", 144))
 
         class Stage2Model(torch.nn.Module):
@@ -123,6 +125,10 @@ class Stage2Verifier:
         anchor = torch.tensor([list(keyword_ids)], dtype=torch.long).to(self._device)
         anchor_lengths = torch.tensor([len(keyword_ids)], dtype=torch.long).to(self._device)
         min_stage2_fbank_frames = int(self._demo_cfg.get("min_stage2_fbank_frames", 7))
+        waveform, sample_rate = self._fbank_extractor.prepare_waveform(
+            waveform,
+            sample_rate,
+        )
 
         scores: list[dict] = []
         for candidate in candidates:
@@ -134,12 +140,16 @@ class Stage2Verifier:
                 end - start,
                 min_frames=min_stage2_fbank_frames,
                 sample_rate=sample_rate,
+                frame_length_ms=float(self._fbank_kwargs["frame_length"]),
+                frame_shift_ms=float(self._fbank_kwargs["frame_shift"]),
+                snip_edges=bool(self._fbank_kwargs["snip_edges"]),
             ):
                 continue
             candidate_wave = waveform[:, start:end]
             candidate_feat = waveform_to_fbank(
                 candidate_wave,
                 sample_rate=sample_rate,
+                extractor=self._fbank_extractor,
                 **self._fbank_kwargs,
             ).unsqueeze(0)
             candidate_lens = torch.tensor([candidate_feat.size(1)], dtype=torch.long)

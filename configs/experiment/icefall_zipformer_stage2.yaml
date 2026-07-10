@@ -15,6 +15,7 @@
 
 defaults:
   - override /paths: default
+  - override /fbank: icefall_kws
   - override /stage1: icefall_zipformer
 
 paths:
@@ -25,7 +26,7 @@ training:
 
 stage1:
   # All params inherited from icefall_zipformer.yaml config above
-  causal: false  # Non-causal for offline verification (full context)
+  causal: true
 
 stage2:
   # Encoder output dimension = max(encoder_dim) = 128 from icefall config
@@ -39,6 +40,9 @@ stage2:
 
   # Freeze encoder, train only QbyT
   freeze_encoder: true
+
+  parquet_file: ${paths.processed_root}/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet
+  wav_dir: ${paths.feature_root}/fbank_icefall_kws
 
   # Training hyperparams (tuned for downstream QbyT training)
   negative_ratio: 1
@@ -80,6 +84,7 @@ stage2:
     val_check_interval: 500
 
   eval:
+    fbank_dir: ${paths.feature_root}/fbank_icefall_kws_eval
     split: easy
     batch_size: 128
 

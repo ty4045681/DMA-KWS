@@ -319,6 +319,11 @@ def test_convert_aggregated_forwards_bound_fbank_kwargs(tmp_path):
         "frame_shift": 8,
         "dither": 0.0,
         "window_type": "povey",
+        "backend": "torchaudio_kaldi",
+        "target_sample_rate": None,
+        "snip_edges": True,
+        "low_freq": 20.0,
+        "high_freq": 0.0,
     }
 
 

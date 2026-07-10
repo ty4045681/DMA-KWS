@@ -3,3 +3,8 @@ frame_length: 25
 frame_shift: 10
 dither: 0.1
 window_type: povey
+backend: torchaudio_kaldi
+target_sample_rate: null
+snip_edges: true
+low_freq: 20.0
+high_freq: 0.0

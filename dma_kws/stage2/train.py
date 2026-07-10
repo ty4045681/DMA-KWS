@@ -60,6 +60,7 @@ def _build_val_dataloader(config: dict[str, Any], tokenizer: Any) -> Any:
     tokenizer_cfg = get_tokenizer_config(config)
     val_dataset = LibriPhraseEvalDataset(
         test_dir=test_dir,
+        fbank_dir=eval_paths["fbank_dir"],
         split=split,
         csv_files=eval_paths["csv_files"],
         aggregate_csv=eval_paths["aggregate_csv"],

@@ -1,4 +1,4 @@
-"""Precompute LibriPhrase eval fbank ``.npy`` files next to eval ``.wav`` clips."""
+"""Precompute LibriPhrase eval fbank ``.npy`` files."""
 
 from __future__ import annotations
 
@@ -38,13 +38,23 @@ def resolve_eval_wav_path(test_dir: Path, rel_wav: str) -> Path:
     return test_dir / rel_wav
 
 
-def resolve_eval_fbank_path_from_wav(wav_path: Path) -> Path:
-    return wav_path.with_suffix(".npy")
+def resolve_eval_fbank_path_from_wav(
+    wav_path: Path,
+    *,
+    test_dir: Path | None = None,
+    fbank_dir: Path | None = None,
+) -> Path:
+    if fbank_dir is None:
+        return wav_path.with_suffix(".npy")
+    if test_dir is None:
+        raise ValueError("test_dir is required when fbank_dir is configured")
+    return fbank_dir / wav_path.relative_to(test_dir).with_suffix(".npy")
 
 
 def prepare_eval_fbank(
     test_dir: Path | str,
     *,
+    fbank_dir: Path | str | None = None,
     wav_paths: Iterable[Path] | None = None,
     skip_existing: bool = True,
     limit: int = 0,
@@ -53,14 +63,21 @@ def prepare_eval_fbank(
     frame_shift: int = 10,
     dither: float = 0.1,
     window_type: str = "povey",
+    backend: str = "torchaudio_kaldi",
+    target_sample_rate: int | None = None,
+    snip_edges: bool = True,
+    low_freq: float = 20.0,
+    high_freq: float = 0.0,
+    extractor=None,
     log_interval: int = 1000,
     compute_fn: Callable[..., str] = compute_fbank_for_clip,
 ) -> tuple[int, int, int]:
-    """Convert eval wav clips to co-located fbank ``.npy`` files.
+    """Convert eval wav clips to fbank ``.npy`` files.
 
     Returns ``(written, skipped, failed)`` counts.
     """
     test_dir = Path(test_dir)
+    fbank_dir = Path(fbank_dir) if fbank_dir is not None else None
     if not test_dir.is_dir():
         raise FileNotFoundError(f"Eval test_dir not found: {test_dir}")
 
@@ -76,7 +93,11 @@ def prepare_eval_fbank(
             break
 
         wav_path = Path(wav_path)
-        npy_path = resolve_eval_fbank_path_from_wav(wav_path)
+        npy_path = resolve_eval_fbank_path_from_wav(
+            wav_path,
+            test_dir=test_dir,
+            fbank_dir=fbank_dir,
+        )
 
         if skip_existing and npy_path.is_file():
             skipped += 1
@@ -96,6 +117,12 @@ def prepare_eval_fbank(
                 frame_shift=frame_shift,
                 dither=dither,
                 window_type=window_type,
+                backend=backend,
+                target_sample_rate=target_sample_rate,
+                snip_edges=snip_edges,
+                low_freq=low_freq,
+                high_freq=high_freq,
+                extractor=extractor,
             )
             written += 1
         except Exception:
@@ -111,6 +138,7 @@ def prepare_eval_fbank(
 def prepare_eval_fbank_from_csv(
     test_dir: Path | str,
     *,
+    fbank_dir: Path | str | None = None,
     csv_files: list[str] | None = None,
     skip_existing: bool = True,
     limit: int = 0,
@@ -119,6 +147,12 @@ def prepare_eval_fbank_from_csv(
     frame_shift: int = 10,
     dither: float = 0.1,
     window_type: str = "povey",
+    backend: str = "torchaudio_kaldi",
+    target_sample_rate: int | None = None,
+    snip_edges: bool = True,
+    low_freq: float = 20.0,
+    high_freq: float = 0.0,
+    extractor=None,
     log_interval: int = 1000,
     compute_fn: Callable[..., str] = compute_fbank_for_clip,
 ) -> tuple[int, int, int]:
@@ -131,6 +165,7 @@ def prepare_eval_fbank_from_csv(
         wav_paths = wav_paths[:limit]
     return prepare_eval_fbank(
         test_dir,
+        fbank_dir=fbank_dir,
         wav_paths=wav_paths,
         skip_existing=skip_existing,
         limit=0,
@@ -139,6 +174,12 @@ def prepare_eval_fbank_from_csv(
         frame_shift=frame_shift,
         dither=dither,
         window_type=window_type,
+        backend=backend,
+        target_sample_rate=target_sample_rate,
+        snip_edges=snip_edges,
+        low_freq=low_freq,
+        high_freq=high_freq,
+        extractor=extractor,
         log_interval=log_interval,
         compute_fn=compute_fn,
     )

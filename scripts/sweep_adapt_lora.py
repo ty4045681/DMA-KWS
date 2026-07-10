@@ -47,6 +47,7 @@ def _eval_lph_auc(config: dict, checkpoint: str, *, subset: int = 0) -> float:
     split = str(config.get("stage2", {}).get("eval", {}).get("split", "hard"))
     dataset = LibriPhraseEvalDataset(
         test_dir=eval_paths["test_dir"],
+        fbank_dir=eval_paths["fbank_dir"],
         split=split,
         csv_files=eval_paths["csv_files"],
         aggregate_csv=eval_paths["aggregate_csv"],

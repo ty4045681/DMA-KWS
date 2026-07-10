@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from dma_kws.stage2.fbank import FbankExtractor
+
 DEFAULT_NUM_MEL_BINS = 80
 DEFAULT_DITHER = 0.1
 DEFAULT_FRAME_LENGTH = 25
@@ -34,24 +36,30 @@ def compute_fbank(
     frame_shift: int = DEFAULT_FRAME_SHIFT,
     dither: float = DEFAULT_DITHER,
     window_type: str = "povey",
+    backend: str = "torchaudio_kaldi",
+    target_sample_rate: int | None = None,
+    snip_edges: bool = True,
+    low_freq: float = 20.0,
+    high_freq: float = 0.0,
+    extractor: FbankExtractor | None = None,
 ) -> dict[str, Any]:
-    """Compute Kaldi fbank features matching ``qbyt.models.processor.compute_fbank``."""
-    import torchaudio.compliance.kaldi as kaldi
-
+    """Compute fbank features with the configured Stage II backend."""
     sample_rate = sample["sample_rate"]
     waveform = sample["wav"]
-    waveform = waveform * (1 << 15)
-    mat = kaldi.fbank(
-        waveform,
-        num_mel_bins=num_mel_bins,
-        frame_length=frame_length,
-        frame_shift=frame_shift,
-        dither=dither,
-        energy_floor=0.0,
-        sample_frequency=sample_rate,
-        window_type=window_type,
-    )
-    sample["feat"] = mat
+    if extractor is None:
+        extractor = FbankExtractor(
+            num_mel_bins=num_mel_bins,
+            frame_length=frame_length,
+            frame_shift=frame_shift,
+            dither=dither,
+            window_type=window_type,
+            backend=backend,
+            target_sample_rate=target_sample_rate,
+            snip_edges=snip_edges,
+            low_freq=low_freq,
+            high_freq=high_freq,
+        )
+    sample["feat"] = extractor.extract(waveform, sample_rate)
     return sample
 
 
@@ -64,10 +72,14 @@ def waveform_to_fbank(
     frame_shift: int = DEFAULT_FRAME_SHIFT,
     dither: float = DEFAULT_DITHER,
     window_type: str = "povey",
+    backend: str = "torchaudio_kaldi",
+    target_sample_rate: int | None = None,
+    snip_edges: bool = True,
+    low_freq: float = 20.0,
+    high_freq: float = 0.0,
+    extractor: FbankExtractor | None = None,
 ) -> torch.Tensor:
-    """Compute Wenet-aligned fbank features from a mono waveform tensor."""
-    if waveform.dim() == 1:
-        waveform = waveform.unsqueeze(0)
+    """Compute configured fbank features from a mono waveform tensor."""
     sample = compute_fbank(
         {"wav": waveform, "sample_rate": sample_rate, "key": ""},
         num_mel_bins=num_mel_bins,
@@ -75,6 +87,12 @@ def waveform_to_fbank(
         frame_shift=frame_shift,
         dither=dither,
         window_type=window_type,
+        backend=backend,
+        target_sample_rate=target_sample_rate,
+        snip_edges=snip_edges,
+        low_freq=low_freq,
+        high_freq=high_freq,
+        extractor=extractor,
     )
     return sample["feat"]
 

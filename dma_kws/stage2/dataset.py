@@ -182,8 +182,13 @@ class LibriPhraseTrainDataset(Dataset):
         }
 
 
-def _resolve_eval_fbank_path(test_dir: str | Path, query_wav: str) -> str:
-    path = os.path.join(str(test_dir), query_wav)
+def _resolve_eval_fbank_path(
+    test_dir: str | Path,
+    query_wav: str,
+    *,
+    fbank_dir: str | Path | None = None,
+) -> str:
+    path = os.path.join(str(fbank_dir or test_dir), query_wav)
     return path.replace(".wav", ".npy")
 
 
@@ -279,9 +284,11 @@ def resolve_stage2_eval_paths(config: dict[str, Any]) -> dict[str, Any]:
     )
     batch_size = int(eval_cfg.get("batch_size", stage2.get("validation", {}).get("batch_size", 256)))
     num_workers = int(eval_cfg.get("num_workers", stage2.get("num_workers", 4)))
+    fbank_dir = eval_cfg.get("fbank_dir", "") or test_dir
 
     return {
         "test_dir": Path(test_dir),
+        "fbank_dir": Path(fbank_dir),
         "csv_files": csv_files,
         "aggregate_csv": aggregate_csv,
         "batch_size": batch_size,
@@ -296,6 +303,7 @@ class LibriPhraseEvalDataset(Dataset):
         self,
         *,
         test_dir: str | Path,
+        fbank_dir: str | Path | None = None,
         split: str = "hard",
         csv_files: list[str] | None = None,
         aggregate_csv: str | Path | None = None,
@@ -311,6 +319,7 @@ class LibriPhraseEvalDataset(Dataset):
             tokenizer = load_char_tokenizer(Path(dict_path), split_with_space=split_with_space)
         self.tokenizer = tokenizer
         self.test_dir = str(test_dir)
+        self.fbank_dir = str(fbank_dir or test_dir)
         self.split = split
         self.g2p = g2p if g2p is not None else make_g2p()
 
@@ -347,7 +356,11 @@ class LibriPhraseEvalDataset(Dataset):
         anchor_phones = self.g2p(re.sub(r"[^\w\s]", "", anchor_text.lower()))
         anchor_g2p = " ".join(phone for phone in anchor_phones if phone != " ")
 
-        fbank_path = _resolve_eval_fbank_path(self.test_dir, comparison_wav)
+        fbank_path = _resolve_eval_fbank_path(
+            self.test_dir,
+            comparison_wav,
+            fbank_dir=self.fbank_dir,
+        )
         feats = torch.from_numpy(np.load(fbank_path))
 
         anchor_seq = tokenize_phoneme_string(self.tokenizer, anchor_g2p)

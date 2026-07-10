@@ -17,6 +17,18 @@ def test_resolve_eval_fbank_path_from_wav_replaces_suffix():
     assert resolve_eval_fbank_path_from_wav(wav) == Path("/data/eval/train-other-500/foo.npy")
 
 
+def test_resolve_eval_fbank_path_from_wav_mirrors_independent_root():
+    wav = Path("/data/eval/train-other-500/foo.wav")
+
+    path = resolve_eval_fbank_path_from_wav(
+        wav,
+        test_dir=Path("/data/eval"),
+        fbank_dir=Path("/features/eval"),
+    )
+
+    assert path == Path("/features/eval/train-other-500/foo.npy")
+
+
 def test_collect_eval_wav_relpaths_reads_anchor_and_comparison(tmp_path):
     eval_dir = tmp_path / "eval"
     csv_dir = eval_dir / "evaluation_set"
@@ -59,6 +71,11 @@ def test_prepare_eval_fbank_passes_fbank_params_to_compute(tmp_path):
         frame_shift=8,
         dither=0.0,
         window_type="hamming",
+        backend="lhotse_fbank",
+        target_sample_rate=16000,
+        snip_edges=False,
+        low_freq=20.0,
+        high_freq=-400.0,
     )
 
     fake_compute.assert_called_once_with(
@@ -69,7 +86,33 @@ def test_prepare_eval_fbank_passes_fbank_params_to_compute(tmp_path):
         frame_shift=8,
         dither=0.0,
         window_type="hamming",
+        backend="lhotse_fbank",
+        target_sample_rate=16000,
+        snip_edges=False,
+        low_freq=20.0,
+        high_freq=-400.0,
+        extractor=None,
     )
+
+
+def test_prepare_eval_fbank_writes_to_independent_root(tmp_path):
+    test_dir = tmp_path / "eval"
+    wav_path = test_dir / "clips" / "sample.wav"
+    wav_path.parent.mkdir(parents=True)
+    wav_path.write_bytes(b"wav")
+    fbank_dir = tmp_path / "features" / "eval"
+    fake_compute = MagicMock()
+
+    written, skipped, failed = prepare_eval_fbank(
+        test_dir,
+        fbank_dir=fbank_dir,
+        skip_existing=False,
+        compute_fn=fake_compute,
+    )
+
+    assert (written, skipped, failed) == (1, 0, 0)
+    assert fake_compute.call_args.args[0] == wav_path
+    assert fake_compute.call_args.args[1] == fbank_dir / "clips" / "sample.npy"
 
 
 def test_prepare_eval_fbank_writes_npy_next_to_wav(tmp_path):

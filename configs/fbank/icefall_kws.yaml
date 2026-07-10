@@ -1,0 +1,10 @@
+num_mel_bins: 80
+frame_length: 25
+frame_shift: 10
+dither: 0.0
+window_type: povey
+backend: lhotse_fbank
+target_sample_rate: 16000
+snip_edges: false
+low_freq: 20.0
+high_freq: -400.0

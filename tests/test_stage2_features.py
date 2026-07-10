@@ -1,10 +1,12 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from dma_kws.stage2.features import FeatureExtractor, compute_fbank, waveform_to_fbank
+from dma_kws.stage2.fbank import FbankExtractor
 
 
 def _write_noise_list(path: Path) -> None:
@@ -100,6 +102,112 @@ def test_waveform_to_fbank_accepts_1d_waveform():
 
     assert feat.ndim == 2
     assert feat.size(1) == 80
+
+
+def test_torchaudio_backend_preserves_wenet_fbank_formula():
+    import torchaudio.compliance.kaldi as kaldi
+
+    waveform = torch.linspace(-0.5, 0.5, 16000).unsqueeze(0)
+    expected = kaldi.fbank(
+        waveform * (1 << 15),
+        num_mel_bins=80,
+        frame_length=25,
+        frame_shift=10,
+        dither=0.0,
+        energy_floor=0.0,
+        sample_frequency=16000,
+        window_type="povey",
+        snip_edges=True,
+        low_freq=20.0,
+        high_freq=0.0,
+    )
+
+    actual = waveform_to_fbank(waveform, sample_rate=16000, dither=0.0)
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+def test_lhotse_fbank_backend_matches_direct_extractor():
+    lhotse = pytest.importorskip("lhotse")
+    waveform = torch.linspace(-0.5, 0.5, 16000).unsqueeze(0)
+    config = lhotse.FbankConfig(
+        sampling_rate=16000,
+        frame_length=0.025,
+        frame_shift=0.01,
+        window_type="povey",
+        dither=0.0,
+        snip_edges=False,
+        low_freq=20.0,
+        high_freq=-400.0,
+        num_mel_bins=80,
+        device="cpu",
+    )
+
+    expected = lhotse.Fbank(config).extract(waveform.squeeze(0), 16000)
+    actual = waveform_to_fbank(
+        waveform,
+        sample_rate=16000,
+        backend="lhotse_fbank",
+        target_sample_rate=16000,
+        dither=0.0,
+        snip_edges=False,
+        low_freq=20.0,
+        high_freq=-400.0,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    assert actual.shape == (100, 80)
+    assert actual.dtype == torch.float32
+
+
+@pytest.mark.parametrize("sample_rate", [8000, 22050])
+def test_lhotse_fbank_backend_resamples_to_target_rate(sample_rate):
+    pytest.importorskip("lhotse")
+    waveform = torch.linspace(-0.5, 0.5, sample_rate).unsqueeze(0)
+
+    feat = waveform_to_fbank(
+        waveform,
+        sample_rate=sample_rate,
+        backend="lhotse_fbank",
+        target_sample_rate=16000,
+        dither=0.0,
+        snip_edges=False,
+        high_freq=-400.0,
+    )
+
+    assert feat.shape == (100, 80)
+
+
+def test_fbank_extractor_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="Unsupported fbank backend"):
+        FbankExtractor(backend="unknown")
+
+
+def test_compute_fbank_for_clip_loads_and_resamples_wav(tmp_path):
+    lhotse = pytest.importorskip("lhotse")
+    soundfile = pytest.importorskip("soundfile")
+    del lhotse
+    from dma_kws.stage2.prepare_paper import compute_fbank_for_clip
+
+    sample_rate = 22050
+    waveform = torch.linspace(-0.5, 0.5, sample_rate).numpy()
+    wav_path = tmp_path / "sample.wav"
+    output_path = tmp_path / "sample.npy"
+    soundfile.write(wav_path, waveform, sample_rate, subtype="FLOAT")
+
+    compute_fbank_for_clip(
+        wav_path,
+        output_path,
+        backend="lhotse_fbank",
+        target_sample_rate=16000,
+        dither=0.0,
+        snip_edges=False,
+        high_freq=-400.0,
+    )
+
+    feat = torch.from_numpy(np.load(output_path))
+    assert feat.shape == (100, 80)
+    assert feat.dtype == torch.float32
 
 
 def test_waveform_to_fbank_differs_from_extract_fbank():

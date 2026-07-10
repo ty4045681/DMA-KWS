@@ -9,9 +9,14 @@ def num_fbank_frames(
     sample_rate: int,
     frame_length_ms: float = 25.0,
     frame_shift_ms: float = 10.0,
+    snip_edges: bool = True,
 ) -> int:
+    if num_samples <= 0:
+        return 0
     frame_length_samples = round(sample_rate * frame_length_ms / 1000.0)
     frame_shift_samples = round(sample_rate * frame_shift_ms / 1000.0)
+    if not snip_edges:
+        return (num_samples + frame_shift_samples // 2) // frame_shift_samples
     if num_samples < frame_length_samples:
         return 0
     return 1 + (num_samples - frame_length_samples) // frame_shift_samples
@@ -23,11 +28,14 @@ def min_samples_for_fbank_frames(
     sample_rate: int,
     frame_length_ms: float = 25.0,
     frame_shift_ms: float = 10.0,
+    snip_edges: bool = True,
 ) -> int:
     if min_frames <= 0:
         return 0
     frame_length_samples = round(sample_rate * frame_length_ms / 1000.0)
     frame_shift_samples = round(sample_rate * frame_shift_ms / 1000.0)
+    if not snip_edges:
+        return max(1, min_frames * frame_shift_samples - frame_shift_samples // 2)
     return frame_length_samples + (min_frames - 1) * frame_shift_samples
 
 
@@ -38,12 +46,14 @@ def has_min_fbank_frames(
     sample_rate: int,
     frame_length_ms: float = 25.0,
     frame_shift_ms: float = 10.0,
+    snip_edges: bool = True,
 ) -> bool:
     return num_samples >= min_samples_for_fbank_frames(
         min_frames,
         sample_rate=sample_rate,
         frame_length_ms=frame_length_ms,
         frame_shift_ms=frame_shift_ms,
+        snip_edges=snip_edges,
     )
 
 
