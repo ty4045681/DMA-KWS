@@ -1,5 +1,4 @@
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -98,6 +97,46 @@ def test_forward_and_training_step_smoke(patched_module):
     loss = module.training_step(batch, 0)
     assert loss.ndim == 0
     assert torch.isfinite(loss)
+
+
+def test_gradient_diagnostics_reports_missing_gradient_changes(patched_module):
+    module = patched_module
+    module._gradient_diagnostics_enabled = True
+    module._gradient_diagnostics_max_steps = 2
+    module._trainer = MagicMock(global_step=3)
+    module.print = MagicMock()
+
+    module.on_after_backward()
+    module.qbyt.dummy.grad = torch.ones_like(module.qbyt.dummy)
+    module.on_after_backward()
+    module.on_after_backward()
+
+    assert module.print.call_count == 2
+    assert "qbyt.dummy" in module.print.call_args_list[0].args[0]
+    assert "all trainable parameters have gradients" in module.print.call_args_list[1].args[0]
+
+
+def test_validation_logs_are_synchronized(patched_module):
+    module = patched_module
+    module.log = MagicMock()
+    module.auc_metric.update = MagicMock()
+    module.eer_metric.update = MagicMock()
+
+    module.validation_step(_random_batch(), 0)
+
+    loss_call = next(call for call in module.log.call_args_list if call.args[0] == "val/utt_loss")
+    assert loss_call.kwargs["sync_dist"] is True
+
+    module.auc_metric.compute = MagicMock(return_value=torch.tensor(0.75))
+    module.eer_metric.compute = MagicMock(return_value=torch.tensor(0.25))
+    module.log.reset_mock()
+
+    module.on_validation_epoch_end()
+
+    calls = {call.args[0]: call.kwargs for call in module.log.call_args_list}
+    assert calls["val/auc"]["sync_dist"] is True
+    assert calls["val/eer"]["sync_dist"] is True
+    assert calls["val_auc"]["sync_dist"] is True
 
 
 def test_freeze_encoder_disables_encoder_gradients(monkeypatch):

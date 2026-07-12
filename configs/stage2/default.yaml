@@ -10,6 +10,10 @@ precision: bf16-mixed
 optimizer: adam
 weight_decay: 0.0
 strategy: auto
+find_unused_parameters: false
+gradient_diagnostics:
+  enabled: false
+  max_steps: 5
 gradient_clip_val: 1.0
 log_interval: 10
 val_check_interval: 1000

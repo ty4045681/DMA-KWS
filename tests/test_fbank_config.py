@@ -128,6 +128,8 @@ def test_icefall_zipformer_experiment_uses_kws_fbank_profile():
     assert cfg.low_freq == 20.0
     assert cfg.high_freq == -400.0
     assert config["stage1"]["causal"] is True
+    assert config["stage2"]["find_unused_parameters"] is True
+    assert config["stage2"]["gradient_diagnostics"] == {"enabled": True, "max_steps": 5}
     assert config["stage2"]["wav_dir"].endswith("features/fbank_icefall_kws")
     assert config["stage2"]["eval"]["fbank_dir"].endswith(
         "features/fbank_icefall_kws_eval"

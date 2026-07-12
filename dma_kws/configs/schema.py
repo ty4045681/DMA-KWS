@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from hydra.core.config_store import ConfigStore
 
@@ -187,6 +186,12 @@ class Stage2CheckpointConfig:
 
 
 @dataclass
+class Stage2GradientDiagnosticsConfig:
+    enabled: bool = False
+    max_steps: int = 5
+
+
+@dataclass
 class Stage2PrepConfig:
     data_root: str = ""
     output_subdir: str = ""
@@ -215,6 +220,7 @@ class Stage2Config:
     optimizer: str = "adam"
     weight_decay: float = 0.0
     strategy: str = "auto"
+    find_unused_parameters: bool = False
     gradient_clip_val: float = 1.0
     log_interval: int = 10
     val_check_interval: int = 1000
@@ -229,6 +235,7 @@ class Stage2Config:
     validation: Stage2ValidationConfig = field(default_factory=Stage2ValidationConfig)
     eval: Stage2EvalConfig = field(default_factory=Stage2EvalConfig)
     checkpoint: Stage2CheckpointConfig = field(default_factory=Stage2CheckpointConfig)
+    gradient_diagnostics: Stage2GradientDiagnosticsConfig = field(default_factory=Stage2GradientDiagnosticsConfig)
     prep: Stage2PrepConfig = field(default_factory=Stage2PrepConfig)
 
 

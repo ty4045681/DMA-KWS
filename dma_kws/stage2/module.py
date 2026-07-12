@@ -68,6 +68,11 @@ class Stage2LightningModule(pl.LightningModule):
 
         self._stage2_cfg = stage2
         self.freeze_encoder = freeze_encoder
+        gradient_diagnostics = stage2.get("gradient_diagnostics", {}) or {}
+        self._gradient_diagnostics_enabled = bool(gradient_diagnostics.get("enabled", False))
+        self._gradient_diagnostics_max_steps = max(0, int(gradient_diagnostics.get("max_steps", 5)))
+        self._gradient_diagnostics_checks = 0
+        self._last_missing_gradients: tuple[str, ...] | None = None
 
         if init_checkpoint:
             self._load_init_checkpoint(Path(init_checkpoint))
@@ -178,12 +183,42 @@ class Stage2LightningModule(pl.LightningModule):
         self.log("train/lr", lr, on_step=True, prog_bar=True)
         return total_loss
 
+    def _parameters_without_gradients(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name, parameter in self.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        )
+
+    def on_after_backward(self) -> None:
+        if (
+            not self._gradient_diagnostics_enabled
+            or self._gradient_diagnostics_checks >= self._gradient_diagnostics_max_steps
+        ):
+            return
+
+        self._gradient_diagnostics_checks += 1
+        missing = self._parameters_without_gradients()
+        if missing == self._last_missing_gradients:
+            return
+        self._last_missing_gradients = missing
+
+        step = int(self.global_step)
+        if missing:
+            names = "\n".join(f"  {name}" for name in missing)
+            self.print(
+                f"Gradient diagnostics at step {step}: "
+                f"{len(missing)} trainable parameters have no gradient:\n{names}"
+            )
+        else:
+            self.print(f"Gradient diagnostics at step {step}: all trainable parameters have gradients.")
+
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> None:
         logits, _ = self(batch["feat"], batch["feat_lengths"], batch["anchor"])
         preds = torch.sigmoid(logits)
         labels = batch["label"].int()
         utt_loss = F.binary_cross_entropy_with_logits(logits, labels.float())
-        self.log("val/utt_loss", utt_loss, prog_bar=True, on_epoch=True)
+        self.log("val/utt_loss", utt_loss, prog_bar=True, on_epoch=True, sync_dist=True)
         self.auc_metric.update(preds, labels)
         self.eer_metric.update(preds, labels)
 
@@ -191,9 +226,9 @@ class Stage2LightningModule(pl.LightningModule):
         auc = self.auc_metric.compute()
         eer = self.eer_metric.compute()
 
-        self.log("val/auc", auc, prog_bar=True)
-        self.log("val/eer", eer, prog_bar=True)
-        self.log("val_auc", auc, prog_bar=True)
+        self.log("val/auc", auc, prog_bar=True, sync_dist=True)
+        self.log("val/eer", eer, prog_bar=True, sync_dist=True)
+        self.log("val_auc", auc, prog_bar=True, sync_dist=True)
 
         self.auc_metric.reset()
         self.eer_metric.reset()
@@ -209,8 +244,8 @@ class Stage2LightningModule(pl.LightningModule):
         auc = self.auc_metric.compute()
         eer = self.eer_metric.compute()
 
-        self.log("test/auc", auc, prog_bar=True)
-        self.log("test/eer", eer, prog_bar=True)
+        self.log("test/auc", auc, prog_bar=True, sync_dist=True)
+        self.log("test/eer", eer, prog_bar=True, sync_dist=True)
 
         self.auc_metric.reset()
         self.eer_metric.reset()

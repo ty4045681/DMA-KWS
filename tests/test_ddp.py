@@ -47,6 +47,29 @@ def test_build_trainer_kwargs_ddp_only_with_multiple_devices():
     assert kwargs_single["strategy"] == "auto"
 
 
+def test_build_trainer_kwargs_enables_unused_parameter_detection_for_multiple_devices():
+    kwargs_multi = build_trainer_kwargs(
+        _stage2_config(strategy="auto", find_unused_parameters=True),
+        devices=4,
+    )
+    kwargs_single = build_trainer_kwargs(
+        _stage2_config(strategy="auto", find_unused_parameters=True),
+        devices=1,
+    )
+
+    assert kwargs_multi["strategy"] == "ddp_find_unused_parameters_true"
+    assert kwargs_single["strategy"] == "auto"
+
+
+def test_build_trainer_kwargs_preserves_explicit_lightning_strategy_alias():
+    kwargs = build_trainer_kwargs(
+        _stage2_config(strategy="ddp_find_unused_parameters_true"),
+        devices=2,
+    )
+
+    assert kwargs["strategy"] == "ddp_find_unused_parameters_true"
+
+
 def test_build_trainer_kwargs_limit_steps_overrides_max_steps():
     kwargs = build_trainer_kwargs(_stage2_config(max_steps=50000), devices=1, limit_steps=20)
 

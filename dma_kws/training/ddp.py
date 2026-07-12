@@ -48,9 +48,12 @@ def build_trainer_kwargs(
             kwargs["check_val_every_n_epoch"] = int(validation.get("check_val_every_n_epoch", 1))
         return kwargs
 
-    strategy = stage.get("strategy", "auto")
-    if strategy == "ddp" and devices > 1:
-        trainer_strategy: str | Any = "ddp"
+    configured_strategy = str(stage.get("strategy", "auto") or "auto")
+    find_unused_parameters = bool(stage.get("find_unused_parameters", False))
+    if devices > 1 and find_unused_parameters:
+        trainer_strategy: str | Any = "ddp_find_unused_parameters_true"
+    elif devices > 1 and configured_strategy != "auto":
+        trainer_strategy = configured_strategy
     else:
         trainer_strategy = "auto"
 
