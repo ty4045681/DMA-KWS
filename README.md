@@ -1326,6 +1326,33 @@ In `auto_assign` mode, unmatched files are skipped when `prep.skip_unmatched=tru
 
 Default output directory: `outputs/eval_stage2_clips` (`prep.stage2_clip_output_dir`). Override with `prep.output_dir=/path/to/output` if needed. The script writes `results.jsonl` with per-clip scores and `summary.json` with accuracy, precision, recall, f1, auc, and eer when labels are present. If a manifest row contains extra columns beyond `audio_path`, `keyword`, and optional `label`, those key-value pairs are copied into `results.jsonl` under `manifest_meta`.
 
+Clips are scored in padded GPU batches, with audio loading and fbank extraction parallelized across DataLoader workers and G2P/tokenization cached per unique keyword. Tune with:
+
+- `prep.batch_size` — clips per forward pass (default 64 when unset/0).
+- `prep.num_workers` — feature-extraction workers (default `min(8, cpu_count)` when unset/0).
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step050000.pt \
+  prep.batch_size=128 \
+  prep.num_workers=8
+```
+
+To evaluate every exported `.pt` checkpoint in one or more directories against a manifest, use `scripts/batch_eval_stage2_clips.sh`:
+
+```bash
+bash scripts/batch_eval_stage2_clips.sh \
+  --dir /path/to/export1:/path/to/out1 \
+  --dir /path/to/export2 \
+  --manifest /path/to/merged.csv \
+  --base-out /path/to/outputs \
+  --experiment icefall_zipformer_stage2
+```
+
+Checkpoints run sequentially on one GPU; to use multiple GPUs, split the checkpoint dirs and launch one invocation per GPU with `CUDA_VISIBLE_DEVICES`.
+
 ---
 
 ## External locator (Zipformer / WeKws+Wenet)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from dma_kws.inference.stage2_clip import Stage2ClipRunner
 from dma_kws.tokenizer import load_char_tokenizer
 
@@ -109,6 +111,92 @@ def test_clip_runner_skipped_when_too_short(monkeypatch):
     assert result["detected"] is False
     assert result["qbyt_score"] == 0.0
     assert result["skipped"] is True
+
+
+class FakeBatchVerifier:
+    def __init__(self, scores: list[float]) -> None:
+        from dma_kws.stage2.fbank import FbankExtractor
+
+        self._scores = list(scores)
+        self.batches: list[int] = []
+        self.fbank_extractor = FbankExtractor(dither=0.0)
+        self.fbank_kwargs = {
+            "num_mel_bins": 80,
+            "frame_length": 25,
+            "frame_shift": 10,
+            "dither": 0.0,
+            "window_type": "povey",
+            "backend": "torchaudio_kaldi",
+            "target_sample_rate": None,
+            "snip_edges": True,
+            "low_freq": 20.0,
+            "high_freq": 0.0,
+        }
+
+    def score_clip_feats(self, feats, keyword_ids_batch):
+        assert len(feats) == len(keyword_ids_batch)
+        self.batches.append(len(feats))
+        scores = self._scores[: len(feats)]
+        self._scores = self._scores[len(feats):]
+        return scores
+
+
+def test_clip_runner_run_batch(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchaudio")
+
+    def loader(path: str, *, sample_rate: int):
+        if path.endswith("short.wav"):
+            return torch.zeros(1, 10), sample_rate
+        return torch.zeros(1, sample_rate * 2), sample_rate
+
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.load_audio", loader)
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.make_g2p", _fake_g2p)
+    g2p_calls: list[str] = []
+
+    def fake_text_to_phonemes(_g2p, text):
+        g2p_calls.append(text)
+        return text.upper().split()
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.text_to_phonemes", fake_text_to_phonemes
+    )
+
+    verifier = FakeBatchVerifier(scores=[0.9, 0.2])
+    tokenizer = load_char_tokenizer("data/dict/lang_char.txt", split_with_space=" ")
+    runner = Stage2ClipRunner(
+        verifier=verifier,
+        tokenizer=tokenizer,
+        demo_cfg={"qbyt_threshold": 0.5, "min_stage2_fbank_frames": 7},
+        sample_rate=16000,
+    )
+
+    rows = [
+        {"audio_path": "/tmp/a.wav", "keyword": "hello"},
+        {"audio_path": "/tmp/short.wav", "keyword": "hello"},
+        {"audio_path": "/tmp/b.wav", "keyword": "hello"},
+    ]
+    results = runner.run_batch(rows, batch_size=8, num_workers=0)
+
+    assert [record["skipped"] for record in results] == [False, True, False]
+    assert results[0]["qbyt_score"] == 0.9
+    assert results[0]["detected"] is True
+    assert results[1]["qbyt_score"] == 0.0
+    assert results[1]["detected"] is False
+    assert results[2]["qbyt_score"] == 0.2
+    assert results[2]["detected"] is False
+    assert g2p_calls == ["hello"]
+    assert verifier.batches == [2]
+    assert set(results[0]) == {
+        "audio",
+        "keyword",
+        "keyword_phonemes",
+        "clip_span_sec",
+        "qbyt_score",
+        "threshold",
+        "detected",
+        "skipped",
+    }
 
 
 def test_clip_runner_result_record_shape(monkeypatch):

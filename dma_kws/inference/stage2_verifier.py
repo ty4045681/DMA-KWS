@@ -86,6 +86,14 @@ class Stage2Verifier:
             ) from exc
         self._model = model.to(device).eval()
 
+    @property
+    def fbank_extractor(self) -> FbankExtractor:
+        return self._fbank_extractor
+
+    @property
+    def fbank_kwargs(self) -> dict:
+        return dict(self._fbank_kwargs)
+
     @classmethod
     def from_config(cls, config: Mapping[str, Any], prep: Mapping[str, Any], device) -> "Stage2Verifier":
         stage1_cfg = config.get("stage1")
@@ -112,6 +120,36 @@ class Stage2Verifier:
             stage2_ckpt=stage2_ckpt,
             device=device,
         )
+
+    def score_clip_feats(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+    ) -> list[float]:
+        """Score a batch of full-clip fbank features against per-clip keyword ids."""
+        torch = self._torch
+        if not feats:
+            return []
+        from torch.nn.utils.rnn import pad_sequence
+
+        padded_feats = pad_sequence(list(feats), batch_first=True, padding_value=0)
+        feat_lengths = torch.tensor([f.size(0) for f in feats], dtype=torch.long)
+        anchors = pad_sequence(
+            [torch.tensor(list(ids), dtype=torch.long) for ids in keyword_ids_batch],
+            batch_first=True,
+            padding_value=0,
+        )
+        anchor_lengths = torch.tensor(
+            [len(ids) for ids in keyword_ids_batch], dtype=torch.long
+        )
+        with torch.no_grad():
+            scores = self._model(
+                padded_feats.to(self._device),
+                feat_lengths.to(self._device),
+                anchors.to(self._device),
+                anchor_lengths.to(self._device),
+            )
+        return [float(value) for value in scores.reshape(-1).cpu()]
 
     def verify_candidates(
         self,

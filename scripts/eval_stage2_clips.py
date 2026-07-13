@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import hydra
@@ -77,10 +78,20 @@ def run_eval(cfg: DictConfig) -> dict:
     device = torch.device(accelerator if accelerator == "cpu" else "cuda")
     runner = Stage2ClipRunner.from_config(config, prep, device)
 
-    results: list[dict] = []
-    for row in rows:
-        runner_result = runner.run(row["audio_path"], row["keyword"])
-        results.append(_result_record(row, runner_result))
+    batch_size = int(prep.get("batch_size", 0) or 0)
+    if batch_size <= 0:
+        batch_size = 64
+    num_workers = int(prep.get("num_workers", 0) or 0)
+    if num_workers <= 0:
+        num_workers = min(8, os.cpu_count() or 1)
+
+    runner_results = runner.run_batch(
+        rows, batch_size=batch_size, num_workers=num_workers
+    )
+    results = [
+        _result_record(row, runner_result)
+        for row, runner_result in zip(rows, runner_results)
+    ]
 
     results_path = output_dir / "results.jsonl"
     with results_path.open("w", encoding="utf-8") as handle:
