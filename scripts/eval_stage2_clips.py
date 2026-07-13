@@ -54,6 +54,8 @@ def run_eval(cfg: DictConfig) -> dict:
             "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
         ) from exc
 
+    torch.multiprocessing.set_sharing_strategy("file_system")
+
     config = resolved_config(cfg)
     require_sections(config, ["paths", "stage1", "stage2", "demo", "tokenizer"])
     prep = OmegaConf.to_container(cfg.prep, resolve=True)
