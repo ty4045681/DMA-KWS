@@ -21,6 +21,7 @@ class AdaptSample:
     text: str
     label: int
     phase: str
+    split: str | None = None
 
 
 def _import_torchaudio():
@@ -40,7 +41,7 @@ def validate_g2p(text: str, g2p: Any) -> None:
 
 
 def scan_raw_tree(data_root: Path, keyword: str) -> list[AdaptSample]:
-    """Scan ``raw/{tts,real}/{positive,negative/*}`` for adaptation samples."""
+    """Scan explicit train and eval trees under ``raw/{tts,real}``."""
     keyword = keyword.strip()
     raw_root = data_root / "raw"
     if not raw_root.is_dir():
@@ -51,33 +52,36 @@ def scan_raw_tree(data_root: Path, keyword: str) -> list[AdaptSample]:
         if not phase_dir.is_dir():
             continue
         phase = phase_dir.name
-        positive_dir = phase_dir / "positive"
-        if positive_dir.is_dir():
-            for wav_path in sorted(positive_dir.rglob("*.wav")):
-                rel = wav_path.relative_to(data_root)
-                samples.append(
-                    AdaptSample(
-                        audio_path=str(rel),
-                        text=keyword,
-                        label=1,
-                        phase=phase,
-                    )
-                )
-
-        negative_root = phase_dir / "negative"
-        if negative_root.is_dir():
-            for neg_dir in sorted(path for path in negative_root.iterdir() if path.is_dir()):
-                neg_text = neg_slug_to_text(neg_dir.name)
-                for wav_path in sorted(neg_dir.rglob("*.wav")):
+        for split, split_dir in (("train", phase_dir), ("eval", phase_dir / "eval")):
+            positive_dir = split_dir / "positive"
+            if positive_dir.is_dir():
+                for wav_path in sorted(positive_dir.rglob("*.wav")):
                     rel = wav_path.relative_to(data_root)
                     samples.append(
                         AdaptSample(
                             audio_path=str(rel),
-                            text=neg_text,
-                            label=0,
+                            text=keyword,
+                            label=1,
                             phase=phase,
+                            split=split,
                         )
                     )
+
+            negative_root = split_dir / "negative"
+            if negative_root.is_dir():
+                for neg_dir in sorted(path for path in negative_root.iterdir() if path.is_dir()):
+                    neg_text = neg_slug_to_text(neg_dir.name)
+                    for wav_path in sorted(neg_dir.rglob("*.wav")):
+                        rel = wav_path.relative_to(data_root)
+                        samples.append(
+                            AdaptSample(
+                                audio_path=str(rel),
+                                text=neg_text,
+                                label=0,
+                                phase=phase,
+                                split=split,
+                            )
+                        )
     if not samples:
         raise ValueError(f"No wav files found under {raw_root}")
     return samples
@@ -180,12 +184,43 @@ def prepare_keyword_adaptation(
     skip_existing: bool = True,
 ) -> dict[str, Any]:
     """Prepare fbank features and manifests for one keyword slug tree."""
-    g2p = make_g2p()
-    if manifest_csv is not None and manifest_csv.is_file():
+    uses_manifest = manifest_csv is not None and manifest_csv.is_file()
+    if uses_manifest:
         all_samples = load_manifest_csv(manifest_csv)
     else:
         all_samples = scan_raw_tree(data_root, keyword)
 
+    by_phase: dict[str, list[AdaptSample]] = {}
+    for sample in all_samples:
+        by_phase.setdefault(sample.phase, []).append(sample)
+
+    phase_splits: dict[str, tuple[list[AdaptSample], list[AdaptSample]]] = {}
+    for phase, phase_samples in sorted(by_phase.items()):
+        if uses_manifest:
+            train_rows, eval_rows = split_train_eval(
+                phase_samples,
+                eval_fraction=eval_fraction,
+                seed=eval_seed,
+            )
+        else:
+            unexpected = sorted({sample.split for sample in phase_samples} - {"train", "eval"})
+            if unexpected:
+                raise ValueError(f"Unexpected adaptation splits for phase {phase!r}: {unexpected}")
+            train_rows = [sample for sample in phase_samples if sample.split == "train"]
+            eval_rows = [sample for sample in phase_samples if sample.split == "eval"]
+            if not train_rows:
+                raise ValueError(
+                    f"No training wav files found for phase {phase!r}; expected positive/ or negative/ "
+                    f"under {data_root / 'raw' / phase}"
+                )
+            if not eval_rows:
+                raise ValueError(
+                    f"No evaluation wav files found for phase {phase!r}; expected positive/ or negative/ "
+                    f"under {data_root / 'raw' / phase / 'eval'}"
+                )
+        phase_splits[phase] = (train_rows, eval_rows)
+
+    g2p = make_g2p()
     for sample in all_samples:
         validate_g2p(sample.text, g2p)
 
@@ -209,22 +244,13 @@ def prepare_keyword_adaptation(
     manifest_dir = data_root / "manifests"
     stats: dict[str, Any] = {"keyword": keyword, "slug": slugify(keyword), "phases": {}}
 
-    by_phase: dict[str, list[AdaptSample]] = {}
-    for sample in all_samples:
-        by_phase.setdefault(sample.phase, []).append(sample)
-
-    for phase, phase_samples in sorted(by_phase.items()):
-        train_rows, eval_rows = split_train_eval(
-            phase_samples,
-            eval_fraction=eval_fraction,
-            seed=eval_seed,
-        )
+    for phase, (train_rows, eval_rows) in phase_splits.items():
         train_path = manifest_dir / f"{phase}_train.csv"
         eval_path = manifest_dir / f"{phase}_eval.csv"
         write_train_manifest(train_path, train_rows)
         write_eval_manifest(eval_path, eval_rows, keyword)
         stats["phases"][phase] = {
-            "total": len(phase_samples),
+            "total": len(train_rows) + len(eval_rows),
             "train": len(train_rows),
             "eval": len(eval_rows),
             "train_manifest": str(train_path),

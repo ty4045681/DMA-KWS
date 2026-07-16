@@ -993,7 +993,8 @@ Paper Section III-E: freeze the full model, LoRA-tune **QbyT phoneme matcher att
 **Data layout** (slug from `adapt.keyword`, e.g. `hey eva` → `hey_eva`; default root `${paths.processed_root}/adapt/<slug>`):
 
 ```text
-data/dma-kws/processed/adapt/<slug>/raw/{tts,real}/{positive,negative/<neg_text_slug>}/...
+data/dma-kws/processed/adapt/<slug>/raw/{tts,real}/{positive,negative/<neg_text_slug>}/...       # train
+data/dma-kws/processed/adapt/<slug>/raw/{tts,real}/eval/{positive,negative/<neg_text_slug>}/...  # eval
 data/dma-kws/processed/adapt/<slug>/fbank/...
 data/dma-kws/processed/adapt/<slug>/manifests/{tts,real}_{train,eval}.csv
 ```
@@ -1041,7 +1042,7 @@ Outputs: `exp/stage2_adapt/<slug>/adapter_<slug>.pt` (small LoRA only), `stage2_
 
 **Directory layout (recommended)**
 
-Place wav files under `raw/` using phase (`tts` / `real`), polarity, and negative phrase slug. The slug is derived automatically from `adapt.keyword` unless you override `adapt.data_root`.
+Place train wav files directly under each `raw/<phase>/` using polarity and negative phrase slug. Place held-out wav files under the phase's `eval/` subtree with the same polarity layout. The slug is derived automatically from `adapt.keyword` unless you override `adapt.data_root`.
 
 Example for `adapt.keyword="hey eva"`:
 
@@ -1049,19 +1050,31 @@ Example for `adapt.keyword="hey eva"`:
 data/dma-kws/processed/adapt/hey_eva/
 ├── raw/
 │   ├── tts/
-│   │   ├── positive/              # label=1, text="hey eva"
+│   │   ├── positive/              # train: label=1, text="hey eva"
 │   │   │   └── *.wav
-│   │   └── negative/
-│   │       ├── hey_ava/           # label=0, text="hey ava"  (folder slug → phrase)
+│   │   ├── negative/
+│   │   │   ├── hey_ava/           # train: label=0, text="hey ava"
+│   │   │   │   └── *.wav
+│   │   │   └── hey_eve/
+│   │   │       └── *.wav
+│   │   └── eval/
+│   │       ├── positive/          # eval: label=1, text="hey eva"
 │   │       │   └── *.wav
-│   │       └── hey_eve/
-│   │           └── *.wav
+│   │       └── negative/
+│   │           └── hey_ava/       # eval: label=0, text="hey ava"
+│   │               └── *.wav
 │   └── real/
-│       ├── positive/
+│       ├── positive/              # train
 │       │   └── *.wav
-│       └── negative/
-│           └── hey_ava/
-│               └── *.wav
+│       ├── negative/
+│       │   └── hey_ava/
+│       │       └── *.wav
+│       └── eval/
+│           ├── positive/          # eval
+│           │   └── *.wav
+│           └── negative/
+│               └── hey_ava/
+│                   └── *.wav
 ├── fbank/                         # written by prepare script (mirrors raw tree, .npy)
 └── manifests/                     # written by prepare script
     ├── tts_train.csv
@@ -1074,14 +1087,14 @@ data/dma-kws/processed/adapt/hey_eva/
 
 | Location | `label` | `text` (G2P query) |
 |----------|---------|---------------------|
-| `*/positive/*.wav` | `1` | `adapt.keyword` exactly (e.g. `hey eva`) |
-| `*/negative/<slug>/*.wav` | `0` | folder slug with `_` → spaces (e.g. `hey_ava` → `hey ava`) |
+| `<phase>/positive/*.wav` and `<phase>/eval/positive/*.wav` | `1` | `adapt.keyword` exactly (e.g. `hey eva`) |
+| `<phase>/negative/<slug>/*.wav` and `<phase>/eval/negative/<slug>/*.wav` | `0` | folder slug with `_` → spaces (e.g. `hey_ava` → `hey ava`) |
 
-All `text` values are validated through G2P at prepare time; invalid phrases fail early.
+Files directly under each phase's `positive/` and `negative/` trees are written to the train manifest. Files under the phase's `eval/` tree are written only to the eval manifest. All `text` values are validated through G2P at prepare time; invalid phrases fail early.
 
 **Prepare command**
 
-Runs G2P check → Kaldi fbank (from `configs/fbank/default.yaml`, 80-dim, dither 0.1) → train/eval split:
+Runs explicit directory split → G2P check → Kaldi fbank (from `configs/fbank/default.yaml`, 80-dim, dither 0.1) → train/eval manifests:
 
 ```bash
 python3 scripts/prepare_keyword_adaptation.py adapt.keyword="hey eva"
@@ -1091,8 +1104,8 @@ Useful overrides:
 
 | Override | Default | Meaning |
 |----------|---------|---------|
-| `adapt.eval_fraction` | `0.2` | Held-out fraction per phase (`tts`, `real`) |
-| `adapt.eval_seed` | `2025` | Shuffle seed for train/eval split |
+| `adapt.eval_fraction` | `0.2` | Held-out fraction per phase only when using `prep.manifest_csv` |
+| `adapt.eval_seed` | `2025` | Shuffle seed only when using `prep.manifest_csv` |
 | `prep.no_skip_existing=true` | off | Recompute all fbank even if `.npy` exists |
 | `adapt.data_root=...` | `${paths.processed_root}/adapt/<slug>` | Custom data root |
 | `prep.manifest_csv=...` | — | Skip directory scan; CSV with columns `audio_path,text,label` |

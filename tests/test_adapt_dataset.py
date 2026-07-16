@@ -12,7 +12,14 @@ from dma_kws.stage2.adapt_dataset import (
 )
 from dma_kws.stage2.adapt_paths import neg_slug_to_text, slugify, wav_to_fbank_mirror
 from dma_kws.stage2.collate import train_collate_fn
-from dma_kws.stage2.prepare_adapt import AdaptSample, split_train_eval, write_eval_manifest, write_train_manifest
+from dma_kws.stage2.prepare_adapt import (
+    AdaptSample,
+    prepare_keyword_adaptation,
+    scan_raw_tree,
+    split_train_eval,
+    write_eval_manifest,
+    write_train_manifest,
+)
 from dma_kws.tokenizer import load_char_tokenizer
 
 
@@ -30,6 +37,96 @@ def test_wav_to_fbank_mirror():
     fbank = wav_to_fbank_mirror(Path("/tmp/data/adapt/hey_eva/fbank"), wav)
     assert fbank.name == "a.npy"
     assert "tts/positive" in str(fbank)
+
+    eval_wav = Path("/tmp/data/adapt/hey_eva/raw/tts/eval/positive/b.wav")
+    eval_fbank = wav_to_fbank_mirror(Path("/tmp/data/adapt/hey_eva/fbank"), eval_wav)
+    assert eval_fbank.name == "b.npy"
+    assert "tts/eval/positive" in str(eval_fbank)
+
+
+def test_scan_raw_tree_assigns_explicit_splits(tmp_path: Path):
+    wav_paths = [
+        tmp_path / "raw" / "tts" / "positive" / "train_pos.wav",
+        tmp_path / "raw" / "tts" / "negative" / "hey_ava" / "train_neg.wav",
+        tmp_path / "raw" / "tts" / "eval" / "positive" / "eval_pos.wav",
+        tmp_path / "raw" / "tts" / "eval" / "negative" / "hey_eve" / "eval_neg.wav",
+    ]
+    for wav_path in wav_paths:
+        wav_path.parent.mkdir(parents=True, exist_ok=True)
+        wav_path.touch()
+
+    samples = {
+        Path(sample.audio_path).name: sample
+        for sample in scan_raw_tree(tmp_path, "hey eva")
+    }
+
+    assert samples["train_pos.wav"].split == "train"
+    assert samples["train_pos.wav"].label == 1
+    assert samples["train_pos.wav"].text == "hey eva"
+    assert samples["train_neg.wav"].split == "train"
+    assert samples["train_neg.wav"].label == 0
+    assert samples["train_neg.wav"].text == "hey ava"
+    assert samples["eval_pos.wav"].split == "eval"
+    assert samples["eval_neg.wav"].split == "eval"
+    assert samples["eval_neg.wav"].text == "hey eve"
+
+
+def test_prepare_uses_explicit_eval_directory(tmp_path: Path, monkeypatch):
+    train_wav = tmp_path / "raw" / "tts" / "positive" / "train.wav"
+    eval_wav = tmp_path / "raw" / "tts" / "eval" / "negative" / "hey_ava" / "eval.wav"
+    for wav_path in (train_wav, eval_wav):
+        wav_path.parent.mkdir(parents=True, exist_ok=True)
+        wav_path.touch()
+
+    monkeypatch.setattr("dma_kws.stage2.prepare_adapt.make_g2p", lambda: object())
+    monkeypatch.setattr("dma_kws.stage2.prepare_adapt.validate_g2p", lambda _text, _g2p: None)
+    monkeypatch.setattr(
+        "dma_kws.stage2.prepare_adapt.compute_and_save_fbank",
+        lambda *_args, **_kwargs: True,
+    )
+
+    stats = prepare_keyword_adaptation(
+        keyword="hey eva",
+        data_root=tmp_path,
+        fbank_params={},
+        eval_fraction=1.0,
+    )
+    train_rows = list(csv.DictReader((tmp_path / "manifests" / "tts_train.csv").open()))
+    eval_rows = list(csv.DictReader((tmp_path / "manifests" / "tts_eval.csv").open()))
+
+    assert stats["phases"]["tts"]["train"] == 1
+    assert stats["phases"]["tts"]["eval"] == 1
+    assert train_rows == [
+        {"audio_path": "raw/tts/positive/train.wav", "text": "hey eva", "label": "1"}
+    ]
+    assert eval_rows == [
+        {
+            "audio_path": "raw/tts/eval/negative/hey_ava/eval.wav",
+            "text": "hey ava",
+            "keyword": "hey eva",
+            "label": "0",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "error"),
+    [
+        ("raw/tts/positive/train.wav", "No evaluation wav files found for phase 'tts'"),
+        ("raw/tts/eval/positive/eval.wav", "No training wav files found for phase 'tts'"),
+    ],
+)
+def test_prepare_requires_explicit_train_and_eval_wavs(
+    tmp_path: Path,
+    relative_path: str,
+    error: str,
+):
+    wav_path = tmp_path / relative_path
+    wav_path.parent.mkdir(parents=True)
+    wav_path.touch()
+
+    with pytest.raises(ValueError, match=error):
+        prepare_keyword_adaptation(keyword="hey eva", data_root=tmp_path, fbank_params={})
 
 
 def test_load_adapt_manifest(tmp_path: Path):
