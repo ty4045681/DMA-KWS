@@ -23,9 +23,16 @@ def _forward_overrides() -> list[str]:
 
     The orchestrator re-assembles overrides for each sub-script, but keys like
     ``+experiment=...`` or ``stage2.eval.test_dir=...`` must still reach them.
-    Excluded keys are internal to the orchestrator.
+    Excluded keys are already rebuilt by the orchestrator, so forwarding them
+    would only create duplicates.
     """
-    excluded = {"adapt.stage"}
+    excluded = {
+        "adapt.stage",
+        "adapt.keyword",
+        "adapt.phase",
+        "prep.stage2_ckpt",
+        "run.device",
+    }
     return [
         arg for arg in sys.argv[1:]
         if "=" in arg
