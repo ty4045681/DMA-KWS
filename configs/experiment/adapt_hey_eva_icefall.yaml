@@ -1,0 +1,28 @@
+# @package _global_
+# Combined LoRA continual adaptation experiment for "hey eva" on Icefall Zipformer frozen.
+#
+# This experiment layers the adaptation data layout and eval paths on top of the
+# Icefall Zipformer Stage II config, matching the exported checkpoint
+# hey-eva-pretrained-icefall-zipformer-frozen.
+#
+# Usage:
+#   python scripts/run_keyword_adaptation.py \
+#     +experiment=adapt_hey_eva_icefall \
+#     adapt.stage=train \
+#     prep.stage2_ckpt=/path/to/step_037000.pt \
+#     run.device=cuda
+
+defaults:
+  - icefall_zipformer_stage2
+  - _self_
+
+paths:
+  libriphrase100_root: data/dma-kws/raw/LibriPhrase-100
+
+adapt:
+  keyword: hey eva
+
+stage2:
+  eval:
+    test_dir: data/dma-kws/raw/LibriPhrase-100/eval
+    split: hard
