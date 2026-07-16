@@ -1,0 +1,28 @@
+# @package _global_
+# LoRA continual adaptation experiment for keyword "hey eva"
+#
+# Usage:
+#   python scripts/run_keyword_adaptation.py \
+#     +experiment=adapt_hey_eva \
+#     adapt.stage=train \
+#     prep.stage2_ckpt=/path/to/step_037000.pt
+#
+# Or run stages directly:
+#   python scripts/adapt_stage2_keyword.py \
+#     +experiment=adapt_hey_eva \
+#     prep.stage2_ckpt=/path/to/step_037000.pt \
+#     adapt.phase=tts
+
+defaults:
+  - override /paths: default
+
+paths:
+  libriphrase100_root: data/dma-kws/raw/LibriPhrase-100
+
+adapt:
+  keyword: hey eva
+
+stage2:
+  eval:
+    test_dir: data/dma-kws/raw/LibriPhrase-100/eval
+    split: hard

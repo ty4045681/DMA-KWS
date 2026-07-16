@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 import hydra
 import yaml
@@ -19,8 +18,29 @@ from dma_kws.stage2.adapt_paths import adapt_data_root, adapt_exp_root, clips_ev
 from dma_kws.stage2.prepare_adapt import prepare_keyword_adaptation
 
 
+def _forward_overrides() -> list[str]:
+    """Forward user-supplied Hydra config overrides to sub-scripts.
+
+    The orchestrator re-assembles overrides for each sub-script, but keys like
+    ``+experiment=...`` or ``stage2.eval.test_dir=...`` must still reach them.
+    Excluded keys are internal to the orchestrator.
+    """
+    excluded = {"adapt.stage"}
+    return [
+        arg for arg in sys.argv[1:]
+        if "=" in arg
+        and not arg.startswith("--")
+        and arg.split("=", 1)[0] not in excluded
+    ]
+
+
 def _run_script(script: str, overrides: list[str]) -> None:
-    cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / script), *overrides]
+    cmd = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / script),
+        *_forward_overrides(),
+        *overrides,
+    ]
     print("Running:", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT))
 
@@ -101,7 +121,6 @@ def main(cfg: DictConfig) -> None:
     if stage != "prepare" and not base_ckpt:
         raise SystemExit("prep.stage2_ckpt or run.init_checkpoint is required")
 
-    slug = slugify(keyword)
     common = [f"adapt.keyword={keyword!r}"]
 
     if stage in {"prepare", "all"}:
