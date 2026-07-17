@@ -32,6 +32,11 @@ ORT_TO_NUMPY = {
     "tensor(uint64)": np.dtype(np.uint64),
 }
 
+MINDSPORE_LITE_DTYPE_MAP = {
+    np.dtype(np.int64): np.dtype(np.int32),
+    np.dtype(np.uint64): np.dtype(np.uint32),
+}
+
 
 def _safe_dir_name(index: int, input_name: str) -> str:
     safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", input_name).strip("._")
@@ -177,7 +182,11 @@ class CalibrationBinWriter:
                     f"actual={array.dtype}; do not silently cast calibration states"
                 )
             self._validate_shape(spec, array)
-            arrays[spec.name] = np.ascontiguousarray(array)
+            array = np.ascontiguousarray(array)
+            target_dtype = MINDSPORE_LITE_DTYPE_MAP.get(array.dtype)
+            arrays[spec.name] = (
+                array.astype(target_dtype) if target_dtype is not None else array
+            )
 
         filename = f"{self.count:06d}.bin"
         written: list[Path] = []
