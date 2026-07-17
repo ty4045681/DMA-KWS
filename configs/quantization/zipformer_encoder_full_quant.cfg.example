@@ -1,0 +1,25 @@
+[common_quant_param]
+# Post-training full INT8 quantization: quantize weights and activations.
+quant_type=FULL_QUANT
+bit_num=8
+
+# Keep this enabled for the first conversion. The generated CSV reports are
+# useful for locating accuracy-sensitive nodes that may need skip_quant_node.
+debug_info_save_path=./quant_debug/zipformer_encoder
+
+# Optional accuracy fallback. Populate with exact ONNX node names, comma-separated.
+# skip_quant_node=node_name_1,node_name_2
+
+[data_preprocess_param]
+# IMPORTANT: replace this line with every real ONNX graph input. A streaming
+# Zipformer encoder has x plus many cache/state inputs. Example format:
+# calibrate_path=x:/abs/calibration/000_x,cached_key_0:/abs/calibration/001_cached_key_0
+calibrate_path=__GENERATE_FROM_THE_ACTUAL_ENCODER_ONNX__
+calibrate_size=100
+input_type=BIN
+
+[full_quant_param]
+# Recommended first attempt when calibration data matches real inference data.
+activation_quant_method=MAX_MIN
+bias_correction=true
+per_channel=true
