@@ -1353,7 +1353,7 @@ python3 scripts/eval_stage2_clips.py \
   prep.num_workers=8
 ```
 
-To evaluate every exported `.pt` checkpoint in one or more directories against a manifest, use `scripts/batch_eval_stage2_clips.sh`:
+To evaluate exported `.pt` checkpoints against a manifest, use `scripts/batch_eval_stage2_clips.sh`. Directory inputs scan immediate `*.pt` children; an optional `:OUT_DIR` sets that directory source's output root, otherwise the script writes to `<base-out>/<checkpoint-directory-name>/<checkpoint-stem>/`:
 
 ```bash
 bash scripts/batch_eval_stage2_clips.sh \
@@ -1364,7 +1364,28 @@ bash scripts/batch_eval_stage2_clips.sh \
   --experiment icefall_zipformer_stage2
 ```
 
-Checkpoints run sequentially on one GPU; to use multiple GPUs, split the checkpoint dirs and launch one invocation per GPU with `CUDA_VISIBLE_DEVICES`.
+To evaluate selected checkpoints, pass repeatable `--pt PT:OUT_DIR` arguments. Each explicit checkpoint writes directly to its declared `OUT_DIR`, without adding its filename:
+
+```bash
+bash scripts/batch_eval_stage2_clips.sh \
+  --pt /path/to/export1/stage2_step010000.pt:/path/to/outputs/step10000 \
+  --pt /path/to/export2/stage2_step020000.pt:/path/to/outputs/step20000 \
+  --manifest /path/to/merged.csv \
+  --experiment icefall_zipformer_stage2
+```
+
+For long lists, use `--dirs-file` (one `CKPT_DIR[:OUT_DIR]` per non-comment line) and `--pts-file` (one `PT:OUT_DIR` per non-comment line). Directory and explicit inputs may be combined; `--manifest` and `--experiment` apply to every checkpoint, while `--base-out` only supplies the fallback output root for directory entries without `:OUT_DIR`:
+
+```bash
+bash scripts/batch_eval_stage2_clips.sh \
+  --dirs-file checkpoint_dirs.txt \
+  --pts-file selected_checkpoints.txt \
+  --manifest /path/to/merged.csv \
+  --base-out /path/to/outputs \
+  --experiment icefall_zipformer_stage2
+```
+
+Checkpoints run sequentially on one GPU; to use multiple GPUs, split the checkpoint sources and launch one invocation per GPU with `CUDA_VISIBLE_DEVICES`.
 
 ---
 
