@@ -45,6 +45,8 @@ def test_summarize_labeled_results_metrics():
     assert summary["accuracy"] == pytest.approx(2 / 3)
     assert summary["precision"] == pytest.approx(1.0)
     assert summary["recall"] == pytest.approx(0.5)
+    assert summary["fpr"] == pytest.approx(0.0)
+    assert summary["fnr"] == pytest.approx(0.5)
     assert 0.0 <= summary["auc"] <= 1.0
     assert 0.0 <= summary["eer"] <= 1.0
 

@@ -95,6 +95,8 @@ def summarize_labeled_results(
     precision = _safe_div(tp, tp + fp)
     recall = _safe_div(tp, tp + fn)
     f1 = _safe_div(2 * precision * recall, precision + recall)
+    fpr = _safe_div(fp, fp + tn)
+    fnr = _safe_div(fn, fn + tp)
 
     return {
         "num_samples": float(len(labeled)),
@@ -102,6 +104,8 @@ def summarize_labeled_results(
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "fpr": fpr,
+        "fnr": fnr,
         "auc": binary_auc(labels, scores),
         "eer": binary_eer(labels, scores),
         "threshold": float(threshold),
