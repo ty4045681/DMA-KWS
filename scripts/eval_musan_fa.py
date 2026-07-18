@@ -107,11 +107,10 @@ def run_eval(cfg: DictConfig) -> dict:
     subset_hours: dict[str, float] = defaultdict(float)
     total_hours = 0.0
 
-    sample_rate = int(runner._sample_rate)
     for source_row in source_rows:
         audio_path = source_row["audio_path"]
         subset = source_row["subset"]
-        duration = audio_duration_sec(audio_path, sample_rate=sample_rate)
+        duration = audio_duration_sec(audio_path)
         total_hours += duration / 3600.0
         subset_hours[subset] += duration / 3600.0
 
