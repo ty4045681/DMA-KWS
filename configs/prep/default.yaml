@@ -33,6 +33,9 @@ last_k: 10
 output: ""
 stage1_ckpt: ""
 stage2_ckpt: ""
+musan_root: ""
+window_sec: 3.0
+hop_sec: 1.0
 audio: ""
 keyword: ""
 keyword_mode: single

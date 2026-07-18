@@ -34,6 +34,7 @@ This repository implements a two-stage keyword spotting pipeline with a **single
 8. [Stage II LoRA continual adaptation](#8-stage-ii-lora-continual-adaptation)
 9. [Run the two-stage demo](#9-run-the-two-stage-demo)
 10. [Stage II-only clip inference](#10-stage-ii-only-clip-inference)
+11. [MUSAN false-accept evaluation](#11-musan-false-accept-evaluation)
 
 **Reference**
 
@@ -1388,6 +1389,66 @@ bash scripts/batch_eval_stage2_clips.sh \
 Checkpoints run sequentially on one GPU; to use multiple GPUs, split the checkpoint sources and launch one invocation per GPU with `CUDA_VISIBLE_DEVICES`.
 
 ---
+
+## 11. MUSAN false-accept evaluation
+
+To measure the false-accept (FA) rate of a Stage-II QbyT checkpoint on continuous
+background audio, use `scripts/eval_musan_fa.py` or the batch wrapper
+`scripts/batch_eval_musan_fa.sh`. These scripts slide a fixed-length window over
+every MUSAN file and score each window with Stage-II only. The output format
+matches `scripts/eval_stage2_clips.py` (`results.jsonl` + `summary.json`), and the
+summary reports both overall and per-subset (`music`/`noise`/`speech`) FA/hour.
+
+Single keyword, single checkpoint:
+
+```bash
+python3 scripts/eval_musan_fa.py \
+  +experiment=icefall_zipformer_stage2 \
+  prep.keyword="hey eva" \
+  prep.musan_root=/path/to/musan \
+  prep.stage2_ckpt=/path/to/stage2_step020000.pt \
+  prep.window_sec=3.0 \
+  prep.hop_sec=1.0 \
+  prep.output_dir=/path/to/out
+```
+
+Batch evaluation across multiple checkpoints and keywords:
+
+```bash
+bash scripts/batch_eval_musan_fa.sh \
+  --keyword "hey eva" \
+  --keyword "hey android" \
+  --musan-root /path/to/musan \
+  --pt /path/to/stage2_step020000.pt \
+  --base-out /path/to/musan_fa_outputs \
+  --window-sec 3.0 \
+  --hop-sec 1.0
+```
+
+For many keywords, put them in a file (`keywords.txt`):
+
+```text
+# One keyword per line. Blank lines and lines starting with # are ignored.
+hey eva
+hey android
+hi galaxy
+```
+
+then run:
+
+```bash
+bash scripts/batch_eval_musan_fa.sh \
+  --keywords-file keywords.txt \
+  --musan-root /path/to/musan \
+  --pts-file checkpoints.txt \
+  --base-out /path/to/musan_fa_outputs
+```
+
+Each checkpoint × keyword combination produces a `summary.json` with
+`total_hours`, `fa_per_hour`, `fa_per_1000_hours`, and
+`subsets.{music,noise,speech}.metrics.fa_per_hour`. After all runs,
+`batch_eval_musan_fa.sh` writes a combined `musan_fa_summary.tsv` for easy
+comparison.
 
 ## External locator (Zipformer / WeKws+Wenet)
 

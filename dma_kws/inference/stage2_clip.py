@@ -242,14 +242,96 @@ class Stage2ClipRunner:
         threshold: float,
         *,
         skipped: bool,
+        start_sec: float = 0.0,
     ) -> dict:
         return {
             "audio": audio_path,
             "keyword": keyword,
             "keyword_phonemes": keyword_phonemes,
-            "clip_span_sec": {"start_sec": 0.0, "end_sec": end_sec},
+            "clip_span_sec": {"start_sec": start_sec, "end_sec": end_sec},
             "qbyt_score": qbyt_score,
             "threshold": threshold,
             "detected": qbyt_score >= threshold,
             "skipped": skipped,
         }
+
+    def run_file_windows(
+        self,
+        audio_path: str,
+        keyword: str,
+        *,
+        window_sec: float,
+        hop_sec: float,
+    ) -> list[dict]:
+        """Run Stage-II verification on sliding windows of a long audio file.
+
+        The file is divided into overlapping windows of length ``window_sec``
+        advanced by ``hop_sec``. Each window is scored independently and a result
+        dict in the same format as :meth:`run` is returned.
+        """
+        from dma_kws.inference.audio_utils import has_min_fbank_frames
+        from dma_kws.stage2.features import waveform_to_fbank
+
+        keyword_phonemes = text_to_phonemes(self._g2p, keyword)
+        keyword_ids = tokenize_phoneme_string(
+            self._tokenizer, " ".join(keyword_phonemes)
+        )
+        threshold = float(self._demo_cfg.get("qbyt_threshold", 0.5))
+        min_stage2_fbank_frames = int(
+            self._demo_cfg.get("min_stage2_fbank_frames", 7)
+        )
+
+        waveform, sample_rate = load_audio(audio_path, sample_rate=self._sample_rate)
+        waveform, sample_rate = self._verifier.fbank_extractor.prepare_waveform(
+            waveform, sample_rate
+        )
+        total_samples = waveform.size(1)
+        window_samples = int(window_sec * sample_rate)
+        hop_samples = int(hop_sec * sample_rate)
+
+        if window_samples <= 0 or hop_samples <= 0 or total_samples < window_samples:
+            return []
+
+        fbank_kwargs = self._verifier.fbank_kwargs
+        feats = []
+        spans: list[tuple[float, float]] = []
+        for start in range(0, total_samples - window_samples + 1, hop_samples):
+            end = start + window_samples
+            if not has_min_fbank_frames(
+                end - start,
+                min_frames=min_stage2_fbank_frames,
+                sample_rate=sample_rate,
+                frame_length_ms=float(fbank_kwargs["frame_length"]),
+                frame_shift_ms=float(fbank_kwargs["frame_shift"]),
+                snip_edges=bool(fbank_kwargs.get("snip_edges", True)),
+            ):
+                continue
+            window_wave = waveform[:, start:end]
+            feat = waveform_to_fbank(
+                window_wave,
+                sample_rate=sample_rate,
+                extractor=self._verifier.fbank_extractor,
+                **fbank_kwargs,
+            )
+            feats.append(feat)
+            spans.append((start / sample_rate, end / sample_rate))
+
+        if not feats:
+            return []
+
+        scores = self._verifier.score_clip_feats(feats, [keyword_ids] * len(feats))
+        results = []
+        for (start_sec, end_sec), score in zip(spans, scores):
+            results.append(
+                self._clip_result(
+                    audio_path,
+                    keyword,
+                    keyword_phonemes,
+                    end_sec=end_sec,
+                    qbyt_score=float(score),
+                    threshold=threshold,
+                    skipped=False,
+                    start_sec=start_sec,
+                )
+            )
+        return results

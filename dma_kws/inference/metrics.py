@@ -114,3 +114,29 @@ def summarize_labeled_results(
         "fp": float(fp),
         "fn": float(fn),
     }
+
+
+def summarize_false_accept_rate(
+    results: list[dict[str, Any]],
+    *,
+    threshold: float,
+    total_hours: float,
+) -> dict[str, float]:
+    """Aggregate FA/hour metrics from negative-only evaluation results.
+
+    All rows are expected to have ``label=0`` (no keyword present). The false
+    accept rate is ``fp / total_hours``. Also reports the standard labeled
+    metrics so the output can be consumed by the same tooling as
+    :func:`summarize_labeled_results`.
+    """
+    summary = summarize_labeled_results(results, threshold=threshold)
+    if not summary:
+        return {}
+
+    fp = float(summary.get("fp", 0.0))
+    return {
+        **summary,
+        "total_hours": float(total_hours),
+        "fa_per_hour": _safe_div(fp, total_hours),
+        "fa_per_1000_hours": _safe_div(fp * 1000.0, total_hours),
+    }
