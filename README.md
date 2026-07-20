@@ -1450,6 +1450,60 @@ Each checkpoint × keyword combination produces a `summary.json` with
 `batch_eval_musan_fa.sh` writes a combined `musan_fa_summary.tsv` for easy
 comparison.
 
+### Remove wake-word audio from MUSAN with WeNet ASR
+
+Use `scripts/filter_musan_by_wenet_asr.py` to build a clean MUSAN copy before
+false-accept evaluation. It decodes 30-second windows with one second of overlap,
+uses normalized RapidFuzz `partial_ratio` matching, and excludes the complete
+source file when any window matches any configured wake word. The default WeNet
+mode is `attention_rescoring`, and the default match threshold is 85.
+
+A model directory can contain:
+
+```text
+wenet-model/
+├── final.pt                  # any single *.pt name is accepted
+├── train.yaml
+├── global_cmvn               # global_cvmn is also accepted
+├── unigram5000.model
+└── units.txt
+```
+
+The WeNet Python source package must be installed or supplied through
+`--wenet-root`/`WENET_ROOT`. The root must contain `wenet/bin/recognize.py`.
+Both current (`--modes`/`--result_dir`) and legacy
+(`--mode`/`--result_file`) recognition CLIs are detected automatically.
+
+```bash
+python3 scripts/filter_musan_by_wenet_asr.py \
+  --musan-root /path/to/musan \
+  --output-root /path/to/musan-filtered \
+  --model-dir /path/to/wenet-model \
+  --wenet-root /path/to/wenet \
+  --keyword "hey eva" \
+  --keyword "hey android" \
+  --device cuda
+```
+
+For a longer list, pass `--keywords-file keywords.txt`. Individual
+`--checkpoint`, `--config`, `--cmvn`, `--bpe-model`, and `--units` arguments
+override model-directory discovery. `--threshold`, `--window-sec`,
+`--overlap-sec`, `--batch-size`, `--beam-size`, and `--mode` are also
+configurable. The output path must not already exist.
+
+By default, audit files are written beside the filtered dataset under
+`<output-name>_asr_filter_report/`:
+
+- `results.jsonl` records each source audio file, every ASR window transcript,
+  the highest-scoring wake word, score, and keep/remove decision.
+- `summary.json` records overall, per-subset, and per-keyword counts together
+  with the resolved model paths and decode settings.
+
+Window audio is materialized temporarily as FLAC and removed after decoding, so
+ensure the system temporary directory has enough free space. For short wake
+words or noisy transcripts, inspect `results.jsonl` and adjust `--threshold` to
+control the trade-off between missed matches and over-filtering.
+
 ## External locator (Zipformer / WeKws+Wenet)
 
 Stage II verification stays on the existing Conformer+QbyT checkpoint (`prep.stage2_ckpt`). You can swap the Stage I candidate proposer with an external locator that only returns time spans; Stage II re-extracts fbank from cropped wav with its own encoder.
