@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 import yaml
-from rapidfuzz import fuzz
 
 from dma_kws.inference.manifest import iter_audio_files
 
@@ -143,14 +142,10 @@ def validate_filter_options(
 
 
 def best_keyword_match(transcript: str, keywords: Sequence[str]) -> tuple[str | None, float]:
-    normalized_text = normalize_match_text(transcript)
-    if not normalized_text:
-        return None, 0.0
-    scored = [
-        (keyword, float(fuzz.partial_ratio(normalize_match_text(keyword), normalized_text)))
-        for keyword in keywords
-    ]
-    return max(scored, key=lambda item: item[1])
+    from dma_kws.inference.musan_asr_rescore import bounded_keyword_match
+
+    keyword, _, score = bounded_keyword_match(transcript, keywords)
+    return keyword, score
 
 
 def _patch_wenet_config(files: WenetModelFiles, output_path: Path) -> None:
