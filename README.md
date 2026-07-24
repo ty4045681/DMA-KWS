@@ -1000,6 +1000,22 @@ data/dma-kws/processed/adapt/<slug>/fbank/...
 data/dma-kws/processed/adapt/<slug>/manifests/{tts,real}_{train,eval}.csv
 ```
 
+Alternatively, configure external source directories for each phase. Every wav under `positive_dir` is a positive example for `adapt.keyword`; each direct child directory under `negative_root` is a negative phrase, with all of its wavs assigned to that phrase. The name is case-insensitive and separators such as `_`, spaces, and `-` normalize to spaces, so `Hi_Eva`, `HI EVA`, and `hi-eva` all map to `hi eva`.
+
+```yaml
+adapt:
+  keyword: hey eva
+  sources:
+    tts:
+      positive_dir: /data/tts/hey_eva
+      negative_root: /data/tts/confusable
+    real:
+      positive_dir: /data/real/hey_eva
+      negative_root: /data/real/confusable
+```
+
+In this mode the TTS and real samples are each split into train/eval sets with `adapt.eval_fraction` and `adapt.eval_seed`, then fbank features and standard phase manifests are written under `adapt.data_root`.
+
 **One command** (prepare → optional Optuna sweep → TTS phase → real phase → eval report):
 
 ```bash

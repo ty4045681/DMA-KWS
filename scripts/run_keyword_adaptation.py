@@ -139,6 +139,7 @@ def main(cfg: DictConfig) -> None:
             eval_fraction=float(adapt.get("eval_fraction", 0.2)),
             eval_seed=int(adapt.get("eval_seed", 2025)),
             manifest_csv=prep.get("manifest_csv") or None,
+            sources=adapt.get("sources") if isinstance(adapt.get("sources"), dict) else None,
             skip_existing=not bool(prep.get("no_skip_existing", False)),
         )
         print(json.dumps(stats, indent=2))

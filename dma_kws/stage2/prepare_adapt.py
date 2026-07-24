@@ -11,7 +11,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from dma_kws.g2p import make_g2p, text_to_phonemes
-from dma_kws.stage2.adapt_paths import neg_slug_to_text, slugify, wav_to_fbank_mirror
+from dma_kws.stage2.adapt_paths import directory_name_to_text, neg_slug_to_text, slugify, wav_to_fbank_mirror
 from dma_kws.stage2.features import waveform_to_fbank
 
 
@@ -84,6 +84,71 @@ def scan_raw_tree(data_root: Path, keyword: str) -> list[AdaptSample]:
                         )
     if not samples:
         raise ValueError(f"No wav files found under {raw_root}")
+    return samples
+
+
+def _wav_paths(root: Path) -> list[Path]:
+    return sorted(path for path in root.rglob("*") if path.is_file() and path.suffix.casefold() == ".wav")
+
+
+def scan_external_source(
+    *,
+    phase: str,
+    keyword: str,
+    positive_dir: Path,
+    negative_root: Path,
+) -> list[AdaptSample]:
+    if not positive_dir.is_dir():
+        raise FileNotFoundError(f"Positive audio directory not found for phase {phase!r}: {positive_dir}")
+    if not negative_root.is_dir():
+        raise FileNotFoundError(f"Negative audio directory not found for phase {phase!r}: {negative_root}")
+
+    positive_paths = _wav_paths(positive_dir)
+    if not positive_paths:
+        raise ValueError(f"No wav files found in positive audio directory for phase {phase!r}: {positive_dir}")
+
+    samples = [
+        AdaptSample(audio_path=str(path.resolve()), text=keyword, label=1, phase=phase)
+        for path in positive_paths
+    ]
+    negative_dirs = sorted(path for path in negative_root.iterdir() if path.is_dir())
+    if not negative_dirs:
+        raise ValueError(f"No negative phrase subdirectories found for phase {phase!r}: {negative_root}")
+
+    negative_count = 0
+    for negative_dir in negative_dirs:
+        text = directory_name_to_text(negative_dir.name)
+        for wav_path in _wav_paths(negative_dir):
+            samples.append(AdaptSample(audio_path=str(wav_path.resolve()), text=text, label=0, phase=phase))
+            negative_count += 1
+    if not negative_count:
+        raise ValueError(f"No wav files found below negative audio directory for phase {phase!r}: {negative_root}")
+    return samples
+
+
+def scan_external_sources(keyword: str, sources: dict[str, Any]) -> list[AdaptSample]:
+    expected_phases = {"tts", "real"}
+    configured_phases = {phase for phase, source in sources.items() if isinstance(source, dict) and source}
+    if configured_phases != expected_phases:
+        raise ValueError("External adaptation sources must configure both 'tts' and 'real' phases")
+
+    samples: list[AdaptSample] = []
+    for phase in sorted(expected_phases):
+        source = sources[phase]
+        positive_dir = str(source.get("positive_dir", "")).strip()
+        negative_root = str(source.get("negative_root", "")).strip()
+        if not positive_dir or not negative_root:
+            raise ValueError(
+                f"External adaptation source for phase {phase!r} requires positive_dir and negative_root"
+            )
+        samples.extend(
+            scan_external_source(
+                phase=phase,
+                keyword=keyword,
+                positive_dir=Path(positive_dir),
+                negative_root=Path(negative_root),
+            )
+        )
     return samples
 
 
@@ -181,12 +246,21 @@ def prepare_keyword_adaptation(
     eval_fraction: float = 0.2,
     eval_seed: int = 2025,
     manifest_csv: Path | None = None,
+    sources: dict[str, Any] | None = None,
     skip_existing: bool = True,
 ) -> dict[str, Any]:
     """Prepare fbank features and manifests for one keyword slug tree."""
     uses_manifest = manifest_csv is not None and manifest_csv.is_file()
+    source_config = sources or {}
+    uses_external_sources = any(
+        isinstance(source, dict)
+        and any(str(source.get(key, "")).strip() for key in ("positive_dir", "negative_root"))
+        for source in source_config.values()
+    )
     if uses_manifest:
         all_samples = load_manifest_csv(manifest_csv)
+    elif uses_external_sources:
+        all_samples = scan_external_sources(keyword, source_config)
     else:
         all_samples = scan_raw_tree(data_root, keyword)
 
@@ -196,7 +270,7 @@ def prepare_keyword_adaptation(
 
     phase_splits: dict[str, tuple[list[AdaptSample], list[AdaptSample]]] = {}
     for phase, phase_samples in sorted(by_phase.items()):
-        if uses_manifest:
+        if uses_manifest or uses_external_sources:
             train_rows, eval_rows = split_train_eval(
                 phase_samples,
                 eval_fraction=eval_fraction,

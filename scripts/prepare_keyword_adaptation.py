@@ -38,6 +38,7 @@ def main(cfg: DictConfig) -> None:
         eval_fraction=float(adapt.get("eval_fraction", 0.2)),
         eval_seed=int(adapt.get("eval_seed", config.get("training", {}).get("seed", 2025))),
         manifest_csv=Path(manifest_csv) if manifest_csv else None,
+        sources=adapt.get("sources") if isinstance(adapt.get("sources"), dict) else None,
         skip_existing=not bool(prep.get("no_skip_existing", False)),
     )
     print(stats)

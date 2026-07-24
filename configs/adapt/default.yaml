@@ -6,6 +6,13 @@ adapt:
   stage: all
   data_root: ""
   exp_root: ""
+  sources:
+    tts:
+      positive_dir: ""
+      negative_root: ""
+    real:
+      positive_dir: ""
+      negative_root: ""
   rank: 16
   alpha: 32
   lr: 4.0e-4

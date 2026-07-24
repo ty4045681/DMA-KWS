@@ -14,9 +14,17 @@ def slugify(keyword: str) -> str:
     return text.strip("_") or "keyword"
 
 
+def directory_name_to_text(name: str) -> str:
+    """Normalize a directory name into a phrase for G2P."""
+    text = re.sub(r"[^a-z0-9]+", " ", name.casefold()).strip()
+    if not text:
+        raise ValueError(f"Directory name does not contain a usable phrase: {name!r}")
+    return text
+
+
 def neg_slug_to_text(slug: str) -> str:
     """Convert negative folder slug back to phrase text."""
-    return slug.replace("_", " ").strip()
+    return directory_name_to_text(slug)
 
 
 def adapt_data_root(config: dict[str, Any], keyword: str) -> Path:
@@ -71,4 +79,7 @@ def wav_to_fbank_mirror(fbank_root: Path, wav_path: Path) -> Path:
         idx = parts.index("raw")
         rel = Path(*parts[idx + 1 :]).with_suffix(".npy")
         return fbank_root / rel
+    if wav_path.is_absolute():
+        rel = Path(*wav_path.parts[1:]).with_suffix(".npy")
+        return fbank_root / "external" / rel
     return fbank_root / wav_path.with_suffix(".npy").name

@@ -10,11 +10,12 @@ from dma_kws.stage2.adapt_dataset import (
     MixedAdaptationDataset,
     load_adapt_manifest,
 )
-from dma_kws.stage2.adapt_paths import neg_slug_to_text, slugify, wav_to_fbank_mirror
+from dma_kws.stage2.adapt_paths import directory_name_to_text, neg_slug_to_text, slugify, wav_to_fbank_mirror
 from dma_kws.stage2.collate import train_collate_fn
 from dma_kws.stage2.prepare_adapt import (
     AdaptSample,
     prepare_keyword_adaptation,
+    scan_external_source,
     scan_raw_tree,
     split_train_eval,
     write_eval_manifest,
@@ -32,6 +33,19 @@ def test_slugify_and_neg_slug():
     assert neg_slug_to_text("hey_ava") == "hey ava"
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Hi_Eva", "hi eva"),
+        ("HI EVA", "hi eva"),
+        ("hi-eva", "hi eva"),
+        ("hi__  eva", "hi eva"),
+    ],
+)
+def test_directory_name_to_text(name: str, expected: str):
+    assert directory_name_to_text(name) == expected
+
+
 def test_wav_to_fbank_mirror():
     wav = Path("/tmp/data/adapt/hey_eva/raw/tts/positive/a.wav")
     fbank = wav_to_fbank_mirror(Path("/tmp/data/adapt/hey_eva/fbank"), wav)
@@ -42,6 +56,73 @@ def test_wav_to_fbank_mirror():
     eval_fbank = wav_to_fbank_mirror(Path("/tmp/data/adapt/hey_eva/fbank"), eval_wav)
     assert eval_fbank.name == "b.npy"
     assert "tts/eval/positive" in str(eval_fbank)
+
+    external_wav = Path("/tmp/external/Hi_Eva/sample.wav")
+    external_fbank = wav_to_fbank_mirror(Path("/tmp/fbank"), external_wav)
+    assert external_fbank == Path("/tmp/fbank/external/tmp/external/Hi_Eva/sample.npy")
+
+
+def test_scan_external_source_maps_negative_directories(tmp_path: Path):
+    positive_dir = tmp_path / "positive"
+    negative_root = tmp_path / "negative"
+    for wav_path in (
+        positive_dir / "pos.wav",
+        negative_root / "Hi_Eva" / "neg_one.wav",
+        negative_root / "HI EVA" / "nested" / "neg_two.WAV",
+    ):
+        wav_path.parent.mkdir(parents=True, exist_ok=True)
+        wav_path.touch()
+
+    samples = scan_external_source(
+        phase="tts",
+        keyword="hey eva",
+        positive_dir=positive_dir,
+        negative_root=negative_root,
+    )
+
+    assert [(sample.label, sample.text) for sample in samples] == [
+        (1, "hey eva"),
+        (0, "hi eva"),
+        (0, "hi eva"),
+    ]
+    assert all(Path(sample.audio_path).is_absolute() for sample in samples)
+
+
+def test_prepare_external_sources_splits_each_phase(tmp_path: Path, monkeypatch):
+    sources: dict[str, dict[str, str]] = {}
+    for phase in ("tts", "real"):
+        positive_dir = tmp_path / "external" / phase / "positive"
+        negative_root = tmp_path / "external" / phase / "negative"
+        for wav_path in (
+            positive_dir / "pos_one.wav",
+            positive_dir / "pos_two.wav",
+            negative_root / "Hi_Eva" / "neg_one.wav",
+            negative_root / "Hi_Eva" / "neg_two.wav",
+        ):
+            wav_path.parent.mkdir(parents=True, exist_ok=True)
+            wav_path.touch()
+        sources[phase] = {"positive_dir": str(positive_dir), "negative_root": str(negative_root)}
+
+    monkeypatch.setattr("dma_kws.stage2.prepare_adapt.make_g2p", lambda: object())
+    monkeypatch.setattr("dma_kws.stage2.prepare_adapt.validate_g2p", lambda _text, _g2p: None)
+    monkeypatch.setattr("dma_kws.stage2.prepare_adapt.compute_and_save_fbank", lambda *_args, **_kwargs: True)
+
+    stats = prepare_keyword_adaptation(
+        keyword="hey eva",
+        data_root=tmp_path / "prepared",
+        fbank_params={},
+        eval_fraction=0.5,
+        eval_seed=1,
+        sources=sources,
+    )
+
+    assert stats["phases"]["tts"]["train"] == 2
+    assert stats["phases"]["tts"]["eval"] == 2
+    assert stats["phases"]["real"]["train"] == 2
+    assert stats["phases"]["real"]["eval"] == 2
+    rows = list(csv.DictReader((tmp_path / "prepared" / "manifests" / "tts_train.csv").open()))
+    assert all(Path(row["audio_path"]).is_absolute() for row in rows)
+    assert {row["text"] for row in rows} <= {"hey eva", "hi eva"}
 
 
 def test_scan_raw_tree_assigns_explicit_splits(tmp_path: Path):
