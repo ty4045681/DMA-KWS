@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import copy
+import random
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import yaml
 
-from dma_kws.stage2.adapt import Stage2AdaptArgs, run_stage2_adaptation
 from dma_kws.stage2.adapt_paths import adapt_exp_root, slugify
 from dma_kws.training.adapt_params import merge_adapt_params, normalize_adapt_params
+
+if TYPE_CHECKING:
+    from dma_kws.stage2.adapt import Stage2AdaptArgs
 
 
 def suggest_adapt_params(trial: Any, *, search_mix: bool = False) -> dict[str, Any]:
@@ -25,6 +28,20 @@ def suggest_adapt_params(trial: Any, *, search_mix: bool = False) -> dict[str, A
     if search_mix:
         params["mix_ratio"] = trial.suggest_float("mix_ratio", 0.3, 0.7)
     return params
+
+
+def select_eval_subset_indices(
+    dataset_size: int, subset: int, *, seed: int = 2025
+) -> list[int] | None:
+    """Pick a reproducible random subset of eval indices, or ``None`` for the full set.
+
+    Taking ``range(subset)`` instead would only ever cover the head of the
+    LibriPhrase eval frame, which is ordered 1-word → 2-word → 3-word → 4-word,
+    so the forgetting metric would be measured on 1-word pairs alone.
+    """
+    if subset <= 0 or subset >= dataset_size:
+        return None
+    return sorted(random.Random(seed).sample(range(dataset_size), subset))
 
 
 def compute_sweep_score(
@@ -58,6 +75,9 @@ def run_adaptation_trial(
     ``on_event(stage, detail)`` reports progress (``train``/``eval`` stages) so
     callers can render console output without this module knowing about rich.
     """
+    # Imported lazily so scoring/param helpers stay importable without torch.
+    from dma_kws.stage2.adapt import Stage2AdaptArgs, run_stage2_adaptation
+
     trial_config = copy.deepcopy(config)
     effective_params = apply_trial_params(trial_config, params)
     adapt = trial_config["adapt"]

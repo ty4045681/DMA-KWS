@@ -292,7 +292,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         collect_hparams,
         numeric_callback_metrics,
     )
-    from dma_kws.training.ddp import build_trainer_kwargs
+    from dma_kws.training.ddp import apply_step_based_validation, build_trainer_kwargs
     from dma_kws.training.device import resolve_accelerator_and_devices
 
     _apply_adapt_overrides(config, args)
@@ -315,6 +315,10 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         raise SystemExit(f"Adaptation eval manifest not found: {eval_manifest}")
 
     phase = adapt_paths["phase_str"]
+    if args.limit_steps:
+        # Keep the cosine schedule horizon in sync with the truncated run, otherwise
+        # training stops while the LR is still on its way down.
+        adapt["max_steps"] = int(args.limit_steps)
     init_checkpoint = _resolve_init_checkpoint(config, adapt_paths, args)
     adapter_resume = _resolve_adapter_resume(adapt_paths, phase)
     accelerator, devices = resolve_accelerator_and_devices(args.device, args.devices)
@@ -494,7 +498,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         train_logger.log_hyperparams(hparams)
 
     recipe = str(training.get("recipe", "adapt"))
-    callbacks = build_stage2_callbacks(config, recipe)
+    callbacks = build_stage2_callbacks(config, recipe, checkpoint_dir=checkpoint_dir)
     history_callback = build_metrics_history_callback(
         run_name=run_name,
         default_dir=log_dir / run_name,
@@ -510,6 +514,15 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     )
     trainer_kwargs["max_steps"] = limit_steps
 
+    # Adaptation runs on short virtual epochs, so it needs its own validation
+    # cadence instead of inheriting the Stage II pretraining schedule.
+    adapt_validation = adapt.get("validation", {}) or {}
+    if adapt_validation.get("val_check_interval") is not None:
+        trainer_kwargs["val_check_interval"] = int(adapt_validation["val_check_interval"])
+    if adapt_validation.get("limit_val_batches") is not None:
+        trainer_kwargs["limit_val_batches"] = adapt_validation["limit_val_batches"]
+    apply_step_based_validation(trainer_kwargs, len(train_dataloader))
+
     print_run_summary(
         config=config,
         devices=devices,
@@ -520,6 +533,12 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         param_counts=model.lora_param_counts,
         extra_rows=[
             ("phase", phase),
+            ("batches_per_epoch", str(len(train_dataloader))),
+            (
+                "val_check_interval",
+                f"{trainer_kwargs['val_check_interval']} "
+                f"({'steps' if trainer_kwargs.get('check_val_every_n_epoch', 1) is None else 'batches/epoch'})",
+            ),
             ("mix_ratio", str(mix_ratio)),
             ("lora_rank", str(lora_rank)),
             ("lora_alpha", str(lora_alpha)),

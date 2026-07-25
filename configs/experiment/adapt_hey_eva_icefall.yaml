@@ -1,16 +1,15 @@
 # @package _global_
 # Combined LoRA continual adaptation experiment for "hey eva" on Icefall Zipformer frozen.
 #
-# This experiment layers the adaptation data layout and eval paths on top of the
-# Icefall Zipformer Stage II config, matching the exported checkpoint
-# hey-eva-pretrained-icefall-zipformer-frozen.
+# This file is the single control panel for the "hey eva" adaptation and sweep:
+# every knob that matters is spelled out below instead of being inherited
+# silently from configs/adapt/default.yaml or configs/stage2/default.yaml.
 #
 # Usage:
-#   python scripts/run_keyword_adaptation.py \
-#     +experiment=adapt_hey_eva_icefall \
-#     adapt.stage=train \
-#     prep.stage2_ckpt=/path/to/step_037000.pt \
-#     run.device=cuda
+#   python scripts/sweep_adapt_lora.py +experiment=adapt_hey_eva_icefall
+#   python scripts/run_keyword_adaptation.py +experiment=adapt_hey_eva_icefall adapt.stage=train
+#
+# CLI overrides still win over everything here.
 
 defaults:
   - icefall_zipformer_stage2
@@ -19,10 +18,84 @@ defaults:
 paths:
   libriphrase100_root: data/dma-kws/raw/LibriPhrase-100
 
+prep:
+  # Un-adapted Stage II checkpoint used as the LoRA base and as the sweep baseline.
+  stage2_ckpt: data/dma-kws/exp/GP-1000/stage2_qbyt/checkpoints/hey-eva-pretrained-icefall-zipformer-frozen/export/step_037000.pt
+
+run:
+  device: cuda
+  devices: 1
+  # Keep at 0 for sweeps: a non-zero value pins every trial to the same step
+  # budget and makes adapt.sweep's max_steps dimension meaningless.
+  limit_steps: 0
+
 adapt:
   keyword: hey eva
+  data_root: data/dma-kws/adapt
+  exp_root: data/dma-kws/exp/lora
+
+  # --- LoRA capacity (the sweep overrides rank/alpha per trial) ---
+  rank: 8
+  alpha: 16
+  # Both attention matrices: with in_proj_weight alone only 2 matrices are
+  # injected (~8k trainable params), which leaves the rank search space inert.
+  lora_targets:
+    - in_proj_weight
+    - out_proj.weight
+
+  # --- optimization (the sweep overrides learning_rate/max_steps per trial) ---
+  learning_rate: 4.0e-4
+  optimizer: adam
+  weight_decay: 0.0
+  warmup_steps: 100
+  max_steps: 2000
+
+  # --- data mixing ---
+  # mix_ratio is the keyword:LibriPhrase ratio, i.e. the main knob trading new
+  # keyword accuracy against forgetting.
+  mix_ratio: 0.5
+  # Virtual epoch length: sample_lens / batch_size = batches per epoch (1000
+  # here). It also bounds how many LibriPhrase anchors the replay stream can
+  # reach, so keep it well above a few thousand.
+  sample_lens: 64000
+  batch_size_per_gpu: 64
+  val_batch_size: 128
+  num_workers: 16
+
+  validation:
+    # Counted in optimizer steps (adaptation epochs are virtual and short).
+    val_check_interval: 1000
+    # The LibriPhrase val split has ~270k pairs; in-loop validation is only for
+    # the curves, sweep scoring is computed separately after training.
+    limit_val_batches: 50
+
+  sweep:
+    n_trials: 10
+    # score = target_auc - lambda_forget * max(0, lph_auc_base - lph_auc_adapted)
+    lambda_forget: 1.0
+    # Random (seeded) subset of the LibriPhrase eval set used for the forgetting
+    # term; below ~5k the AUC noise starts to dominate trial differences.
+    lph_subset: 5000
+    search_mix: true
+    # true = TTS phase only. Re-validate the winning params on the real
+    # recordings before shipping them.
+    single_phase: true
+    study_name: ""
+    storage: ""
 
 stage2:
+  precision: bf16-mixed
+  gradient_diagnostics:
+    enabled: false
+
+  # Adaptation writes its own adapter/merged weights at the end of each phase,
+  # so Lightning checkpoints are only a crash-safety net here.
+  checkpoint:
+    every_n_train_steps: 1000
+    save_top_k: 1
+
   eval:
     test_dir: data/dma-kws/raw/LibriPhrase-100/eval
     split: hard
+    batch_size: 256
+    num_workers: 8

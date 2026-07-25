@@ -308,6 +308,12 @@ class AdaptSweepConfig:
 
 
 @dataclass
+class AdaptValidationConfig:
+    val_check_interval: int = 1000
+    limit_val_batches: float | None = None
+
+
+@dataclass
 class AdaptConfig:
     keyword: str = "hey eva"
     slug: str = ""
@@ -333,6 +339,7 @@ class AdaptConfig:
     init_checkpoint: str = ""
     params_file: str = ""
     lora_targets: list[str] = field(default_factory=lambda: ["in_proj_weight", "out_proj.weight"])
+    validation: AdaptValidationConfig = field(default_factory=AdaptValidationConfig)
     sweep: AdaptSweepConfig = field(default_factory=AdaptSweepConfig)
 
 

@@ -33,7 +33,12 @@ class EMAWeightAveraging:
         return _EMA(**kwargs)
 
 
-def build_stage2_callbacks(config: dict[str, Any], recipe: str) -> list[Any]:
+def build_stage2_callbacks(
+    config: dict[str, Any],
+    recipe: str,
+    *,
+    checkpoint_dir: str | Path | None = None,
+) -> list[Any]:
     """Build checkpoint, console, and optional EMA callbacks for Stage II."""
     from dma_kws.training.checkpoint_callback import build_stage2_checkpoint_callback
 
@@ -43,7 +48,9 @@ def build_stage2_callbacks(config: dict[str, Any], recipe: str) -> list[Any]:
 
     # No LearningRateMonitor: the modules already log ``train/lr`` each step,
     # so the monitor's ``lr-Adam`` column would duplicate it.
-    callbacks: list[Any] = [build_stage2_checkpoint_callback(config, recipe)]
+    callbacks: list[Any] = [
+        build_stage2_checkpoint_callback(config, recipe, checkpoint_dir=checkpoint_dir)
+    ]
 
     if console_cfg.get("device_stats", False):
         try:

@@ -33,6 +33,14 @@ adapt:
   lora_targets:
     - in_proj_weight
     - out_proj.weight
+  validation:
+    # Counted in optimizer steps: adaptation epochs are virtual (sample_lens /
+    # batch_size) and usually shorter than the interval, so Lightning is switched
+    # to step-based validation automatically.
+    val_check_interval: 1000
+    # null = full validation set; an int caps batches per val dataloader, which
+    # matters because the LibriPhrase eval split has ~270k pairs.
+    limit_val_batches: null
   sweep:
     enabled: false
     n_trials: 20

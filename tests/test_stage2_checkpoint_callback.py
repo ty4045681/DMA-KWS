@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("pytorch_lightning")
@@ -49,6 +51,16 @@ def test_checkpoint_section_overrides_defaults(tmp_path):
 
     ft_cb = build_stage2_checkpoint_callback(config, "ft-ls-gs-1460")
     assert ft_cb.filename == "ft_{step:04d}_auc_{val_auc:.4f}"
+
+
+def test_explicit_checkpoint_dir_overrides_stage2_section(tmp_path):
+    trial_dir = tmp_path / "sweep" / "trial_1" / "tts" / "checkpoints"
+
+    callback = build_stage2_checkpoint_callback(
+        _base_config(tmp_path), "icefall-zipformer-frozen", checkpoint_dir=trial_dir
+    )
+
+    assert str(callback.dirpath).endswith(str(Path("trial_1") / "tts" / "checkpoints"))
 
 
 def test_frozen_encoder_recipe_uses_init_filename(tmp_path):

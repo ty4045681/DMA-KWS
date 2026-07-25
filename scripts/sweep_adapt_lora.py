@@ -18,11 +18,18 @@ from dma_kws.stage2.sweep_adapt import (
     compute_sweep_score,
     run_adaptation_trial,
     save_best_params,
+    select_eval_subset_indices,
     suggest_adapt_params,
 )
 
 
-def _eval_lph_auc(config: dict, checkpoint: str, *, subset: int = 0) -> float:
+def _eval_lph_auc(
+    config: dict,
+    checkpoint: str,
+    *,
+    subset: int = 0,
+    accelerator: str = "cpu",
+) -> float:
     try:
         import pytorch_lightning as pl
         from torch.utils.data import DataLoader
@@ -54,14 +61,15 @@ def _eval_lph_auc(config: dict, checkpoint: str, *, subset: int = 0) -> float:
         aggregate_csv=eval_paths["aggregate_csv"],
         tokenizer=tokenizer,
     )
-    if subset > 0 and subset < len(dataset):
-        dataset = torch.utils.data.Subset(dataset, list(range(subset)))
+    indices = select_eval_subset_indices(len(dataset), subset)
+    if indices is not None:
+        dataset = torch.utils.data.Subset(dataset, indices)
 
     dataloader = DataLoader(
         dataset,
         batch_size=eval_paths["batch_size"],
         shuffle=False,
-        num_workers=0,
+        num_workers=eval_paths["num_workers"],
         collate_fn=test_collate_fn,
     )
 
@@ -69,13 +77,17 @@ def _eval_lph_auc(config: dict, checkpoint: str, *, subset: int = 0) -> float:
     ckpt = torch.load(checkpoint, map_location="cpu")
     state = extract_state_dict(ckpt)
     model.load_state_dict(state, strict=False)
-    trainer = pl.Trainer(accelerator="cpu", devices=1, logger=False, enable_checkpointing=False)
+    trainer = pl.Trainer(
+        accelerator=accelerator, devices=1, logger=False, enable_checkpointing=False
+    )
     results = trainer.test(model, dataloaders=dataloader, verbose=False)
     metrics = results[0] if results else {}
     return float(metrics.get("test/auc", 0.0))
 
 
-def _eval_target_auc(config: dict, checkpoint: str, keyword: str) -> float:
+def _eval_target_auc(
+    config: dict, checkpoint: str, keyword: str, *, accelerator: str = "cpu"
+) -> float:
     try:
         import pytorch_lightning as pl
         from torch.utils.data import DataLoader
@@ -109,7 +121,12 @@ def _eval_target_auc(config: dict, checkpoint: str, keyword: str) -> float:
         tokenizer=tokenizer,
         manifest_root=data_root,
     )
-    val_loader = DataLoader(dataset, batch_size=32, shuffle=False, collate_fn=test_collate_fn)
+    val_loader = DataLoader(
+        dataset,
+        batch_size=int(adapt.get("val_batch_size", 64)),
+        shuffle=False,
+        collate_fn=test_collate_fn,
+    )
 
     ckpt = torch.load(checkpoint, map_location="cpu")
     state = extract_state_dict(ckpt)
@@ -133,7 +150,9 @@ def _eval_target_auc(config: dict, checkpoint: str, keyword: str) -> float:
     model = _TargetValModule(config, vocab_size=vocab_size)
     model.load_state_dict(state, strict=False)
 
-    trainer = pl.Trainer(accelerator="cpu", devices=1, logger=False, enable_checkpointing=False)
+    trainer = pl.Trainer(
+        accelerator=accelerator, devices=1, logger=False, enable_checkpointing=False
+    )
     results = trainer.validate(model, dataloaders=val_loader, verbose=False)
     metrics = results[0] if results else {}
     return float(metrics.get("val/target_auc", 0.0))
@@ -179,9 +198,15 @@ def main(cfg: DictConfig) -> None:
     if reporter.use_rich:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    # Scoring runs the model over ~thousands of eval pairs twice per trial; keep it
+    # on the training accelerator instead of falling back to CPU.
+    from dma_kws.training.device import resolve_accelerator_and_devices
+
+    eval_accelerator, _ = resolve_accelerator_and_devices(str(run.device), 1)
+
     reporter.section(f"LoRA hyperparameter sweep · {keyword}")
     reporter.info("Measuring LibriPhrase baseline AUC for the un-adapted checkpoint...")
-    lph_base = _eval_lph_auc(config, base_ckpt, subset=lph_subset)
+    lph_base = _eval_lph_auc(config, base_ckpt, subset=lph_subset, accelerator=eval_accelerator)
     reporter.print_plan(
         adapt_console.sweep_baseline_rows(
             keyword=keyword,
@@ -218,8 +243,12 @@ def main(cfg: DictConfig) -> None:
             params=params,
             base_args=base_args,
             single_phase=single_phase,
-            eval_lph_fn=lambda ckpt: _eval_lph_auc(config, ckpt, subset=lph_subset),
-            eval_target_fn=lambda cfg, ckpt, kw: _eval_target_auc(cfg, ckpt, kw),
+            eval_lph_fn=lambda ckpt: _eval_lph_auc(
+                config, ckpt, subset=lph_subset, accelerator=eval_accelerator
+            ),
+            eval_target_fn=lambda cfg, ckpt, kw: _eval_target_auc(
+                cfg, ckpt, kw, accelerator=eval_accelerator
+            ),
             on_event=lambda stage, detail: reporter.info(f"trial {trial.number}: {stage} {detail}"),
         )
         score = compute_sweep_score(

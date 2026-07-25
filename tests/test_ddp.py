@@ -1,4 +1,8 @@
-from dma_kws.training.ddp import build_trainer_kwargs, resolve_precision
+from dma_kws.training.ddp import (
+    apply_step_based_validation,
+    build_trainer_kwargs,
+    resolve_precision,
+)
 
 
 def _stage2_config(**overrides):
@@ -37,6 +41,31 @@ def test_build_trainer_kwargs_uses_validation_val_check_interval():
     kwargs = build_trainer_kwargs(config, devices=1)
 
     assert kwargs["val_check_interval"] == 250
+
+
+def test_step_based_validation_when_interval_exceeds_epoch():
+    kwargs = {"val_check_interval": 1000}
+
+    apply_step_based_validation(kwargs, batches_per_epoch=46)
+
+    assert kwargs["val_check_interval"] == 1000
+    assert kwargs["check_val_every_n_epoch"] is None
+
+
+def test_step_based_validation_keeps_epoch_semantics_when_interval_fits():
+    kwargs = {"val_check_interval": 500}
+
+    apply_step_based_validation(kwargs, batches_per_epoch=1000)
+
+    assert "check_val_every_n_epoch" not in kwargs
+
+
+def test_step_based_validation_ignores_fractional_interval():
+    kwargs = {"val_check_interval": 0.5}
+
+    apply_step_based_validation(kwargs, batches_per_epoch=46)
+
+    assert "check_val_every_n_epoch" not in kwargs
 
 
 def test_build_trainer_kwargs_ddp_only_with_multiple_devices():

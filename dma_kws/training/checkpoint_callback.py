@@ -13,12 +13,26 @@ _INIT_FILENAME = "step_{step:06d}"
 _FINETUNE_FILENAME = "step_{step:06d}_auc_{val_auc:.6f}"
 
 
-def build_stage2_checkpoint_callback(config: dict[str, Any], recipe: str) -> ModelCheckpoint:
-    """Build a Lightning ``ModelCheckpoint`` for Stage II init or finetune training."""
+def build_stage2_checkpoint_callback(
+    config: dict[str, Any],
+    recipe: str,
+    *,
+    checkpoint_dir: str | Path | None = None,
+) -> ModelCheckpoint:
+    """Build a Lightning ``ModelCheckpoint`` for Stage II init or finetune training.
+
+    ``checkpoint_dir`` overrides ``stage2.checkpoint_dir`` for runs that own their
+    own output tree (LoRA adaptation phases, sweep trials), so they never write
+    into the pretrained Stage II checkpoint directory.
+    """
     stage2 = config["stage2"]
     ckpt_cfg = stage2.get("checkpoint", {}) or {}
 
-    checkpoint_dir = Path(stage2.get("checkpoint_dir", Path(config["paths"]["exp_root"]) / "stage2_qbyt" / "checkpoints"))
+    if checkpoint_dir is None:
+        checkpoint_dir = stage2.get(
+            "checkpoint_dir", Path(config["paths"]["exp_root"]) / "stage2_qbyt" / "checkpoints"
+        )
+    checkpoint_dir = Path(checkpoint_dir)
     every_n_train_steps = int(ckpt_cfg.get("every_n_train_steps", _DEFAULT_EVERY_N_TRAIN_STEPS))
     save_top_k = int(ckpt_cfg.get("save_top_k", _DEFAULT_SAVE_TOP_K))
 

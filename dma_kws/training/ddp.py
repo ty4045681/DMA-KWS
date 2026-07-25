@@ -19,6 +19,25 @@ def resolve_precision(stage2: dict[str, Any], accelerator: str) -> str:
     return "bf16-mixed"
 
 
+def apply_step_based_validation(
+    trainer_kwargs: dict[str, Any], batches_per_epoch: int
+) -> dict[str, Any]:
+    """Make an integer ``val_check_interval`` count global steps when it spans epochs.
+
+    Lightning reads an integer ``val_check_interval`` as a batch index *inside* one
+    epoch and raises if it exceeds the epoch length. Virtual epochs (``sample_lens``
+    divided by the batch size) are often much shorter than the configured interval,
+    so switch Lightning to step-based validation instead of failing or validating
+    dozens of times per run. Mutates and returns ``trainer_kwargs``.
+    """
+    interval = trainer_kwargs.get("val_check_interval")
+    if not isinstance(interval, int) or isinstance(interval, bool):
+        return trainer_kwargs
+    if batches_per_epoch > 0 and interval > batches_per_epoch:
+        trainer_kwargs["check_val_every_n_epoch"] = None
+    return trainer_kwargs
+
+
 def build_trainer_kwargs(
     config: dict[str, Any],
     devices: int,

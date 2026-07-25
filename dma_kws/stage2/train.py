@@ -105,7 +105,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training import resolve_resume_path
     from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
-    from dma_kws.training.ddp import build_trainer_kwargs
+    from dma_kws.training.ddp import apply_step_based_validation, build_trainer_kwargs
     from dma_kws.training.metrics_history import (
         append_wide_row,
         build_metrics_history_callback,
@@ -229,6 +229,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         limit_steps=limit_steps,
         accelerator=accelerator,
     )
+    apply_step_based_validation(trainer_kwargs, len(train_dataloader))
 
     param_counts = {
         "encoder": sum(p.numel() for p in model.encoder.parameters()),
