@@ -40,7 +40,7 @@ class Stage2LightningModule(pl.LightningModule):
         self,
         config: dict[str, Any],
         *,
-        vocab_size: int = 73,
+        vocab_size: int,
         freeze_encoder: bool = False,
         init_checkpoint: str | Path | None = None,
     ) -> None:

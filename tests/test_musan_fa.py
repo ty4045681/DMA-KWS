@@ -11,12 +11,18 @@ from dma_kws.inference.stage2_clip import Stage2ClipRunner
 from dma_kws.tokenizer import load_char_tokenizer
 
 
+def _fake_phonemes(text: str) -> list[str]:
+    """Mimic g2p_en: upper-case ARPAbet with stress digits on vowels."""
+    phones = {"hey eva": ["HH", "EY1", "IY1", "V", "AH0"]}
+    return phones.get(text.lower(), text.upper().split())
+
+
 def _fake_g2p():
-    return lambda text: text.upper().split()
+    return _fake_phonemes
 
 
 def _fake_text_to_phonemes(_g2p, text):
-    return text.upper().split()
+    return _fake_phonemes(text)
 
 
 class FakeBatchVerifier:

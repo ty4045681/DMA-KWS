@@ -82,7 +82,8 @@ def test_sweep_objective_stub(monkeypatch):
         phase = config["adapt"]["phase"]
         return {"merged": f"/tmp/{phase}/stage2_adapted.pt"}
 
-    monkeypatch.setattr(sweep_adapt, "run_stage2_adaptation", fake_run)
+    # run_adaptation_trial imports this lazily, so patch it at the source module.
+    monkeypatch.setattr("dma_kws.stage2.adapt.run_stage2_adaptation", fake_run)
     config = {"adapt": {"keyword": "hey eva", "max_steps": 10}}
     metrics = sweep_adapt.run_adaptation_trial(
         config,

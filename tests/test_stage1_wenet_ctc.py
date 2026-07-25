@@ -62,15 +62,15 @@ def patched_module(monkeypatch):
     fake_encoder = MagicMock(side_effect=_mock_encoder_output)
     monkeypatch.setattr("dma_kws.stage1.module.build_encoder", lambda *_args, **_kwargs: fake_encoder)
     monkeypatch.setattr("dma_kws.stage1.module._load_ctc", lambda: _FakeCTC)
-    return Stage1LightningModule(_minimal_config(), vocab_size=73)
+    return Stage1LightningModule(_minimal_config(), vocab_size=71)
 
 
 def test_phonemes_to_g2p_string_and_encode_manifest_target():
     tok = load_char_tokenizer(DICT_PATH)
-    assert phonemes_to_g2p_string(["HH", "AH", "L", "OW"]) == "HH AH L OW"
+    assert phonemes_to_g2p_string(["HH", "AH0", "L", "OW1"]) == "HH AH0 L OW1"
 
-    list_ids = encode_manifest_target({"phonemes": ["HH", "AH", "L", "OW"]}, tok)
-    str_ids = encode_manifest_target({"phonemes_g2p": "HH AH L OW"}, tok)
+    list_ids = encode_manifest_target({"phonemes": ["HH", "AH0", "L", "OW1"]}, tok)
+    str_ids = encode_manifest_target({"phonemes_g2p": "HH AH0 L OW1"}, tok)
     assert list_ids == str_ids
     assert all(isinstance(token_id, int) for token_id in list_ids)
 
@@ -119,18 +119,18 @@ def test_export_stage1_encoder_pt_roundtrip(tmp_path, monkeypatch):
     from dma_kws.stage1.wenet_ctc import Stage1LightningModule, export_stage1_encoder_pt
 
     config = _minimal_config()
-    module = Stage1LightningModule(config, vocab_size=73)
+    module = Stage1LightningModule(config, vocab_size=71)
     out = export_stage1_encoder_pt(
         module,
         tmp_path / "stage1.pt",
         config=config,
         dict_path=DICT_PATH,
-        vocab_size=73,
+        vocab_size=71,
         blank_id=0,
         step=42,
     )
 
-    stage2 = Stage2LightningModule({"stage1": config["stage1"], "stage2": {}}, vocab_size=73)
+    stage2 = Stage2LightningModule({"stage1": config["stage1"], "stage2": {}}, vocab_size=71)
     stage2._load_init_checkpoint(out)
     assert any(p.requires_grad for p in stage2.qbyt.parameters())
 

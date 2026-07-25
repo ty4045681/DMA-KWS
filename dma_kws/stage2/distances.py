@@ -7,14 +7,21 @@ from typing import Any, Callable
 import numpy as np
 
 from dma_kws.g2p import clean_phoneme_tokens
+from dma_kws.stage1.librispeech import strip_stress_marker
 
 _PHONEME_CHAR_BASE = 0xE000
 _EXCLUDE_DIST = int(np.iinfo(np.uint8).max)
 
 
 def phoneme_tokens_from_g2p(g2p_text: str, *, strip_stress: bool = True) -> list[str]:
-    """Parse a space-separated G2P string into phoneme tokens."""
-    return clean_phoneme_tokens(str(g2p_text).split(), strip_stress=strip_stress)
+    """Parse a space-separated G2P string into phoneme tokens.
+
+    Hard-negative mining strips stress by default even though the model is
+    trained on stress-marked symbols: confusability is about phone identity, so
+    ``AH0``/``AH1`` should count as the same phone when ranking neighbours.
+    """
+    tokens = clean_phoneme_tokens(str(g2p_text).split())
+    return [strip_stress_marker(token) for token in tokens] if strip_stress else tokens
 
 
 def encode_phoneme_strings(

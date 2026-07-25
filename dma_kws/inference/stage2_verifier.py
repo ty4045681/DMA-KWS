@@ -16,8 +16,6 @@ from dma_kws.stage1.candidates import KeywordCandidate
 from dma_kws.stage2.fbank import FbankExtractor
 from dma_kws.stage2.features import waveform_to_fbank
 
-NUM_EMBEDS = 73
-
 
 def _load_model_state(model, ckpt_path: str, load_fn):
     ckpt = load_fn(ckpt_path, map_location="cpu")
@@ -37,6 +35,7 @@ class Stage2Verifier:
         demo_cfg: Mapping[str, Any],
         fbank_cfg: FbankConfig,
         stage2_ckpt: str,
+        vocab_size: int,
         device,
     ) -> None:
         try:
@@ -61,7 +60,7 @@ class Stage2Verifier:
                 self.encoder = build_encoder(stage1_cfg, output_dim=stage2_encoder_dim)
                 self.qbyt = QbyT(
                     encoder_output_size=stage2_encoder_dim,
-                    num_embeds=NUM_EMBEDS,
+                    num_embeds=vocab_size,
                     embed_dim=int(stage2_cfg.get("qbyt_embed_dim", 128)),
                     post_num_layers=int(stage2_cfg.get("qbyt_layers", 2)),
                 )
@@ -96,6 +95,9 @@ class Stage2Verifier:
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any], prep: Mapping[str, Any], device) -> "Stage2Verifier":
+        from dma_kws.pathing import resolve_dict_path
+        from dma_kws.tokenizer import load_char_tokenizer
+
         stage1_cfg = config.get("stage1")
         if not isinstance(stage1_cfg, Mapping):
             raise ValueError("Config section 'stage1' must be a mapping")
@@ -111,6 +113,9 @@ class Stage2Verifier:
             raise SystemExit("prep.stage2_ckpt is required for Stage II verification")
 
         fbank_cfg = get_eval_fbank_config(dict(config))
+        # The text embedding table is sized by the phoneme vocabulary, so it has
+        # to come from the same dict the checkpoint was trained with.
+        tokenizer = load_char_tokenizer(resolve_dict_path(config))
 
         return cls(
             stage1_cfg=stage1_cfg,
@@ -118,6 +123,7 @@ class Stage2Verifier:
             demo_cfg=demo_cfg,
             fbank_cfg=fbank_cfg,
             stage2_ckpt=stage2_ckpt,
+            vocab_size=len(tokenizer.symbol_table),
             device=device,
         )
 

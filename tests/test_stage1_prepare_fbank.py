@@ -42,7 +42,7 @@ def test_prepare_manifest_fbank_writes_npy_and_updates_manifest(tmp_path, monkey
     manifest.write_text(
         '{"utt_id":"utt","wav_path":"'
         + str(wav_path)
-        + '","phonemes_g2p":"HH AH L OW"}\n',
+        + '","phonemes_g2p":"HH AH0 L OW1"}\n',
         encoding="utf-8",
     )
 
@@ -92,7 +92,7 @@ def test_stage1_dataset_loads_precomputed_fbank(tmp_path):
     manifest.write_text(
         '{"wav_path":"/ignored.wav","fbank_path":"'
         + str(fbank_path)
-        + '","phonemes_g2p":"HH AH L OW"}\n',
+        + '","phonemes_g2p":"HH AH0 L OW1"}\n',
         encoding="utf-8",
     )
 
@@ -123,7 +123,7 @@ def test_stage1_dataset_derives_fbank_from_root(tmp_path):
     manifest.write_text(
         '{"wav_path":"'
         + str(wav_path)
-        + '","phonemes_g2p":"HH AH L OW"}\n',
+        + '","phonemes_g2p":"HH AH0 L OW1"}\n',
         encoding="utf-8",
     )
 

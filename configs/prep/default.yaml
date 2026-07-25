@@ -14,6 +14,9 @@ decoded_parquet_root: ""
 dataset_root: ""
 output_subdir: ""
 limit_anchors: 0
+# Force regenerating the parquet ngram_g2p column with g2p_en. Stage II prep does
+# this automatically when the column has no stress markers (legacy data).
+force_g2p_recompute: false
 num_workers: 0
 use_rich: true
 train_manifest: ""
@@ -53,4 +56,6 @@ recompute_distances:
   top_k: 100
   block_size: 1000
   workers: -1
+  # Hard-negative ranking compares phone identity, so AH0/AH1/AH2 collapse here
+  # even though the model itself is trained on stress-marked symbols.
   strip_stress: true

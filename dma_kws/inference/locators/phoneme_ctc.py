@@ -22,8 +22,6 @@ from dma_kws.stage1.streaming_search import (
 )
 from dma_kws.tokenizer import load_char_tokenizer, tokenize_phoneme_string
 
-NUM_EMBEDS = 73
-
 
 def _load_model_state(model, ckpt_path: str, load_fn):
     ckpt = load_fn(ckpt_path, map_location="cpu")
@@ -79,12 +77,15 @@ class PhonemeCtcLocator:
         self._sample_rate = int(stage1_cfg.get("sample_rate", 16000))
         self._num_mel_bins = int(stage1_cfg.get("input_dim", 80))
         encoder_dim = int(stage1_cfg.get("encoder_output_dim", 144))
+        # The CTC head is sized by the phoneme vocabulary, so it has to come from
+        # the same dict the checkpoint was trained with.
+        vocab_size = len(tokenizer.symbol_table)
 
         class Stage1Model(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.encoder = build_encoder(stage1_cfg, output_dim=encoder_dim)
-                self.ctc = CTC(NUM_EMBEDS, encoder_dim, blank_id=0)
+                self.ctc = CTC(vocab_size, encoder_dim, blank_id=0)
 
             def forward(self, feats, feat_lengths):
                 encoder_out, encoder_mask = self.encoder(feats, feat_lengths)

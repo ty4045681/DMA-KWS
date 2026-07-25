@@ -482,7 +482,7 @@ data/dma-kws/processed/stage1_phoneme_ctc/train.jsonl
 data/dma-kws/processed/stage1_phoneme_ctc/dev.jsonl
 ```
 
-Manifests include `phonemes_g2p` targets for Wenet `CharTokenizer` — a phoneme vocabulary over `data/dict/lang_char.txt` (ARPAbet-like symbols; stress markers such as `AH0` are normalized to `AH` everywhere).
+Manifests include `phonemes_g2p` targets for Wenet `CharTokenizer` — a phoneme vocabulary over `data/dict/lang_char.txt` (stress-marked ARPAbet: `AH0`, `AH1`, `AH2` are three distinct symbols).
 
 If the smoke run works, prepare the full LibriSpeech-100 split:
 
@@ -537,8 +537,8 @@ directory layout; otherwise the script stops instead of silently writing an empt
 
 Notes:
 
-- The script uses `g2p_en` to convert English transcripts to ARPAbet-like phonemes.
-- Stress markers such as `AH0` are normalized to `AH` in manifests and downstream G2P.
+- The script uses `g2p_en` to convert English transcripts to ARPAbet phonemes.
+- Stress markers are **kept** everywhere (`AH0` stays `AH0`): the 71-token vocabulary spells out every stress variant, and all stages must tokenize text through `dma_kws.g2p.text_to_phonemes` so their symbols match. Phonemes outside the vocabulary abort data preparation instead of becoming `<unk>`.
 - Stage I and Stage II share the Wenet CharTokenizer phoneme vocabulary at `data/dict/lang_char.txt`.
 
 Optional: precompute Stage I fbank features for faster training (reads the JSONL manifests above):
@@ -643,12 +643,15 @@ python3 scripts/recompute_stage2_distances.py \
 Default output is alongside the input with the `_g2p_distance.parquet` suffix. Pass
 that file to `prepare_stage2_paper.py` via `prep.input_parquet`. Useful overrides:
 `prep.recompute_distances.output_parquet`, `top_k` (default 100), `block_size`,
-`workers` (-1 = auto), `strip_stress` (default true). When `prep.recompute_distances.input_parquet` is unset,
+`workers` (-1 = auto), `strip_stress` (default true — hard-negative ranking compares phone identity, so
+`AH0`/`AH1`/`AH2` collapse here even though the model itself trains on stress-marked symbols). When `prep.recompute_distances.input_parquet` is unset,
 the script looks for `aggregated_segments_with_g2p.parquet` under
 `paths.libriphrase460_root`, `paths.libriphrase100_root`, or `paths.libriphrase_root`.
 
-If `ngram_g2p` is missing from the aggregated parquet, `prepare_stage2_paper.py` runs
-on-the-fly G2P via `g2p_en`. When per-anchor `distances` is empty, it falls back to
+If `ngram_g2p` is missing from the aggregated parquet — or its phonemes carry no stress
+markers, i.e. they predate the stress-marked vocabulary — `prepare_stage2_paper.py` runs
+G2P via `g2p_en` for every anchor and reports `g2p_recomputed=True`. Force that with
+`prep.force_g2p_recompute=true`. When per-anchor `distances` is empty, it falls back to
 phoneme edit-distance confusables within the anchor set (top-5 by default).
 
 Demo smoke run:

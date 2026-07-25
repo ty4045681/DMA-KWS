@@ -128,11 +128,11 @@ def test_demo_stage2_candidate_requires_enough_fbank_frames():
     assert audio_utils.has_min_fbank_frames(1360, min_frames=min_frames, sample_rate=sample_rate)
 
 
-def test_stage2_text_to_phonemes_filters_tokens_that_become_empty():
+def test_stage2_text_to_phonemes_drops_blanks_and_keeps_stress():
     class FakeG2P:
         def __call__(self, text):
             assert text == "hello"
-            return ["HH0", " ", "", "1", "OW1"]
+            return ["HH", "AH0", " ", "", "L", "OW1"]
 
-    assert text_to_phonemes(FakeG2P(), "HELLO") == ["HH", "OW"]
-    assert clean_phoneme_tokens(["AH0", "", "2", "  ", "L"]) == ["AH", "L"]
+    assert text_to_phonemes(FakeG2P(), "HELLO!") == ["HH", "AH0", "L", "OW1"]
+    assert clean_phoneme_tokens(["AH0", "", "  ", "L"]) == ["AH0", "L"]

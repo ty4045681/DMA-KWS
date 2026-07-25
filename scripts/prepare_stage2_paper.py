@@ -278,12 +278,18 @@ def main(cfg: DictConfig) -> None:
             distances_dir=distances_dir,
             fbank_dir=fbank_dir,
             limit_anchors=limit_anchors,
+            force_g2p_recompute=bool(prep.get("force_g2p_recompute", False)),
             on_progress=on_anchor,
         )
     reporter.info(
         f"Prepared {stats['anchors']} anchors; {len(fbank_targets)} fbank files to compute "
         f"({stats['fbank_skipped']} already present)"
     )
+    if stats["g2p_recomputed"]:
+        reporter.warn(
+            "Recomputed ngram_g2p with g2p_en: the input parquet had no stress markers "
+            "(or recompute was forced), so its phonemes could not match the vocabulary."
+        )
 
     reporter.section("Write output")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -316,6 +322,7 @@ def main(cfg: DictConfig) -> None:
     reporter.print_stats(
         [
             ("anchors", str(stats["anchors"])),
+            ("g2p_recomputed", str(bool(stats["g2p_recomputed"]))),
             ("clips_total", str(stats["clips_total"])),
             ("fbank_written", str(stats["fbank_written"])),
             ("fbank_skipped", str(stats["fbank_skipped"])),

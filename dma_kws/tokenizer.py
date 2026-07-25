@@ -4,56 +4,76 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Iterable
 
 CANONICAL_DICT_PATH = Path(__file__).resolve().parents[1] / "data" / "dict" / "lang_char.txt"
-CANONICAL_VOCAB_SIZE = 73
 
-_REQUIRED_SPECIAL_TOKENS = frozenset({"<blank>", "<unk>", "<sos/eos>"})
+_REQUIRED_SPECIAL_TOKENS = frozenset({"<blank>", "<unk>"})
 
-# Stress-stripped CMU ARPAbet phones (AA through ZH).
-_REQUIRED_ARPABET_PHONES = frozenset(
-    {
-        "AA",
-        "AE",
-        "AH",
-        "AO",
-        "AW",
-        "AY",
-        "B",
-        "CH",
-        "D",
-        "DH",
-        "EH",
-        "ER",
-        "EY",
-        "F",
-        "G",
-        "HH",
-        "IH",
-        "IY",
-        "JH",
-        "K",
-        "L",
-        "M",
-        "N",
-        "NG",
-        "OW",
-        "OY",
-        "P",
-        "R",
-        "S",
-        "SH",
-        "T",
-        "TH",
-        "UH",
-        "UW",
-        "V",
-        "W",
-        "Y",
-        "Z",
-        "ZH",
-    }
+# CMU ARPAbet vowels carry a stress digit in g2p_en output (AH0/AH1/AH2);
+# consonants never do. The model is trained and evaluated on these exact
+# stress-marked symbols, so the vocabulary must spell them all out.
+ARPABET_STRESS_LEVELS = ("0", "1", "2")
+ARPABET_VOWELS = (
+    "AA",
+    "AE",
+    "AH",
+    "AO",
+    "AW",
+    "AY",
+    "EH",
+    "ER",
+    "EY",
+    "IH",
+    "IY",
+    "OW",
+    "OY",
+    "UH",
+    "UW",
 )
+ARPABET_CONSONANTS = (
+    "B",
+    "CH",
+    "D",
+    "DH",
+    "F",
+    "G",
+    "HH",
+    "JH",
+    "K",
+    "L",
+    "M",
+    "N",
+    "NG",
+    "P",
+    "R",
+    "S",
+    "SH",
+    "T",
+    "TH",
+    "V",
+    "W",
+    "Y",
+    "Z",
+    "ZH",
+)
+_REQUIRED_ARPABET_PHONES = frozenset(
+    {f"{vowel}{stress}" for vowel in ARPABET_VOWELS for stress in ARPABET_STRESS_LEVELS}
+    | set(ARPABET_CONSONANTS)
+)
+
+# 2 special tokens + 45 stress-marked vowels + 24 consonants, matching the
+# 71-symbol phoneme inventory reported in the paper.
+CANONICAL_VOCAB_SIZE = len(_REQUIRED_SPECIAL_TOKENS) + len(_REQUIRED_ARPABET_PHONES)
+
+
+def unsupported_phones(phones: Iterable[str]) -> list[str]:
+    """Return sorted phones that fall outside the canonical ARPAbet inventory.
+
+    Data preparation calls this so an unexpected symbol fails loudly instead of
+    being tokenized to ``<unk>`` and quietly poisoning training.
+    """
+    return sorted({str(phone) for phone in phones} - _REQUIRED_ARPABET_PHONES)
 
 
 def _parse_dict_line(line: str, line_no: int, dict_path: Path) -> tuple[str, int]:
@@ -77,8 +97,8 @@ def validate_lang_char_dict(dict_path: Path) -> None:
     """Validate a Wenet-format ``lang_char.txt`` phoneme vocabulary.
 
     Raises ``ValueError`` when the file does not match the repo-canonical
-    constraints: 73 tokens with contiguous ids 0-72, required special tokens,
-    and the full stress-stripped ARPAbet phone inventory (AA-ZH).
+    constraints: 71 tokens with contiguous ids 0-70, ``<blank>``/``<unk>``, and
+    the full stress-marked ARPAbet phone inventory (AA0-ZH).
     """
     dict_path = Path(dict_path)
     if not dict_path.is_file():
@@ -139,5 +159,10 @@ def tokenize_phoneme_string(tokenizer, g2p_text: str) -> list[int]:
 
 
 def build_seq_label(anchor_ids: list[int], query_ids: list[int]) -> list[int]:
-    """Build per-anchor-token membership labels against ``query_ids``."""
+    """Build per-anchor-token membership labels against ``query_ids``.
+
+    Ids are stress-marked, so ``AH0`` in the anchor does not match ``AH1`` in the
+    query. If the phoneme matcher's ``seq_loss`` ever needs the looser
+    stress-agnostic supervision, this is the single place to relax.
+    """
     return [1 if anchor_id in query_ids else 0 for anchor_id in anchor_ids]

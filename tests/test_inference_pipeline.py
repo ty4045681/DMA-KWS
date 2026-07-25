@@ -52,8 +52,14 @@ class FakeVerifier:
         return output
 
 
+def _fake_phonemes(text: str) -> list[str]:
+    """Mimic g2p_en: upper-case ARPAbet with stress digits on vowels."""
+    phones = {"hey eva": ["HH", "EY1", "IY1", "V", "AH0"]}
+    return phones.get(text.lower(), text.upper().split())
+
+
 def _fake_g2p():
-    return lambda text: text.upper().split()
+    return _fake_phonemes
 
 
 def _build_pipeline(
@@ -67,7 +73,7 @@ def _build_pipeline(
         monkeypatch.setattr("dma_kws.inference.pipeline.make_g2p", _fake_g2p)
         monkeypatch.setattr(
             "dma_kws.inference.pipeline.text_to_phonemes",
-            lambda _g2p, text: text.upper().split(),
+            lambda _g2p, text: _fake_phonemes(text),
         )
     tokenizer = load_char_tokenizer("data/dict/lang_char.txt", split_with_space=" ")
     return TwoStageKWSPipeline(

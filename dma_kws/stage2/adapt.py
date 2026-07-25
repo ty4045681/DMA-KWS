@@ -107,7 +107,7 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         self,
         config: dict[str, Any],
         *,
-        vocab_size: int = 73,
+        vocab_size: int,
         init_checkpoint: str | Path | None = None,
         lora_rank: int = 16,
         lora_alpha: float = 32.0,

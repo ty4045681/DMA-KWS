@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import random
-import re
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +12,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from dma_kws.g2p import make_g2p
+from dma_kws.g2p import make_g2p, text_to_phonemes
 from dma_kws.tokenizer import build_seq_label, load_char_tokenizer, tokenize_phoneme_string
 
 _PARQUET_COLUMNS = ["ngram", "ngram_g2p", "clips_file", "distances_file"]
@@ -353,8 +352,10 @@ class LibriPhraseEvalDataset(Dataset):
             _sample_type,
         ) = self.data[index]
 
-        anchor_phones = self.g2p(re.sub(r"[^\w\s]", "", anchor_text.lower()))
-        anchor_g2p = " ".join(phone for phone in anchor_phones if phone != " ")
+        # Must go through the same helper as training/inference: tokenizing raw
+        # g2p_en output here would leave stress digits attached in one place and
+        # not the others, and every mismatching symbol silently becomes <unk>.
+        anchor_g2p = " ".join(text_to_phonemes(self.g2p, anchor_text))
 
         fbank_path = _resolve_eval_fbank_path(
             self.test_dir,

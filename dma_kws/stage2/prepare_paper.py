@@ -11,9 +11,10 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
-from dma_kws.g2p import clean_phoneme_tokens, make_g2p, text_to_phonemes
+from dma_kws.g2p import clean_phoneme_tokens, has_stress_markers, make_g2p, text_to_phonemes
 from dma_kws.metrics import edit_distance
 from dma_kws.stage2.pairs import clip_to_audio_rel
+from dma_kws.tokenizer import unsupported_phones
 
 PARQUET_COLUMNS = ["ngram", "ngram_g2p", "clips_file", "distances_file"]
 OUTPUT_PARQUET_NAME = "aggregated_segments_with_g2p_distance.parquet"
@@ -185,14 +186,36 @@ def compute_hard_negatives_from_phonemes(
     return [{"ngram": ngram} for _, ngram in scored[:top_k]]
 
 
-def _resolve_g2p(row: dict[str, Any], g2p: Any | None) -> tuple[str, list[str]]:
+def needs_g2p_recompute(df, *, force: bool = False, sample_size: int = 200) -> bool:
+    """Decide whether ``ngram_g2p`` has to be regenerated from the anchor text.
+
+    Legacy parquet files carry stress-stripped phonemes (``AH`` instead of
+    ``AH1``), which no longer exist in the vocabulary. Such a column is dropped
+    and recomputed with g2p_en so training anchors match what evaluation and
+    inference produce for the same text.
+    """
+    if force or "ngram_g2p" not in getattr(df, "columns", []):
+        return True
+    values = [str(value) for value in df["ngram_g2p"].head(sample_size).tolist() if value]
+    return not any(has_stress_markers(value) for value in values)
+
+
+def _resolve_g2p(
+    row: dict[str, Any], g2p: Any | None, *, recompute: bool = False
+) -> tuple[str, list[str]]:
     text = str(row["ngram"])
-    if "ngram_g2p" in row and row.get("ngram_g2p"):
+    if not recompute and row.get("ngram_g2p"):
         phonemes = clean_phoneme_tokens(str(row["ngram_g2p"]).split())
     else:
         if g2p is None:
             g2p = make_g2p()
         phonemes = text_to_phonemes(g2p, text)
+    unsupported = unsupported_phones(phonemes)
+    if unsupported:
+        raise ValueError(
+            f"Anchor {text!r} produced phonemes outside the vocabulary: "
+            f"{', '.join(unsupported)} (full sequence: {' '.join(phonemes)})"
+        )
     return " ".join(phonemes), phonemes
 
 
@@ -261,6 +284,7 @@ def build_anchor_metadata(
     limit_anchors: int = 0,
     hard_negative_top_k: int = DEFAULT_HARD_NEGATIVE_TOP_K,
     g2p: Any | None = None,
+    force_g2p_recompute: bool = False,
     on_progress: Callable[[str, int], None] | None = None,
 ) -> tuple[Any, dict[str, FbankTarget], dict[str, int]]:
     """Write paper-format anchor metadata without touching any audio.
@@ -278,6 +302,7 @@ def build_anchor_metadata(
 
     rows: list[dict[str, str]] = []
     pending: list[dict[str, Any]] = []
+    recompute_g2p = needs_g2p_recompute(df, force=force_g2p_recompute)
 
     for _, row in df.iterrows():
         text = str(row["ngram"])
@@ -285,7 +310,7 @@ def build_anchor_metadata(
         if not clips:
             continue
 
-        g2p_text, _phonemes = _resolve_g2p(row, g2p)
+        g2p_text, _phonemes = _resolve_g2p(row, g2p, recompute=recompute_g2p)
         pending.append({"ngram": text, "ngram_g2p": g2p_text, "clips": clips, "distances": parse_distances(row.get("distances"))})
         if limit_anchors and len(pending) >= limit_anchors:
             break
@@ -296,6 +321,7 @@ def build_anchor_metadata(
         "fbank_written": 0,
         "fbank_skipped": 0,
         "clips_total": 0,
+        "g2p_recomputed": int(recompute_g2p),
     }
 
     candidate_pairs = [(item["ngram"], item["ngram_g2p"]) for item in pending]
@@ -429,6 +455,7 @@ def convert_aggregated_to_paper_parquet(
     limit_anchors: int = 0,
     hard_negative_top_k: int = DEFAULT_HARD_NEGATIVE_TOP_K,
     g2p: Any | None = None,
+    force_g2p_recompute: bool = False,
     compute_fbank: Callable[..., str] = compute_fbank_for_clip,
     num_workers: int = 1,
     on_progress: Callable[[str, int], None] | None = None,
@@ -450,6 +477,7 @@ def convert_aggregated_to_paper_parquet(
         limit_anchors=limit_anchors,
         hard_negative_top_k=hard_negative_top_k,
         g2p=g2p,
+        force_g2p_recompute=force_g2p_recompute,
         on_progress=on_progress,
     )
 

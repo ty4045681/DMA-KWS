@@ -31,7 +31,7 @@ def test_validate_lang_char_dict_rejects_broken_dict(tmp_path):
 
 def test_validate_lang_char_dict_rejects_non_contiguous_ids(tmp_path):
     lines = CANONICAL_DICT_PATH.read_text(encoding="utf-8").splitlines()
-    lines[10] = "D 11"  # canonical id for D is 10; creates duplicate/gap
+    lines[22] = "D 23"  # canonical id for D is 22; creates duplicate/gap
 
     broken = tmp_path / "lang_char.txt"
     broken.write_text("\n".join(lines), encoding="utf-8")
@@ -42,11 +42,24 @@ def test_validate_lang_char_dict_rejects_non_contiguous_ids(tmp_path):
 
 def test_validate_lang_char_dict_rejects_missing_special_tokens(tmp_path):
     canonical = CANONICAL_DICT_PATH.read_text(encoding="utf-8").splitlines()
-    broken_lines = [line for line in canonical if not line.startswith("<sos/eos>")]
+    broken_lines = [line for line in canonical if not line.startswith("<unk> ")]
     broken = tmp_path / "lang_char.txt"
     broken.write_text("\n".join(broken_lines), encoding="utf-8")
 
     with pytest.raises(ValueError, match="missing required special tokens"):
+        validate_lang_char_dict(broken)
+
+
+def test_validate_lang_char_dict_rejects_stress_stripped_inventory(tmp_path):
+    """A stress-stripped dict cannot tokenize what g2p_en actually emits."""
+    lines = ["<blank> 0", "<unk> 1"]
+    for index, phone in enumerate(("AA", "AE", "AH", "B", "CH"), start=2):
+        lines.append(f"{phone} {index}")
+
+    broken = tmp_path / "lang_char.txt"
+    broken.write_text("\n".join(lines), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing required ARPAbet phones"):
         validate_lang_char_dict(broken)
 
 

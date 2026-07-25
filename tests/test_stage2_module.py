@@ -77,7 +77,7 @@ def patched_module(monkeypatch):
     fake_encoder = MagicMock(side_effect=_mock_encoder_output)
     monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_args, **_kwargs: fake_encoder)
     monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _FakeQbyT)
-    return Stage2LightningModule(_minimal_config(), vocab_size=73)
+    return Stage2LightningModule(_minimal_config(), vocab_size=71)
 
 
 def test_forward_and_training_step_smoke(patched_module):
@@ -147,7 +147,7 @@ def test_freeze_encoder_disables_encoder_gradients(monkeypatch):
     monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_args, **_kwargs: fake_encoder)
     monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _FakeQbyT)
 
-    module = Stage2LightningModule(_minimal_config(), vocab_size=73, freeze_encoder=True)
+    module = Stage2LightningModule(_minimal_config(), vocab_size=71, freeze_encoder=True)
 
     assert all(not param.requires_grad for param in encoder.parameters())
     assert any(param.requires_grad for param in module.qbyt.parameters())
@@ -175,7 +175,7 @@ def test_load_init_checkpoint_detects_icefall_model_keys(monkeypatch, tmp_path):
     monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_args, **_kwargs: fake_encoder)
     monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _FakeQbyT)
 
-    module = Stage2LightningModule(_minimal_config(), vocab_size=73)
+    module = Stage2LightningModule(_minimal_config(), vocab_size=71)
 
     # If generic branch is used, this would be called and fail the test.
     module.encoder.load_state_dict = MagicMock(side_effect=AssertionError("wrong checkpoint branch used"))

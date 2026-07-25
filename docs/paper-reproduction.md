@@ -42,7 +42,7 @@ Expected directory layout:
 Tokenizer (shared across stages):
 
 ```text
-data/dict/lang_char.txt   # repo-canonical Wenet CharTokenizer phoneme vocabulary (73 tokens)
+data/dict/lang_char.txt   # repo-canonical Wenet CharTokenizer phoneme vocabulary (71 stress-marked tokens)
 ```
 
 See [`data/dict/README.md`](../data/dict/README.md). The vendored dict is the single source of truth for both stages; the original author dictionary is unavailable. Do not replace it without retraining Stage I and Stage II. Runtime validation: `dma_kws.tokenizer.validate_lang_char_dict` (also called from `load_char_tokenizer`).

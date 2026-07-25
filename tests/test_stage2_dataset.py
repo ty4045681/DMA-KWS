@@ -17,7 +17,7 @@ def _mock_dataframe() -> pd.DataFrame:
     return pd.DataFrame(
         {
             "ngram": ["hello", "world"],
-            "ngram_g2p": ["HH AH L OW", "W ER L D"],
+            "ngram_g2p": ["HH AH0 L OW1", "W ER1 L D"],
             "clips_file": ["clips-2-a.npy", "clips-2-b.npy"],
             "distances_file": ["dist-0-a.npy", "dist-2-b.npy"],
         }
@@ -135,6 +135,6 @@ def test_dataset_loads_tokenizer_from_dict_path(mock_npy_loader):
 
     sample = dataset[0]
     anchor_ids = load_char_tokenizer(DICT_PATH)
-    _, expected = anchor_ids.tokenize("HH AH L OW")
+    _, expected = anchor_ids.tokenize("HH AH0 L OW1")
 
     assert sample["anchor_seq"].tolist() == expected

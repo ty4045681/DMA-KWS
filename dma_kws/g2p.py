@@ -7,8 +7,11 @@ and run_two_stage_demo.py.
 
 from __future__ import annotations
 
+import re
+
 from dma_kws.phonemes import normalize_english_text
-from dma_kws.stage1.librispeech import strip_stress_marker
+
+_STRESS_DIGIT_RE = re.compile(r"[0-2]")
 
 
 def make_g2p():
@@ -20,26 +23,31 @@ def make_g2p():
     return G2p()
 
 
-def text_to_phonemes(g2p, text: str, *, strip_stress: bool = True) -> list[str]:
+def text_to_phonemes(g2p, text: str) -> list[str]:
     """Normalize ``text`` and convert it to a clean phoneme token list.
 
-    When ``strip_stress`` is True (the default, matching Stage I), ARPAbet
-    stress digits are removed (e.g. ``AH0`` -> ``AH``).
+    ARPAbet stress digits are **kept** (``AH0`` stays ``AH0``): the phoneme
+    vocabulary spells out every stress variant, and training, evaluation and
+    inference must all tokenize text through this one function so the symbols
+    they produce are identical.
     """
-    normalized = normalize_english_text(text)
-    return clean_phoneme_tokens(g2p(normalized), strip_stress=strip_stress)
+    return clean_phoneme_tokens(g2p(normalize_english_text(text)))
 
 
-def clean_phoneme_tokens(tokens, *, strip_stress: bool = True) -> list[str]:
-    """Drop spaces/empties and optionally strip stress markers from tokens."""
+def clean_phoneme_tokens(tokens) -> list[str]:
+    """Drop spaces and empty tokens from a raw G2P token sequence."""
     phonemes: list[str] = []
     for phone in tokens:
-        if phone == " ":
-            continue
-        cleaned = str(phone)
-        if strip_stress:
-            cleaned = strip_stress_marker(cleaned)
-        cleaned = cleaned.strip()
+        cleaned = str(phone).strip()
         if cleaned:
             phonemes.append(cleaned)
     return phonemes
+
+
+def has_stress_markers(g2p_text: str) -> bool:
+    """Return True when a space-separated G2P string carries stress digits.
+
+    Used to detect legacy stress-stripped ``ngram_g2p`` columns, which must be
+    recomputed before they can be tokenized against the current vocabulary.
+    """
+    return bool(_STRESS_DIGIT_RE.search(str(g2p_text)))

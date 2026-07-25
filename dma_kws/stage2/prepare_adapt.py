@@ -13,6 +13,7 @@ import numpy as np
 from dma_kws.g2p import make_g2p, text_to_phonemes
 from dma_kws.stage2.adapt_paths import directory_name_to_text, neg_slug_to_text, slugify, wav_to_fbank_mirror
 from dma_kws.stage2.features import waveform_to_fbank
+from dma_kws.tokenizer import unsupported_phones
 
 
 @dataclass
@@ -35,9 +36,20 @@ def _import_torchaudio():
 
 
 def validate_g2p(text: str, g2p: Any) -> None:
+    """Fail early when a keyword/negative text cannot be tokenized cleanly.
+
+    Phonemes outside the vocabulary would otherwise be silently mapped to
+    ``<unk>`` at training and inference time.
+    """
     phonemes = text_to_phonemes(g2p, text)
     if not phonemes:
         raise ValueError(f"G2P produced empty phoneme sequence for text: {text!r}")
+    unsupported = unsupported_phones(phonemes)
+    if unsupported:
+        raise ValueError(
+            f"G2P produced phonemes outside the vocabulary for text {text!r}: "
+            f"{', '.join(unsupported)} (full sequence: {' '.join(phonemes)})"
+        )
 
 
 def scan_raw_tree(data_root: Path, keyword: str) -> list[AdaptSample]:

@@ -36,6 +36,12 @@ class _FakeTokenizer:
         return tokens, ids
 
 
+def _fake_g2p(text: str):
+    """Mimic g2p_en: upper-case ARPAbet with stress digits on vowels."""
+    phones = {"hello": ["HH", "AH0", "L", "OW1"], "world": ["W", "ER1", "L", "D"]}
+    return phones.get(text, text.upper().split())
+
+
 @pytest.fixture
 def mock_eval_npy(monkeypatch):
     fbank = np.ones((4, 80), dtype=np.float32)
@@ -81,7 +87,7 @@ def test_eval_dataset_easy_split_length(mock_eval_npy):
         split="easy",
         df=_mock_eval_df(),
         tokenizer=_FakeTokenizer(),
-        g2p=lambda text: text.upper().split(),
+        g2p=_fake_g2p,
     )
 
     assert len(dataset) == 2
@@ -93,7 +99,7 @@ def test_eval_dataset_getitem_keys_and_shapes(mock_eval_npy):
         split="all",
         df=_mock_eval_df(),
         tokenizer=_FakeTokenizer(),
-        g2p=lambda text: text.upper().split(),
+        g2p=_fake_g2p,
     )
 
     sample = dataset[0]
@@ -132,15 +138,12 @@ def test_eval_metrics_smoke(monkeypatch, mock_eval_npy):
 
     from dma_kws.stage2.module import Stage2LightningModule
 
-    def fake_g2p(text: str):
-        return text.upper().split()
-
     dataset = LibriPhraseEvalDataset(
         test_dir="/data/eval",
         split="all",
         df=_mock_eval_df(),
         tokenizer=_FakeTokenizer(),
-        g2p=fake_g2p,
+        g2p=_fake_g2p,
     )
 
     def _mock_encoder_output(feat: torch.Tensor, feat_lengths: torch.Tensor):
@@ -184,7 +187,7 @@ def test_eval_metrics_smoke(monkeypatch, mock_eval_npy):
     monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_args, **_kwargs: fake_encoder)
     monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _FakeQbyT)
 
-    module = Stage2LightningModule(config, vocab_size=73)
+    module = Stage2LightningModule(config, vocab_size=71)
     module.eval()
 
     batch = test_collate_fn([dataset[i] for i in range(len(dataset))])

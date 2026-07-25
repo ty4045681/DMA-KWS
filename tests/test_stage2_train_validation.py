@@ -42,12 +42,15 @@ def mock_eval_npy(monkeypatch):
     return fbank
 
 
+def _fake_g2p(text: str):
+    """Mimic g2p_en: upper-case ARPAbet with stress digits on vowels."""
+    phones = {"hello": ["HH", "AH0", "L", "OW1"], "world": ["W", "ER1", "L", "D"]}
+    return phones.get(text, text.upper().split())
+
+
 @pytest.fixture
 def mock_g2p(monkeypatch):
-    monkeypatch.setattr(
-        "dma_kws.stage2.dataset.make_g2p",
-        lambda: (lambda text: text.upper().split()),
-    )
+    monkeypatch.setattr("dma_kws.stage2.dataset.make_g2p", lambda: _fake_g2p)
 
 
 def _write_eval_aggregate(test_dir: Path) -> None:

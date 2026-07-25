@@ -30,7 +30,7 @@ def _synthetic_df() -> pd.DataFrame:
     return pd.DataFrame(
         {
             "ngram": ["hello world", "hello word", "goodbye"],
-            "ngram_g2p": ["HH AH L OW W ER L D", "HH AH L OW W ER D", "G UH D B AY"],
+            "ngram_g2p": ["HH AH0 L OW1 W ER1 L D", "HH AH0 L OW1 W ER1 D", "G UH0 D B AY1"],
             "clips": [
                 [{"audio_path": "LP-100/hello world/a.wav"}, {"audio_path": "LP-100/hello world/b.wav"}],
                 [{"audio_path": "LP-100/hello word/c.wav"}],
@@ -44,7 +44,7 @@ def _synthetic_gp1000_df() -> pd.DataFrame:
     return pd.DataFrame(
         {
             "ngram": ["hello world", "hello word"],
-            "ngram_g2p": ["HH AH L OW W ER L D", "HH AH L OW W ER D"],
+            "ngram_g2p": ["HH AH0 L OW1 W ER1 L D", "HH AH0 L OW1 W ER1 D"],
             "clips": [
                 [
                     {"audio_path": "GP-1000/hello world/a.wav"},
@@ -68,7 +68,7 @@ def _synthetic_mixed_gp_lp460_df() -> pd.DataFrame:
     return pd.DataFrame(
         {
             "ngram": ["tomatoes"],
-            "ngram_g2p": ["T AH M EY T OW Z"],
+            "ngram_g2p": ["T AH0 M EY1 T OW0 Z"],
             "clips": [
                 [
                     {"audio_path": "GP-1000/tomatoes/AUD0000001043_S0000775_000.wav"},
@@ -163,13 +163,13 @@ def test_build_clips_and_distances_npy_roundtrip(tmp_path):
 
 def test_compute_hard_negatives_prefers_small_edit_distance():
     candidates = [
-        ("hello world", "HH AH L OW W ER L D"),
-        ("hello word", "HH AH L OW W ER D"),
-        ("goodbye", "G UH D B AY"),
+        ("hello world", "HH AH0 L OW1 W ER1 L D"),
+        ("hello word", "HH AH0 L OW1 W ER1 D"),
+        ("goodbye", "G UH0 D B AY1"),
     ]
     hard = compute_hard_negatives_from_phonemes(
         "hello world",
-        "HH AH L OW W ER L D",
+        "HH AH0 L OW1 W ER1 L D",
         candidates,
         top_k=1,
     )
@@ -359,7 +359,7 @@ def test_distances_npy_works_with_dataset_get_hard_negative(tmp_path):
 
     negative_wav, negative_g2p, negative = dataset.get_hard_negative(hard_neg)
     assert negative == "hello word"
-    assert negative_g2p == "HH AH L OW W ER D"
+    assert negative_g2p == "HH AH0 L OW1 W ER1 D"
     assert "audio_path" in negative_wav
     assert negative_wav["audio_path"] == "LP-100/hello word/c.wav"
 

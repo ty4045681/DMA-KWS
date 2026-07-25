@@ -6,8 +6,14 @@ from dma_kws.inference.stage2_clip import Stage2ClipRunner
 from dma_kws.tokenizer import load_char_tokenizer
 
 
+def _fake_phonemes(text: str) -> list[str]:
+    """Mimic g2p_en: upper-case ARPAbet with stress digits on vowels."""
+    phones = {"hey eva": ["HH", "EY1", "IY1", "V", "AH0"]}
+    return phones.get(text.lower(), text.upper().split())
+
+
 def _fake_g2p():
-    return lambda text: text.upper().split()
+    return _fake_phonemes
 
 
 class FakeWaveform:
@@ -56,7 +62,7 @@ def _build_runner(
         monkeypatch.setattr("dma_kws.inference.stage2_clip.make_g2p", _fake_g2p)
         monkeypatch.setattr(
             "dma_kws.inference.stage2_clip.text_to_phonemes",
-            lambda _g2p, text: text.upper().split(),
+            lambda _g2p, text: _fake_phonemes(text),
         )
     tokenizer = load_char_tokenizer("data/dict/lang_char.txt", split_with_space=" ")
     return Stage2ClipRunner(
@@ -156,7 +162,7 @@ def test_clip_runner_run_batch(monkeypatch):
 
     def fake_text_to_phonemes(_g2p, text):
         g2p_calls.append(text)
-        return text.upper().split()
+        return _fake_phonemes(text)
 
     monkeypatch.setattr(
         "dma_kws.inference.stage2_clip.text_to_phonemes", fake_text_to_phonemes

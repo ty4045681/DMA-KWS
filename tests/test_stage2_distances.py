@@ -31,7 +31,7 @@ def _synthetic_g2p_df() -> pd.DataFrame:
                 json.dumps([{"audio_path": "LP-100/hello word/c.wav"}]),
                 json.dumps([{"audio_path": "LP-100/goodbye/d.wav"}]),
             ],
-            "ngram_g2p": ["HH AH L OW W ER L D", "HH AH L OW W ER D", "G UH D B AY"],
+            "ngram_g2p": ["HH AH0 L OW1 W ER1 L D", "HH AH0 L OW1 W ER1 D", "G UH0 D B AY1"],
         }
     )
 

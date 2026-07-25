@@ -43,7 +43,7 @@ def test_prepare_parquet_split_writes_manifest_and_audio_cache(tmp_path, monkeyp
 
     extracted_audio = audio_output_dir / "19" / "198" / "19-198-0001.flac"
     assert extracted_audio.read_bytes() == b"fake-flac-bytes"
-    assert phones == ["HH", "AH", "L", "OW"]
+    assert phones == ["HH", "AH0", "L", "OW1"]
     records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
     assert records == [
         {
@@ -52,7 +52,7 @@ def test_prepare_parquet_split_writes_manifest_and_audio_cache(tmp_path, monkeyp
             "wav_path": str(extracted_audio),
             "text": "HELLO WORLD",
             "normalized_text": "hello world",
-            "phonemes": ["HH", "AH", "L", "OW"],
-            "phonemes_g2p": "HH AH L OW",
+            "phonemes": ["HH", "AH0", "L", "OW1"],
+            "phonemes_g2p": "HH AH0 L OW1",
         }
     ]
