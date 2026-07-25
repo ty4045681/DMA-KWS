@@ -2,8 +2,10 @@ from pathlib import Path
 
 import pytest
 
+import numpy as np
+
 from dma_kws.inference.manifest import load_manifest
-from dma_kws.inference.metrics import summarize_labeled_results
+from dma_kws.inference.metrics import binary_eer, summarize_labeled_results
 from scripts.eval_stage2_clips import _result_record as stage2_clip_result_record
 from scripts.eval_two_stage_kws import _result_record as two_stage_result_record
 
@@ -49,6 +51,83 @@ def test_summarize_labeled_results_metrics():
     assert summary["fnr"] == pytest.approx(0.5)
     assert 0.0 <= summary["auc"] <= 1.0
     assert 0.0 <= summary["eer"] <= 1.0
+    assert 0.0 <= summary["eer_threshold"] <= 1.0
+
+
+def test_summarize_labeled_results_reports_eer_threshold_away_from_operating_point():
+    # Scores are perfectly ranked but shifted far above the 0.5 operating
+    # point, so every sample is accepted there while the EER sits near 0.8.
+    results = [
+        {"label": 1, "best_qbyt_score": score}
+        for score in (0.99, 0.98, 0.97, 0.96)
+    ] + [
+        {"label": 0, "best_qbyt_score": score}
+        for score in (0.95, 0.94, 0.93, 0.92)
+    ]
+
+    summary = summarize_labeled_results(results, threshold=0.5)
+
+    assert summary["fpr"] == pytest.approx(1.0)
+    assert summary["auc"] == pytest.approx(1.0)
+    assert summary["eer"] == pytest.approx(0.0)
+    assert summary["eer_threshold"] == pytest.approx(0.96)
+
+
+def _eer(labels, scores):
+    return binary_eer(np.array(labels, dtype=np.int64), np.array(scores, dtype=np.float64))
+
+
+def test_binary_eer_perfectly_separable():
+    assert _eer([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9]) == (pytest.approx(0.0), pytest.approx(0.8))
+
+
+def test_binary_eer_perfectly_inverted():
+    eer, _ = _eer([0, 0, 1, 1], [0.9, 0.8, 0.2, 0.1])
+    assert eer == pytest.approx(1.0)
+
+
+def test_binary_eer_all_scores_tied():
+    eer, _ = _eer([0, 1], [0.5, 0.5])
+    assert eer == pytest.approx(0.5)
+
+
+def test_binary_eer_random_scores_approach_one_half():
+    rng = np.random.default_rng(0)
+    labels = rng.integers(0, 2, 20_000)
+    scores = rng.random(20_000)
+
+    eer, _ = _eer(labels, scores)
+
+    assert eer == pytest.approx(0.5, abs=0.02)
+
+
+def test_binary_eer_is_invariant_to_monotone_rescaling():
+    labels = [0, 0, 1, 0, 1, 1, 0, 1]
+    scores = np.array([0.1, 0.4, 0.35, 0.8, 0.7, 0.9, 0.2, 0.6])
+
+    eer, threshold = _eer(labels, scores)
+    rescaled_eer, rescaled_threshold = _eer(labels, scores**2)
+
+    assert rescaled_eer == pytest.approx(eer)
+    assert rescaled_threshold == pytest.approx(threshold**2)
+
+
+def test_binary_eer_is_zero_only_when_auc_is_one():
+    labels = [0, 0, 1, 1]
+    summary = summarize_labeled_results(
+        [
+            {"label": label, "best_qbyt_score": score}
+            for label, score in zip(labels, [0.1, 0.6, 0.4, 0.9])
+        ],
+        threshold=0.5,
+    )
+
+    assert summary["auc"] < 1.0
+    assert summary["eer"] > 0.0
+
+
+def test_binary_eer_single_class_returns_zero():
+    assert _eer([0, 0, 0], [0.1, 0.2, 0.3]) == (0.0, 0.0)
 
 
 def test_summarize_labeled_results_empty_without_labels():

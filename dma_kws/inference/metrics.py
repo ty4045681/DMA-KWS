@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import torch
+from torchmetrics.functional.classification import binary_eer as _torchmetrics_eer
+from torchmetrics.functional.classification import binary_roc as _torchmetrics_roc
 
 
 def _safe_div(numerator: float, denominator: float) -> float:
@@ -56,25 +59,29 @@ def binary_auc(labels: np.ndarray, scores: np.ndarray) -> float:
     return float(np.clip(auc, 0.0, 1.0))
 
 
-def binary_eer(labels: np.ndarray, scores: np.ndarray) -> float:
-    """Compute equal error rate over score thresholds."""
+def binary_eer(labels: np.ndarray, scores: np.ndarray) -> tuple[float, float]:
+    """Compute the equal error rate and the score threshold that attains it.
+
+    The EER itself is delegated to ``torchmetrics`` so that offline evaluation
+    matches the ``val/eer`` values logged during Stage II training. ``scores``
+    must be probabilities in ``[0, 1]``; torchmetrics would otherwise squash
+    them through a sigmoid and the returned threshold would no longer be
+    comparable to ``demo.qbyt_threshold``.
+    """
     labels = labels.astype(np.int64)
     scores = scores.astype(np.float64)
-    positives = int(np.sum(labels == 1))
-    negatives = int(np.sum(labels == 0))
-    if positives == 0 or negatives == 0:
-        return 0.0
+    if int(np.sum(labels == 1)) == 0 or int(np.sum(labels == 0)) == 0:
+        return 0.0, 0.0
 
-    thresholds = np.unique(scores)
-    best_eer = 1.0
-    for threshold in thresholds:
-        predictions = _binary_predictions(labels, scores, float(threshold))
-        tp, tn, fp, fn = _confusion_counts(labels, predictions)
-        fpr = fp / negatives
-        fnr = fn / positives
-        best_eer = min(best_eer, abs(fpr - fnr))
+    preds = torch.as_tensor(scores, dtype=torch.float64)
+    target = torch.as_tensor(labels, dtype=torch.long)
+    eer = float(_torchmetrics_eer(preds, target, thresholds=None))
 
-    return float(best_eer)
+    # torchmetrics picks the ROC point minimising |FPR - FNR|; replay that
+    # choice on the same curve so the reported threshold actually attains eer.
+    fpr, tpr, roc_thresholds = _torchmetrics_roc(preds, target, thresholds=None)
+    index = int(torch.argmin(torch.abs(fpr - (1.0 - tpr))))
+    return eer, float(roc_thresholds[index])
 
 
 def summarize_labeled_results(
@@ -82,7 +89,12 @@ def summarize_labeled_results(
     *,
     threshold: float,
 ) -> dict[str, float]:
-    """Aggregate accuracy, precision, recall, f1, auc, and eer from labeled rows."""
+    """Aggregate accuracy, precision, recall, f1, auc, and eer from labeled rows.
+
+    ``threshold`` is the operating point the caller is deployed at, while
+    ``eer_threshold`` reports where the equal error rate actually sits. A large
+    gap between the two means the scores are miscalibrated for ``threshold``.
+    """
     labeled = [row for row in results if "label" in row]
     if not labeled:
         return {}
@@ -97,6 +109,7 @@ def summarize_labeled_results(
     f1 = _safe_div(2 * precision * recall, precision + recall)
     fpr = _safe_div(fp, fp + tn)
     fnr = _safe_div(fn, fn + tp)
+    eer, eer_threshold = binary_eer(labels, scores)
 
     return {
         "num_samples": float(len(labeled)),
@@ -107,7 +120,8 @@ def summarize_labeled_results(
         "fpr": fpr,
         "fnr": fnr,
         "auc": binary_auc(labels, scores),
-        "eer": binary_eer(labels, scores),
+        "eer": eer,
+        "eer_threshold": eer_threshold,
         "threshold": float(threshold),
         "tp": float(tp),
         "tn": float(tn),
