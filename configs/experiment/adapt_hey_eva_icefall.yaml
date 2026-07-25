@@ -60,7 +60,10 @@ adapt:
   sample_lens: 64000
   batch_size_per_gpu: 64
   val_batch_size: 128
-  num_workers: 16
+  # Data loading is not the bottleneck here (64-sample batches, ~15 it/s), while each
+  # worker costs file descriptors that accumulate across sweep trials in one process.
+  num_workers: 8
+  val_num_workers: 2
 
   validation:
     # Counted in optimizer steps (adaptation epochs are virtual and short).

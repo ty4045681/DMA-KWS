@@ -60,6 +60,21 @@ def apply_trial_params(config: dict[str, Any], params: dict[str, Any]) -> dict[s
     return merge_adapt_params(config.setdefault("adapt", {}), params)
 
 
+def disable_persistent_workers(config: dict[str, Any]) -> dict[str, Any]:
+    """Turn off ``stage2.dataloader.persistent_workers`` for a sweep trial config.
+
+    Trials run back-to-back inside a single process: persistent workers from the
+    previous trial stay alive until its loaders are collected, so their file
+    descriptors pile up across trials until the process hits ``ulimit -n``. Sweeps
+    trade the (small) per-epoch worker startup cost for that stability.
+    """
+    stage2_cfg = config.setdefault("stage2", {})
+    dataloader_cfg = dict(stage2_cfg.get("dataloader") or {})
+    dataloader_cfg["persistent_workers"] = False
+    stage2_cfg["dataloader"] = dataloader_cfg
+    return config
+
+
 def run_adaptation_trial(
     config: dict[str, Any],
     *,
@@ -78,7 +93,7 @@ def run_adaptation_trial(
     # Imported lazily so scoring/param helpers stay importable without torch.
     from dma_kws.stage2.adapt import Stage2AdaptArgs, run_stage2_adaptation
 
-    trial_config = copy.deepcopy(config)
+    trial_config = disable_persistent_workers(copy.deepcopy(config))
     effective_params = apply_trial_params(trial_config, params)
     adapt = trial_config["adapt"]
     keyword = str(adapt["keyword"])

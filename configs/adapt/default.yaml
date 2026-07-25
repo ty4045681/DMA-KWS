@@ -26,6 +26,9 @@ adapt:
   batch_size_per_gpu: 64
   val_batch_size: 64
   num_workers: 2
+  # null = min(num_workers, 4). The target-keyword val set is small, so it does not
+  # need the train worker count; every extra worker costs file descriptors.
+  val_num_workers: null
   eval_fraction: 0.2
   eval_seed: 2025
   init_checkpoint: ""

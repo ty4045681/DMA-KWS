@@ -334,6 +334,7 @@ class AdaptConfig:
     batch_size_per_gpu: int = 64
     val_batch_size: int = 64
     num_workers: int = 2
+    val_num_workers: int | None = None
     eval_fraction: float = 0.2
     eval_seed: int = 2025
     init_checkpoint: str = ""

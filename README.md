@@ -1191,7 +1191,8 @@ Defaults live in `configs/adapt/default.yaml`. Override on the CLI with `adapt.<
 | `adapt.sample_lens` | `3000` | Virtual epoch length (random resampling) |
 | `adapt.batch_size_per_gpu` | `64` | Train batch size |
 | `adapt.val_batch_size` | `64` | Target-keyword val batch size |
-| `adapt.num_workers` | `2` | DataLoader workers |
+| `adapt.num_workers` | `2` | Train DataLoader workers |
+| `adapt.val_num_workers` | `null` | Target-keyword val workers (`null` = `min(num_workers, 4)`) |
 
 **Checkpoint inputs**
 

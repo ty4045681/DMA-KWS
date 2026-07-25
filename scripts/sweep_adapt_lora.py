@@ -164,6 +164,18 @@ def main(cfg: DictConfig) -> None:
         import optuna
     except ImportError as exc:
         raise SystemExit("Install optuna: pip install 'dma-kws[adapt]'") from exc
+    try:
+        import torch
+    except ImportError as exc:
+        raise SystemExit(
+            "Missing torch. Install CUDA PyTorch on the remote training machine first."
+        ) from exc
+
+    # Every trial spins up a fresh set of dataloader workers inside this one process.
+    # With the default file_descriptor sharing strategy their fds accumulate until the
+    # process hits `ulimit -n`, which surfaces as "received 0 items of ancdata" and then
+    # as sqlite "unable to open database file" when Optuna tries to record the trial.
+    torch.multiprocessing.set_sharing_strategy("file_system")
 
     config = resolved_config(cfg)
     adapt = OmegaConf.to_container(cfg.adapt, resolve=True)
@@ -284,8 +296,15 @@ def main(cfg: DictConfig) -> None:
         sampler=optuna.samplers.TPESampler(),
         pruner=optuna.pruners.MedianPruner(),
     )
-    study.optimize(objective, n_trials=n_trials)
+    # A single crashed trial (OOM, fd exhaustion, ...) must not throw away the trials
+    # that already landed in the study storage.
+    study.optimize(objective, n_trials=n_trials, catch=(Exception,))
 
+    if not any(trial.state == optuna.trial.TrialState.COMPLETE for trial in study.trials):
+        raise SystemExit(
+            f"No trial completed for study {study_name!r}; see the first traceback above "
+            "for the failure and re-run with the same study_name to resume."
+        )
     best = study.best_trial
     best_path = sweep_root / "best_params.yaml"
     save_best_params(best_path, best.params, score=float(best.value))

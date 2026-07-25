@@ -386,9 +386,16 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
 
     batch_size = int(adapt.get("batch_size_per_gpu", stage2.get("batch_size_per_gpu", 64)))
     num_workers = int(adapt.get("num_workers", stage2.get("num_workers", 2)))
+    # The target-keyword val set is a few thousand clips against a 64k-sample virtual
+    # train epoch; giving it the full train worker count only multiplies worker
+    # processes and open file descriptors for no throughput gain.
+    val_workers_cfg = adapt.get("val_num_workers")
+    val_num_workers = min(num_workers, 4) if val_workers_cfg is None else int(val_workers_cfg)
     from dma_kws.training.loaders import build_loader_kwargs
 
-    loader_kwargs = build_loader_kwargs(num_workers, stage2.get("dataloader", {}) or {})
+    dataloader_cfg = stage2.get("dataloader", {}) or {}
+    loader_kwargs = build_loader_kwargs(num_workers, dataloader_cfg)
+    val_loader_kwargs = build_loader_kwargs(val_num_workers, dataloader_cfg)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -410,10 +417,10 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         target_val_dataset,
         batch_size=int(adapt.get("val_batch_size", batch_size)),
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=val_num_workers,
         collate_fn=test_collate_fn,
         drop_last=False,
-        **loader_kwargs,
+        **val_loader_kwargs,
     )
     lph_val_loader = _build_val_dataloader(config, tokenizer)
 

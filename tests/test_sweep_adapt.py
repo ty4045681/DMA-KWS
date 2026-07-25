@@ -1,6 +1,10 @@
 """Sweep scoring and eval-subset helpers (no torch required)."""
 
-from dma_kws.stage2.sweep_adapt import compute_sweep_score, select_eval_subset_indices
+from dma_kws.stage2.sweep_adapt import (
+    compute_sweep_score,
+    disable_persistent_workers,
+    select_eval_subset_indices,
+)
 
 
 def test_subset_is_spread_over_the_whole_eval_set():
@@ -21,6 +25,19 @@ def test_subset_is_reproducible_across_calls():
 def test_subset_disabled_returns_none():
     assert select_eval_subset_indices(1000, 0) is None
     assert select_eval_subset_indices(1000, 5000) is None
+
+
+def test_trial_config_opts_out_of_persistent_workers():
+    """Regression: persistent workers leaked file descriptors across trials."""
+    config = {"stage2": {"dataloader": {"persistent_workers": True, "prefetch_factor": 4}}}
+
+    updated = disable_persistent_workers(config)
+
+    assert updated["stage2"]["dataloader"] == {
+        "persistent_workers": False,
+        "prefetch_factor": 4,
+    }
+    assert disable_persistent_workers({})["stage2"]["dataloader"] == {"persistent_workers": False}
 
 
 def test_sweep_score_penalizes_forgetting_only():
