@@ -317,7 +317,7 @@ class AdaptConfig:
     exp_root: str = ""
     rank: int = 16
     alpha: int = 32
-    lr: float = 4e-4
+    lr: float | None = None
     learning_rate: float = 4e-4
     optimizer: str = "adam"
     weight_decay: float = 0.0

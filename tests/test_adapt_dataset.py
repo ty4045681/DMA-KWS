@@ -107,6 +107,7 @@ def test_prepare_external_sources_splits_each_phase(tmp_path: Path, monkeypatch)
     monkeypatch.setattr("dma_kws.stage2.prepare_adapt.validate_g2p", lambda _text, _g2p: None)
     monkeypatch.setattr("dma_kws.stage2.prepare_adapt.compute_and_save_fbank", lambda *_args, **_kwargs: True)
 
+    events: list[tuple[str, int]] = []
     stats = prepare_keyword_adaptation(
         keyword="hey eva",
         data_root=tmp_path / "prepared",
@@ -114,15 +115,28 @@ def test_prepare_external_sources_splits_each_phase(tmp_path: Path, monkeypatch)
         eval_fraction=0.5,
         eval_seed=1,
         sources=sources,
+        on_progress=lambda stage, value: events.append((stage, value)),
     )
 
     assert stats["phases"]["tts"]["train"] == 2
     assert stats["phases"]["tts"]["eval"] == 2
     assert stats["phases"]["real"]["train"] == 2
     assert stats["phases"]["real"]["eval"] == 2
+    for phase in ("tts", "real"):
+        phase_stats = stats["phases"][phase]
+        assert phase_stats["train_positive"] + phase_stats["train_negative"] == phase_stats["train"]
+        assert phase_stats["eval_positive"] + phase_stats["eval_negative"] == phase_stats["eval"]
     rows = list(csv.DictReader((tmp_path / "prepared" / "manifests" / "tts_train.csv").open()))
     assert all(Path(row["audio_path"]).is_absolute() for row in rows)
     assert {row["text"] for row in rows} <= {"hey eva", "hi eva"}
+
+    totals = dict(event for event in events if event[0].endswith("_total") or event[0] == "scan")
+    assert totals["scan"] == 8
+    assert totals["fbank_total"] == 8
+    # G2P runs once per unique text, not once per sample
+    assert totals["g2p_total"] == stats["unique_texts"] == 2
+    assert sum(value for stage, value in events if stage == "fbank") == 8
+    assert sum(value for stage, value in events if stage == "g2p") == 2
 
 
 def test_scan_raw_tree_assigns_explicit_splits(tmp_path: Path):

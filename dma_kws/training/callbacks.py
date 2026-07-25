@@ -41,14 +41,9 @@ def build_stage2_callbacks(config: dict[str, Any], recipe: str) -> list[Any]:
     console_cfg = stage2.get("console", {}) or {}
     ema_cfg = stage2.get("ema", {}) or {}
 
+    # No LearningRateMonitor: the modules already log ``train/lr`` each step,
+    # so the monitor's ``lr-Adam`` column would duplicate it.
     callbacks: list[Any] = [build_stage2_checkpoint_callback(config, recipe)]
-
-    try:
-        from pytorch_lightning.callbacks import LearningRateMonitor
-    except ImportError:
-        from lightning.pytorch.callbacks import LearningRateMonitor
-
-    callbacks.append(LearningRateMonitor(logging_interval="step"))
 
     if console_cfg.get("device_stats", False):
         try:
@@ -147,6 +142,107 @@ def build_stage1_callbacks(
     return callbacks, checkpoint_callback
 
 
+RUN_SUMMARY_TITLES = {
+    "stage2": "Stage II QbyT Training Run",
+    "adapt": "Stage II LoRA Adaptation Run",
+}
+
+
+def build_run_summary_rows(
+    *,
+    config: dict[str, Any],
+    devices: int,
+    accelerator: str,
+    train_samples: int,
+    val_samples: int,
+    param_counts: dict[str, int] | None = None,
+    paths: dict[str, str | Path] | None = None,
+    section: str = "stage2",
+    extra_rows: list[tuple[str, str]] | None = None,
+) -> list[tuple[str, str]]:
+    """Build ``(setting, value)`` rows describing a training run.
+
+    ``section`` selects where hyperparameters come from. Trainer-level settings
+    always come from ``stage2`` because ``build_trainer_kwargs`` and
+    ``build_stage2_callbacks`` read that section regardless of the recipe.
+    """
+    from dma_kws.training.adapt_params import resolve_adapt_lr
+    from dma_kws.training.ddp import resolve_precision
+    from dma_kws.training.scheduler import build_optimizer_config
+
+    stage2 = config.get("stage2", {}) or {}
+    stage = stage2 if section == "stage2" else (config.get(section) or {})
+    dataloader_cfg = stage2.get("dataloader", {}) or {}
+    ema_cfg = stage2.get("ema", {}) or {}
+
+    def setting(key: str, default: Any) -> Any:
+        """Read from the run's section, falling back to ``stage2``."""
+        value = stage.get(key)
+        return stage2.get(key, default) if value is None else value
+
+    if section == "adapt":
+        lr, lr_source = resolve_adapt_lr(stage)
+        opt_cfg = {
+            "optimizer": str(stage.get("optimizer", "adam")).lower(),
+            "lr": lr,
+            "weight_decay": float(stage.get("weight_decay", 0.0)),
+            "warmup_steps": int(stage.get("warmup_steps", 100)),
+            "total_steps": int(stage.get("max_steps", 3000)),
+        }
+        lr_label = "learning_rate" if lr_source == "learning_rate" else f"learning_rate ({lr_source})"
+    else:
+        opt_cfg = build_optimizer_config(stage)
+        lr_label = "learning_rate"
+
+    batch_size = int(setting("batch_size_per_gpu", 64))
+    accumulate = int(stage2.get("accumulate_grad_batches", 1))
+    effective_batch = batch_size * devices * accumulate
+    num_workers = int(setting("num_workers", 0))
+    max_steps = int(setting("max_steps", 50000))
+
+    rows = [
+        ("recipe", str(config.get("training", {}).get("recipe", ""))),
+        ("accelerator", accelerator),
+        ("devices", str(devices)),
+        ("precision", resolve_precision(stage2, accelerator)),
+        ("effective_batch", str(effective_batch)),
+        ("batch_size_per_gpu", str(batch_size)),
+        ("accumulate_grad_batches", str(accumulate)),
+        ("max_steps", str(max_steps)),
+        (lr_label, str(opt_cfg["lr"])),
+        ("warmup_steps", str(opt_cfg["warmup_steps"])),
+        ("optimizer", opt_cfg["optimizer"]),
+        ("weight_decay", str(opt_cfg["weight_decay"])),
+    ]
+    if int(opt_cfg["total_steps"]) != max_steps:
+        rows.append(("scheduler_total_steps", str(opt_cfg["total_steps"])))
+    rows.extend(
+        [
+            ("ema", "enabled" if ema_cfg.get("enabled", False) else "disabled"),
+            ("train_samples", str(train_samples)),
+            ("val_samples", str(val_samples)),
+            ("num_workers", str(num_workers)),
+            ("pin_memory", str(dataloader_cfg.get("pin_memory", True))),
+        ]
+    )
+    if num_workers > 0:
+        rows.extend(
+            [
+                ("persistent_workers", str(dataloader_cfg.get("persistent_workers", True))),
+                ("prefetch_factor", str(dataloader_cfg.get("prefetch_factor", 4))),
+            ]
+        )
+    if extra_rows:
+        rows.extend(extra_rows)
+    if param_counts:
+        for name, count in param_counts.items():
+            rows.append((f"params/{name}", f"{count:,}" if isinstance(count, int) else str(count)))
+    if paths:
+        for name, path in paths.items():
+            rows.append((name, str(path)))
+    return rows
+
+
 def print_run_summary(
     *,
     config: dict[str, Any],
@@ -156,66 +252,35 @@ def print_run_summary(
     val_samples: int,
     param_counts: dict[str, int] | None = None,
     paths: dict[str, str | Path] | None = None,
+    section: str = "stage2",
+    title: str | None = None,
+    extra_rows: list[tuple[str, str]] | None = None,
 ) -> None:
-    """Print a one-screen summary of the Stage II training run."""
-    from dma_kws.training.ddp import resolve_precision
-    from dma_kws.training.scheduler import build_optimizer_config
-
-    stage2 = config.get("stage2", {})
-    dataloader_cfg = stage2.get("dataloader", {}) or {}
-    ema_cfg = stage2.get("ema", {}) or {}
-    opt_cfg = build_optimizer_config(stage2)
-
-    batch_size = int(stage2.get("batch_size_per_gpu", 64))
-    accumulate = int(stage2.get("accumulate_grad_batches", 1))
-    effective_batch = batch_size * devices * accumulate
-    num_workers = int(stage2.get("num_workers", 0))
-    precision = resolve_precision(stage2, accelerator)
-
-    rows = [
-        ("recipe", str(config.get("training", {}).get("recipe", ""))),
-        ("accelerator", accelerator),
-        ("devices", str(devices)),
-        ("precision", precision),
-        ("effective_batch", str(effective_batch)),
-        ("batch_size_per_gpu", str(batch_size)),
-        ("accumulate_grad_batches", str(accumulate)),
-        ("max_steps", str(stage2.get("max_steps", 50000))),
-        ("learning_rate", str(opt_cfg["lr"])),
-        ("warmup_steps", str(opt_cfg["warmup_steps"])),
-        ("optimizer", opt_cfg["optimizer"]),
-        ("weight_decay", str(opt_cfg["weight_decay"])),
-        ("ema", "enabled" if ema_cfg.get("enabled", False) else "disabled"),
-        ("train_samples", str(train_samples)),
-        ("val_samples", str(val_samples)),
-        ("num_workers", str(num_workers)),
-        ("pin_memory", str(dataloader_cfg.get("pin_memory", True))),
-    ]
-    if num_workers > 0:
-        rows.extend(
-            [
-                ("persistent_workers", str(dataloader_cfg.get("persistent_workers", True))),
-                ("prefetch_factor", str(dataloader_cfg.get("prefetch_factor", 4))),
-            ]
-        )
-    if param_counts:
-        for name, count in param_counts.items():
-            rows.append((f"params/{name}", f"{count:,}"))
-    if paths:
-        for name, path in paths.items():
-            rows.append((name, str(path)))
+    """Print a one-screen summary of a training run."""
+    rows = build_run_summary_rows(
+        config=config,
+        devices=devices,
+        accelerator=accelerator,
+        train_samples=train_samples,
+        val_samples=val_samples,
+        param_counts=param_counts,
+        paths=paths,
+        section=section,
+        extra_rows=extra_rows,
+    )
+    heading = title or RUN_SUMMARY_TITLES.get(section, f"{section} Training Run")
 
     try:
         from rich.console import Console
         from rich.table import Table
 
-        table = Table(title="Stage II QbyT Training Run", show_header=True, header_style="bold")
+        table = Table(title=heading, show_header=True, header_style="bold")
         table.add_column("Setting", style="cyan")
         table.add_column("Value")
         for key, value in rows:
             table.add_row(key, value)
         Console().print(table)
     except ImportError:
-        print("=== Stage II QbyT Training Run ===")
+        print(f"=== {heading} ===")
         for key, value in rows:
             print(f"  {key}: {value}")

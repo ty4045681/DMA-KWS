@@ -1046,6 +1046,23 @@ python3 scripts/run_keyword_adaptation.py adapt.keyword="hey eva" prep.stage2_ck
 
 Outputs: `exp/stage2_adapt/<slug>/adapter_<slug>.pt` (small LoRA only), `stage2_adapted.pt` (merged, loadable by `Stage2Verifier`). To adapt another wake word, change `adapt.keyword` and place data under `data/dma-kws/processed/adapt/<new_slug>/raw/...`.
 
+### Console output
+
+All four adaptation scripts print rich progress and summary tables: a plan table before any heavy work, G2P/fbank progress bars during preparation, dataset composition and LoRA parameter budget before training, the resolved run summary (`Stage II LoRA Adaptation Run`), per-trial sweep scores, and a base-vs-adapted metric comparison with deltas at eval time. Each table is followed by the machine-readable JSON/YAML line the scripts have always emitted.
+
+Set `prep.use_rich=false` for plain text; output also degrades to plain text automatically when stdout is not a TTY (piped output, CI logs, captured subprocesses).
+
+### Metrics logs (CSV / TensorBoard)
+
+Stage II training and LoRA adaptation write metrics through the backends in `stage2.logging.backends` (default `[csv, tensorboard]`; W&B and Trackio optional). Per run (`logs/<run_name>/version_N/`):
+
+- `metrics.csv` / TensorBoard events — Lightning's native step-level stream: `train/loss`, `train/utt_loss`, `train/seq_loss`, `train/lr`, `train/grad_norm`, and all `val/*` metrics. Adaptation additionally logs per-source training metrics: `train/keyword_utt_loss`, `train/libri_utt_loss`, and `train/keyword_frac` (actual keyword share per batch). Hyperparameters (lr, batch size, max_steps, seed; plus rank/alpha/mix_ratio/keyword/phase for adaptation) are logged once at startup, so the TensorBoard HPARAMS tab is populated. Set `stage2.logging.grad_norm=false` to disable gradient-norm logging.
+- `eval_history.csv` — one dense row per validation pass (no sparse columns): step, epoch, wall time, steps/sec, the latest train metrics, and every val metric. Use this for within-run comparison and plotting.
+
+Cross-run comparison: every completed run appends one row (timestamp, run name, hyperparameters, final and best val metrics, step count, duration) to `exp/stage2_qbyt/runs.csv` (Stage II) or `exp/stage2_adapt/runs.csv` (adaptation). Best-metric direction is inferred per metric (AUC-like → max, EER/loss → min).
+
+Note: `val_auc` (an alias of `val/auc` used only for checkpoint filenames) is no longer written to CSV/TensorBoard, and the redundant `lr-Adam` column from `LearningRateMonitor` was removed in favor of `train/lr`.
+
 ### Data preparation
 
 **Prerequisites**
@@ -1158,7 +1175,8 @@ Defaults live in `configs/adapt/default.yaml`. Override on the CLI with `adapt.<
 |-----|---------|-------------|
 | `adapt.rank` | `16` | LoRA rank on QbyT matcher attention |
 | `adapt.alpha` | `32` | LoRA scaling (`alpha/rank` applied to `B@A`) |
-| `adapt.lr` / `adapt.learning_rate` | `4e-4` | Adam learning rate (LoRA params only) |
+| `adapt.learning_rate` | `4e-4` | Adam learning rate (LoRA params only); canonical key |
+| `adapt.lr` | unset | Alias for `adapt.learning_rate`; wins when explicitly set |
 | `adapt.optimizer` | `adam` | `adam` or `adamw` |
 | `adapt.weight_decay` | `0` | Weight decay (AdamW only) |
 | `adapt.warmup_steps` | `100` | Cosine schedule warmup |
@@ -1195,6 +1213,10 @@ Defaults live in `configs/adapt/default.yaml`. Override on the CLI with `adapt.<
 | `adapt.sweep.single_phase` | `false` | TTS-only trials for quick search |
 | `adapt.sweep.search_mix` | `false` | Also search `mix_ratio` |
 | `adapt.sweep.storage` | auto | SQLite path (`exp/stage2_adapt/<slug>/sweep/optuna.db`) |
+
+The sweep searches `rank`, `alpha_ratio` (`alpha = alpha_ratio × rank`), `learning_rate`, `max_steps`, and optionally `mix_ratio`. Best params are written to `exp/stage2_adapt/<slug>/sweep/best_params.yaml` using `adapt.*` config keys, and are picked up automatically by `adapt_stage2_keyword.py` (or explicitly via `adapt.params_file=...`).
+
+> **Re-sweep after upgrading:** earlier revisions dropped the searched learning rate (shadowed by the `adapt.lr` default) and the derived `alpha` (persisted as `alpha_ratio`), so every trial effectively trained at `lr=4e-4, alpha=32`. Both are fixed, and old `best_params.yaml` files are normalized on load, but sweep results produced before the fix only reflect `rank`/`max_steps` and are worth re-running.
 
 **Example: adapt a new wake word on a shared server**
 

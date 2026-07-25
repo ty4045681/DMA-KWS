@@ -15,7 +15,7 @@ adapt:
       negative_root: ""
   rank: 16
   alpha: 32
-  lr: 4.0e-4
+  lr: null            # alias for learning_rate; only applied when explicitly set
   learning_rate: 4.0e-4
   optimizer: adam
   weight_decay: 0.0

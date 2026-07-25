@@ -10,6 +10,7 @@ import yaml
 
 from dma_kws.stage2.adapt import Stage2AdaptArgs, run_stage2_adaptation
 from dma_kws.stage2.adapt_paths import adapt_exp_root, slugify
+from dma_kws.training.adapt_params import merge_adapt_params, normalize_adapt_params
 
 
 def suggest_adapt_params(trial: Any, *, search_mix: bool = False) -> dict[str, Any]:
@@ -37,12 +38,9 @@ def compute_sweep_score(
     return float(target_auc) - float(lambda_forget) * forget_penalty
 
 
-def apply_trial_params(config: dict[str, Any], params: dict[str, Any]) -> None:
-    adapt = config.setdefault("adapt", {})
-    for key, value in params.items():
-        if key.startswith("_"):
-            continue
-        adapt[key] = value
+def apply_trial_params(config: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    """Write normalized trial params into ``config['adapt']`` and return them."""
+    return merge_adapt_params(config.setdefault("adapt", {}), params)
 
 
 def run_adaptation_trial(
@@ -53,10 +51,15 @@ def run_adaptation_trial(
     single_phase: bool = False,
     eval_lph_fn: Callable[[str], float] | None = None,
     eval_target_fn: Callable[[str, str], float] | None = None,
+    on_event: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
-    """Run one TTS→real adaptation trial and return metrics for Optuna."""
+    """Run one TTS→real adaptation trial and return metrics for Optuna.
+
+    ``on_event(stage, detail)`` reports progress (``train``/``eval`` stages) so
+    callers can render console output without this module knowing about rich.
+    """
     trial_config = copy.deepcopy(config)
-    apply_trial_params(trial_config, params)
+    effective_params = apply_trial_params(trial_config, params)
     adapt = trial_config["adapt"]
     keyword = str(adapt["keyword"])
     trial_number = params.get("_trial_number", "manual")
@@ -64,21 +67,14 @@ def run_adaptation_trial(
     trial_root.mkdir(parents=True, exist_ok=True)
     adapt["exp_root"] = str(trial_root)
 
-    adapt["phase"] = "tts"
-    tts_artifacts = run_stage2_adaptation(
-        trial_config,
-        Stage2AdaptArgs(
-            init_checkpoint=base_args.init_checkpoint,
-            device=base_args.device,
-            devices=base_args.devices,
-            limit_steps=base_args.limit_steps or int(adapt.get("max_steps", 3000)),
-        ),
-    )
+    def report(stage: str, detail: str) -> None:
+        if on_event is not None:
+            on_event(stage, detail)
 
-    real_artifacts = None
-    if not single_phase:
-        adapt["phase"] = "real"
-        real_artifacts = run_stage2_adaptation(
+    def train_phase(phase: str) -> dict[str, Path]:
+        adapt["phase"] = phase
+        report("train", phase)
+        return run_stage2_adaptation(
             trial_config,
             Stage2AdaptArgs(
                 init_checkpoint=base_args.init_checkpoint,
@@ -88,17 +84,26 @@ def run_adaptation_trial(
             ),
         )
 
+    tts_artifacts = train_phase("tts")
+    real_artifacts = None if single_phase else train_phase("real")
+
     merged_ckpt = str(trial_root / "stage2_adapted.pt")
     if eval_target_fn is not None:
+        report("eval", "target")
         target_auc = eval_target_fn(trial_config, merged_ckpt, keyword)
     else:
         target_auc = 0.0
 
-    lph_auc = eval_lph_fn(merged_ckpt) if eval_lph_fn is not None else 0.0
+    if eval_lph_fn is not None:
+        report("eval", "libriphrase")
+        lph_auc = eval_lph_fn(merged_ckpt)
+    else:
+        lph_auc = 0.0
 
     return {
         "target_auc": target_auc,
         "lph_auc": lph_auc,
+        "params": effective_params,
         "tts": tts_artifacts,
         "real": real_artifacts,
         "merged_checkpoint": merged_ckpt,
@@ -106,7 +111,8 @@ def run_adaptation_trial(
 
 
 def save_best_params(path: Path, params: dict[str, Any], *, score: float) -> None:
+    """Persist sweep best params using ``adapt`` config keys (not Optuna search keys)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"score": score, **params}
+    payload = {"score": score, **normalize_adapt_params(params)}
     with path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)

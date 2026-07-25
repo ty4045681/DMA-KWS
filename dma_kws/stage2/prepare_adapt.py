@@ -6,7 +6,7 @@ import csv
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -248,8 +248,19 @@ def prepare_keyword_adaptation(
     manifest_csv: Path | None = None,
     sources: dict[str, Any] | None = None,
     skip_existing: bool = True,
+    on_progress: Callable[[str, int], None] | None = None,
 ) -> dict[str, Any]:
-    """Prepare fbank features and manifests for one keyword slug tree."""
+    """Prepare fbank features and manifests for one keyword slug tree.
+
+    ``on_progress(stage, value)`` reports work as it happens; stages are
+    ``scan``, ``g2p_total``/``g2p`` and ``fbank_total``/``fbank`` (``*_total``
+    carries a count, the others an increment).
+    """
+
+    def report(stage: str, value: int) -> None:
+        if on_progress is not None:
+            on_progress(stage, value)
+
     uses_manifest = manifest_csv is not None and manifest_csv.is_file()
     source_config = sources or {}
     uses_external_sources = any(
@@ -263,6 +274,7 @@ def prepare_keyword_adaptation(
         all_samples = scan_external_sources(keyword, source_config)
     else:
         all_samples = scan_raw_tree(data_root, keyword)
+    report("scan", len(all_samples))
 
     by_phase: dict[str, list[AdaptSample]] = {}
     for sample in all_samples:
@@ -294,10 +306,14 @@ def prepare_keyword_adaptation(
                 )
         phase_splits[phase] = (train_rows, eval_rows)
 
+    unique_texts = sorted({sample.text for sample in all_samples})
+    report("g2p_total", len(unique_texts))
     g2p = make_g2p()
-    for sample in all_samples:
-        validate_g2p(sample.text, g2p)
+    for text in unique_texts:
+        validate_g2p(text, g2p)
+        report("g2p", 1)
 
+    report("fbank_total", len(all_samples))
     written = 0
     skipped = 0
     for sample in all_samples:
@@ -314,9 +330,15 @@ def prepare_keyword_adaptation(
             written += 1
         else:
             skipped += 1
+        report("fbank", 1)
 
     manifest_dir = data_root / "manifests"
-    stats: dict[str, Any] = {"keyword": keyword, "slug": slugify(keyword), "phases": {}}
+    stats: dict[str, Any] = {
+        "keyword": keyword,
+        "slug": slugify(keyword),
+        "phases": {},
+        "unique_texts": len(unique_texts),
+    }
 
     for phase, (train_rows, eval_rows) in phase_splits.items():
         train_path = manifest_dir / f"{phase}_train.csv"
@@ -327,6 +349,10 @@ def prepare_keyword_adaptation(
             "total": len(train_rows) + len(eval_rows),
             "train": len(train_rows),
             "eval": len(eval_rows),
+            "train_positive": sum(1 for row in train_rows if row.label == 1),
+            "train_negative": sum(1 for row in train_rows if row.label == 0),
+            "eval_positive": sum(1 for row in eval_rows if row.label == 1),
+            "eval_negative": sum(1 for row in eval_rows if row.label == 0),
             "train_manifest": str(train_path),
             "eval_manifest": str(eval_path),
         }

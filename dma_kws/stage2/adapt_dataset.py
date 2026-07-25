@@ -160,13 +160,21 @@ class MixedAdaptationDataset(Dataset):
     def __len__(self) -> int:
         return self.sample_lens
 
+    #: ``source`` values attached to mixed samples for per-source loss logging.
+    SOURCE_LIBRIPHRASE = 0
+    SOURCE_KEYWORD = 1
+
     def __getitem__(self, index: int) -> dict:
         del index
         if self._rng.random() < self.mix_ratio:
             kw_index = self._rng.randrange(len(self.keyword_dataset))
-            return self.keyword_dataset[kw_index]
-        lp_index = self._rng.randrange(len(self.libri_dataset))
-        return self.libri_dataset[lp_index]
+            item = dict(self.keyword_dataset[kw_index])
+            item["source"] = self.SOURCE_KEYWORD
+        else:
+            lp_index = self._rng.randrange(len(self.libri_dataset))
+            item = dict(self.libri_dataset[lp_index])
+            item["source"] = self.SOURCE_LIBRIPHRASE
+        return item
 
 
 TargetKeywordEvalDataset = TargetKeywordValDataset

@@ -3,15 +3,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from dma_kws.config import fbank_kwargs, get_fbank_config, require_sections
+from dma_kws.config import require_sections
 from dma_kws.hydra_app import CONFIG_DIR, resolved_config
-from dma_kws.stage2.adapt_paths import adapt_data_root
-from dma_kws.stage2.prepare_adapt import prepare_keyword_adaptation
+from dma_kws.stage2.adapt_console import prepare_with_console
 
 
 @hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="config")
@@ -25,23 +24,8 @@ def main(cfg: DictConfig) -> None:
     if not isinstance(prep, dict):
         prep = {}
 
-    keyword = str(adapt.get("keyword", "")).strip()
-    if not keyword:
-        raise SystemExit("adapt.keyword is required")
-
-    data_root = Path(adapt["data_root"]) if adapt.get("data_root") else adapt_data_root(config, keyword)
-    manifest_csv = prep.get("manifest_csv") or adapt.get("manifest_csv")
-    stats = prepare_keyword_adaptation(
-        keyword=keyword,
-        data_root=data_root,
-        fbank_params=fbank_kwargs(get_fbank_config(config)),
-        eval_fraction=float(adapt.get("eval_fraction", 0.2)),
-        eval_seed=int(adapt.get("eval_seed", config.get("training", {}).get("seed", 2025))),
-        manifest_csv=Path(manifest_csv) if manifest_csv else None,
-        sources=adapt.get("sources") if isinstance(adapt.get("sources"), dict) else None,
-        skip_existing=not bool(prep.get("no_skip_existing", False)),
-    )
-    print(stats)
+    stats = prepare_with_console(config, adapt, prep)
+    print(json.dumps(stats, indent=2))
 
 
 if __name__ == "__main__":

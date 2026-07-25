@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,12 +21,17 @@ from dma_kws.stage2.adapt_dataset import (
 from dma_kws.stage2.adapt_paths import adapt_data_root, phase_manifest, slugify
 from dma_kws.stage2.module import Stage2LightningModule
 from dma_kws.stage2.train import _build_val_dataloader, _resolve_path
+from dma_kws.training.adapt_params import (
+    load_adapt_params_file,
+    merge_adapt_params,
+    resolve_adapt_lr,
+)
 from dma_kws.training.lora import (
+    count_lora_params,
     inject_qbyt_lora,
     load_lora_state_dict,
     lora_state_dict,
     merge_lora,
-    print_lora_param_counts,
 )
 
 
@@ -84,24 +90,14 @@ def _resolve_adapt_paths(config: dict[str, Any]) -> dict[str, Path]:
     }
 
 
-def _load_params_file(params_file: str) -> dict[str, Any]:
-    import yaml
-
-    path = Path(params_file)
-    if not path.exists():
-        raise FileNotFoundError(f"adapt params file not found: {path}")
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"adapt params file must be a mapping: {path}")
-    return data
-
-
-def _apply_adapt_overrides(config: dict[str, Any], args: Stage2AdaptArgs) -> None:
-    if args.params_file:
-        overrides = _load_params_file(args.params_file)
-        adapt = _adapt_section(config)
-        adapt.update(overrides)
+def _apply_adapt_overrides(config: dict[str, Any], args: Stage2AdaptArgs) -> dict[str, Any]:
+    """Merge ``adapt.params_file`` overrides (e.g. sweep best params) into the config."""
+    if not args.params_file:
+        return {}
+    return merge_adapt_params(
+        _adapt_section(config),
+        load_adapt_params_file(args.params_file),
+    )
 
 
 class Stage2LoraAdaptationModule(Stage2LightningModule):
@@ -127,7 +123,7 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         for param in self.parameters():
             param.requires_grad = False
 
-        inject_qbyt_lora(
+        self.lora_injected = inject_qbyt_lora(
             self.qbyt,
             rank=lora_rank,
             alpha=lora_alpha,
@@ -138,8 +134,7 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             adapter_state = state.get("lora_state_dict", state)
             load_lora_state_dict(self.qbyt, adapter_state, strict=False)
 
-        print_lora_param_counts(self, prefix="Stage2 LoRA")
-
+        self.lora_param_counts = count_lora_params(self)
         self._adapt_cfg = _adapt_section(config)
         self.target_auc_metric = torchmetrics.AUROC(task="binary")
         self.target_eer_metric = torchmetrics.classification.EER(task="binary")
@@ -149,9 +144,10 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         if not trainable:
             raise RuntimeError("No trainable LoRA parameters found")
         adapt = self._adapt_cfg
+        lr, _ = resolve_adapt_lr(adapt)
         optim_cfg = {
             "optimizer": str(adapt.get("optimizer", "adam")).lower(),
-            "lr": float(adapt.get("lr", adapt.get("learning_rate", 4e-4))),
+            "lr": lr,
             "weight_decay": float(adapt.get("weight_decay", 0.0)),
             "warmup_steps": int(adapt.get("warmup_steps", 100)),
             "total_steps": int(adapt.get("max_steps", 3000)),
@@ -186,6 +182,23 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             },
         }
 
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        total_loss, losses, logits = self._forward_train_losses(batch)
+        self._log_train_losses(total_loss, losses)
+
+        source = batch.get("source")
+        if source is not None:
+            keyword_mask = source.bool()
+            per_sample = F.binary_cross_entropy_with_logits(
+                logits, batch["label"].float(), reduction="none"
+            )
+            self.log("train/keyword_frac", keyword_mask.float().mean(), on_step=True)
+            if keyword_mask.any():
+                self.log("train/keyword_utt_loss", per_sample[keyword_mask].mean(), on_step=True)
+            if (~keyword_mask).any():
+                self.log("train/libri_utt_loss", per_sample[~keyword_mask].mean(), on_step=True)
+        return total_loss
+
     def validation_step(
         self,
         batch: dict[str, torch.Tensor],
@@ -217,7 +230,8 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         lph_eer = self.eer_metric.compute()
         self.log("val/auc", lph_auc, prog_bar=True, sync_dist=True)
         self.log("val/eer", lph_eer, prog_bar=True, sync_dist=True)
-        self.log("val_auc", lph_auc, prog_bar=True, sync_dist=True)
+        # Checkpoint-filename alias of val/auc; kept out of CSV/TensorBoard.
+        self.log("val_auc", lph_auc, sync_dist=True, logger=False)
 
         self.target_auc_metric.reset()
         self.target_eer_metric.reset()
@@ -265,11 +279,19 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
 
     from dma_kws.config import get_tokenizer_config, require_sections
     from dma_kws.runlog import build_loggers
+    from dma_kws.stage2 import adapt_console
     from dma_kws.stage2.collate import test_collate_fn, train_collate_fn
     from dma_kws.stage2.dataset import LibriPhraseTrainDataset
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training import resolve_resume_path
     from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
+    from dma_kws.training.metrics_history import (
+        append_wide_row,
+        build_metrics_history_callback,
+        build_run_record,
+        collect_hparams,
+        numeric_callback_metrics,
+    )
     from dma_kws.training.ddp import build_trainer_kwargs
     from dma_kws.training.device import resolve_accelerator_and_devices
 
@@ -283,6 +305,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     stage2 = config["stage2"]
     training = config["training"]
     tokenizer_cfg = get_tokenizer_config(config)
+    reporter = adapt_console.adapt_reporter(config)
 
     train_manifest = adapt_paths["train_manifest"]
     eval_manifest = adapt_paths["eval_manifest"]
@@ -290,6 +313,30 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         raise SystemExit(f"Adaptation train manifest not found: {train_manifest}")
     if not eval_manifest.exists():
         raise SystemExit(f"Adaptation eval manifest not found: {eval_manifest}")
+
+    phase = adapt_paths["phase_str"]
+    init_checkpoint = _resolve_init_checkpoint(config, adapt_paths, args)
+    adapter_resume = _resolve_adapter_resume(adapt_paths, phase)
+    accelerator, devices = resolve_accelerator_and_devices(args.device, args.devices)
+
+    adapt_paths["phase_dir"].mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = adapt_paths["phase_dir"] / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    resume_path = resolve_resume_path(args.resume_from, checkpoint_dir)
+
+    reporter.section(f"LoRA adaptation · {adapt_paths['keyword_str']} · phase={phase}")
+    reporter.print_plan(
+        adapt_console.adapt_plan_rows(
+            adapt_paths=adapt_paths,
+            accelerator=accelerator,
+            devices=devices,
+            init_checkpoint=init_checkpoint,
+            adapter_resume=adapter_resume,
+            resume_path=resume_path,
+            params_file=args.params_file,
+        ),
+        title="Adaptation Plan",
+    )
 
     dict_path = resolve_dict_path(config)
     tokenizer = load_char_tokenizer(dict_path, split_with_space=tokenizer_cfg.get("split_with_space", " "))
@@ -366,19 +413,44 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     )
     lph_val_loader = _build_val_dataloader(config, tokenizer)
 
-    phase = adapt_paths["phase_str"]
-    init_checkpoint = _resolve_init_checkpoint(config, adapt_paths, args)
-    adapter_resume = _resolve_adapter_resume(adapt_paths, phase)
+    mix_ratio = float(adapt.get("mix_ratio", 0.5))
+    reporter.print_table(
+        *adapt_console.dataset_table(
+            [
+                (
+                    "keyword train",
+                    len(keyword_dataset),
+                    adapt_console.label_breakdown(keyword_dataset),
+                ),
+                (
+                    "libriphrase train pool",
+                    len(libri_dataset),
+                    f"negative_ratio={stage2.get('negative_ratio', 1)}",
+                ),
+                (
+                    "mixed virtual epoch",
+                    len(train_dataset),
+                    f"mix_ratio={mix_ratio} (keyword:libriphrase)",
+                ),
+                (
+                    "target keyword val",
+                    len(target_val_dataset),
+                    adapt_console.label_breakdown(target_val_dataset),
+                ),
+                (
+                    "libriphrase val",
+                    len(lph_val_loader.dataset),
+                    f"split={(stage2.get('eval', {}) or {}).get('split', 'hard')}",
+                ),
+            ]
+        ),
+        title="Datasets",
+    )
 
     lora_rank = int(adapt.get("rank", 16))
     lora_alpha = float(adapt.get("alpha", 32))
     lora_targets = tuple(adapt.get("lora_targets", ("in_proj_weight", "out_proj.weight")))
 
-    adapt_paths["phase_dir"].mkdir(parents=True, exist_ok=True)
-    checkpoint_dir = adapt_paths["phase_dir"] / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    resume_path = resolve_resume_path(args.resume_from, checkpoint_dir)
     if resume_path is not None:
         model = Stage2LoraAdaptationModule(
             config,
@@ -399,7 +471,17 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             adapter_checkpoint=adapter_resume,
         )
 
-    accelerator, devices = resolve_accelerator_and_devices(args.device, args.devices)
+    reporter.print_plan(
+        adapt_console.lora_rows(
+            rank=lora_rank,
+            alpha=lora_alpha,
+            targets=lora_targets,
+            injected=getattr(model, "lora_injected", None),
+            param_counts=model.lora_param_counts,
+        ),
+        title="LoRA Adapters",
+    )
+
     if accelerator == "gpu":
         torch.set_float32_matmul_precision("high")
 
@@ -407,8 +489,17 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     run_name = f"adapt_{adapt_paths['slug_str']}_{phase}"
     loggers = build_loggers(log_dir, run_name, config=config)
 
+    hparams = collect_hparams(config, section="adapt", extra={"slug": adapt_paths["slug_str"]})
+    for train_logger in loggers:
+        train_logger.log_hyperparams(hparams)
+
     recipe = str(training.get("recipe", "adapt"))
     callbacks = build_stage2_callbacks(config, recipe)
+    history_callback = build_metrics_history_callback(
+        run_name=run_name,
+        default_dir=log_dir / run_name,
+    )
+    callbacks.append(history_callback)
 
     limit_steps = args.limit_steps or int(adapt.get("max_steps", 3000)) or None
     trainer_kwargs = build_trainer_kwargs(
@@ -423,9 +514,16 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         config=config,
         devices=devices,
         accelerator=accelerator,
+        section="adapt",
         train_samples=len(train_dataset),
         val_samples=len(target_val_dataset) + len(lph_val_loader.dataset),
-        param_counts=print_lora_param_counts(model),
+        param_counts=model.lora_param_counts,
+        extra_rows=[
+            ("phase", phase),
+            ("mix_ratio", str(mix_ratio)),
+            ("lora_rank", str(lora_rank)),
+            ("lora_alpha", str(lora_alpha)),
+        ],
         paths={
             "train_manifest": train_manifest,
             "eval_manifest": eval_manifest,
@@ -435,6 +533,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         },
     )
 
+    reporter.section(f"Training · {run_name}")
     trainer = pl_mod.Trainer(
         accelerator=accelerator,
         callbacks=callbacks,
@@ -463,7 +562,6 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         },
         adapter_out,
     )
-    print(f"Saved LoRA adapter {adapter_out}")
 
     merge_lora(model.qbyt)
     merged_out = adapt_paths["merged_path"]
@@ -480,15 +578,63 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         },
         merged_out,
     )
-    print(f"Saved merged checkpoint {merged_out}")
 
     final_adapter = adapt_paths["adapter_path"]
     if adapter_out.resolve() != final_adapter.resolve():
         torch.save(torch.load(adapter_out, map_location="cpu"), final_adapter)
-        print(f"Copied adapter to {final_adapter}")
 
-    return {
+    artifacts = {
         "adapter": adapter_out,
         "merged": merged_out,
         "final_adapter": final_adapter,
     }
+
+    final_metrics = numeric_callback_metrics(dict(trainer.callback_metrics))
+    runs_csv = Path(paths["exp_root"]) / "stage2_adapt" / "runs.csv"
+    append_wide_row(
+        runs_csv,
+        build_run_record(
+            run_name=run_name,
+            hparams=hparams,
+            final_metrics=final_metrics,
+            best_metrics=history_callback.best,
+            global_step=global_step,
+            duration_seconds=history_callback.duration_seconds,
+        ),
+    )
+
+    reporter.section("Artifacts")
+    reporter.print_table(*adapt_console.artifact_rows(artifacts), title="Saved Checkpoints")
+    log_files = {"runs_csv": runs_csv}
+    if history_callback.csv_path is not None:
+        log_files["eval_history"] = history_callback.csv_path
+    reporter.print_plan(
+        [(name, str(path)) for name, path in sorted(log_files.items())],
+        title="Metrics CSVs",
+    )
+    metrics = {
+        key: round(value, 6)
+        for key, value in final_metrics.items()
+        if key.startswith("val/")
+    }
+    if metrics:
+        reporter.print_plan(
+            [(key, f"{value:.4f}") for key, value in sorted(metrics.items())],
+            title="Final Validation Metrics",
+        )
+    reporter.done(f"LoRA adaptation complete for phase {phase!r} at step {global_step}.")
+    print(
+        json.dumps(
+            {
+                "keyword": adapt_paths["keyword_str"],
+                "slug": adapt_paths["slug_str"],
+                "phase": phase,
+                "step": global_step,
+                "metrics": metrics,
+                "artifacts": {name: str(path) for name, path in artifacts.items()},
+                "logs": {name: str(path) for name, path in log_files.items()},
+            }
+        )
+    )
+
+    return artifacts

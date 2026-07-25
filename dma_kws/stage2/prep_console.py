@@ -72,6 +72,22 @@ class Stage2PrepReporter:
     def print_stats(self, rows: list[tuple[str, str]], *, title: str = "Summary") -> None:
         self.print_plan(rows, title=title)
 
+    def print_table(self, columns: list[str], rows: list[list[str]], *, title: str) -> None:
+        """Print an arbitrary-width table (``print_plan`` is the 2-column case)."""
+        if self.use_rich:
+            table = Table(title=title, show_header=True, header_style="bold")
+            for index, column in enumerate(columns):
+                table.add_column(column, style="cyan" if index == 0 else "")
+            for row in rows:
+                table.add_row(*row)
+            self.console.print(table)
+            return
+
+        print(f"=== {title} ===")
+        print("  " + " | ".join(columns))
+        for row in rows:
+            print("  " + " | ".join(row))
+
     @contextmanager
     def track(self, description: str, total: int | None = None) -> Iterator[Any]:
         if not self.use_rich:
@@ -157,9 +173,7 @@ class _FallbackTaskGroup(_TaskGroup):
 
     def add(self, description: str, *, total: int | None = None) -> str:
         if total:
-            from tqdm import tqdm
-
-            self._tasks[description] = tqdm(total=total, desc=description, unit="item")
+            self._tasks[description] = self._new_bar(description, total)
         else:
             self._reporter.info(description)
             self._tasks[description] = None
@@ -172,9 +186,18 @@ class _FallbackTaskGroup(_TaskGroup):
 
     def set_total(self, task: str, total: int) -> None:
         bar = self._tasks.get(task)
-        if bar is not None:
-            bar.total = total
-            bar.refresh()
+        if bar is None:
+            # Totals discovered after the task was added still get a bar.
+            self._tasks[task] = self._new_bar(task, total)
+            return
+        bar.total = total
+        bar.refresh()
+
+    @staticmethod
+    def _new_bar(description: str, total: int) -> Any:
+        from tqdm import tqdm
+
+        return tqdm(total=total, desc=description, unit="item")
 
 
 class _RichTask:

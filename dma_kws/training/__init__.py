@@ -1,5 +1,6 @@
 """Shared training utilities for DMA-KWS."""
 
+from dma_kws.training.adapt_params import normalize_adapt_params, resolve_adapt_lr
 from dma_kws.training.ddp import build_trainer_kwargs, resolve_precision
 from dma_kws.training.loaders import build_loader_kwargs
 from dma_kws.training.resume import resolve_resume_path
@@ -13,7 +14,9 @@ __all__ = [
     "build_stage2_callbacks",
     "build_stage2_checkpoint_callback",
     "build_trainer_kwargs",
+    "normalize_adapt_params",
     "print_run_summary",
+    "resolve_adapt_lr",
     "resolve_precision",
     "resolve_resume_path",
 ]

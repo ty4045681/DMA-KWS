@@ -21,7 +21,7 @@ def train_collate_fn(batch: list[dict]) -> dict:
     padded_seq_labels = pad_sequence(seq_labels, batch_first=True, padding_value=-1)
     seq_label_mask = (padded_seq_labels != -1).float()
 
-    return {
+    out = {
         "anchor": anchor,
         "feat": padded_feats,
         "feat_lengths": feat_lengths,
@@ -29,6 +29,9 @@ def train_collate_fn(batch: list[dict]) -> dict:
         "seq_label": padded_seq_labels,
         "seq_label_mask": seq_label_mask,
     }
+    if "source" in batch[0]:
+        out["source"] = torch.tensor([int(item["source"]) for item in batch])
+    return out
 
 
 def test_collate_fn(batch: list[dict]) -> dict:

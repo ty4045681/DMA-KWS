@@ -106,6 +106,13 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     from dma_kws.training import resolve_resume_path
     from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
     from dma_kws.training.ddp import build_trainer_kwargs
+    from dma_kws.training.metrics_history import (
+        append_wide_row,
+        build_metrics_history_callback,
+        build_run_record,
+        collect_hparams,
+        numeric_callback_metrics,
+    )
 
     require_sections(config, ["paths", "stage1", "stage2", "tokenizer", "training"])
     paths = config["paths"]
@@ -204,8 +211,17 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     run_name = str(stage2.get("run_name", "stage2_qbyt"))
     loggers = build_loggers(log_dir, run_name, config=config)
 
+    hparams = collect_hparams(config)
+    for train_logger in loggers:
+        train_logger.log_hyperparams(hparams)
+
     recipe = str(training.get("recipe", ""))
     callbacks = build_stage2_callbacks(config, recipe)
+    history_callback = build_metrics_history_callback(
+        run_name=run_name,
+        default_dir=Path(log_dir) / run_name,
+    )
+    callbacks.append(history_callback)
 
     trainer_kwargs = build_trainer_kwargs(
         config,
@@ -248,6 +264,23 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     )
 
     global_step = int(trainer.global_step)
+
+    runs_csv = Path(paths["exp_root"]) / "stage2_qbyt" / "runs.csv"
+    append_wide_row(
+        runs_csv,
+        build_run_record(
+            run_name=run_name,
+            hparams=hparams,
+            final_metrics=numeric_callback_metrics(dict(trainer.callback_metrics)),
+            best_metrics=history_callback.best,
+            global_step=global_step,
+            duration_seconds=history_callback.duration_seconds,
+        ),
+    )
+    if history_callback.csv_path is not None:
+        print(f"Eval history: {history_callback.csv_path}")
+    print(f"Run record appended to {runs_csv}")
+
     ckpt_path = checkpoint_dir / f"stage2_step{global_step:06d}.pt"
     torch.save(
         {

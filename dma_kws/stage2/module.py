@@ -68,6 +68,7 @@ class Stage2LightningModule(pl.LightningModule):
 
         self._stage2_cfg = stage2
         self.freeze_encoder = freeze_encoder
+        self._log_grad_norm = bool((stage2.get("logging", {}) or {}).get("grad_norm", True))
         gradient_diagnostics = stage2.get("gradient_diagnostics", {}) or {}
         self._gradient_diagnostics_enabled = bool(gradient_diagnostics.get("enabled", False))
         self._gradient_diagnostics_max_steps = max(0, int(gradient_diagnostics.get("max_steps", 5)))
@@ -161,7 +162,9 @@ class Stage2LightningModule(pl.LightningModule):
         if self.freeze_encoder:
             self.encoder.eval()
 
-    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def _forward_train_losses(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
         if self.freeze_encoder:
             self.encoder.eval()
 
@@ -173,7 +176,9 @@ class Stage2LightningModule(pl.LightningModule):
             seq_labels=batch["seq_label"],
             seq_label_mask=batch["seq_label_mask"],
         )
+        return total_loss, losses, logits
 
+    def _log_train_losses(self, total_loss: torch.Tensor, losses: dict[str, torch.Tensor]) -> None:
         self.log("train/loss", total_loss, on_step=True, prog_bar=True)
         self.log("train/utt_loss", losses["utt_loss"], on_step=True, prog_bar=True)
         self.log("train/seq_loss", losses["seq_loss"], on_step=True, prog_bar=True)
@@ -181,7 +186,21 @@ class Stage2LightningModule(pl.LightningModule):
         optimizer = self.optimizers()
         lr = optimizer.param_groups[0]["lr"]
         self.log("train/lr", lr, on_step=True, prog_bar=True)
+
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        total_loss, losses, _ = self._forward_train_losses(batch)
+        self._log_train_losses(total_loss, losses)
         return total_loss
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        if not self._log_grad_norm:
+            return
+        from pytorch_lightning.utilities import grad_norm
+
+        norms = grad_norm(self, norm_type=2)
+        total = norms.get("grad_2.0_norm_total")
+        if total is not None:
+            self.log("train/grad_norm", total, on_step=True)
 
     def _parameters_without_gradients(self) -> tuple[str, ...]:
         return tuple(
@@ -228,7 +247,8 @@ class Stage2LightningModule(pl.LightningModule):
 
         self.log("val/auc", auc, prog_bar=True, sync_dist=True)
         self.log("val/eer", eer, prog_bar=True, sync_dist=True)
-        self.log("val_auc", auc, prog_bar=True, sync_dist=True)
+        # Checkpoint-filename alias of val/auc; kept out of CSV/TensorBoard.
+        self.log("val_auc", auc, sync_dist=True, logger=False)
 
         self.auc_metric.reset()
         self.eer_metric.reset()
