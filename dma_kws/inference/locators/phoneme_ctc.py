@@ -10,9 +10,9 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from dma_kws.audio import extract_fbank, load_audio
-from dma_kws.config import get_tokenizer_config
+from dma_kws.config import get_tokenizer_config, resolve_stream_policy
 from dma_kws.g2p import make_g2p, text_to_phonemes
-from dma_kws.nn import build_encoder
+from dma_kws.nn import build_encoder, run_encoder
 from dma_kws.pathing import ensure_qbyt_on_path, resolve_dict_path
 from dma_kws.stage1.candidates import KeywordCandidate
 from dma_kws.stage1.streaming_search import (
@@ -80,6 +80,8 @@ class PhonemeCtcLocator:
         # The CTC head is sized by the phoneme vocabulary, so it has to come from
         # the same dict the checkpoint was trained with.
         vocab_size = len(tokenizer.symbol_table)
+        stream_policy = resolve_stream_policy(stage1_cfg)
+        self._stream_policy = stream_policy
 
         class Stage1Model(torch.nn.Module):
             def __init__(self):
@@ -88,7 +90,14 @@ class PhonemeCtcLocator:
                 self.ctc = CTC(vocab_size, encoder_dim, blank_id=0)
 
             def forward(self, feats, feat_lengths):
-                encoder_out, encoder_mask = self.encoder(feats, feat_lengths)
+                # Inference always runs at the deployment operating point.
+                encoder_out, encoder_mask = run_encoder(
+                    self.encoder,
+                    feats,
+                    feat_lengths,
+                    policy=stream_policy,
+                    mode="eval",
+                )
                 return self.ctc.log_softmax(encoder_out), encoder_mask
 
         model = Stage1Model()

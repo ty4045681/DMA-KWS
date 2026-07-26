@@ -292,6 +292,7 @@ def resolve_stage2_eval_paths(config: dict[str, Any]) -> dict[str, Any]:
         "aggregate_csv": aggregate_csv,
         "batch_size": batch_size,
         "num_workers": num_workers,
+        "split": str(eval_cfg.get("split", "hard")),
     }
 
 

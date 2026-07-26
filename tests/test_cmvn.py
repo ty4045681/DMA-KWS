@@ -123,6 +123,9 @@ def test_build_encoder_passes_cmvn_and_wenet_options(tmp_path):
         "use_dynamic_chunk": True,
         "use_dynamic_left_chunk": True,
         "gradient_checkpointing": True,
+        # use_dynamic_chunk requires a declared operating point so that eval is
+        # never left on wenet's random chunk sampler.
+        "stream": {"chunk_size": 8, "left_context_frames": 32},
         "cmvn": "global_cmvn",
         "cmvn_conf": {
             "cmvn_file": str(cmvn_file),

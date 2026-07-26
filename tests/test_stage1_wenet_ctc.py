@@ -65,6 +65,64 @@ def patched_module(monkeypatch):
     return Stage1LightningModule(_minimal_config(), vocab_size=71)
 
 
+class _StreamSpyEncoder(nn.Module):
+    """Wenet-style encoder that records the chunk kwargs it is called with."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(1))
+        self.kwargs: list[dict] = []
+
+    def forward(self, feat, feat_lengths, **kwargs):
+        self.kwargs.append(kwargs)
+        return _mock_encoder_output(feat, feat_lengths)
+
+
+@pytest.fixture
+def stream_spy_module(monkeypatch):
+    config = _minimal_config()
+    config["stage1"].update(
+        {
+            "use_dynamic_chunk": True,
+            "stream": {"chunk_size": 8, "left_context_frames": 32, "train_policy": "multi"},
+        }
+    )
+    encoder = _StreamSpyEncoder()
+    monkeypatch.setattr("dma_kws.stage1.module.build_encoder", lambda *_a, **_k: encoder)
+    monkeypatch.setattr("dma_kws.stage1.module._load_ctc", lambda: _FakeCTC)
+    return Stage1LightningModule(config, vocab_size=71), encoder
+
+
+def _stage1_batch():
+    return stage1_collate_fn(
+        [
+            {"feat": torch.randn(4, 80), "target": torch.tensor([17, 4, 22, 26], dtype=torch.long)},
+            {"feat": torch.randn(6, 80), "target": torch.tensor([17, 4], dtype=torch.long)},
+        ]
+    )
+
+
+def test_training_step_delegates_to_the_dynamic_chunk_sampler(stream_spy_module):
+    module, encoder = stream_spy_module
+    fake_optimizer = MagicMock()
+    fake_optimizer.param_groups = [{"lr": 1e-3}]
+    module.optimizers = MagicMock(return_value=fake_optimizer)
+    module.log = MagicMock()
+
+    module.training_step(_stage1_batch(), 0)
+
+    assert encoder.kwargs == [{"decoding_chunk_size": 0, "num_decoding_left_chunks": -1}]
+
+
+def test_validation_step_pins_the_deployment_point(stream_spy_module):
+    module, encoder = stream_spy_module
+    module.on_validation_epoch_start()
+
+    module.validation_step(_stage1_batch(), 0)
+
+    assert encoder.kwargs == [{"decoding_chunk_size": 8, "num_decoding_left_chunks": 4}]
+
+
 def test_phonemes_to_g2p_string_and_encode_manifest_target():
     tok = load_char_tokenizer(DICT_PATH)
     assert phonemes_to_g2p_string(["HH", "AH0", "L", "OW1"]) == "HH AH0 L OW1"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -10,10 +11,11 @@ import torch
 import torch.nn.functional as F
 import torchmetrics
 
-from dma_kws.nn import build_encoder
+from dma_kws.config import resolve_stream_policy
+from dma_kws.nn import build_encoder, run_encoder
 from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage2.losses import compute_stage2_losses
-from dma_kws.training.checkpoint_io import extract_state_dict
+from dma_kws.training.checkpoint_io import assert_stream_policy_matches, extract_state_dict
 from dma_kws.training.scheduler import build_cosine_warmup_optimizer
 
 
@@ -57,6 +59,7 @@ class Stage2LightningModule(pl.LightningModule):
         stage2 = config["stage2"]
         encoder_dim = int(stage2.get("encoder_output_dim", stage1.get("encoder_output_dim", 144)))
 
+        self.stream_policy = resolve_stream_policy(stage1)
         self.encoder = build_encoder(stage1, output_dim=encoder_dim)
         QbyT = _load_qbyt()
         self.qbyt = QbyT(
@@ -87,6 +90,7 @@ class Stage2LightningModule(pl.LightningModule):
 
     def _load_init_checkpoint(self, checkpoint_path: Path) -> None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        assert_stream_policy_matches(checkpoint, self.stream_policy, source=checkpoint_path)
         
         # Check if this is an icefall checkpoint (has "model" key)
         # vs standard DMA-KWS checkpoint (has "state_dict", "model_state_dict", etc)
@@ -146,8 +150,18 @@ class Stage2LightningModule(pl.LightningModule):
         feat: torch.Tensor,
         feat_lengths: torch.Tensor,
         anchor: torch.Tensor,
+        *,
+        mode: str = "eval",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        encoder_out, encoder_mask = self.encoder(feat, feat_lengths)
+        # ``mode`` defaults to "eval" so validation/test/inference always run at the
+        # deployment operating point; only the training step opts into randomization.
+        encoder_out, encoder_mask = run_encoder(
+            self.encoder,
+            feat,
+            feat_lengths,
+            policy=self.stream_policy,
+            mode=mode,
+        )
         encoder_lens = encoder_mask.squeeze(1).sum(dim=1).to(dtype=torch.long)
         anchor_lengths = anchor.ne(0).sum(dim=1).to(dtype=torch.long)
         logits, seq_logits = self.qbyt(
@@ -157,6 +171,19 @@ class Stage2LightningModule(pl.LightningModule):
             text_lengths=anchor_lengths,
         )
         return logits, seq_logits
+
+    def on_train_start(self) -> None:
+        # Only warn once a fit actually starts; eval scripts build this module with
+        # the default freeze_encoder=False and must stay quiet.
+        if not self.freeze_encoder and self.stream_policy.backend == "icefall_zipformer":
+            warnings.warn(
+                "Fine-tuning an icefall Zipformer encoder: icefall's set_batch_count() is never "
+                "called here, so every ScheduledFloat (dropout, Balancer limits, layerdrop, "
+                "whitening) stays pinned to its `default` and the icefall training recipe is not "
+                "reproduced.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def on_train_epoch_start(self) -> None:
         if self.freeze_encoder:
@@ -168,7 +195,9 @@ class Stage2LightningModule(pl.LightningModule):
         if self.freeze_encoder:
             self.encoder.eval()
 
-        logits, seq_logits = self(batch["feat"], batch["feat_lengths"], batch["anchor"])
+        logits, seq_logits = self(
+            batch["feat"], batch["feat_lengths"], batch["anchor"], mode="train"
+        )
         total_loss, losses = compute_stage2_losses(
             logits=logits,
             seq_logits=seq_logits,

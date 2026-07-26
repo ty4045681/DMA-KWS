@@ -86,6 +86,11 @@ class Stage2ClipRunner:
         self._sample_rate = int(sample_rate)
         self._g2p = make_g2p()
 
+    @property
+    def stream_policy(self):
+        """Resolved streaming operating point used for every score."""
+        return self._verifier.stream_policy
+
     @classmethod
     def from_config(cls, config: Mapping[str, Any], prep: Mapping[str, Any], device) -> "Stage2ClipRunner":
         from dma_kws.config import get_tokenizer_config
@@ -183,7 +188,7 @@ class Stage2ClipRunner:
             sample_rate=self._sample_rate,
             fbank_extractor=self._verifier.fbank_extractor,
             fbank_kwargs=self._verifier.fbank_kwargs,
-            min_fbank_frames=int(self._demo_cfg.get("min_stage2_fbank_frames", 7)),
+            min_fbank_frames=self._verifier.min_fbank_frames,
         )
         loader = DataLoader(
             dataset,
@@ -277,9 +282,7 @@ class Stage2ClipRunner:
             self._tokenizer, " ".join(keyword_phonemes)
         )
         threshold = float(self._demo_cfg.get("qbyt_threshold", 0.5))
-        min_stage2_fbank_frames = int(
-            self._demo_cfg.get("min_stage2_fbank_frames", 7)
-        )
+        min_stage2_fbank_frames = self._verifier.min_fbank_frames
 
         waveform, sample_rate = load_audio(audio_path, sample_rate=self._sample_rate)
         waveform, sample_rate = self._verifier.fbank_extractor.prepare_waveform(

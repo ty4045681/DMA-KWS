@@ -80,7 +80,7 @@ def _build_pipeline(
         locator=locator,
         verifier=verifier,
         tokenizer=tokenizer,
-        demo_cfg={"qbyt_threshold": threshold, "min_stage2_fbank_frames": 7},
+        demo_cfg={"qbyt_threshold": threshold},
         sample_rate=16000,
     )
 

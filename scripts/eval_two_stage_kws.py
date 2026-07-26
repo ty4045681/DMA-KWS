@@ -80,6 +80,7 @@ def run_eval(cfg: DictConfig) -> dict:
         "manifest": str(Path(manifest_path).resolve()),
         "num_samples": len(results),
         "output_dir": str(output_dir.resolve()),
+        "stream": pipeline.stream_policy.describe(),
     }
     labeled_summary = summarize_labeled_results(
         results,

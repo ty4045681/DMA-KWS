@@ -68,7 +68,7 @@ def _build_runner(
     return Stage2ClipRunner(
         verifier=verifier,
         tokenizer=tokenizer,
-        demo_cfg={"qbyt_threshold": threshold, "min_stage2_fbank_frames": 7},
+        demo_cfg={"qbyt_threshold": threshold},
         sample_rate=16000,
     )
 
@@ -125,6 +125,7 @@ class FakeBatchVerifier:
 
         self._scores = list(scores)
         self.batches: list[int] = []
+        self.min_fbank_frames = 7
         self.fbank_extractor = FbankExtractor(dither=0.0)
         self.fbank_kwargs = {
             "num_mel_bins": 80,
@@ -173,7 +174,7 @@ def test_clip_runner_run_batch(monkeypatch):
     runner = Stage2ClipRunner(
         verifier=verifier,
         tokenizer=tokenizer,
-        demo_cfg={"qbyt_threshold": 0.5, "min_stage2_fbank_frames": 7},
+        demo_cfg={"qbyt_threshold": 0.5},
         sample_rate=16000,
     )
 

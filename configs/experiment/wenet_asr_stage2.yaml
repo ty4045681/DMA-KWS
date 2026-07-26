@@ -10,6 +10,20 @@ paths:
 training:
   recipe: wenet-asr-init
 
+stage1:
+  # encoder_only sets use_dynamic_chunk/use_dynamic_left_chunk, whose random chunk
+  # sampling in wenet's add_optional_chunk_mask is NOT gated on training mode. The
+  # deployment operating point below pins validation/eval/inference to a fixed chunk.
+  # Units: frames at 25 Hz (after the 4x conv2d subsampling), so 8 -> 320 ms chunk
+  # and 32 -> 1.28 s left context. Confirm against the wenet runtime you deploy;
+  # use -1/-1 for offline full context.
+  # train_policy=multi keeps wenet's own dynamic-chunk sampling during training
+  # (the train_chunk_size lists are icefall-only and unused here).
+  stream:
+    chunk_size: 8
+    left_context_frames: 32
+    train_policy: multi
+
 stage2:
   init_checkpoint: ${oc.env:WENET_ASR_CHECKPOINT,""}
   parquet_file: data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet

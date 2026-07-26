@@ -7,8 +7,9 @@ from typing import Any
 import pytorch_lightning as pl
 import torch
 
+from dma_kws.config import resolve_stream_policy
 from dma_kws.metrics import collapse_ctc, edit_distance
-from dma_kws.nn import build_encoder
+from dma_kws.nn import build_encoder, run_encoder
 from dma_kws.pathing import ensure_qbyt_on_path
 from dma_kws.training.scheduler import build_cosine_warmup_optimizer
 
@@ -44,6 +45,7 @@ class Stage1LightningModule(pl.LightningModule):
 
         stage1 = config["stage1"]
         encoder_dim = int(stage1.get("encoder_output_dim", 144))
+        self.stream_policy = resolve_stream_policy(stage1)
         self.encoder = build_encoder(stage1, output_dim=encoder_dim)
 
         CTC = _load_ctc()
@@ -62,13 +64,23 @@ class Stage1LightningModule(pl.LightningModule):
         self,
         feats: torch.Tensor,
         feat_lengths: torch.Tensor,
+        *,
+        mode: str = "eval",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        encoder_out, encoder_mask = self.encoder(feats, feat_lengths)
+        # ``mode`` defaults to "eval" so validation and inference always run at the
+        # deployment operating point; only the training step opts into randomization.
+        encoder_out, encoder_mask = run_encoder(
+            self.encoder,
+            feats,
+            feat_lengths,
+            policy=self.stream_policy,
+            mode=mode,
+        )
         encoder_lens = encoder_mask.squeeze(1).sum(dim=1).to(dtype=torch.long)
         return encoder_out, encoder_lens
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        encoder_out, encoder_lens = self(batch["feats"], batch["feat_lengths"])
+        encoder_out, encoder_lens = self(batch["feats"], batch["feat_lengths"], mode="train")
         loss, _ = self.ctc(
             encoder_out,
             encoder_lens,

@@ -63,7 +63,10 @@ def main(cfg: DictConfig) -> None:
 
     eval_paths = resolve_stage2_eval_paths(config)
     batch_size = int(prep.get("batch_size", 0)) or eval_paths["batch_size"]
-    split = str(prep.get("split", "hard"))
+    # stage2.eval.split is the single source of truth — it also drives the
+    # validation split inside training, so the two cannot report different
+    # numbers under the same name. prep.split stays as an explicit per-run override.
+    split = str(prep.get("split") or eval_paths["split"])
 
     dataset = LibriPhraseEvalDataset(
         test_dir=eval_paths["test_dir"],
@@ -97,7 +100,12 @@ def main(cfg: DictConfig) -> None:
     auc = float(metrics.get("test/auc", 0.0))
     eer = float(metrics.get("test/eer", 0.0))
 
-    output = {"split": split, "auc": auc, "eer": eer}
+    output = {
+        "split": split,
+        "auc": auc,
+        "eer": eer,
+        "stream": model.stream_policy.describe(),
+    }
     print(json.dumps(output))
 
 

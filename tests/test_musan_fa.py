@@ -31,6 +31,7 @@ class FakeBatchVerifier:
 
         self._scores = list(scores)
         self.batches: list[int] = []
+        self.min_fbank_frames = 7
         self.fbank_extractor = FbankExtractor(dither=0.0)
         self.fbank_kwargs = {
             "num_mel_bins": 80,
@@ -62,7 +63,7 @@ def _build_runner(threshold: float, verifier, monkeypatch) -> Stage2ClipRunner:
     return Stage2ClipRunner(
         verifier=verifier,
         tokenizer=tokenizer,
-        demo_cfg={"qbyt_threshold": threshold, "min_stage2_fbank_frames": 7},
+        demo_cfg={"qbyt_threshold": threshold},
         sample_rate=16000,
     )
 

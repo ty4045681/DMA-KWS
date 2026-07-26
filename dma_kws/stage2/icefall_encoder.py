@@ -19,6 +19,23 @@ import torch.nn as nn
 
 from dma_kws.pathing import ensure_icefall_on_path
 
+#: ``Zipformer2`` halves its own output on top of ``Conv2dSubsampling``. Shared by
+#: the constructor call and :meth:`IcefallZipformerEncoder.output_frames` so the
+#: two can never disagree about the encoder's frame rate.
+OUTPUT_DOWNSAMPLING_FACTOR = 2
+
+
+def embed_output_frames(num_frames: int) -> int:
+    """Frames ``Conv2dSubsampling`` emits for ``num_frames`` input frames.
+
+    Transcribes the upstream formula: its class docstring states
+    ``T' = (T - 3) // 2 - 2 == (T - 7) // 2`` and its ``forward`` computes the
+    same thing as ``x_lens = (x_lens - 7) // 2``. Short inputs give a
+    non-positive result, which is what makes them unusable rather than merely
+    short.
+    """
+    return (num_frames - 3) // 2 - 2
+
 
 def _load_icefall_modules() -> tuple[type, type, type]:
     """Lazily import icefall Zipformer2 and Conv2dSubsampling.
@@ -77,6 +94,35 @@ class IcefallZipformerEncoder(nn.Module):
         
         self.output_dim = output_dim
 
+    def apply_stream_config(
+        self,
+        chunk_sizes: tuple[int, ...],
+        left_context_frames: tuple[int, ...],
+    ) -> None:
+        """Set the chunked-attention settings used by the next forward pass.
+
+        ``Zipformer2.get_chunk_info`` draws from these tuples with
+        ``random.choice`` and is *not* gated on ``self.training``, so a
+        multi-value tuple randomizes every forward pass, eval included. Callers
+        go through :func:`dma_kws.nn.run_encoder`, which passes a single-element
+        tuple for every phase except opt-in multi-latency training.
+        """
+        self.encoder.chunk_size = tuple(chunk_sizes)
+        self.encoder.left_context_frames = tuple(left_context_frames)
+
+    def output_frames(self, num_input_frames: int) -> int:
+        """Encoder frames produced for ``num_input_frames`` fbank frames.
+
+        ``Conv2dSubsampling`` reduces the length first, then ``Zipformer2``
+        applies ``output_downsampling_factor`` as ``(t + 1) // 2``. Callers use
+        this to reject inputs that would subsample away to nothing before the
+        convolutions raise a shape error.
+        """
+        subsampled = embed_output_frames(num_input_frames)
+        if subsampled <= 0:
+            return 0
+        return (subsampled + 1) // OUTPUT_DOWNSAMPLING_FACTOR
+
     def forward(
         self,
         feat: torch.Tensor,
@@ -123,12 +169,17 @@ class IcefallZipformerEncoder(nn.Module):
         stage1_cfg: dict[str, Any],
         *,
         output_dim: int = 128,
+        policy: Any = None,
     ) -> IcefallZipformerEncoder:
         """Build encoder from stage1 config.
         
         Args:
             stage1_cfg: Stage1 config dict containing zipformer hyperparams
             output_dim: Desired output dimension (default 128 for Zipformer2)
+            policy: Resolved :class:`~dma_kws.configs.schema.StreamPolicy`; when
+                omitted it is resolved from ``stage1_cfg``. The encoder is left
+                at the deployment operating point so that any caller bypassing
+                :func:`dma_kws.nn.run_encoder` still gets deterministic output.
         
         Returns:
             Initialized IcefallZipformerEncoder
@@ -142,6 +193,10 @@ class IcefallZipformerEncoder(nn.Module):
             }
             encoder = IcefallZipformerEncoder.build_from_params(stage1_cfg)
         """
+        if policy is None:
+            from dma_kws.config import resolve_stream_policy
+
+            policy = resolve_stream_policy(stage1_cfg)
         Conv2dSubsampling, Zipformer2, ScheduledFloat = _load_icefall_modules()
         
         # Parse comma-separated config strings into tuples
@@ -162,8 +217,10 @@ class IcefallZipformerEncoder(nn.Module):
         encoder_unmasked_dim = _parse_tuple(stage1_cfg.get("encoder_unmasked_dim", "128,128,128,128,128,128"))
         cnn_module_kernel = _parse_tuple(stage1_cfg.get("cnn_module_kernel", "31,31,15,15,15,31"))
         causal = bool(stage1_cfg.get("causal", False))
-        chunk_size = _parse_tuple(stage1_cfg.get("chunk_size", "-1"))
-        left_context_frames = _parse_tuple(stage1_cfg.get("left_context_frames", "-1"))
+        # Built at the deployment operating point; dma_kws.nn.run_encoder swaps in
+        # the training tuples per forward pass when multi-latency training is on.
+        chunk_size = (policy.chunk_size,) if policy.enabled else (-1,)
+        left_context_frames = (policy.left_context_frames,) if policy.enabled else (-1,)
         
         # Input feature dimension (always 80 for fbank)
         input_dim = int(stage1_cfg.get("input_dim", 80))
@@ -184,7 +241,7 @@ class IcefallZipformerEncoder(nn.Module):
         
         # Build Zipformer2 encoder
         encoder_module = Zipformer2(
-            output_downsampling_factor=2,
+            output_downsampling_factor=OUTPUT_DOWNSAMPLING_FACTOR,
             downsampling_factor=downsampling_factor,
             num_encoder_layers=num_encoder_layers,
             encoder_dim=encoder_dim,

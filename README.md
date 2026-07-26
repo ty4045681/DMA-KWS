@@ -984,9 +984,53 @@ Notes:
 - The Icefall encoder adapter (`dma_kws/stage2/icefall_encoder.py`) exposes the same `forward(feat, feat_lengths) → (encoder_out, encoder_mask)` interface as the Wenet Conformer, so the rest of the Stage II training pipeline is unchanged.
 - QbyT still uses the phoneme CharTokenizer at `data/dict/lang_char.txt`.
 - Default encoder output dimension is `max(encoder_dim) = 128` (Zipformer KWS recipe default), aligned with `stage2.qbyt_embed_dim: 128` — no extra projection layer is needed.
-- `causal` must match the checkpoint. The `icefall_zipformer_stage2` preset sets `causal: true` for the target KWS checkpoint; override it only when loading a checkpoint trained with `--causal=false`.
+- `causal` must match the checkpoint. The `icefall_zipformer_stage2` preset sets `causal: true` for the target KWS checkpoint; override it only when loading a checkpoint trained with `--causal=false`. Flipping it swaps `ChunkCausalDepthwiseConv1d` for a plain `nn.Conv1d`, and because the icefall state dict is loaded with `strict=False` the convolution weights would be dropped silently.
 - Online Stage II verification uses the same Hydra fbank profile as precomputation and resamples the full validation waveform before slicing candidate spans.
 - On startup, look for `Loaded encoder_embed weights from ...: missing=N unexpected=M` and `Loaded encoder weights from ...`. Both counts should be low. High unexpected counts usually mean a config mismatch (wrong `encoder_dim`, `num_encoder_layers`, etc.).
+
+### Streaming operating point (`stage1.stream`)
+
+Chunked attention is configured in one place and applied consistently to every phase. `chunk_size` / `left_context_frames` are the **deployment operating point**: they must be single values and they drive validation, offline eval and inference. Randomized multi-latency training is opt-in via `train_policy`.
+
+```yaml
+stage1:
+  causal: true
+  stream:
+    chunk_size: 16              # 50 Hz frames -> 320 ms
+    left_context_frames: 64     # 50 Hz frames -> 1.28 s
+    train_policy: match         # match | multi
+    train_chunk_size: "16,32,64,-1"
+    train_left_context_frames: "64,128,256,-1"
+```
+
+| Phase | Chunk config |
+|-------|--------------|
+| Stage I icefall decode | `--causal/--chunk-size/--left-context-frames` generated from `stage1.stream` |
+| Stage II training, encoder frozen | `train_policy` (`match` reuses the operating point) |
+| Stage II training, encoder fine-tuned | same; use `multi` only if you ship several latencies |
+| Validation inside training | operating point |
+| Offline eval / test | operating point |
+| Inference / demo | operating point |
+
+Units are backend specific. For `icefall_zipformer` they are frames at 50 Hz (fbank 100 Hz halved by `Conv2dSubsampling`); for the Wenet Conformer they are frames at 25 Hz (after the 4x conv2d subsampling), and `train_policy: multi` delegates to wenet's own dynamic-chunk sampler. `chunk_size: -1` with `left_context_frames: -1` selects offline full context on both backends.
+
+This matters because neither backend gates its chunk sampling on training mode: icefall's `Zipformer2.get_chunk_info` calls `random.choice` unconditionally, and wenet's `add_optional_chunk_mask` takes its `torch.randint` branch whenever `decoding_chunk_size == 0`. Without a declared operating point, eval scores are not reproducible and do not correspond to any deployable configuration. Every eval script therefore records the resolved point in its output (`"stream": "backend=... eval=16/64 ..."`), and loading a `.pt` checkpoint trained at a different point raises.
+
+The operating point lives in the experiment overlay, so comparing points is a shell loop:
+
+```bash
+for point in 16/64 32/128 64/256 -1/-1; do
+  python3 scripts/eval_stage2_libriphrase.py \
+    +experiment=icefall_zipformer_stage2 \
+    stage1.stream.chunk_size=${point%/*} \
+    stage1.stream.left_context_frames=${point#*/} \
+    prep.checkpoint=/path/to/stage2.pt
+done
+```
+
+**Migration.** `stage1.chunk_size` / `stage1.left_context_frames` were removed; setting either raises with the replacement snippet. Previous runs left the encoder on icefall's `16,32,64,-1` list in *all* phases, so their metrics are a mixture over randomly drawn operating points and are not comparable with post-migration numbers — re-measure your baseline before starting a new sweep.
+
+Known gaps that a fixed operating point does **not** close: training and eval encode isolated clips, so the first chunk has no left context and the clip always starts on a chunk boundary, whereas a streaming deployment carries real preceding audio and an arbitrary chunk phase. `Stage2Verifier` also crops the waveform and re-encodes, while a shared streaming encoder would slice already-computed output frames.
 
 ---
 
@@ -1263,7 +1307,14 @@ The decision threshold defaults to `0.5` in config; override on the CLI as above
 ```yaml
 demo:
   qbyt_threshold: 0.5
+  # Shortest candidate that gets scored, in *encoder* frames. The fbank length
+  # this implies is derived from the configured encoder, because each backend
+  # subsamples differently: one encoder frame needs 7 fbank frames on the Wenet
+  # Conformer but 9 on the icefall Zipformer.
+  min_stage2_encoder_frames: 1
 ```
+
+`demo.min_stage2_fbank_frames` was removed and now raises. It hardcoded the Wenet figure, so an 65–85 ms candidate passed the guard and then subsampled to zero frames inside icefall's `Conv2dSubsampling` (`(T-7)//2`), crashing the convolution.
 
 Output is JSON:
 

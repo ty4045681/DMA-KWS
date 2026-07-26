@@ -27,6 +27,13 @@ training:
 stage1:
   # All params inherited from icefall_zipformer.yaml config above
   causal: true
+  # Deployment operating point, shared by Stage I streaming decode and Stage II.
+  # Units: frames at 50 Hz. 16 -> 320 ms chunk, 64 -> 1.28 s left context.
+  # Override per run, e.g. stage1.stream.chunk_size=32 stage1.stream.left_context_frames=128,
+  # or stage1.stream.chunk_size=-1 stage1.stream.left_context_frames=-1 for offline full context.
+  stream:
+    chunk_size: 16
+    left_context_frames: 64
 
 stage2:
   # Encoder output dimension = max(encoder_dim) = 128 from icefall config
@@ -89,7 +96,10 @@ stage2:
 
   eval:
     fbank_dir: ${paths.feature_root}/fbank_icefall_kws_eval
-    split: easy
+    # Hard is the paper's reported split and what adapt_hey_eva_icefall measures;
+    # keeping training validation on easy made val/auc silently incomparable with
+    # every offline eval number.
+    split: hard
     batch_size: 128
 
   checkpoint:

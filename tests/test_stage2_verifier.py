@@ -33,12 +33,79 @@ def _build_verifier_for_fbank_test(monkeypatch, captured: dict) -> Stage2Verifie
 
     verifier = Stage2Verifier.__new__(Stage2Verifier)
     verifier._torch = torch
-    verifier._demo_cfg = {"min_stage2_fbank_frames": 7}
+    verifier._demo_cfg = {}
     verifier._device = torch.device("cpu")
     verifier._fbank_kwargs = fbank_kwargs(fbank_cfg)
     verifier._fbank_extractor = FbankExtractor(**verifier._fbank_kwargs)
     verifier._model = _FakeStage2Model()
+    verifier._min_fbank_frames = 7
     return verifier
+
+
+def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch, tmp_path):
+    """Inference must never inherit the randomized training chunk config."""
+    import torch.nn as nn
+
+    calls: list[dict] = []
+
+    class _StubEncoder(nn.Module):
+        def output_frames(self, num_input_frames):
+            return num_input_frames
+
+        def forward(self, feats, feat_lengths):
+            mask = torch.ones(feats.size(0), 1, feats.size(1), dtype=torch.bool)
+            return torch.zeros(feats.size(0), feats.size(1), 8), mask
+
+    class _StubQbyT(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+
+        def forward(self, speech, text, speech_lengths=None, text_lengths=None):
+            del text, speech_lengths, text_lengths
+            return torch.zeros(speech.size(0)), None
+
+    def _spy_run_encoder(encoder, feat, feat_lengths, *, policy, mode="eval"):
+        calls.append({"mode": mode, "chunk_size": policy.chunk_size})
+        return encoder(feat, feat_lengths)
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_verifier.build_encoder", lambda *_a, **_k: _StubEncoder()
+    )
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_verifier.load_qbyt_class", lambda: _StubQbyT
+    )
+    monkeypatch.setattr("dma_kws.inference.stage2_verifier.run_encoder", _spy_run_encoder)
+
+    ckpt_path = tmp_path / "stage2.pt"
+    torch.save({"model_state_dict": {}}, ckpt_path)
+
+    stage1_cfg = {
+        "encoder_type": "icefall_zipformer",
+        "causal": True,
+        "downsampling_factor": "1,2,4,8,4,2",
+        "cnn_module_kernel": "31,31,15,15,15,31",
+        "stream": {
+            "chunk_size": 16,
+            "left_context_frames": 64,
+            "train_policy": "multi",
+            "train_chunk_size": "16,32,64,-1",
+            "train_left_context_frames": "64,128,256,-1",
+        },
+    }
+    verifier = Stage2Verifier(
+        stage1_cfg=stage1_cfg,
+        stage2_cfg={"encoder_output_dim": 8},
+        demo_cfg={},
+        fbank_cfg=FbankConfig(dither=0.0, window_type="povey"),
+        stage2_ckpt=str(ckpt_path),
+        device=torch.device("cpu"),
+        vocab_size=73,
+    )
+
+    verifier.score_clip_feats([torch.zeros(20, 80)], [[1, 2, 3]])
+
+    assert calls == [{"mode": "eval", "chunk_size": 16}]
+    assert "eval=16/64" in verifier.stream_policy.describe()
 
 
 def test_stage2_verifier_uses_waveform_to_fbank(monkeypatch):
@@ -85,11 +152,12 @@ def test_stage2_verifier_resamples_before_candidate_slicing(monkeypatch):
     )
     verifier = Stage2Verifier.__new__(Stage2Verifier)
     verifier._torch = torch
-    verifier._demo_cfg = {"min_stage2_fbank_frames": 7}
+    verifier._demo_cfg = {}
     verifier._device = torch.device("cpu")
     verifier._fbank_kwargs = fbank_kwargs(fbank_cfg)
     verifier._fbank_extractor = FbankExtractor(**verifier._fbank_kwargs)
     verifier._model = _FakeStage2Model()
+    verifier._min_fbank_frames = 7
 
     waveform = torch.randn(1, 8000)
     candidates = [

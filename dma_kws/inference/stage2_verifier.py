@@ -8,17 +8,27 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from dma_kws.config import FbankConfig, fbank_kwargs, get_eval_fbank_config
+from dma_kws.config import (
+    FbankConfig,
+    fbank_kwargs,
+    get_eval_fbank_config,
+    resolve_min_encoder_frames,
+    resolve_stream_policy,
+)
 from dma_kws.inference.audio_utils import has_min_fbank_frames
-from dma_kws.nn import build_encoder
+from dma_kws.nn import build_encoder, min_input_frames_for_encoder, run_encoder
 from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage1.candidates import KeywordCandidate
 from dma_kws.stage2.fbank import FbankExtractor
 from dma_kws.stage2.features import waveform_to_fbank
 
 
-def _load_model_state(model, ckpt_path: str, load_fn):
+def _load_model_state(model, ckpt_path: str, load_fn, *, stream_policy=None):
     ckpt = load_fn(ckpt_path, map_location="cpu")
+    if stream_policy is not None:
+        from dma_kws.training.checkpoint_io import assert_stream_policy_matches
+
+        assert_stream_policy_matches(ckpt, stream_policy, source=ckpt_path)
     state = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state, strict=True)
     return model
@@ -53,6 +63,8 @@ class Stage2Verifier:
         self._fbank_kwargs = fbank_kwargs(fbank_cfg)
         self._fbank_extractor = FbankExtractor(**self._fbank_kwargs)
         stage2_encoder_dim = int(stage2_cfg.get("encoder_output_dim", 144))
+        stream_policy = resolve_stream_policy(stage1_cfg)
+        self._stream_policy = stream_policy
 
         class Stage2Model(torch.nn.Module):
             def __init__(self):
@@ -66,7 +78,14 @@ class Stage2Verifier:
                 )
 
             def forward(self, feats, feat_lengths, anchors, anchor_lengths):
-                encoder_out, encoder_mask = self.encoder(feats, feat_lengths)
+                # Inference always runs at the deployment operating point.
+                encoder_out, encoder_mask = run_encoder(
+                    self.encoder,
+                    feats,
+                    feat_lengths,
+                    policy=stream_policy,
+                    mode="eval",
+                )
                 encoder_lens = encoder_mask.squeeze(1).sum(1)
                 logits, _ = self.qbyt(
                     encoder_out,
@@ -78,12 +97,18 @@ class Stage2Verifier:
 
         model = Stage2Model()
         try:
-            _load_model_state(model, stage2_ckpt, torch.load)
+            _load_model_state(model, stage2_ckpt, torch.load, stream_policy=stream_policy)
         except RuntimeError as exc:
             raise SystemExit(
                 f"Checkpoint {stage2_ckpt} is incompatible with the model architecture: {exc}"
             ) from exc
         self._model = model.to(device).eval()
+        # A span can be long enough to produce fbank frames and still subsample
+        # away to nothing, so the guard is expressed in encoder frames and
+        # converted using the encoder that will actually run.
+        self._min_fbank_frames = min_input_frames_for_encoder(
+            model.encoder, resolve_min_encoder_frames(self._demo_cfg)
+        )
 
     @property
     def fbank_extractor(self) -> FbankExtractor:
@@ -92,6 +117,16 @@ class Stage2Verifier:
     @property
     def fbank_kwargs(self) -> dict:
         return dict(self._fbank_kwargs)
+
+    @property
+    def stream_policy(self):
+        """Resolved streaming operating point used for every score."""
+        return self._stream_policy
+
+    @property
+    def min_fbank_frames(self) -> int:
+        """Shortest fbank input this encoder can score, in frames."""
+        return self._min_fbank_frames
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any], prep: Mapping[str, Any], device) -> "Stage2Verifier":
@@ -168,7 +203,7 @@ class Stage2Verifier:
         torch = self._torch
         anchor = torch.tensor([list(keyword_ids)], dtype=torch.long).to(self._device)
         anchor_lengths = torch.tensor([len(keyword_ids)], dtype=torch.long).to(self._device)
-        min_stage2_fbank_frames = int(self._demo_cfg.get("min_stage2_fbank_frames", 7))
+        min_stage2_fbank_frames = self._min_fbank_frames
         waveform, sample_rate = self._fbank_extractor.prepare_waveform(
             waveform,
             sample_rate,

@@ -210,6 +210,13 @@ def main(cfg: DictConfig) -> None:
     if reporter.use_rich:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    # Scores are only comparable within one streaming operating point, so record it
+    # alongside the study instead of leaving it implicit in the config.
+    from dma_kws.config import resolve_stream_policy
+
+    stream_policy = resolve_stream_policy(config)
+    reporter.info(f"Encoder stream policy: {stream_policy.describe()}")
+
     # Scoring runs the model over ~thousands of eval pairs twice per trial; keep it
     # on the training accelerator instead of falling back to CPU.
     from dma_kws.training.device import resolve_accelerator_and_devices
@@ -235,7 +242,7 @@ def main(cfg: DictConfig) -> None:
         ),
         title="Sweep Plan",
     )
-    print(json.dumps({"lph_auc_base": lph_base}))
+    print(json.dumps({"lph_auc_base": lph_base, "stream": stream_policy.describe()}))
 
     base_args = Stage2AdaptArgs(
         init_checkpoint=base_ckpt,
@@ -320,7 +327,16 @@ def main(cfg: DictConfig) -> None:
         title="Best Parameters",
     )
     reporter.done(f"Best params written to {best_path}")
-    print(yaml.safe_dump({"best_score": best.value, "best_params": best_params, "best_path": str(best_path)}))
+    print(
+        yaml.safe_dump(
+            {
+                "best_score": best.value,
+                "best_params": best_params,
+                "best_path": str(best_path),
+                "stream": stream_policy.describe(),
+            }
+        )
+    )
 
 
 if __name__ == "__main__":

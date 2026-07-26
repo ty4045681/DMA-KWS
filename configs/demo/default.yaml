@@ -1,3 +1,6 @@
 stage1_candidate_margin_sec: 0.15
 qbyt_threshold: 0.5
-min_stage2_fbank_frames: 7
+# Minimum encoder frames a candidate span must produce to be scored. The fbank
+# length this implies is derived from the configured encoder, since each backend
+# subsamples by a different amount.
+min_stage2_encoder_frames: 1

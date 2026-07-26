@@ -67,6 +67,64 @@ class Stage1CmvnConfConfig:
 
 
 @dataclass
+class Stage1StreamConfig:
+    """Chunked-attention operating point for the Stage I/II encoder.
+
+    ``chunk_size``/``left_context_frames`` describe the *deployment* operating
+    point and must be single values; they are used by validation, offline eval
+    and inference, and are never randomized. ``None`` means "not declared" and
+    is an error for encoders that support chunking.
+
+    Units are backend specific:
+    - ``icefall_zipformer``: frames at 50 Hz (fbank 100 Hz halved by Conv2dSubsampling)
+    - ``conformer`` (Wenet): frames at 25 Hz (after the 4x conv2d subsampling)
+
+    ``-1`` means "no chunking" (full context) for both backends.
+    """
+
+    chunk_size: int | None = None
+    left_context_frames: int | None = None
+    train_policy: str = "match"
+    train_chunk_size: str = ""
+    train_left_context_frames: str = ""
+
+
+@dataclass
+class StreamPolicy:
+    """Resolved, validated chunked-attention policy for one encoder."""
+
+    backend: str = "conformer"
+    enabled: bool = False
+    chunk_size: int = -1
+    left_context_frames: int = -1
+    train_policy: str = "match"
+    train_chunk_sizes: tuple[int, ...] = ()
+    train_left_context_frames: tuple[int, ...] = ()
+
+    @property
+    def left_context_chunks(self) -> int:
+        """Left context expressed in chunks, using icefall's rounding rule."""
+        if self.chunk_size <= 0 or self.left_context_frames < 0:
+            return -1
+        return max(1, self.left_context_frames // self.chunk_size)
+
+    def describe(self) -> str:
+        point = f"{self.chunk_size}/{self.left_context_frames}"
+        if not self.enabled:
+            return f"backend={self.backend} chunking=off (full context)"
+        if self.train_policy != "multi":
+            train = f"match ({point})"
+        elif self.train_chunk_sizes:
+            train = (
+                f"multi chunk={','.join(map(str, self.train_chunk_sizes))}"
+                f" left={','.join(map(str, self.train_left_context_frames))}"
+            )
+        else:
+            train = "multi (backend-native dynamic chunk)"
+        return f"backend={self.backend} eval={point} train={train}"
+
+
+@dataclass
 class Stage1Config:
     train_splits: list[str] = field(default_factory=list)
     dev_splits: list[str] = field(default_factory=list)
@@ -101,6 +159,8 @@ class Stage1Config:
     use_dynamic_left_chunk: bool = False
     gradient_checkpointing: bool = False
     cmvn: str = ""
+    encoder_type: str = "conformer"
+    stream: Stage1StreamConfig = field(default_factory=Stage1StreamConfig)
     cmvn_conf: Stage1CmvnConfConfig = field(default_factory=Stage1CmvnConfConfig)
     checkpoint_avg: Stage1CheckpointAvgConfig = field(default_factory=Stage1CheckpointAvgConfig)
     validation: Stage1ValidationConfig = field(default_factory=Stage1ValidationConfig)
@@ -274,6 +334,7 @@ class IcefallPtLocatorConfig:
     root: str = ""
     decode_script: str = ""
     checkpoint: str = ""
+    decode_args: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -293,6 +354,7 @@ class LocatorConfig:
     root: str = ""
     decode_script: str = ""
     checkpoint: str = ""
+    decode_args: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -348,7 +410,10 @@ class AdaptConfig:
 class DemoConfig:
     stage1_candidate_margin_sec: float = 0.15
     qbyt_threshold: float = 0.5
-    min_stage2_fbank_frames: int = 7
+    #: Minimum number of *encoder* frames a candidate must yield to be scored.
+    #: The equivalent fbank length is derived per backend, because each encoder
+    #: subsamples differently (see ``dma_kws.nn.min_input_frames_for_encoder``).
+    min_stage2_encoder_frames: int = 1
 
 
 @dataclass

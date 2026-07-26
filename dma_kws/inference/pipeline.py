@@ -37,6 +37,11 @@ class TwoStageKWSPipeline:
         self._sample_rate = int(sample_rate)
         self._g2p = make_g2p()
 
+    @property
+    def stream_policy(self):
+        """Resolved streaming operating point shared by Stage I and Stage II."""
+        return self._verifier.stream_policy
+
     @classmethod
     def from_config(cls, config: Mapping[str, Any], prep: Mapping[str, Any], device) -> "TwoStageKWSPipeline":
         stage1_cfg = config.get("stage1")

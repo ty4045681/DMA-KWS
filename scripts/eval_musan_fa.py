@@ -139,6 +139,7 @@ def run_eval(cfg: DictConfig) -> dict:
         "hop_sec": hop_sec,
         "total_files": len(source_rows),
         "total_hours": total_hours,
+        "stream": runner.stream_policy.describe(),
     }
 
     overall_metrics = summarize_false_accept_rate(

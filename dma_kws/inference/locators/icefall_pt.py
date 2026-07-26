@@ -9,10 +9,34 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
+from dma_kws.config import resolve_stream_policy
 from dma_kws.inference.audio_utils import apply_margin_to_span
 from dma_kws.stage1.candidates import KeywordCandidate
 
 DEFAULT_ICEFALL_ROOT = ""
+
+#: Streaming flags owned by ``stage1.stream``; users must not set them by hand in
+#: ``locator.decode_args`` or Stage I and Stage II could drift apart.
+_MANAGED_DECODE_FLAGS = ("--causal", "--chunk-size", "--left-context-frames")
+
+
+def _stream_decode_args(config: Mapping[str, Any]) -> list[str]:
+    """Render ``stage1.stream`` as icefall decode flags.
+
+    icefall's ``decode.py`` asserts single values for ``--chunk-size`` and
+    ``--left-context-frames``, which the resolved policy already guarantees.
+    """
+    policy = resolve_stream_policy(config)
+    if not policy.enabled:
+        return ["--causal", "0"]
+    return [
+        "--causal",
+        "1",
+        "--chunk-size",
+        str(policy.chunk_size),
+        "--left-context-frames",
+        str(policy.left_context_frames),
+    ]
 
 
 def _locator_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -91,7 +115,23 @@ class IcefallPtKwsLocator:
         self._root = Path(root).expanduser()
         self._decode_script = Path(decode_script).expanduser()
         self._checkpoint = str(checkpoint)
-        self._extra_args = list(locator_cfg.get("decode_args", []))
+        self._extra_args = [str(arg) for arg in locator_cfg.get("decode_args", [])]
+        # Catch both "--chunk-size 16" and "--chunk-size=16".
+        conflicting = sorted(
+            {
+                flag
+                for arg in self._extra_args
+                for flag in _MANAGED_DECODE_FLAGS
+                if arg == flag or arg.startswith(f"{flag}=")
+            }
+        )
+        if conflicting:
+            raise ValueError(
+                f"locator.decode_args must not set {', '.join(conflicting)}; these are derived "
+                "from stage1.stream so Stage I and Stage II share one operating point. "
+                "Set stage1.stream.chunk_size / stage1.stream.left_context_frames instead."
+            )
+        self._stream_args = _stream_decode_args(config)
 
     def _build_command(self, audio_path: str, keyword: str) -> list[str]:
         script = self._decode_script
@@ -106,6 +146,7 @@ class IcefallPtKwsLocator:
             audio_path,
             "--keywords",
             keyword,
+            *self._stream_args,
             *self._extra_args,
         ]
 

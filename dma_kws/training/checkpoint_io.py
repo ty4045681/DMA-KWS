@@ -21,6 +21,61 @@ def extract_state_dict(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:
     return checkpoint
 
 
+def assert_stream_policy_matches(
+    checkpoint: dict[str, Any],
+    policy: Any,
+    *,
+    source: Any,
+) -> None:
+    """Fail when a checkpoint was produced at a different streaming operating point.
+
+    ``.pt`` payloads written by :func:`export_model_pt` and the LoRA adaptation
+    runner embed the full config, so the operating point they were trained at is
+    recoverable. Lightning ``.ckpt`` files do not carry it and are skipped.
+    """
+    import warnings
+
+    from dma_kws.config import resolve_stream_policy
+
+    if not isinstance(checkpoint, dict):
+        return
+    config = checkpoint.get("config")
+    if not isinstance(config, dict) or "stage1" not in config:
+        return
+    try:
+        saved = resolve_stream_policy(config)
+    except ValueError as exc:
+        # Pre-migration checkpoints carry the multi-value `stage1.chunk_size` list,
+        # which means they were trained (and validated) on a random draw per batch.
+        # There is no operating point to compare against, but staying silent would
+        # hide exactly the mismatch this check exists for.
+        warnings.warn(
+            f"Cannot verify the streaming operating point of {source}: "
+            f"{str(exc).splitlines()[0]} "
+            "It predates stage1.stream, so it was trained under a randomized chunk "
+            "config and its metrics are not comparable with the current fixed point.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return
+
+    if not saved.enabled and not policy.enabled:
+        return
+    mismatch = (
+        saved.enabled != policy.enabled
+        or saved.chunk_size != policy.chunk_size
+        or saved.left_context_frames != policy.left_context_frames
+    )
+    if mismatch:
+        raise ValueError(
+            f"Streaming operating point mismatch for {source}: checkpoint was trained at "
+            f"[{saved.describe()}] but the current config resolves to [{policy.describe()}]. "
+            "Scores are not comparable across operating points; set "
+            "stage1.stream.chunk_size / stage1.stream.left_context_frames to match, "
+            "or re-train at the new point."
+        )
+
+
 def extract_icefall_encoder_state(
     checkpoint_path: Path | str,
 ) -> dict[str, dict[str, torch.Tensor]]:

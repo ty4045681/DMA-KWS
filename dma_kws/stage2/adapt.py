@@ -26,6 +26,7 @@ from dma_kws.training.adapt_params import (
     merge_adapt_params,
     resolve_adapt_lr,
 )
+from dma_kws.training.checkpoint_io import assert_stream_policy_matches
 from dma_kws.training.lora import (
     count_lora_params,
     inject_qbyt_lora,
@@ -131,6 +132,8 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         )
         if adapter_checkpoint:
             state = torch.load(adapter_checkpoint, map_location="cpu")
+            # LoRA weights are tuned against a specific encoder operating point.
+            assert_stream_policy_matches(state, self.stream_policy, source=adapter_checkpoint)
             adapter_state = state.get("lora_state_dict", state)
             load_lora_state_dict(self.qbyt, adapter_state, strict=False)
 

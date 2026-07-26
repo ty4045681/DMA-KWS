@@ -2,3 +2,7 @@ type: icefall_pt
 root: ${oc.env:ICEFALL_ROOT,""}
 decode_script: ""
 checkpoint: ""
+# --causal / --chunk-size / --left-context-frames are generated from stage1.stream
+# so Stage I decoding and Stage II verification share one operating point; setting
+# them here raises. Put any other decode flags in decode_args.
+decode_args: []
