@@ -10,6 +10,7 @@ from dma_kws.stage2.dataset import LibriPhraseTrainDataset
 from scripts.prepare_stage2_paper import collect_needed_audio_keys, find_decoded_parquets
 from dma_kws.stage2.prepare_paper import (
     PARQUET_COLUMNS,
+    build_anchor_metadata,
     build_clips_npy,
     build_distances_npy,
     compute_hard_negatives_from_phonemes,
@@ -174,6 +175,25 @@ def test_compute_hard_negatives_prefers_small_edit_distance():
         top_k=1,
     )
     assert [item["ngram"] for item in hard] == ["hello word"]
+
+
+def test_compute_hard_negatives_ranks_stress_agnostically():
+    # Same phone identity, different stress: not a confusable pair, matching
+    # recompute_stage2_distances.py which also drops zero-distance neighbours.
+    candidates = [
+        ("the sun", "DH AH0 S AH1 N"),
+        ("the son", "DH AH1 S AH2 N"),
+        ("the sung", "DH AH0 S AH1 NG"),
+    ]
+
+    hard = compute_hard_negatives_from_phonemes(
+        "the sun",
+        "DH AH0 S AH1 N",
+        candidates,
+        top_k=5,
+    )
+
+    assert [item["ngram"] for item in hard] == ["the sung"]
 
 
 def test_convert_aggregated_to_paper_parquet_writes_expected_layout(tmp_path):
@@ -366,6 +386,76 @@ def test_distances_npy_works_with_dataset_get_hard_negative(tmp_path):
     # Ensure dataset can load the corresponding fbank for the hard negative clip.
     sample = dataset[hello_idx]
     assert sample["feat"].shape[1] == 80
+
+
+def test_build_anchor_metadata_shares_one_g2p_across_anchors(tmp_path, monkeypatch):
+    # G2p() loads cmudict plus a POS tagger, so the legacy-parquet migration must
+    # not pay that cost once per anchor.
+    legacy_df = pd.DataFrame(
+        {
+            "ngram": ["hello", "world", "goodbye"],
+            "ngram_g2p": ["HH AH L OW", "W ER L D", "G UH D B AY"],
+            "clips": [
+                [{"audio_path": "LP-100/hello/a.wav"}],
+                [{"audio_path": "LP-100/world/b.wav"}],
+                [{"audio_path": "LP-100/goodbye/c.wav"}],
+            ],
+        }
+    )
+    constructed = 0
+
+    def fake_make_g2p():
+        nonlocal constructed
+        constructed += 1
+        return lambda _text: ["HH", "AH0", "L", "OW1"]
+
+    monkeypatch.setattr("dma_kws.stage2.prepare_paper.make_g2p", fake_make_g2p)
+
+    paper_df, _fbank_targets, stats = build_anchor_metadata(
+        legacy_df,
+        clips_dir=tmp_path / "clips",
+        distances_dir=tmp_path / "distances",
+        fbank_dir=tmp_path / "fbank",
+    )
+
+    assert constructed == 1
+    assert stats["g2p_recomputed"] == 1
+    assert paper_df["ngram_g2p"].tolist() == ["HH AH0 L OW1"] * 3
+
+
+def test_build_anchor_metadata_runs_g2p_for_missing_cells_only_once(tmp_path, monkeypatch):
+    # A stress-marked column with holes: the empty cells must be filled by g2p_en
+    # rather than tokenized from "None"/"nan", and still share one converter.
+    df = pd.DataFrame(
+        {
+            "ngram": ["hello", "world", "goodbye"],
+            "ngram_g2p": ["HH AH0 L OW1", None, float("nan")],
+            "clips": [
+                [{"audio_path": "LP-100/hello/a.wav"}],
+                [{"audio_path": "LP-100/world/b.wav"}],
+                [{"audio_path": "LP-100/goodbye/c.wav"}],
+            ],
+        }
+    )
+    constructed = 0
+
+    def fake_make_g2p():
+        nonlocal constructed
+        constructed += 1
+        return lambda _text: ["W", "ER1", "L", "D"]
+
+    monkeypatch.setattr("dma_kws.stage2.prepare_paper.make_g2p", fake_make_g2p)
+
+    paper_df, _fbank_targets, stats = build_anchor_metadata(
+        df,
+        clips_dir=tmp_path / "clips",
+        distances_dir=tmp_path / "distances",
+        fbank_dir=tmp_path / "fbank",
+    )
+
+    assert constructed == 1
+    assert stats["g2p_recomputed"] == 0
+    assert paper_df["ngram_g2p"].tolist() == ["HH AH0 L OW1", "W ER1 L D", "W ER1 L D"]
 
 
 def test_convert_respects_limit_anchors(tmp_path):

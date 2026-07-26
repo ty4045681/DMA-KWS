@@ -12,6 +12,7 @@ import re
 from dma_kws.phonemes import normalize_english_text
 
 _STRESS_DIGIT_RE = re.compile(r"[0-2]")
+_LETTER_RE = re.compile(r"[A-Za-z]")
 
 
 def make_g2p():
@@ -35,11 +36,19 @@ def text_to_phonemes(g2p, text: str) -> list[str]:
 
 
 def clean_phoneme_tokens(tokens) -> list[str]:
-    """Drop spaces and empty tokens from a raw G2P token sequence."""
+    """Drop spaces, empties and the punctuation g2p_en passes through verbatim.
+
+    g2p_en echoes any token that contains no letter, so ``boys'`` yields a bare
+    ``'`` alongside its phones. Those symbols are not phonemes and are not in the
+    vocabulary, so they are dropped here — the single place every stage
+    tokenizes through — rather than aborting data preparation or silently
+    becoming ``<unk>`` at evaluation time. Anything letter-bearing is kept so
+    genuinely wrong symbols still fail ``unsupported_phones``.
+    """
     phonemes: list[str] = []
     for phone in tokens:
         cleaned = str(phone).strip()
-        if cleaned:
+        if cleaned and _LETTER_RE.search(cleaned):
             phonemes.append(cleaned)
     return phonemes
 

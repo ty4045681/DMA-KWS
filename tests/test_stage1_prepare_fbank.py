@@ -140,6 +140,32 @@ def test_stage1_dataset_derives_fbank_from_root(tmp_path):
     assert sample["feat"].shape == (5, 80)
 
 
+def test_stage1_dataset_rejects_legacy_stress_stripped_manifest(tmp_path):
+    # Stress-stripped phonemes are absent from the vocabulary, so CharTokenizer
+    # would map every vowel to <unk> and Stage I would train on consonants only.
+    manifest = tmp_path / "train.jsonl"
+    manifest.write_text(
+        '{"wav_path":"/ignored.wav","phonemes_g2p":"HH AH L OW"}\n',
+        encoding="utf-8",
+    )
+
+    tok = load_char_tokenizer(DICT_PATH)
+    with pytest.raises(ValueError, match="outside the vocabulary"):
+        Stage1Dataset(manifest, tokenizer=tok, sample_rate=16000, num_mel_bins=80)
+
+
+def test_stage1_dataset_rejects_legacy_phonemes_list(tmp_path):
+    manifest = tmp_path / "train.jsonl"
+    manifest.write_text(
+        '{"wav_path":"/ignored.wav","phonemes":["HH","AH","L","OW"]}\n',
+        encoding="utf-8",
+    )
+
+    tok = load_char_tokenizer(DICT_PATH)
+    with pytest.raises(ValueError, match="prepare_stage1_librispeech"):
+        Stage1Dataset(manifest, tokenizer=tok, sample_rate=16000, num_mel_bins=80)
+
+
 def test_resolve_record_fbank_path_prefers_explicit_field(tmp_path):
     record = {"wav_path": "/a.wav", "fbank_path": str(tmp_path / "custom.npy")}
     assert resolve_record_fbank_path(record) == tmp_path / "custom.npy"

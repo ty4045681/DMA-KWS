@@ -12,7 +12,9 @@ from torch.utils.data import Dataset
 from dma_kws.audio import extract_fbank, load_audio
 from dma_kws.jsonl import read_jsonl
 from dma_kws.stage1.prepare_fbank import resolve_record_fbank_path
-from dma_kws.tokenizer import tokenize_phoneme_string
+from dma_kws.tokenizer import tokenize_phoneme_string, unsupported_phones
+
+_MANIFEST_VALIDATION_SAMPLE = 200
 
 
 def phonemes_to_g2p_string(phonemes: list[str] | str) -> str:
@@ -22,13 +24,41 @@ def phonemes_to_g2p_string(phonemes: list[str] | str) -> str:
     return " ".join(phonemes)
 
 
+def manifest_phoneme_tokens(record: dict[str, Any]) -> list[str]:
+    """Return the phoneme tokens a manifest record will be tokenized from."""
+    if "phonemes_g2p" in record:
+        return str(record["phonemes_g2p"]).split()
+    if "phonemes" in record:
+        return phonemes_to_g2p_string(record["phonemes"]).split()
+    raise KeyError("Manifest record must contain 'phonemes_g2p' or 'phonemes'")
+
+
 def encode_manifest_target(record: dict[str, Any], tokenizer) -> list[int]:
     """Encode a manifest record using Wenet ``CharTokenizer``."""
-    if "phonemes_g2p" in record:
-        return tokenize_phoneme_string(tokenizer, str(record["phonemes_g2p"]))
-    if "phonemes" in record:
-        return tokenize_phoneme_string(tokenizer, phonemes_to_g2p_string(record["phonemes"]))
-    raise KeyError("Manifest record must contain 'phonemes_g2p' or 'phonemes'")
+    return tokenize_phoneme_string(tokenizer, " ".join(manifest_phoneme_tokens(record)))
+
+
+def validate_manifest_phonemes(
+    records: list[dict[str, Any]],
+    *,
+    manifest_path: Path | str,
+    sample_size: int = _MANIFEST_VALIDATION_SAMPLE,
+) -> None:
+    """Reject manifests whose phonemes are outside the current vocabulary.
+
+    Manifests written before the stress-marked vocabulary carry stress-stripped
+    phonemes (``AH`` instead of ``AH1``), and ``CharTokenizer`` maps every one of
+    them to ``<unk>`` — training would see no vowels at all. Checking a bounded
+    sample is enough because a manifest is generated in one pass.
+    """
+    for record in records[:sample_size]:
+        unsupported = unsupported_phones(manifest_phoneme_tokens(record))
+        if unsupported:
+            raise ValueError(
+                f"{manifest_path}: phonemes outside the vocabulary: {', '.join(unsupported)}. "
+                "Manifests predating the stress-marked vocabulary tokenize entirely to <unk>; "
+                "regenerate them with scripts/prepare_stage1_librispeech.py."
+            )
 
 
 class Stage1Dataset(Dataset):
@@ -45,6 +75,7 @@ class Stage1Dataset(Dataset):
         audio_root: Path | str | None = None,
     ) -> None:
         self.records = read_jsonl(manifest_path)
+        validate_manifest_phonemes(self.records, manifest_path=manifest_path)
         self.tokenizer = tokenizer
         self.sample_rate = sample_rate
         self.num_mel_bins = num_mel_bins

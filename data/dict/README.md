@@ -6,9 +6,9 @@ This directory holds the repo-canonical Wenet-format phoneme dictionary used by 
 
 - **`lang_char.txt`** — 71-token `CharTokenizer` vocabulary (ids 0–70): CTC `<blank>`, `<unk>`, and the full **stress-marked** CMU ARPAbet inventory — 15 vowels × 3 stress levels (`AA0`–`UW2`) plus 24 consonants (`B`–`ZH`). This matches the 71-symbol phoneme inventory reported in the paper.
 
-`g2p_en` emits stress digits on every vowel, so training, evaluation and inference all tokenize those symbols directly — nothing strips stress. The one exception is hard-negative mining (`prep.recompute_distances.strip_stress`), which collapses `AH0`/`AH1`/`AH2` before ranking phoneme edit distances because confusability is about phone identity.
+`g2p_en` emits stress digits on every vowel, so training, evaluation and inference all tokenize those symbols directly — nothing strips stress. The one exception is hard-negative mining, which collapses `AH0`/`AH1`/`AH2` before ranking phoneme edit distances because confusability is about phone identity; both mining paths do this — `prep.recompute_distances.strip_stress` and the in-prep fallback `compute_hard_negatives_from_phonemes`.
 
-Symbols outside this inventory are rejected at data-preparation time (`dma_kws.tokenizer.unsupported_phones`) instead of silently becoming `<unk>`.
+Symbols outside this inventory are rejected at data-preparation time (`dma_kws.tokenizer.unsupported_phones`) instead of silently becoming `<unk>`. Punctuation that `g2p_en` echoes verbatim for letterless tokens (the `'` in `boys'`) is not a phoneme and is dropped by `clean_phoneme_tokens` before that check.
 
 ## Canonical source of truth
 
@@ -21,7 +21,8 @@ Do **not** replace or edit this file without retraining **both** stages. Checkpo
 Checkpoints trained against the old 73-token dict are **not loadable**: the QbyT text embedding and the Stage I CTC head are both sized by the vocabulary. Rebuild in this order:
 
 1. Re-run `scripts/prepare_stage2_paper.py` — it regenerates `ngram_g2p` when the parquet column has no stress markers and reports `g2p_recomputed=True`. Precomputed fbank `.npy` features are **unaffected** and do not need recomputing.
-2. Retrain Stage II (and Stage I if you use the repo's phoneme-CTC locator), then re-measure the LibriPhrase baseline before starting a new adaptation sweep.
+2. Re-run `scripts/prepare_stage1_librispeech.py` if you train Stage I: the old `train.jsonl`/`dev.jsonl` carry stress-stripped `phonemes_g2p`. `Stage1Dataset` refuses to load such a manifest rather than tokenizing every vowel to `<unk>`.
+3. Retrain Stage II (and Stage I if you use the repo's phoneme-CTC locator), then re-measure the LibriPhrase baseline before starting a new adaptation sweep.
 
 ## Validation
 

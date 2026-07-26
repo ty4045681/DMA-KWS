@@ -13,6 +13,7 @@ import numpy as np
 
 from dma_kws.g2p import clean_phoneme_tokens, has_stress_markers, make_g2p, text_to_phonemes
 from dma_kws.metrics import edit_distance
+from dma_kws.stage2.distances import phoneme_tokens_from_g2p
 from dma_kws.stage2.pairs import clip_to_audio_rel
 from dma_kws.tokenizer import unsupported_phones
 
@@ -171,13 +172,21 @@ def compute_hard_negatives_from_phonemes(
     *,
     top_k: int = DEFAULT_HARD_NEGATIVE_TOP_K,
 ) -> list[dict[str, str]]:
-    """Pick top-K confusable anchors by phoneme edit distance within the anchor set."""
-    anchor_tokens = anchor_g2p.split()
+    """Pick top-K confusable anchors by phoneme edit distance within the anchor set.
+
+    Stress is stripped before ranking, matching the ``recompute_distances``
+    path in ``dma_kws.stage2.distances``: confusability is about phone identity,
+    so ``AH0`` must not count as an edit against ``AH1`` even though the model
+    itself trains on the stress-marked symbols. Anchors that differ only in
+    stress therefore collapse to distance 0 and are skipped, exactly like the
+    zero-distance entries ``top_k_hard_negatives`` drops.
+    """
+    anchor_tokens = phoneme_tokens_from_g2p(anchor_g2p)
     scored: list[tuple[int, str]] = []
     for ngram, g2p in candidates:
         if ngram == anchor_ngram:
             continue
-        distance = edit_distance(anchor_tokens, g2p.split())
+        distance = edit_distance(anchor_tokens, phoneme_tokens_from_g2p(g2p))
         if distance <= 0:
             continue
         scored.append((distance, ngram))
@@ -200,11 +209,23 @@ def needs_g2p_recompute(df, *, force: bool = False, sample_size: int = 200) -> b
     return not any(has_stress_markers(value) for value in values)
 
 
+def has_g2p_text(row: dict[str, Any]) -> bool:
+    """True when a row carries a usable precomputed ``ngram_g2p`` string.
+
+    Missing cells read back as ``None`` or NaN, and NaN is truthy: without this
+    check such a row would be tokenized from the literal string ``"nan"``.
+    """
+    value = row.get("ngram_g2p")
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return False
+    return bool(str(value).strip())
+
+
 def _resolve_g2p(
     row: dict[str, Any], g2p: Any | None, *, recompute: bool = False
 ) -> tuple[str, list[str]]:
     text = str(row["ngram"])
-    if not recompute and row.get("ngram_g2p"):
+    if not recompute and has_g2p_text(row):
         phonemes = clean_phoneme_tokens(str(row["ngram_g2p"]).split())
     else:
         if g2p is None:
@@ -303,6 +324,11 @@ def build_anchor_metadata(
     rows: list[dict[str, str]] = []
     pending: list[dict[str, Any]] = []
     recompute_g2p = needs_g2p_recompute(df, force=force_g2p_recompute)
+    if recompute_g2p and g2p is None:
+        # Build the converter once: G2p() loads cmudict and a POS tagger, so
+        # letting _resolve_g2p construct one per anchor would dominate the
+        # runtime of the whole legacy-parquet migration.
+        g2p = make_g2p()
 
     for _, row in df.iterrows():
         text = str(row["ngram"])
@@ -310,6 +336,8 @@ def build_anchor_metadata(
         if not clips:
             continue
 
+        if g2p is None and not has_g2p_text(row):
+            g2p = make_g2p()
         g2p_text, _phonemes = _resolve_g2p(row, g2p, recompute=recompute_g2p)
         pending.append({"ngram": text, "ngram_g2p": g2p_text, "clips": clips, "distances": parse_distances(row.get("distances"))})
         if limit_anchors and len(pending) >= limit_anchors:
