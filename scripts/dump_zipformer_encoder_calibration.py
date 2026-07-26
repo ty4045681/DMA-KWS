@@ -233,6 +233,18 @@ def _resolve_random_shape(
     return tuple(int(dim) for dim in spec.shape)
 
 
+def _validate_feed(
+    session: Any,
+    feed_dict: Mapping[str, Any],
+    label: str = "",
+) -> None:
+    try:
+        session.run(None, feed_dict)
+    except Exception as exc:
+        prefix = f" ({label})" if label else ""
+        raise RuntimeError(f"ONNX Runtime validation failed{prefix}: {exc}") from exc
+
+
 def _make_random_array(
     spec: InputSpec,
     shape: tuple[int, ...],
@@ -260,14 +272,47 @@ def _make_random_array(
     raise ValueError(f"Random generation is unsupported for {spec.name!r}: {dtype}")
 
 
+def _is_state_input(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in ("cached_", "cache", "state", "embed_states"))
+
+
+def _make_safe_array(
+    spec: InputSpec,
+    shape: tuple[int, ...],
+    rng: np.random.Generator,
+    float_low: float,
+    float_high: float,
+    integer_low: int,
+    integer_high: int,
+    feature_time: int | None = None,
+) -> np.ndarray[Any, Any]:
+    lower_name = spec.name.lower()
+    if "processed_lens" in lower_name:
+        return np.zeros(shape, dtype=spec.numpy_dtype)
+    if _is_state_input(spec.name):
+        return np.zeros(shape, dtype=spec.numpy_dtype)
+    if feature_time is not None and any(
+        k in lower_name
+        for k in ("x_lens", "x_length", "feat_lengths", "feature_lengths", "feature_length")
+    ):
+        return np.full(shape, feature_time, dtype=spec.numpy_dtype)
+    return _make_random_array(
+        spec, shape, rng, float_low, float_high, integer_low, integer_high
+    )
+
+
 def write_random_samples(
     writer: CalibrationBinWriter,
+    session: Any,
     seed: int,
     shape_overrides: Mapping[str, tuple[int, ...]],
     float_low: float = -1.0,
     float_high: float = 1.0,
     integer_low: int = 0,
     integer_high: int = 32,
+    validate: bool = False,
+    safe: bool = False,
 ) -> None:
     if not float_low < float_high:
         raise ValueError("--float-low must be less than --float-high")
@@ -283,20 +328,60 @@ def write_random_samples(
         raise ValueError(f"Shape overrides contain unknown ONNX inputs: {unknown_overrides}")
 
     rng = np.random.default_rng(seed)
+
+    feature_time = None
+    if safe:
+        for spec in writer.input_specs:
+            if (
+                np.issubdtype(spec.numpy_dtype, np.floating)
+                and not _is_state_input(spec.name)
+                and "processed_lens" not in spec.name.lower()
+            ):
+                shape = shapes[spec.name]
+                if len(shape) >= 2:
+                    feature_time = int(shape[1])
+                    break
+
     while not writer.full:
-        feed_dict = {
-            spec.name: _make_random_array(
-                spec,
-                shapes[spec.name],
-                rng,
-                float_low=float_low,
-                float_high=float_high,
-                integer_low=integer_low,
-                integer_high=integer_high,
+        if safe:
+            feed_dict = {
+                spec.name: _make_safe_array(
+                    spec,
+                    shapes[spec.name],
+                    rng,
+                    feature_time=feature_time,
+                    float_low=float_low,
+                    float_high=float_high,
+                    integer_low=integer_low,
+                    integer_high=integer_high,
+                )
+                for spec in writer.input_specs
+            }
+        else:
+            feed_dict = {
+                spec.name: _make_random_array(
+                    spec,
+                    shapes[spec.name],
+                    rng,
+                    float_low=float_low,
+                    float_high=float_high,
+                    integer_low=integer_low,
+                    integer_high=integer_high,
+                )
+                for spec in writer.input_specs
+            }
+
+        if validate or safe:
+            _validate_feed(
+                session,
+                feed_dict,
+                label="safe" if safe else f"sample {writer.count:06d}",
             )
-            for spec in writer.input_specs
-        }
+
         writer.write(feed_dict)
+
+        if safe:
+            break
 
 
 def _load_session(model_path: Path) -> Any:
@@ -333,6 +418,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--float-high", type=float, default=1.0)
     parser.add_argument("--integer-low", type=int, default=0)
     parser.add_argument("--integer-high", type=int, default=32)
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Run session.run() on every generated/loaded feed before writing BINs",
+    )
+    parser.add_argument(
+        "--safe",
+        action="store_true",
+        help=(
+            "Crash-localization: generate one sample with cache/state tensors zero "
+            "and processed_lens=0, then validate"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -348,10 +446,14 @@ def main() -> int:
             print(f"{index:03d}  {node_arg.name}  {node_arg.type}  {node_arg.shape}")
         return 0
 
+    if args.safe and not args.random:
+        raise SystemExit("--safe must be used together with --random")
+
+    limit = 1 if args.safe else args.limit
     writer = CalibrationBinWriter.from_session(
         session,
         output_root=args.output_root,
-        limit=args.limit,
+        limit=limit,
     )
 
     if args.random:
@@ -359,25 +461,34 @@ def main() -> int:
             shape_overrides = _parse_shape_overrides(args.shape_overrides)
             write_random_samples(
                 writer,
+                session,
                 seed=args.seed,
                 shape_overrides=shape_overrides,
                 float_low=args.float_low,
                 float_high=args.float_high,
                 integer_low=args.integer_low,
                 integer_high=args.integer_high,
+                validate=args.validate,
+                safe=args.safe,
             )
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RuntimeError) as exc:
             raise SystemExit(str(exc)) from exc
     elif args.npz_dir is not None:
         npz_files = sorted(args.npz_dir.glob("*.npz"))
         if not npz_files:
             raise SystemExit(f"No .npz feed snapshots found in: {args.npz_dir}")
 
-        for npz_path in npz_files:
-            if writer.full:
-                break
-            with np.load(npz_path, allow_pickle=False) as snapshot:
-                writer.write({name: snapshot[name] for name in snapshot.files})
+        try:
+            for npz_path in npz_files:
+                if writer.full:
+                    break
+                with np.load(npz_path, allow_pickle=False) as snapshot:
+                    feed_dict = {name: snapshot[name] for name in snapshot.files}
+                    if args.validate:
+                        _validate_feed(session, feed_dict, label=str(npz_path))
+                    writer.write(feed_dict)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise SystemExit(str(exc)) from exc
     else:
         raise SystemExit("Choose --random or --npz-dir when --output-root is set")
 
