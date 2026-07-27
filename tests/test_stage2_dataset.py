@@ -82,12 +82,32 @@ def test_dataset_getitem_returns_expected_keys_and_seq_label_length(mock_npy_loa
 
     sample = dataset[0]
 
-    assert set(sample.keys()) == {"anchor_seq", "feat", "label", "seq_label"}
+    assert set(sample.keys()) == {"anchor_seq", "query_seq", "feat", "label", "seq_label"}
     assert sample["anchor_seq"].dtype == torch.long
+    assert sample["query_seq"].dtype == torch.long
     assert sample["feat"].shape == (5, 80)
     assert sample["label"].dtype == torch.long
     assert sample["seq_label"].dtype == torch.long
     assert sample["seq_label"].numel() == sample["anchor_seq"].numel()
+
+
+def test_positive_pair_query_seq_matches_anchor(mock_npy_loader):
+    """``query_seq`` describes the clip in ``feat``, so a positive pair repeats
+    the anchor while a negative pair must not. Supervising the auxiliary CTC loss
+    with the anchor instead would teach the trunk the wrong transcript on every
+    negative."""
+    dataset = LibriPhraseTrainDataset(
+        wav_dir="/data/segments",
+        tokenizer=_FakeTokenizer(),
+        df=_mock_dataframe(),
+        sample_lens=1,
+        seed=1,
+    )
+
+    sample = dataset[0]
+
+    assert sample["label"].item() == 1
+    assert sample["query_seq"].tolist() == sample["anchor_seq"].tolist()
 
 
 def test_dataset_positive_sample_has_matching_seq_label(mock_npy_loader):

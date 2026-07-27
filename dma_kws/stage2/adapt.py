@@ -123,6 +123,11 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         )
         for param in self.parameters():
             param.requires_grad = False
+        # The phoneme adapter trunk is part of the shared Stage I/II forward
+        # pass; letting LoRA move it would break the premise that both stages
+        # read one encoder pass. Freeze it and turn off the auxiliary CTC loss.
+        self.freeze_adapter = self.adapter is not None
+        self.ctc_weight = 0.0
 
         self.lora_injected = inject_qbyt_lora(
             self.qbyt,

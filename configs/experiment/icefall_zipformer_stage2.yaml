@@ -38,14 +38,36 @@ stage1:
 stage2:
   # Encoder output dimension = max(encoder_dim) = 128 from icefall config
   encoder_output_dim: 128
-  qbyt_embed_dim: 128  # Must match encoder_output_dim for alignment
+  qbyt_embed_dim: 128
   qbyt_layers: 2
+
+  # Phoneme CTC trunk from Step A (scripts/train_ctc_adapter.py).
+  #
+  # Off by default so this config still reproduces the pre-adapter baseline that
+  # the adapter runs are compared against. Turn it on together with an
+  # init_checkpoint; leaving it enabled with a randomly initialized trunk throws
+  # away the frozen encoder's representation for no reason.
+  #
+  # B1: freeze=true,  ctc_weight=0.0  - trunk fixed after Step A, only QbyT trains
+  # B2: freeze=false, ctc_weight=0.2  - trunk keeps training, CTC holds it in
+  #     phoneme space against the two BCE terms
+  phoneme_adapter:
+    enabled: false
+    init_checkpoint: ""
+    freeze: false
+    ctc_weight: 0.2
+    trunk:
+      type: conv
+      output_dim: 192
+      num_layers: 2
+      kernel_size: 7
+      dropout: 0.1
 
   # Load weights from icefall KWS checkpoint
   # Set via env var at runtime: export ICEFALL_CHECKPOINT=/path/to/checkpoint.pt
   init_checkpoint: ${oc.env:ICEFALL_CHECKPOINT,""}
 
-  # Freeze encoder, train only QbyT
+  # Freeze encoder, train only QbyT (+ the adapter trunk when it is enabled)
   freeze_encoder: true
 
   parquet_file: ${paths.processed_root}/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet

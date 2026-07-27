@@ -31,6 +31,7 @@ This repository implements a two-stage keyword spotting pipeline with a **single
 7. [Stage II: train QbyT verifier](#7-stage-ii-train-qbyt-verifier)
 7b. [Stage II: initialize from external Wenet ASR encoder](#7b-stage-ii-initialize-from-external-wenet-asr-encoder)
 7c. [Stage II: initialize from Icefall Zipformer encoder](#7c-stage-ii-initialize-from-icefall-zipformer-encoder)
+7d. [Phoneme CTC adapter on a frozen encoder](#7d-phoneme-ctc-adapter-on-a-frozen-encoder)
 8. [Stage II LoRA continual adaptation](#8-stage-ii-lora-continual-adaptation)
 9. [Run the two-stage demo](#9-run-the-two-stage-demo)
 10. [Stage II-only clip inference](#10-stage-ii-only-clip-inference)
@@ -48,7 +49,8 @@ This repository implements a two-stage keyword spotting pipeline with a **single
 | Term | Meaning |
 |------|---------|
 | **experiment** | Hydra config overlay selected on the CLI, e.g. `+experiment=demo_librispeech100` |
-| **recipe** | `training.recipe` label for multi-phase Stage II chains: `init-ls-460`, `ft-ls-gs-1460`, `frozen-wenet-encoder`, `wenet-asr-init`, `icefall-zipformer-frozen` |
+| **recipe** | `training.recipe` label for multi-phase Stage II chains: `init-ls-460`, `ft-ls-gs-1460`, `frozen-wenet-encoder`, `wenet-asr-init`, `icefall-zipformer-frozen`, `phoneme-adapter-ctc`, `icefall-zipformer-frozen-adapter` |
+| **trunk** | The trainable module the phoneme CTC loss and QbyT share on top of a frozen encoder — see [§7d](#7d-phoneme-ctc-adapter-on-a-frozen-encoder) |
 | **demo preset** | Scale-only experiment (`demo_librispeech100`) — same algorithm as the paper, smaller data and step counts |
 
 Do not overload "recipe" to mean the whole codebase; the repo is one shared pipeline with multiple experiment/recipe presets.
@@ -82,6 +84,7 @@ Or edit `paths:` in `configs/experiment/<name>.yaml` or `configs/paths/default.y
 | Script | Use |
 |--------|-----|
 | `scripts/train_stage2_qbyt.py` | Demo single-phase training, Wenet ASR encoder init (`wenet_asr_stage2`, §7b), and Icefall Zipformer encoder init (`icefall_zipformer_stage2`, §7c) |
+| `scripts/train_ctc_adapter.py` | Step A for a frozen encoder: train the phoneme CTC trunk that Stage II then reads; see [§7d](#7d-phoneme-ctc-adapter-on-a-frozen-encoder) |
 | `scripts/train_stage2_recipe.py` | Paper multi-phase chain only: `init-ls-460`, `ft-ls-gs-1460`, `frozen-wenet-encoder` |
 | `scripts/adapt_stage2_keyword.py` | Stage II LoRA continual adaptation for a user keyword (phoneme matcher QKV); see [§8](#8-stage-ii-lora-continual-adaptation) |
 | `scripts/run_keyword_adaptation.py` | One-command prepare → sweep → train → eval for keyword adaptation; see [§8](#8-stage-ii-lora-continual-adaptation) |
@@ -112,6 +115,7 @@ Outputs land under `exp/stage2_adapt/<slug>/` (`adapter_<slug>.pt`, merged `stag
 | `run.resume_from` | Lightning `.ckpt` | Full training-state resume (weights, optimizer, scheduler, step) |
 | `run.init_checkpoint` / `stage2.init_checkpoint` | Exported `.pt` | Weight-only seed for a **new** run (e.g. Stage I encoder → Stage II, or external Wenet ASR) |
 | `stage2.resume_checkpoint` | `.ckpt` or exported weights | Weight seed for finetune from prior Stage II average (`avg_10.ckpt`) |
+| `stage2.phoneme_adapter.init_checkpoint` | Exported `.pt` | Step A trunk weights (`adapter_step*.pt`); loaded with `strict=True` — see [§7d](#7d-phoneme-ctc-adapter-on-a-frozen-encoder) |
 
 Exported weight files use names like `stage1_step000020.pt` and `stage2_step000020.pt`. Stage I training also writes `stage1_avg.pt` when `stage1.checkpoint_avg.enabled=true` (demo default).
 
@@ -137,6 +141,10 @@ LibriPhrase (paper-format parquet + precomputed fbank .npy)
   -> Stage II Conformer + QbyT training
      demo: single phase (train_stage2_qbyt.py)
      paper: init -> avg -> finetune chain only (train_stage2_recipe.py)
+
+Frozen external encoder (optional, §7d)
+  -> Step A: phoneme CTC trunk on the frozen encoder (train_ctc_adapter.py)
+  -> Step B: QbyT reads the trunk instead of the raw encoder output
 
 User keyword (optional, after SI Stage II)
   -> LoRA on QbyT matcher, TTS -> real, LibriPhrase 1:1 mix
@@ -166,6 +174,8 @@ Default Stage I is the trained phoneme-CTC model. You can swap it for external l
 
 `+experiment=icefall_zipformer_stage2` seeds the Stage II **encoder** from an Icefall Zipformer KWS checkpoint (requires `ICEFALL_ROOT` + `ICEFALL_CHECKPOINT` env vars). The Conformer encoder is replaced by Icefall's `Zipformer2`; `freeze_encoder=true` by default so only the QbyT head is trained — see [§7c](#7c-stage-ii-initialize-from-icefall-zipformer-encoder).
 
+An external transducer/BPE encoder was never trained against a phoneme target, so QbyT's phoneme text embedding has nothing comparable to match against. `stage2.phoneme_adapter` inserts a small phoneme-CTC-supervised trunk between the frozen encoder and QbyT so both read the same tensor — off by default, see [§7d](#7d-phoneme-ctc-adapter-on-a-frozen-encoder).
+
 Main entry points:
 
 ```text
@@ -179,6 +189,7 @@ scripts/recompute_stage2_distances.py  # phoneme hard-negative distances from g2
 scripts/prepare_stage2_libriphrase.py  # alias for prepare_stage2_paper.py
 scripts/prepare_stage2_eval_fbank.py   # precompute LibriPhrase eval fbank .npy for Stage II validation
 scripts/train_stage2_qbyt.py           # demo + wenet-asr-init (single phase)
+scripts/train_ctc_adapter.py           # Step A: phoneme CTC trunk on a frozen encoder (§7d)
 scripts/train_stage2_recipe.py         # paper multi-phase chain only
 scripts/prepare_keyword_adaptation.py  # keyword LoRA: fbank + manifests (§8)
 scripts/adapt_stage2_keyword.py        # keyword LoRA: per-phase training (§8)
@@ -193,7 +204,7 @@ scripts/run_two_stage_demo.py
 
 The repo vendors the Wenet toolkit under `wenet/` for encoder/tokenizer utilities. The legacy `qbyt/` reference scripts are not used by the Hydra training pipeline.
 
-Paper-scale configs: `+experiment=paper_ls460`, `+experiment=paper_ls_gs1460`, `+experiment=frozen_wenet_encoder`. Wenet ASR encoder init preset: `+experiment=wenet_asr_stage2`. Icefall Zipformer encoder init preset: `+experiment=icefall_zipformer_stage2`. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
+Paper-scale configs: `+experiment=paper_ls460`, `+experiment=paper_ls_gs1460`, `+experiment=frozen_wenet_encoder`. Wenet ASR encoder init preset: `+experiment=wenet_asr_stage2`. Icefall Zipformer encoder init preset: `+experiment=icefall_zipformer_stage2`. Phoneme CTC adapter presets: `+experiment=ctc_adapter_icefall` (Step A), `+experiment=icefall_zipformer_stage2_adapter` (Step B). See [docs/paper-reproduction.md](docs/paper-reproduction.md) for the full recipe chain.
 
 Configs use [Hydra](https://hydra.cc/): base groups live under `configs/` (paths, stage1, stage2, …) and experiments are overlays in `configs/experiment/`. Select one with `+experiment=<name>` and override any leaf with dotlist syntax, e.g. `run.devices=2 run.limit_steps=20 stage2.learning_rate=0.001`.
 
@@ -482,7 +493,7 @@ data/dma-kws/processed/stage1_phoneme_ctc/train.jsonl
 data/dma-kws/processed/stage1_phoneme_ctc/dev.jsonl
 ```
 
-Manifests include `phonemes_g2p` targets for Wenet `CharTokenizer` — a phoneme vocabulary over `data/dict/lang_char.txt` (stress-marked ARPAbet: `AH0`, `AH1`, `AH2` are three distinct symbols).
+Manifests include `phonemes_g2p` targets for Wenet `CharTokenizer` — a phoneme vocabulary over `data/dict/lang_char.txt` (stress-marked ARPAbet: `AH0`, `AH1`, `AH2` are three distinct symbols). `validate_lang_char_dict` enforces the whole contract on load: exactly 71 tokens, contiguous ids `0-70`, the full stress-marked inventory present, and `<blank>` at id 0 — the last because every CTC consumer here (Stage I, the `phoneme_ctc` locator, `collapse_ctc`, the search helpers, the §7d adapter) hardcodes blank 0.
 
 If the smoke run works, prepare the full LibriSpeech-100 split:
 
@@ -983,7 +994,8 @@ Notes:
 
 - The Icefall encoder adapter (`dma_kws/stage2/icefall_encoder.py`) exposes the same `forward(feat, feat_lengths) → (encoder_out, encoder_mask)` interface as the Wenet Conformer, so the rest of the Stage II training pipeline is unchanged.
 - QbyT still uses the phoneme CharTokenizer at `data/dict/lang_char.txt`.
-- Default encoder output dimension is `max(encoder_dim) = 128` (Zipformer KWS recipe default), aligned with `stage2.qbyt_embed_dim: 128` — no extra projection layer is needed.
+- Default encoder output dimension is `max(encoder_dim) = 128` (Zipformer KWS recipe default). `stage2.qbyt_embed_dim` does **not** have to match it: `QbyT.audio_projection` is `Linear(encoder_output_size, embed_dim)`, which is also what lets the [§7d](#7d-phoneme-ctc-adapter-on-a-frozen-encoder) trunk change the width.
+- This preset trains QbyT directly on the frozen encoder output. That output lives in the space a BPE transducer objective produced, not a phoneme space, so the single `audio_projection` layer carries the whole cross-space mapping under utterance/sequence BCE supervision only. [§7d](#7d-phoneme-ctc-adapter-on-a-frozen-encoder) is the alternative that adds phoneme CTC supervision to that mapping.
 - `causal` must match the checkpoint. The `icefall_zipformer_stage2` preset sets `causal: true` for the target KWS checkpoint; override it only when loading a checkpoint trained with `--causal=false`. Flipping it swaps `ChunkCausalDepthwiseConv1d` for a plain `nn.Conv1d`, and because the icefall state dict is loaded with `strict=False` the convolution weights would be dropped silently.
 - Online Stage II verification uses the same Hydra fbank profile as precomputation and resamples the full validation waveform before slicing candidate spans.
 - On startup, look for `Loaded encoder_embed weights from ...: missing=N unexpected=M` and `Loaded encoder weights from ...`. Both counts should be low. High unexpected counts usually mean a config mismatch (wrong `encoder_dim`, `num_encoder_layers`, etc.).
@@ -1031,6 +1043,115 @@ done
 **Migration.** `stage1.chunk_size` / `stage1.left_context_frames` were removed; setting either raises with the replacement snippet. Previous runs left the encoder on icefall's `16,32,64,-1` list in *all* phases, so their metrics are a mixture over randomly drawn operating points and are not comparable with post-migration numbers — re-measure your baseline before starting a new sweep.
 
 Known gaps that a fixed operating point does **not** close: training and eval encode isolated clips, so the first chunk has no left context and the clip always starts on a chunk boundary, whereas a streaming deployment carries real preceding audio and an arbitrary chunk phase. `Stage2Verifier` also crops the waveform and re-encodes, while a shared streaming encoder would slice already-computed output frames.
+
+---
+
+## 7d. Phoneme CTC adapter on a frozen encoder
+
+Optional addition to §7c. **Off by default** (`stage2.phoneme_adapter.enabled: false`), so §7c reproduces unchanged and stays the baseline any adapter run is compared against.
+
+### Why
+
+QbyT's text branch is `nn.Embedding` over the 71-symbol phoneme table, so the audio it is matched against has to live in a comparable space. In the paper that came free: the Stage I encoder was trained with phoneme CTC, so its frames are already phoneme-discriminative. An Icefall Zipformer KWS encoder was trained with a **transducer/BPE** objective instead, and §7c hands QbyT its raw output — the entire cross-space mapping then rests on one `Linear` layer supervised only by the two BCE terms.
+
+That supervision is weak in a specific way: `seq_label` is per-anchor-phoneme **set membership** (`build_seq_label` in `dma_kws/tokenizer.py`), with no ordering, position or count information. Nothing in the objective forces compositional phoneme matching over whole-phrase acoustic templates, and the latter does not generalize to unseen keywords.
+
+The fix is a trunk that the CTC loss and QbyT **share**:
+
+```text
+frozen encoder ──▶ h = trunk(encoder_out)      <- the only shared trainable module
+                        ├─▶ Linear(d, 71) ──▶ CTC loss        (Step A, and optionally Step B)
+                        └─▶ QbyT ──────────▶ utt BCE + seq BCE
+```
+
+A CTC head bolted on as a **separate branch** would not do this. It would only give Stage I phoneme search; QbyT would still read the untouched encoder output and the cross-space problem would be exactly where it was.
+
+### Step A — train the trunk
+
+```bash
+export ICEFALL_ROOT=/path/to/icefall
+export ICEFALL_CHECKPOINT=/path/to/zipformer_kws.pt
+
+python3 scripts/train_ctc_adapter.py +experiment=ctc_adapter_icefall
+```
+
+Reuses the Stage I manifests from `scripts/prepare_stage1_librispeech.py` (`${paths.processed_root}/stage1_phoneme_ctc/{train,dev}.jsonl`); no new data prep. Validates with `val/per` on the dev manifest and exports `adapter_step*.pt` to `phoneme_adapter.checkpoint_dir` — the presets give each trunk its own subdirectory (`${paths.exp_root}/phoneme_adapter/checkpoints/{conv,linear,mlp,conformer}/`) so the control runs do not overwrite each other.
+
+A dev manifest is required, not optional: `val/per` on the frozen representation is the only signal that says which trunk to use.
+
+The encoder is frozen and forced into `eval()`. That is not cosmetic: `use_icefall_dropout_schedule` builds a `ScheduledFloat((0,0.3),(20000,0.1))` and icefall's `set_batch_count()` is never called here, so a train-mode encoder would leave dropout pinned at `0.3` and the trunk would learn against a representation the deployed encoder never produces.
+
+**Features must be the same profile as Stage II.** The runner forces `FbankExtractor` with the resolved `fbank:` group, and `ctc_adapter_icefall` overrides that group to `icefall_kws`. Do not substitute `scripts/prepare_stage1_fbank.py` output here: `dma_kws/audio.py:extract_fbank` calls `kaldi.fbank(waveform, …)` while `FbankExtractor` calls `kaldi.fbank(waveform * (1 << 15), …)`, a 32768× amplitude difference on top of differing `dither`/`snip_edges`.
+
+### Trunk types
+
+`phoneme_adapter.trunk.type` selects how much temporal context the trunk has. `linear` and `mlp` are pointwise — they re-mix channels within a frame but cannot move evidence between frames, which is what an RNN-T-trained encoder needs because transducer emission is systematically delayed relative to the acoustics.
+
+| `trunk.type` | Structure | Purpose | Preset |
+|---|---|---|---|
+| `linear` | `Linear(128, d)` | Control: how linearly separable phonemes already are | `+experiment=ctc_adapter_probe_linear` |
+| `mlp` | `Linear → LayerNorm → SiLU → Linear` | Control: separates "needs capacity" from "needs context" | `+experiment=ctc_adapter_probe_mlp` |
+| `conv` | N × depthwise-separable conv + residual | **Default.** Has a receptive field | `+experiment=ctc_adapter_icefall` |
+| `conformer` | 1–2 Wenet Conformer blocks | Expressiveness upper bound | `+experiment=ctc_adapter_probe_conformer` |
+
+`conv` padding follows `stage1.causal`: left-only when causal, so the trunk cannot train with lookahead the streaming deployment has no way to provide. For a `conformer` trunk on a causal encoder, `trunk.chunk_size` is **required** (units are trunk-input frames, i.e. encoder output frames at 25 Hz) — unrestricted attention there would be the same silent lookahead, so it raises instead of defaulting.
+
+### Step B — Stage II reads the trunk
+
+```bash
+python3 scripts/train_stage2_qbyt.py \
+  +experiment=icefall_zipformer_stage2_adapter \
+  stage2.phoneme_adapter.init_checkpoint=/path/to/adapter_step060000.pt \
+  run.devices=2
+```
+
+Two modes:
+
+| Mode | Config | Behaviour |
+|---|---|---|
+| **B1** | `freeze: true`, `ctc_weight: 0.0` | Trunk fixed after Step A; only QbyT trains. Reproducible, cache-friendly |
+| **B2** | `freeze: false`, `ctc_weight: 0.2` | Trunk keeps training, with CTC holding it in phoneme space against the two BCE terms. Preset default |
+
+B2's CTC target is each clip's **own** phoneme sequence (`query_seq`), not the anchor's — for a negative pair the audio is a different phrase, so supervising with the anchor would teach the trunk the wrong transcript. Samples whose label is longer than their frame count are dropped and counted in `train/ctc_skipped`; at 25 Hz a 0.5 s clip has only ~12 frames, so watch that counter. A high skip rate means the auxiliary loss only ever sees the long clips.
+
+`trunk.*` in Step B must match what Step A trained. The checkpoint loads with `strict=True`, and the recorded `blank_id` is compared, so a mismatch fails at construction rather than scoring against a space CTC never supervised.
+
+### LoRA (§8) with an adapter
+
+Set `stage2.phoneme_adapter.enabled=true` and mirror the trunk shape. The trunk stays frozen with `ctc_weight: 0.0` during adaptation — it is part of the forward pass Stage I and Stage II share, so letting LoRA move it would break the single-encoder-pass premise.
+
+### Adapter config keys
+
+Step A reads the top-level `phoneme_adapter:` group (`configs/phoneme_adapter/default.yaml`); Step B reads `stage2.phoneme_adapter:`. The `trunk` block has the same shape in both and must agree.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `phoneme_adapter.init_checkpoint` | `""` | Icefall/Stage I checkpoint the frozen encoder starts from |
+| `phoneme_adapter.train_manifest` / `.dev_manifest` | `""` | Empty → `${paths.processed_root}/stage1_phoneme_ctc/{train,dev}.jsonl` |
+| `phoneme_adapter.trunk.type` | `conv` | `linear` / `mlp` / `conv` / `conformer` |
+| `phoneme_adapter.trunk.output_dim` | `192` | Trunk width; becomes QbyT's `encoder_output_size` |
+| `phoneme_adapter.trunk.num_layers` | `2` | Blocks (`conv`) or Conformer layers |
+| `phoneme_adapter.trunk.kernel_size` | `7` | Conv kernel (`conv`) or CNN module kernel (`conformer`) |
+| `phoneme_adapter.trunk.chunk_size` | `0` | `conformer` only, in 25 Hz frames; **required** when `stage1.causal` |
+| `phoneme_adapter.trunk.left_context_chunks` | `-1` | `conformer` only; `<0` = all left chunks |
+| `phoneme_adapter.expose_posterior` | `false` | Concatenate CTC log-posteriors onto the QbyT input (ablation) |
+| `phoneme_adapter.checkpoint.every_n_train_steps` | `2000` | Must be a multiple of the validation interval |
+| `stage2.phoneme_adapter.enabled` | `false` | Insert the trunk between encoder and QbyT |
+| `stage2.phoneme_adapter.init_checkpoint` | `""` | Step A `adapter_step*.pt`; `strict=True` |
+| `stage2.phoneme_adapter.freeze` | `false` | `true` = B1 |
+| `stage2.phoneme_adapter.ctc_weight` | `0.0` | Auxiliary CTC weight; `0.0` reproduces the pre-adapter loss exactly |
+
+### What to measure
+
+`val/per` picks the trunk; it does not by itself say whether the adapter is worth keeping. The decision metric is Stage II **LibriPhrase `hard` AUC/EER against the §7c baseline checkpoint**, since `enabled=false` is always available as the fallback.
+
+### Notes
+
+- Feed QbyT the trunk hidden state, not the 71-dim posteriors. `expose_posterior: true` concatenates `[h ; log_softmax]` as an ablation, but a posteriorgram alone is a hard information bottleneck and its blank-dominated peaks are a poor dense sequence representation.
+- With `ctc_weight: 0.0` the CTC projection is frozen and skipped in the forward pass. It stays in the state dict so checkpoints load strictly, but leaving it trainable would make DDP abort — a parameter that requires grad and never receives one fails the reduction check unless `find_unused_parameters` happens to be on.
+- Loading a checkpoint that was supposed to carry trunk weights but does not raises. A random trunk is only accepted when no checkpoint was given at all (training the trunk from scratch inside Stage II is a legitimate variant).
+- `data/dict/lang_char.txt` must keep `<blank>` at id 0; `validate_lang_char_dict` now enforces it, because every CTC consumer here hardcodes it.
+- `phoneme_adapter.checkpoint.every_n_train_steps` must be a multiple of the validation interval, otherwise `ModelCheckpoint` cannot read `val/per` at save time and silently stops writing a best checkpoint.
 
 ---
 

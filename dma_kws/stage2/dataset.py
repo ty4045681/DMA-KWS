@@ -175,6 +175,10 @@ class LibriPhraseTrainDataset(Dataset):
 
         return {
             "anchor_seq": torch.tensor(anchor_seq, dtype=torch.long),
+            # The clip's own phoneme sequence, kept so the auxiliary CTC loss can
+            # supervise the adapter trunk. For negatives this differs from the
+            # anchor, which is precisely why it has to be carried separately.
+            "query_seq": torch.tensor(query_seq, dtype=torch.long),
             "feat": feats,
             "label": torch.tensor(label, dtype=torch.long),
             "seq_label": torch.tensor(seq_label, dtype=torch.long),

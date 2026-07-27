@@ -91,6 +91,15 @@ stage2:
   gradient_diagnostics:
     enabled: false
 
+  # If the base checkpoint was trained with the phoneme adapter, set enabled=true
+  # and mirror the trunk shape here. The trunk stays frozen with no auxiliary CTC
+  # during adaptation: it is part of the forward pass Stage I and Stage II share,
+  # so letting LoRA move it would break the single-encoder-pass premise.
+  phoneme_adapter:
+    enabled: false
+    freeze: true
+    ctc_weight: 0.0
+
   # Adaptation writes its own adapter/merged weights at the end of each phase,
   # so Lightning checkpoints are only a crash-safety net here.
   checkpoint:

@@ -14,7 +14,7 @@ from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.pathing import resolve_dict_path
 from dma_kws.stage2.collate import test_collate_fn
 from dma_kws.stage2.dataset import LibriPhraseEvalDataset, resolve_stage2_eval_paths
-from dma_kws.stage2.module import Stage2LightningModule
+from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
 from dma_kws.tokenizer import load_char_tokenizer
 from dma_kws.training.checkpoint_io import extract_state_dict
 from dma_kws.training.device import resolve_accelerator
@@ -32,6 +32,7 @@ def _load_model(config: dict, checkpoint_path: Path, vocab_size: int) -> Stage2L
         state = checkpoint.get("state_dict", checkpoint)
 
     missing, unexpected = model.load_state_dict(state, strict=False)
+    assert_adapter_weights_loaded(model, missing)
     if missing:
         print(f"Warning: missing keys when loading checkpoint: {len(missing)}")
     if unexpected:

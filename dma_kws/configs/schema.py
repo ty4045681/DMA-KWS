@@ -167,6 +167,41 @@ class Stage1Config:
 
 
 @dataclass
+class AdapterTrunkConfig:
+    """Shape of the trainable trunk that sits on the frozen encoder.
+
+    ``type`` selects how much temporal context the trunk can use:
+    ``linear``/``mlp`` are pointwise probes kept for the representation-quality
+    control experiments, while ``conv``/``conformer`` can move evidence across
+    frames, which is what a transducer-trained encoder needs (RNN-T emission is
+    systematically delayed relative to the acoustics).
+    """
+
+    type: str = "conv"
+    output_dim: int = 192
+    num_layers: int = 2
+    kernel_size: int = 7
+    dropout: float = 0.1
+    #: ``conformer`` trunk only, in trunk-input frames (the encoder's own output
+    #: rate, 25 Hz for the icefall KWS Zipformer). Required when the encoder is
+    #: causal: leaving attention unrestricted there would give the trunk
+    #: unlimited lookahead that the deployed pipeline cannot provide.
+    chunk_size: int = 0
+    #: ``conformer`` trunk only. <0 means all left chunks.
+    left_context_chunks: int = -1
+    #: ``conformer`` trunk only.
+    attention_heads: int = 4
+    linear_units: int = 512
+
+
+@dataclass
+class PhonemeAdapterValidationConfig:
+    val_check_interval: int = 2000
+    num_decode_batches: int = 20
+    batch_size: int = 32
+
+
+@dataclass
 class Stage2DataloaderConfig:
     pin_memory: bool = True
     persistent_workers: bool = True
@@ -258,6 +293,68 @@ class Stage2PrepConfig:
 
 
 @dataclass
+class PhonemeAdapterConfig:
+    """Step A: train a phoneme-CTC trunk on top of a frozen encoder."""
+
+    trunk: AdapterTrunkConfig = field(default_factory=AdapterTrunkConfig)
+    ctc_dropout: float = 0.0
+    #: Concatenate the CTC log-posteriors onto the trunk output handed to Stage II.
+    #: Off by default: the 71-dim posteriorgram is a hard information bottleneck
+    #: and its blank-dominated peaks are a poor dense sequence representation.
+    expose_posterior: bool = False
+    #: Icefall (or Stage I) checkpoint the frozen encoder is initialized from.
+    init_checkpoint: str = ""
+    train_manifest: str = ""
+    dev_manifest: str = ""
+    batch_size_per_gpu: int = 32
+    num_workers: int = 4
+    max_steps: int = 60000
+    learning_rate: float = 1e-3
+    optimizer: str = "adamw"
+    weight_decay: float = 0.01
+    warmup_steps: int = 500
+    total_scheduler_steps: int = 60000
+    accumulate_grad_batches: int = 1
+    precision: str = ""
+    strategy: str = "auto"
+    find_unused_parameters: bool = False
+    gradient_clip_val: float = 5.0
+    log_interval: int = 50
+    val_check_interval: int = 2000
+    checkpoint_dir: str = ""
+    log_dir: str = ""
+    run_name: str = "phoneme_adapter_ctc"
+    dataloader: Stage2DataloaderConfig = field(default_factory=Stage2DataloaderConfig)
+    validation: PhonemeAdapterValidationConfig = field(
+        default_factory=PhonemeAdapterValidationConfig
+    )
+    logging: Stage2LoggingConfig = field(default_factory=Stage2LoggingConfig)
+    checkpoint: Stage2CheckpointConfig = field(default_factory=Stage2CheckpointConfig)
+
+
+@dataclass
+class Stage2PhonemeAdapterConfig:
+    """Stage II wiring for the Step A trunk.
+
+    Disabled by default so existing checkpoints keep loading and the pre-adapter
+    baseline stays reproducible.
+    """
+
+    enabled: bool = False
+    #: Step A ``.pt`` used to initialize the trunk when the Stage II checkpoint
+    #: does not already carry ``adapter.*`` weights.
+    init_checkpoint: str = ""
+    #: B1 (frozen trunk) vs B2 (trunk trained jointly with an auxiliary CTC loss).
+    freeze: bool = False
+    #: Weight of the auxiliary CTC loss in Stage II. 0.0 reproduces the
+    #: pre-adapter loss exactly.
+    ctc_weight: float = 0.0
+    trunk: AdapterTrunkConfig = field(default_factory=AdapterTrunkConfig)
+    ctc_dropout: float = 0.0
+    expose_posterior: bool = False
+
+
+@dataclass
 class Stage2Config:
     encoder_output_dim: int = 144
     qbyt_embed_dim: int = 128
@@ -297,6 +394,9 @@ class Stage2Config:
     checkpoint: Stage2CheckpointConfig = field(default_factory=Stage2CheckpointConfig)
     gradient_diagnostics: Stage2GradientDiagnosticsConfig = field(default_factory=Stage2GradientDiagnosticsConfig)
     prep: Stage2PrepConfig = field(default_factory=Stage2PrepConfig)
+    phoneme_adapter: Stage2PhonemeAdapterConfig = field(
+        default_factory=Stage2PhonemeAdapterConfig
+    )
 
 
 @dataclass
@@ -436,6 +536,7 @@ class DMAKWSConfig:
     fbank: FbankConfig = field(default_factory=FbankConfig)
     stage1: Stage1Config = field(default_factory=Stage1Config)
     stage2: Stage2Config = field(default_factory=Stage2Config)
+    phoneme_adapter: PhonemeAdapterConfig = field(default_factory=PhonemeAdapterConfig)
     demo: DemoConfig = field(default_factory=DemoConfig)
     run: RunConfig = field(default_factory=RunConfig)
     adapt: AdaptConfig = field(default_factory=AdaptConfig)

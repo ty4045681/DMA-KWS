@@ -40,6 +40,27 @@ def test_validate_lang_char_dict_rejects_non_contiguous_ids(tmp_path):
         validate_lang_char_dict(broken)
 
 
+def test_validate_lang_char_dict_rejects_non_zero_blank(tmp_path):
+    """Every CTC consumer here hardcodes blank 0 (Stage I, the phoneme_ctc
+    locator, collapse_ctc, the search helpers, the adapter default), so a dict
+    that merely *contains* <blank> is not enough."""
+    lines = CANONICAL_DICT_PATH.read_text(encoding="utf-8").splitlines()
+    swapped = []
+    for line in lines:
+        if line.startswith("<blank> "):
+            swapped.append("<blank> 1")
+        elif line.startswith("<unk> "):
+            swapped.append("<unk> 0")
+        else:
+            swapped.append(line)
+
+    broken = tmp_path / "lang_char.txt"
+    broken.write_text("\n".join(swapped), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="<blank> must have id 0"):
+        validate_lang_char_dict(broken)
+
+
 def test_validate_lang_char_dict_rejects_missing_special_tokens(tmp_path):
     canonical = CANONICAL_DICT_PATH.read_text(encoding="utf-8").splitlines()
     broken_lines = [line for line in canonical if not line.startswith("<unk> ")]

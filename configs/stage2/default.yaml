@@ -18,6 +18,23 @@ gradient_clip_val: 1.0
 log_interval: 10
 val_check_interval: 1000
 freeze_encoder: false
+
+# Phoneme-CTC trunk between the frozen encoder and QbyT (see configs/phoneme_adapter).
+# Off by default so pre-adapter checkpoints keep loading and stay comparable.
+phoneme_adapter:
+  enabled: false
+  init_checkpoint: ""
+  freeze: false
+  ctc_weight: 0.0
+  ctc_dropout: 0.0
+  expose_posterior: false
+  trunk:
+    type: conv
+    output_dim: 192
+    num_layers: 2
+    kernel_size: 7
+    dropout: 0.1
+
 checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints
 log_dir: ${paths.exp_root}/stage2_qbyt/logs
 run_name: stage2_qbyt

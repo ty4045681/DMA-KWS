@@ -29,6 +29,13 @@ def train_collate_fn(batch: list[dict]) -> dict:
         "seq_label": padded_seq_labels,
         "seq_label_mask": seq_label_mask,
     }
+    if "query_seq" in batch[0]:
+        # Phoneme sequence of the clip that is actually in ``feat``. For negative
+        # pairs that is a different phrase than ``anchor``, so the auxiliary CTC
+        # loss must use this and not the anchor.
+        query_seqs = [item["query_seq"] for item in batch]
+        out["query_seq"] = pad_sequence(query_seqs, batch_first=True, padding_value=0)
+        out["query_lengths"] = torch.tensor([seq.size(0) for seq in query_seqs])
     if "source" in batch[0]:
         out["source"] = torch.tensor([int(item["source"]) for item in batch])
     return out

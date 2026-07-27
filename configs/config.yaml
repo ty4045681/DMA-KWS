@@ -5,6 +5,7 @@ defaults:
   - fbank: default
   - stage1: default
   - stage2: default
+  - phoneme_adapter: default
   - demo: default
   - run: default
   - prep: default

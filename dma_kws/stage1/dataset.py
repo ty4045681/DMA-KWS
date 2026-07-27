@@ -73,6 +73,7 @@ class Stage1Dataset(Dataset):
         num_mel_bins: int,
         fbank_root: Path | str | None = None,
         audio_root: Path | str | None = None,
+        feature_extractor=None,
     ) -> None:
         self.records = read_jsonl(manifest_path)
         validate_manifest_phonemes(self.records, manifest_path=manifest_path)
@@ -81,11 +82,21 @@ class Stage1Dataset(Dataset):
         self.num_mel_bins = num_mel_bins
         self.fbank_root = Path(fbank_root) if fbank_root else None
         self.audio_root = Path(audio_root) if audio_root else None
+        # A configured :class:`~dma_kws.stage2.fbank.FbankExtractor`. The default
+        # path below is *not* interchangeable with it: it feeds the waveform to
+        # kaldi.fbank unscaled, while FbankExtractor scales by 1<<15 and applies
+        # snip_edges/low_freq/high_freq. Anything that has to match a Stage II
+        # feature space must pass one in rather than rely on the fallback.
+        self.feature_extractor = feature_extractor
 
     def __len__(self) -> int:
         return len(self.records)
 
     def _load_features(self, record: dict[str, Any]) -> torch.Tensor:
+        if self.feature_extractor is not None:
+            waveform, sr = load_audio(record["wav_path"], sample_rate=self.sample_rate)
+            return self.feature_extractor.extract(waveform, sr)
+
         fbank_path = resolve_record_fbank_path(
             record,
             fbank_root=self.fbank_root,

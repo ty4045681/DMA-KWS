@@ -23,6 +23,26 @@ def _load_qbyt():
     return load_qbyt_class()
 
 
+def assert_adapter_weights_loaded(model, missing_keys) -> None:
+    """Fail when an enabled phoneme adapter got no weights from a checkpoint.
+
+    Evaluation loads Stage II weights with ``strict=False`` so older checkpoints
+    keep working. That tolerance is dangerous here: a randomly initialized trunk
+    still produces scores, just meaningless ones, and the only symptom is a
+    "missing keys" line in the log.
+    """
+    if getattr(model, "adapter", None) is None:
+        return
+    missing_adapter = [key for key in missing_keys if key.startswith("adapter.")]
+    if missing_adapter:
+        raise SystemExit(
+            f"stage2.phoneme_adapter is enabled but the checkpoint has no weights for "
+            f"{len(missing_adapter)} adapter parameters (e.g. {missing_adapter[0]}). "
+            "Scoring with a randomly initialized trunk is silently wrong; either load a "
+            "checkpoint trained with the adapter or set stage2.phoneme_adapter.enabled=false."
+        )
+
+
 def _split_submodule_state(
     state: dict[str, torch.Tensor],
     prefix: str,
@@ -61,15 +81,49 @@ class Stage2LightningModule(pl.LightningModule):
 
         self.stream_policy = resolve_stream_policy(stage1)
         self.encoder = build_encoder(stage1, output_dim=encoder_dim)
+
+        # The phoneme adapter is the trunk the CTC loss and QbyT share. Without
+        # it QbyT reads the encoder output directly, which for a BPE/transducer
+        # encoder is not a space the phoneme text embedding can be compared
+        # against. Disabled by default so pre-adapter checkpoints still load.
+        adapter_cfg = stage2.get("phoneme_adapter", {}) or {}
+        self.adapter_enabled = bool(adapter_cfg.get("enabled", False))
+        self.freeze_adapter = self.adapter_enabled and bool(adapter_cfg.get("freeze", False))
+        # There is no trunk to apply CTC to when the adapter is off, so keep the
+        # reported weight honest instead of leaving a configured value dangling.
+        self.ctc_weight = float(adapter_cfg.get("ctc_weight", 0.0)) if self.adapter_enabled else 0.0
+        if self.adapter_enabled:
+            from dma_kws.phoneme_adapter.module import build_phoneme_adapter
+
+            self.adapter = build_phoneme_adapter(
+                adapter_cfg,
+                input_dim=encoder_dim,
+                vocab_size=vocab_size,
+                causal=bool(stage1.get("causal", False)),
+            )
+            qbyt_input_dim = self.adapter.output_dim
+            if not self.ctc_weight:
+                # With no auxiliary CTC loss the projection is dead weight in
+                # this stage. It has to stay in the state dict for strict loads,
+                # but leaving it trainable makes DDP abort: a parameter that
+                # requires grad and never receives one fails the reduction check
+                # unless find_unused_parameters happens to be on.
+                for param in self.adapter.ctc.parameters():
+                    param.requires_grad = False
+        else:
+            self.adapter = None
+            qbyt_input_dim = encoder_dim
+
         QbyT = _load_qbyt()
         self.qbyt = QbyT(
-            encoder_output_size=encoder_dim,
+            encoder_output_size=qbyt_input_dim,
             num_embeds=vocab_size,
             embed_dim=int(stage2.get("qbyt_embed_dim", 128)),
             post_num_layers=int(stage2.get("qbyt_layers", 2)),
         )
 
         self._stage2_cfg = stage2
+        self._adapter_cfg = adapter_cfg
         self.freeze_encoder = freeze_encoder
         self._log_grad_norm = bool((stage2.get("logging", {}) or {}).get("grad_norm", True))
         gradient_diagnostics = stage2.get("gradient_diagnostics", {}) or {}
@@ -78,11 +132,35 @@ class Stage2LightningModule(pl.LightningModule):
         self._gradient_diagnostics_checks = 0
         self._last_missing_gradients: tuple[str, ...] | None = None
 
+        self._adapter_weights_loaded = False
         if init_checkpoint:
             self._load_init_checkpoint(Path(init_checkpoint))
 
+        adapter_checkpoint = str(adapter_cfg.get("init_checkpoint", "")).strip()
+        if self.adapter_enabled and adapter_checkpoint:
+            self._load_adapter_checkpoint(Path(adapter_checkpoint))
+
+        # A random trunk is a legitimate starting point only when no checkpoint
+        # was supposed to provide one. When one was and it carried no adapter
+        # weights, the trunk stays random, gets frozen for LoRA a moment later,
+        # and every score comes from an unmapped space -- with nothing in the log
+        # but a missing-keys count.
+        if self.adapter is not None and not self._adapter_weights_loaded:
+            source = adapter_checkpoint or init_checkpoint
+            if source:
+                raise SystemExit(
+                    f"stage2.phoneme_adapter is enabled but {source} carries no adapter.* "
+                    "weights, so the trunk would stay randomly initialized. Load a checkpoint "
+                    "trained with the adapter, set stage2.phoneme_adapter.init_checkpoint to a "
+                    "scripts/train_ctc_adapter.py export, or disable the adapter."
+                )
+
         if freeze_encoder:
             for param in self.encoder.parameters():
+                param.requires_grad = False
+
+        if self.freeze_adapter:
+            for param in self.adapter.parameters():
                 param.requires_grad = False
 
         self.auc_metric = torchmetrics.AUROC(task="binary")
@@ -131,6 +209,7 @@ class Stage2LightningModule(pl.LightningModule):
             
             encoder_state = _split_submodule_state(state, "encoder")
             qbyt_state = _split_submodule_state(state, "qbyt")
+            adapter_state = _split_submodule_state(state, "adapter")
 
             if encoder_state:
                 missing, unexpected = self.encoder.load_state_dict(encoder_state, strict=False)
@@ -138,12 +217,52 @@ class Stage2LightningModule(pl.LightningModule):
                     f"Loaded encoder weights from {checkpoint_path}: "
                     f"missing={len(missing)} unexpected={len(unexpected)}"
                 )
+            if adapter_state and self.adapter is not None:
+                # Strict on purpose: a partially loaded trunk means QbyT reads a
+                # space CTC only partly supervised, and the generic strict=False
+                # path above would reduce that to a "missing=N" line.
+                self.adapter.load_state_dict(adapter_state, strict=True)
+                self._adapter_weights_loaded = True
+                print(f"Loaded phoneme adapter weights from {checkpoint_path}")
+            elif adapter_state and self.adapter is None:
+                warnings.warn(
+                    f"{checkpoint_path} carries phoneme adapter weights but "
+                    "stage2.phoneme_adapter.enabled is false, so they are ignored.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             if qbyt_state:
                 missing, unexpected = self.qbyt.load_state_dict(qbyt_state, strict=False)
                 print(
                     f"Loaded QbyT weights from {checkpoint_path}: "
                     f"missing={len(missing)} unexpected={len(unexpected)}"
                 )
+
+    def _load_adapter_checkpoint(self, checkpoint_path: Path) -> None:
+        """Load a Step A adapter export produced by ``scripts/train_ctc_adapter.py``.
+
+        Strict: a trunk whose shape does not match the Stage II config is not a
+        warning-level problem, it means QbyT would be reading a differently
+        shaped space than the one CTC supervised.
+        """
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        assert_stream_policy_matches(checkpoint, self.stream_policy, source=checkpoint_path)
+
+        # The Step A export records the blank id it was trained with. Nothing
+        # downstream would notice a mismatch: CTC would just be optimizing a
+        # different symbol than the one collapse/search treat as blank.
+        saved_blank_id = checkpoint.get("blank_id") if isinstance(checkpoint, dict) else None
+        if saved_blank_id is not None and int(saved_blank_id) != self.adapter.blank_id:
+            raise SystemExit(
+                f"{checkpoint_path} was trained with blank_id={int(saved_blank_id)} but this "
+                f"adapter uses blank_id={self.adapter.blank_id}."
+            )
+
+        state = extract_state_dict(checkpoint)
+        adapter_state = _split_submodule_state(state, "adapter") or state
+        self.adapter.load_state_dict(adapter_state, strict=True)
+        self._adapter_weights_loaded = True
+        print(f"Loaded phoneme adapter weights from {checkpoint_path}")
 
     def forward(
         self,
@@ -153,6 +272,26 @@ class Stage2LightningModule(pl.LightningModule):
         *,
         mode: str = "eval",
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits, seq_logits, _ = self.forward_with_encoder(
+            feat, feat_lengths, anchor, mode=mode
+        )
+        return logits, seq_logits
+
+    def forward_with_encoder(
+        self,
+        feat: torch.Tensor,
+        feat_lengths: torch.Tensor,
+        anchor: torch.Tensor,
+        *,
+        mode: str = "eval",
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor | None, torch.Tensor]]:
+        """Like :meth:`forward` but also returns ``(ctc_log_probs, encoder_mask)``.
+
+        The CTC log-probabilities come from the same adapter call that produced
+        QbyT's input. Recomputing them would run the trunk twice per step and,
+        with dropout on, would let the CTC loss supervise a different realization
+        than the one the matcher saw, undoing the coupling the trunk exists for.
+        """
         # ``mode`` defaults to "eval" so validation/test/inference always run at the
         # deployment operating point; only the training step opts into randomization.
         encoder_out, encoder_mask = run_encoder(
@@ -164,13 +303,26 @@ class Stage2LightningModule(pl.LightningModule):
         )
         encoder_lens = encoder_mask.squeeze(1).sum(dim=1).to(dtype=torch.long)
         anchor_lengths = anchor.ne(0).sum(dim=1).to(dtype=torch.long)
+
+        speech = encoder_out
+        ctc_log_probs = None
+        if self.adapter is not None:
+            speech, ctc_log_probs = self.adapter(
+                encoder_out,
+                encoder_mask,
+                # Skip the CTC projection when no loss consumes it, otherwise
+                # ``ctc.ctc_lo`` receives no gradient and DDP aborts unless
+                # find_unused_parameters is on.
+                with_log_probs=bool(self.ctc_weight),
+            )
+
         logits, seq_logits = self.qbyt(
-            encoder_out,
+            speech,
             anchor,
             speech_lengths=encoder_lens,
             text_lengths=anchor_lengths,
         )
-        return logits, seq_logits
+        return logits, seq_logits, (ctc_log_probs, encoder_mask)
 
     def on_train_start(self) -> None:
         # Only warn once a fit actually starts; eval scripts build this module with
@@ -186,16 +338,46 @@ class Stage2LightningModule(pl.LightningModule):
             )
 
     def on_train_epoch_start(self) -> None:
+        self._set_frozen_submodules_to_eval()
+
+    def _set_frozen_submodules_to_eval(self) -> None:
         if self.freeze_encoder:
             self.encoder.eval()
+        if self.freeze_adapter:
+            self.adapter.eval()
+
+    def _auxiliary_ctc_loss(
+        self,
+        batch: dict[str, torch.Tensor],
+        ctc_log_probs: torch.Tensor | None,
+        encoder_mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Phoneme CTC on the trunk, using each clip's *own* phoneme sequence.
+
+        The target is ``query_seq``, not the anchor: for a negative pair the
+        audio is a different phrase, so supervising it with the anchor's phonemes
+        would teach the trunk the wrong transcript.
+        """
+        if ctc_log_probs is None or not self.ctc_weight:
+            return None
+        targets = batch.get("query_seq")
+        target_lengths = batch.get("query_lengths")
+        if targets is None or target_lengths is None:
+            return None
+
+        ctc_loss, num_skipped = self.adapter.ctc_loss(
+            ctc_log_probs, encoder_mask, targets, target_lengths
+        )
+        # A high skip rate means the auxiliary loss only ever sees long clips.
+        self.log("train/ctc_skipped", float(num_skipped), on_step=True)
+        return ctc_loss
 
     def _forward_train_losses(
         self, batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
-        if self.freeze_encoder:
-            self.encoder.eval()
+        self._set_frozen_submodules_to_eval()
 
-        logits, seq_logits = self(
+        logits, seq_logits, (ctc_log_probs, encoder_mask) = self.forward_with_encoder(
             batch["feat"], batch["feat_lengths"], batch["anchor"], mode="train"
         )
         total_loss, losses = compute_stage2_losses(
@@ -204,6 +386,8 @@ class Stage2LightningModule(pl.LightningModule):
             labels=batch["label"],
             seq_labels=batch["seq_label"],
             seq_label_mask=batch["seq_label_mask"],
+            ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
+            ctc_weight=self.ctc_weight,
         )
         return total_loss, losses, logits
 
@@ -211,6 +395,8 @@ class Stage2LightningModule(pl.LightningModule):
         self.log("train/loss", total_loss, on_step=True, prog_bar=True)
         self.log("train/utt_loss", losses["utt_loss"], on_step=True, prog_bar=True)
         self.log("train/seq_loss", losses["seq_loss"], on_step=True, prog_bar=True)
+        if "ctc_loss" in losses:
+            self.log("train/ctc_loss", losses["ctc_loss"], on_step=True, prog_bar=True)
 
         optimizer = self.optimizers()
         lr = optimizer.param_groups[0]["lr"]
@@ -299,6 +485,21 @@ class Stage2LightningModule(pl.LightningModule):
         self.auc_metric.reset()
         self.eer_metric.reset()
 
+    def trainable_module(self) -> torch.nn.Module:
+        """Return the module whose parameters the optimizer should own.
+
+        Enumerated explicitly rather than defaulting to ``self.qbyt`` whenever
+        the encoder is frozen: that shortcut silently drops the phoneme adapter,
+        which is exactly the module the auxiliary CTC loss is meant to train,
+        and no loss curve would reveal the omission.
+        """
+        if not self.freeze_encoder:
+            return self
+
+        trainable = [self.qbyt]
+        if self.adapter is not None and not self.freeze_adapter:
+            trainable.append(self.adapter)
+        return torch.nn.ModuleList(trainable)
+
     def configure_optimizers(self) -> dict:
-        optim_module = self.qbyt if self.freeze_encoder else self
-        return build_cosine_warmup_optimizer(optim_module, self._stage2_cfg)
+        return build_cosine_warmup_optimizer(self.trainable_module(), self._stage2_cfg)

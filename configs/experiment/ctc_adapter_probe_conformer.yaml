@@ -1,0 +1,26 @@
+# @package _global_
+# Control 3: Conformer trunk, the expressiveness upper bound.
+#
+# chunk_size is mandatory here because stage1.causal=true: units are trunk-input
+# frames, i.e. encoder output frames at 25 Hz, so 8 -> 320 ms, matching the
+# encoder's own chunk_size=16 at 50 Hz.
+#
+#   python scripts/train_ctc_adapter.py +experiment=ctc_adapter_probe_conformer
+
+defaults:
+  - ctc_adapter_icefall
+  - _self_
+
+phoneme_adapter:
+  trunk:
+    type: conformer
+    output_dim: 192
+    num_layers: 2
+    kernel_size: 15
+    dropout: 0.1
+    chunk_size: 8
+    left_context_chunks: 4
+    attention_heads: 4
+    linear_units: 512
+  checkpoint_dir: ${paths.exp_root}/phoneme_adapter/checkpoints/conformer
+  run_name: phoneme-adapter-conformer

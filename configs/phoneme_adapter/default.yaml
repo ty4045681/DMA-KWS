@@ -1,0 +1,76 @@
+# Step A: phoneme-CTC trunk trained on a frozen encoder.
+#
+# The trunk is the only trainable module here, and it is also the module Stage II
+# reads from (see stage2.phoneme_adapter): CTC supervision is what keeps the
+# frozen encoder's BPE/transducer representation comparable to QbyT's phoneme
+# text embeddings. Training it as a dead branch that Stage II never consumes
+# buys nothing beyond Stage I phoneme search.
+#
+# Usage:
+#   export ICEFALL_ROOT=/path/to/icefall
+#   export ICEFALL_CHECKPOINT=/path/to/icefall_checkpoint.pt
+#   python scripts/train_ctc_adapter.py +experiment=ctc_adapter_icefall
+
+trunk:
+  # linear | mlp    - pointwise probes, kept for the representation controls
+  # conv | conformer - have temporal context, which is what repairs the
+  #                    systematic emission delay of an RNN-T-trained encoder
+  type: conv
+  output_dim: 192
+  num_layers: 2
+  kernel_size: 7
+  dropout: 0.1
+
+ctc_dropout: 0.0
+expose_posterior: false
+
+# Icefall (or Stage I) checkpoint the frozen encoder is initialized from.
+# Resuming a run uses run.resume_from, not a separate weights-only key.
+init_checkpoint: ""
+
+# Empty means ${paths.processed_root}/stage1_phoneme_ctc/{train,dev}.jsonl,
+# i.e. the manifests scripts/prepare_stage1_librispeech.py already writes.
+# Features are always computed on the fly through FbankExtractor so the trunk
+# sees Stage II's feature space; there is deliberately no precomputed-fbank key.
+train_manifest: ""
+dev_manifest: ""
+
+batch_size_per_gpu: 32
+num_workers: 4
+max_steps: 60000
+learning_rate: 0.001
+optimizer: adamw
+weight_decay: 0.01
+warmup_steps: 500
+total_scheduler_steps: 60000
+accumulate_grad_batches: 1
+precision: bf16-mixed
+strategy: auto
+find_unused_parameters: false
+gradient_clip_val: 5.0
+log_interval: 50
+val_check_interval: 2000
+
+checkpoint_dir: ${paths.exp_root}/phoneme_adapter/checkpoints
+log_dir: ${paths.exp_root}/phoneme_adapter/logs
+run_name: phoneme_adapter_ctc
+
+dataloader:
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+validation:
+  val_check_interval: 2000
+  num_decode_batches: 20
+  batch_size: 32
+
+logging:
+  backends: [csv, tensorboard]
+  wandb:
+    project: dma-kws
+    mode: online
+
+checkpoint:
+  every_n_train_steps: 2000
+  save_top_k: 3

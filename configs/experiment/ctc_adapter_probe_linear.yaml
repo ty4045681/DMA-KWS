@@ -1,0 +1,17 @@
+# @package _global_
+# Control 1: linear probe. Measures how linearly separable phonemes already are
+# in the frozen encoder's output. This is the floor the real trunk must beat;
+# it is not meant to be deployed.
+#
+#   python scripts/train_ctc_adapter.py +experiment=ctc_adapter_probe_linear
+
+defaults:
+  - ctc_adapter_icefall
+  - _self_
+
+phoneme_adapter:
+  trunk:
+    type: linear
+    output_dim: 192
+  checkpoint_dir: ${paths.exp_root}/phoneme_adapter/checkpoints/linear
+  run_name: phoneme-adapter-linear

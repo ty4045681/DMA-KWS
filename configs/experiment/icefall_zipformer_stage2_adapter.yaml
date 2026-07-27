@@ -1,0 +1,38 @@
+# @package _global_
+# Stage II with the phoneme CTC trunk in the loop (B2: trunk trains, auxiliary
+# CTC keeps it in phoneme space).
+#
+# Requires a Step A checkpoint:
+#   python scripts/train_ctc_adapter.py +experiment=ctc_adapter_icefall
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_adapter \
+#     stage2.phoneme_adapter.init_checkpoint=<adapter_step*.pt>
+#
+# For B1 (trunk frozen after Step A), override:
+#   stage2.phoneme_adapter.freeze=true stage2.phoneme_adapter.ctc_weight=0.0
+
+defaults:
+  - icefall_zipformer_stage2
+  - _self_
+
+training:
+  recipe: icefall-zipformer-frozen-adapter
+
+stage2:
+  phoneme_adapter:
+    enabled: true
+    # Must match the trunk Step A trained; the checkpoint loads strict=True so a
+    # mismatch fails at construction instead of scoring against a space CTC
+    # never supervised.
+    trunk:
+      type: conv
+      output_dim: 192
+      num_layers: 2
+      kernel_size: 7
+      dropout: 0.1
+    init_checkpoint: ${oc.env:PHONEME_ADAPTER_CHECKPOINT,""}
+    freeze: false
+    ctc_weight: 0.2
+
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-adapter
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-adapter
+  run_name: icefall-zipformer-frozen-adapter

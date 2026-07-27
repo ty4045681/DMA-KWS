@@ -1,0 +1,61 @@
+# @package _global_
+# Step A: phoneme CTC trunk on the frozen icefall Zipformer KWS encoder.
+#
+# Usage:
+#   export ICEFALL_ROOT=/path/to/icefall
+#   export ICEFALL_CHECKPOINT=/path/to/icefall_checkpoint.pt
+#   python scripts/train_ctc_adapter.py +experiment=ctc_adapter_icefall
+#
+# Produces exp/phoneme_adapter/checkpoints/adapter_step*.pt, which Stage II
+# consumes via stage2.phoneme_adapter.init_checkpoint.
+
+defaults:
+  - override /paths: default
+  # Not optional: the trunk is trained to feed Stage II, so it must see Stage
+  # II's feature space (lhotse fbank, dither 0.0, snip_edges false). The default
+  # fbank group would hand the frozen encoder a differently scaled input.
+  - override /fbank: icefall_kws
+  - override /stage1: icefall_zipformer
+
+training:
+  recipe: phoneme-adapter-ctc
+
+stage1:
+  causal: true
+  encoder_output_dim: 128
+  # Same deployment operating point as Stage II; the exported adapter records it
+  # so a mismatched Stage II run fails loudly instead of silently degrading.
+  stream:
+    chunk_size: 16
+    left_context_frames: 64
+
+phoneme_adapter:
+  init_checkpoint: ${oc.env:ICEFALL_CHECKPOINT,""}
+
+  trunk:
+    type: conv
+    output_dim: 192
+    num_layers: 2
+    kernel_size: 7
+    dropout: 0.1
+
+  batch_size_per_gpu: 32
+  num_workers: 8
+  max_steps: 60000
+  learning_rate: 0.001
+  optimizer: adamw
+  weight_decay: 0.01
+  warmup_steps: 500
+  total_scheduler_steps: 60000
+  gradient_clip_val: 5.0
+  precision: bf16-mixed
+
+  val_check_interval: 2000
+  validation:
+    val_check_interval: 2000
+    num_decode_batches: 20
+    batch_size: 32
+
+  checkpoint_dir: ${paths.exp_root}/phoneme_adapter/checkpoints/conv
+  log_dir: ${paths.exp_root}/phoneme_adapter/logs
+  run_name: phoneme-adapter-conv

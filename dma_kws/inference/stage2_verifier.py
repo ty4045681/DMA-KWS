@@ -65,13 +65,31 @@ class Stage2Verifier:
         stage2_encoder_dim = int(stage2_cfg.get("encoder_output_dim", 144))
         stream_policy = resolve_stream_policy(stage1_cfg)
         self._stream_policy = stream_policy
+        adapter_cfg = stage2_cfg.get("phoneme_adapter", {}) or {}
+        adapter_enabled = bool(adapter_cfg.get("enabled", False))
 
         class Stage2Model(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.encoder = build_encoder(stage1_cfg, output_dim=stage2_encoder_dim)
+                # Mirrors Stage2LightningModule: the checkpoint is loaded with
+                # strict=True below, so an architecture that disagrees with the
+                # training-time one fails here instead of scoring silently wrong.
+                if adapter_enabled:
+                    from dma_kws.phoneme_adapter.module import build_phoneme_adapter
+
+                    self.adapter = build_phoneme_adapter(
+                        adapter_cfg,
+                        input_dim=stage2_encoder_dim,
+                        vocab_size=vocab_size,
+                        causal=bool(stage1_cfg.get("causal", False)),
+                    )
+                    qbyt_input_dim = self.adapter.output_dim
+                else:
+                    self.adapter = None
+                    qbyt_input_dim = stage2_encoder_dim
                 self.qbyt = QbyT(
-                    encoder_output_size=stage2_encoder_dim,
+                    encoder_output_size=qbyt_input_dim,
                     num_embeds=vocab_size,
                     embed_dim=int(stage2_cfg.get("qbyt_embed_dim", 128)),
                     post_num_layers=int(stage2_cfg.get("qbyt_layers", 2)),
@@ -87,8 +105,15 @@ class Stage2Verifier:
                     mode="eval",
                 )
                 encoder_lens = encoder_mask.squeeze(1).sum(1)
+                speech = encoder_out
+                if self.adapter is not None:
+                    # Inference never scores the CTC posteriors; ctc_lo stays in
+                    # the state dict only so training checkpoints load strictly.
+                    speech, _ = self.adapter(
+                        encoder_out, encoder_mask, with_log_probs=False
+                    )
                 logits, _ = self.qbyt(
-                    encoder_out,
+                    speech,
                     anchors,
                     speech_lengths=encoder_lens,
                     text_lengths=anchor_lengths,

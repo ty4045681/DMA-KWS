@@ -1,0 +1,18 @@
+# @package _global_
+# Control 2: pointwise MLP. Separates "needs more capacity" from "needs temporal
+# context" — it has the capacity but still cannot move evidence between frames,
+# so it cannot repair the transducer encoder's emission delay.
+#
+#   python scripts/train_ctc_adapter.py +experiment=ctc_adapter_probe_mlp
+
+defaults:
+  - ctc_adapter_icefall
+  - _self_
+
+phoneme_adapter:
+  trunk:
+    type: mlp
+    output_dim: 192
+    dropout: 0.1
+  checkpoint_dir: ${paths.exp_root}/phoneme_adapter/checkpoints/mlp
+  run_name: phoneme-adapter-mlp

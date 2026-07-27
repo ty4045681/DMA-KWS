@@ -81,6 +81,10 @@ class KeywordAdaptationDataset(Dataset):
 
         return {
             "anchor_seq": torch.tensor(self._anchor_seq, dtype=torch.long),
+            # Kept so the adaptation batch schema matches Stage II training even
+            # though the auxiliary CTC loss is off during LoRA (the trunk is
+            # frozen there).
+            "query_seq": torch.tensor(query_seq, dtype=torch.long),
             "feat": feats,
             "label": torch.tensor(label, dtype=torch.long),
             "seq_label": torch.tensor(seq_label, dtype=torch.long),

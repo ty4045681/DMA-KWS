@@ -117,6 +117,8 @@ Place the finetune parquet at:
 
 Stage I uses Wenet-aligned **CharTokenizer** targets (`data/dict/lang_char.txt`), ConformerEncoder (80→144, 6 blocks), and CTC loss. **Train Stage I yourself** on LibriSpeech; do not use external author checkpoints (e.g. `/nvme01/.../avg_10.pt`). The averaged Stage I checkpoint from your run initializes Stage II when using `frozen-wenet-encoder` or `run.init_checkpoint`.
 
+Because this encoder is trained with phoneme CTC, its frames are already in a phoneme space QbyT can match against, so the `stage2.phoneme_adapter` trunk (README §7d) does **not** apply to this chain — leave it disabled. That trunk exists for encoders trained on a non-phoneme objective, such as the Icefall Zipformer transducer/BPE checkpoint.
+
 ### Prepare manifests + optional offline fbank
 
 In-repo prep (recommended — no external Wenet submodule):

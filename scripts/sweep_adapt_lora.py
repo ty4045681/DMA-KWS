@@ -40,7 +40,7 @@ def _eval_lph_auc(
     from dma_kws.pathing import resolve_dict_path
     from dma_kws.stage2.collate import test_collate_fn
     from dma_kws.stage2.dataset import LibriPhraseEvalDataset, resolve_stage2_eval_paths
-    from dma_kws.stage2.module import Stage2LightningModule
+    from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training.checkpoint_io import extract_state_dict
 
@@ -76,7 +76,8 @@ def _eval_lph_auc(
     model = Stage2LightningModule(config, vocab_size=vocab_size)
     ckpt = torch.load(checkpoint, map_location="cpu")
     state = extract_state_dict(ckpt)
-    model.load_state_dict(state, strict=False)
+    missing, _ = model.load_state_dict(state, strict=False)
+    assert_adapter_weights_loaded(model, missing)
     trainer = pl.Trainer(
         accelerator=accelerator, devices=1, logger=False, enable_checkpointing=False
     )
@@ -99,7 +100,7 @@ def _eval_target_auc(
     from dma_kws.stage2.adapt_dataset import TargetKeywordValDataset
     from dma_kws.stage2.adapt_paths import adapt_data_root, phase_manifest
     from dma_kws.stage2.collate import test_collate_fn
-    from dma_kws.stage2.module import Stage2LightningModule
+    from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training.checkpoint_io import extract_state_dict
 
@@ -148,7 +149,8 @@ def _eval_target_auc(
             self.target_auc_metric.reset()
 
     model = _TargetValModule(config, vocab_size=vocab_size)
-    model.load_state_dict(state, strict=False)
+    missing, _ = model.load_state_dict(state, strict=False)
+    assert_adapter_weights_loaded(model, missing)
 
     trainer = pl.Trainer(
         accelerator=accelerator, devices=1, logger=False, enable_checkpointing=False

@@ -134,6 +134,16 @@ def validate_lang_char_dict(dict_path: Path) -> None:
             f"got ids {ids}"
         )
 
+    # Every CTC consumer in the repo hardcodes blank 0 (Stage I module, the
+    # phoneme_ctc locator, collapse_ctc, the search helpers, and the adapter's
+    # default). Make that assumption a checked precondition rather than a
+    # coincidence of the shipped dict.
+    if symbol_table["<blank>"] != 0:
+        raise ValueError(
+            f"{dict_path}: <blank> must have id 0, got {symbol_table['<blank>']}; "
+            "CTC collapsing and keyword search assume blank is 0 throughout."
+        )
+
 
 def _ensure_qbyt_on_path() -> None:
     repo_root = Path(__file__).resolve().parents[1]
