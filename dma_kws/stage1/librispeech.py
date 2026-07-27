@@ -178,17 +178,31 @@ def _parquet_record_to_utterance(
     )
 
 
+def list_librispeech_parquet_shards(parquet_root: str | Path) -> list[Path]:
+    """Return sorted parquet shard paths from a file or directory root."""
+    root = Path(parquet_root)
+    parquet_paths = [root] if root.is_file() else sorted(root.glob("*.parquet"))
+    if not parquet_paths:
+        raise FileNotFoundError(f"No parquet shards found in {root}")
+    return parquet_paths
+
+
+def iter_librispeech_parquet_shard_utterances(
+    parquet_path: str | Path,
+    *,
+    split: str,
+) -> Iterator[ParquetAudioUtterance]:
+    """Yield utterances from a single HuggingFace LibriSpeech parquet shard."""
+    shard_path = Path(parquet_path)
+    for record in _iter_parquet_records(shard_path):
+        yield _parquet_record_to_utterance(record, split=split, parquet_path=shard_path)
+
+
 def iter_librispeech_parquet_utterances(
     parquet_root: str | Path,
     *,
     split: str,
 ) -> Iterator[ParquetAudioUtterance]:
     """Yield utterances from HuggingFace `openslr/librispeech_asr` parquet shards."""
-    root = Path(parquet_root)
-    parquet_paths = [root] if root.is_file() else sorted(root.glob("*.parquet"))
-    if not parquet_paths:
-        raise FileNotFoundError(f"No parquet shards found in {root}")
-
-    for parquet_path in parquet_paths:
-        for record in _iter_parquet_records(parquet_path):
-            yield _parquet_record_to_utterance(record, split=split, parquet_path=parquet_path)
+    for parquet_path in list_librispeech_parquet_shards(parquet_root):
+        yield from iter_librispeech_parquet_shard_utterances(parquet_path, split=split)

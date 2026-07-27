@@ -52,3 +52,13 @@ def test_iter_librispeech_parquet_utterances_reads_hf_audio_bytes(tmp_path, monk
     assert utterances[0].audio_bytes == b"fake-flac-bytes"
     assert utterances[0].audio_path is None
     assert utterances[0].audio_extension == ".flac"
+
+
+def test_list_librispeech_parquet_shards_returns_sorted_paths(tmp_path):
+    parquet_dir = tmp_path / "clean" / "train.360"
+    parquet_dir.mkdir(parents=True)
+    (parquet_dir / "0002.parquet").write_bytes(b"b")
+    (parquet_dir / "0001.parquet").write_bytes(b"a")
+
+    shards = librispeech.list_librispeech_parquet_shards(parquet_dir)
+    assert [path.name for path in shards] == ["0001.parquet", "0002.parquet"]

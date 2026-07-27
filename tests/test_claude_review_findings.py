@@ -96,6 +96,7 @@ def test_stage1_hf_parquet_can_prepare_dev_from_parquet(tmp_path, monkeypatch):
     prep = {
         "limit": 0,
         "input_format": "hf-parquet",
+        "num_workers": 4,
         "parquet_root": str(tmp_path / "train.parquet"),
         "parquet_split": "",
         "parquet_audio_dir": "",
@@ -116,6 +117,8 @@ def test_stage1_hf_parquet_can_prepare_dev_from_parquet(tmp_path, monkeypatch):
 
     assert [call["output_path"].name for call in calls] == ["train.jsonl", "dev.jsonl"]
     assert calls[1]["split"] == "dev-clean"
+    assert calls[0]["num_workers"] == 4
+    assert calls[1]["num_workers"] == 4
 
 
 def test_demo_stage2_candidate_requires_enough_fbank_frames():

@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 import json
 from pathlib import Path
+import tempfile
 from typing import Iterable
 
 import hydra
@@ -16,8 +19,10 @@ from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.phonemes import normalize_english_text
 from dma_kws.stage1.librispeech import (
     ParquetAudioUtterance,
+    iter_librispeech_parquet_shard_utterances,
     iter_librispeech_parquet_utterances,
     iter_librispeech_utterances,
+    list_librispeech_parquet_shards,
 )
 from dma_kws.stage1.wenet_ctc import phonemes_to_g2p_string
 
@@ -71,23 +76,39 @@ def _parquet_utterance_audio_path(utt: ParquetAudioUtterance, audio_output_dir: 
     )
 
 
-def prepare_parquet_split(
-    *,
-    g2p,
-    parquet_root: Path,
-    split: str,
-    output_path: Path,
-    audio_output_dir: Path,
-    limit: int,
-) -> list[str]:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    all_phones: list[str] = []
+@dataclass(frozen=True)
+class _ParquetShardTask:
+    shard_path: Path
+    split: str
+    audio_output_dir: Path
+    tmp_jsonl_path: Path
+
+
+@dataclass(frozen=True)
+class _ParquetShardResult:
+    shard_path: Path
+    tmp_jsonl_path: Path
+    count: int
+
+
+def _resolve_num_workers(value: int) -> int:
+    if value < 0:
+        raise ValueError(f"num_workers must be >= 0, got {value}")
+    if value == 0:
+        import os
+
+        return max(1, min(8, os.cpu_count() or 1))
+    return value
+
+
+def _prepare_parquet_shard(task: _ParquetShardTask) -> _ParquetShardResult:
+    g2p = make_g2p()
     count = 0
-    with output_path.open("w", encoding="utf-8") as writer:
-        for utt in iter_librispeech_parquet_utterances(parquet_root, split=split):
-            wav_path = _parquet_utterance_audio_path(utt, audio_output_dir)
+    task.tmp_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    with task.tmp_jsonl_path.open("w", encoding="utf-8") as writer:
+        for utt in iter_librispeech_parquet_shard_utterances(task.shard_path, split=task.split):
+            wav_path = _parquet_utterance_audio_path(utt, task.audio_output_dir)
             phones = text_to_phonemes(g2p, utt.text)
-            all_phones.extend(phones)
             record = {
                 "utt_id": utt.utt_id,
                 "split": utt.split,
@@ -99,8 +120,87 @@ def prepare_parquet_split(
             }
             writer.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
-            if limit and count >= limit:
-                break
+    return _ParquetShardResult(shard_path=task.shard_path, tmp_jsonl_path=task.tmp_jsonl_path, count=count)
+
+
+def prepare_parquet_split(
+    *,
+    g2p,
+    parquet_root: Path,
+    split: str,
+    output_path: Path,
+    audio_output_dir: Path,
+    limit: int,
+    num_workers: int = 1,
+) -> list[str]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shard_paths = list_librispeech_parquet_shards(parquet_root)
+    if num_workers <= 1 or len(shard_paths) <= 1:
+        all_phones: list[str] = []
+        count = 0
+        with output_path.open("w", encoding="utf-8") as writer:
+            for utt in iter_librispeech_parquet_utterances(parquet_root, split=split):
+                wav_path = _parquet_utterance_audio_path(utt, audio_output_dir)
+                phones = text_to_phonemes(g2p, utt.text)
+                all_phones.extend(phones)
+                record = {
+                    "utt_id": utt.utt_id,
+                    "split": utt.split,
+                    "wav_path": str(wav_path),
+                    "text": utt.text,
+                    "normalized_text": normalize_english_text(utt.text),
+                    "phonemes": phones,
+                    "phonemes_g2p": phonemes_to_g2p_string(phones),
+                }
+                writer.write(json.dumps(record, ensure_ascii=False) + "\n")
+                count += 1
+                if limit and count >= limit:
+                    break
+        print(f"Wrote {count} parquet utterances to {output_path}")
+        return all_phones
+
+    all_phones: list[str] = []
+    count = 0
+    with tempfile.TemporaryDirectory(prefix="stage1_librispeech_shards_") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        tasks = [
+            _ParquetShardTask(
+                shard_path=shard_path,
+                split=split,
+                audio_output_dir=audio_output_dir,
+                tmp_jsonl_path=tmp_root / f"{shard_path.stem}.jsonl",
+            )
+            for shard_path in shard_paths
+        ]
+
+        results: dict[Path, _ParquetShardResult] = {}
+        worker_count = min(num_workers, len(tasks))
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_task = {executor.submit(_prepare_parquet_shard, task): task for task in tasks}
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to process parquet shard: {task.shard_path}") from exc
+                results[result.shard_path] = result
+
+        with output_path.open("w", encoding="utf-8") as writer:
+            for shard_path in shard_paths:
+                result = results[shard_path]
+                with result.tmp_jsonl_path.open("r", encoding="utf-8") as reader:
+                    for line in reader:
+                        if limit and count >= limit:
+                            break
+                        writer.write(line)
+                        record = json.loads(line)
+                        phonemes = record.get("phonemes")
+                        if isinstance(phonemes, list):
+                            all_phones.extend(str(phone) for phone in phonemes)
+                        count += 1
+                if limit and count >= limit:
+                    break
+
     print(f"Wrote {count} parquet utterances to {output_path}")
     return all_phones
 
@@ -123,6 +223,7 @@ def run_prepare_stage1_librispeech(config: dict, prep: dict) -> None:
     train_splits = stage1.get("train_splits", ["train-clean-100"])
     dev_splits = stage1.get("dev_splits", ["dev-clean"])
     limit = int(prep.get("limit", 0))
+    num_workers = _resolve_num_workers(int(prep.get("num_workers", 0)))
     input_format = str(prep.get("input_format", "librispeech-dir"))
 
     g2p = make_g2p()
@@ -140,6 +241,7 @@ def run_prepare_stage1_librispeech(config: dict, prep: dict) -> None:
             output_path=output_dir / "train.jsonl",
             audio_output_dir=parquet_audio_dir,
             limit=limit,
+            num_workers=num_workers,
         )
     else:
         prepare_split(
@@ -166,6 +268,7 @@ def run_prepare_stage1_librispeech(config: dict, prep: dict) -> None:
                 output_path=output_dir / "dev.jsonl",
                 audio_output_dir=dev_parquet_audio_dir,
                 limit=limit,
+                num_workers=num_workers,
             )
         elif has_librispeech_transcripts(librispeech_root, dev_splits):
             prepare_split(

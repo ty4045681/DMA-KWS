@@ -518,6 +518,7 @@ python3 scripts/prepare_stage1_librispeech.py \
   +experiment=demo_librispeech100 \
   prep.limit=100 \
   prep.input_format=hf-parquet \
+  prep.num_workers=4 \
   prep.parquet_root=/home/h00513998/librispeech_train_clean_360 \
   prep.parquet_split=train-clean-360 \
   prep.dev_parquet_root=/home/h00513998/librispeech_dev_clean \
@@ -530,6 +531,7 @@ Remove `prep.limit=100` for the full run after the smoke run completes:
 python3 scripts/prepare_stage1_librispeech.py \
   +experiment=demo_librispeech100 \
   prep.input_format=hf-parquet \
+  prep.num_workers=4 \
   prep.parquet_root=/home/h00513998/librispeech_train_clean_360 \
   prep.parquet_split=train-clean-360 \
   prep.dev_parquet_root=/home/h00513998/librispeech_dev_clean \
@@ -551,6 +553,12 @@ Notes:
 - The script uses `g2p_en` to convert English transcripts to ARPAbet phonemes.
 - Stress markers are **kept** everywhere (`AH0` stays `AH0`): the 71-token vocabulary spells out every stress variant, and all stages must tokenize text through `dma_kws.g2p.text_to_phonemes` so their symbols match. Phonemes outside the vocabulary abort data preparation instead of becoming `<unk>`.
 - Stage I and Stage II share the Wenet CharTokenizer phoneme vocabulary at `data/dict/lang_char.txt`.
+- `prep.num_workers` controls **hf-parquet mode only** (`prep.input_format=hf-parquet`) for both train and dev manifests:
+  - `0` = auto (`min(8, cpu_count())`)
+  - `1` = serial processing
+  - `>1` = multi-process processing by parquet shard
+- In hf-parquet mode with `prep.num_workers>1`, each worker initializes its own `g2p_en` instance, writes a per-shard temporary JSONL, and the main process merges shard outputs by shard filename order so `train.jsonl` / `dev.jsonl` stay deterministic across runs.
+- `prep.limit` still caps the final manifest size. In parallel hf-parquet mode the cap is applied during stable merge (same deterministic ordering each run).
 
 Optional: precompute Stage I fbank features for faster training (reads the JSONL manifests above):
 
