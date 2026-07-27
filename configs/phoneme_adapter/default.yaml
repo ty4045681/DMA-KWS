@@ -62,7 +62,11 @@ dataloader:
 
 validation:
   val_check_interval: 2000
-  num_decode_batches: 20
+  # 0 = decode the whole dev set. The forward pass already runs over every dev
+  # batch for val/loss, so the extra cost is just the argmax collapse and edit
+  # distance; capping it would make val/per (what ModelCheckpoint monitors) a
+  # prefix-of-dev number that shifts with batch size and world size.
+  num_decode_batches: 0
   batch_size: 32
 
 logging:

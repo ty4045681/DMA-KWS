@@ -197,7 +197,10 @@ class AdapterTrunkConfig:
 @dataclass
 class PhonemeAdapterValidationConfig:
     val_check_interval: int = 2000
-    num_decode_batches: int = 20
+    #: 0 decodes the whole dev set, so ``val/per`` is the number model selection
+    #: is monitoring. A positive value caps decoding at that many batches, which
+    #: makes the reported PER depend on batch size and world size.
+    num_decode_batches: int = 0
     batch_size: int = 32
 
 

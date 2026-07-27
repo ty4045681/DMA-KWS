@@ -53,7 +53,8 @@ phoneme_adapter:
   val_check_interval: 2000
   validation:
     val_check_interval: 2000
-    num_decode_batches: 20
+    # 0 = full dev set, so val/per is comparable across runs and world sizes.
+    num_decode_batches: 0
     batch_size: 32
 
   checkpoint_dir: ${paths.exp_root}/phoneme_adapter/checkpoints/conv
