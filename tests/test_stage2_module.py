@@ -280,6 +280,78 @@ def test_init_checkpoint_from_the_same_operating_point_is_accepted(monkeypatch, 
     module._load_init_checkpoint(ckpt_path)
 
 
+def _stage2_module(monkeypatch, config: dict | None = None) -> Stage2LightningModule:
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_encoder", lambda *_a, **_k: _StreamSpyEncoder()
+    )
+    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _FakeQbyT)
+    return Stage2LightningModule(config or _minimal_config(), vocab_size=71)
+
+
+def test_init_checkpoint_with_a_stale_qbyt_readout_is_rejected(monkeypatch, tmp_path):
+    """Shapes still match after the readout fix, so nothing else would notice."""
+    module = _stage2_module(monkeypatch)
+    ckpt_path = tmp_path / "legacy_readout.pt"
+    torch.save({"model_state_dict": {"qbyt.dummy": torch.zeros(1)}}, ckpt_path)
+
+    with pytest.raises(SystemExit, match="readout unversioned"):
+        module._load_init_checkpoint(ckpt_path)
+
+
+def test_init_checkpoint_without_qbyt_weights_skips_the_readout_check(monkeypatch, tmp_path):
+    """Stage I exports and icefall checkpoints encode no readout convention."""
+    module = _stage2_module(monkeypatch)
+    ckpt_path = tmp_path / "stage1.pt"
+    torch.save({"model_state_dict": {"encoder.dummy": torch.zeros(1)}}, ckpt_path)
+
+    module._load_init_checkpoint(ckpt_path)
+
+
+def test_stale_qbyt_readout_can_be_opted_into_with_a_warning(monkeypatch, tmp_path):
+    config = _minimal_config()
+    config["stage2"]["allow_legacy_qbyt_readout"] = True
+    module = _stage2_module(monkeypatch, config)
+    ckpt_path = tmp_path / "legacy_readout.pt"
+    torch.save({"model_state_dict": {"qbyt.dummy": torch.zeros(1)}}, ckpt_path)
+
+    with pytest.warns(UserWarning, match="not comparable"):
+        module._load_init_checkpoint(ckpt_path)
+
+
+def test_saved_checkpoints_carry_the_readout_version(monkeypatch):
+    """Without the stamp, every checkpoint this build writes looks stale."""
+    from dma_kws.training.checkpoint_io import (
+        QBYT_READOUT_VERSION,
+        QBYT_READOUT_VERSION_KEY,
+    )
+
+    module = _stage2_module(monkeypatch)
+    checkpoint: dict = {"state_dict": module.state_dict()}
+    module.on_save_checkpoint(checkpoint)
+
+    assert checkpoint[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION
+    module.on_load_checkpoint(checkpoint)
+
+
+def test_lightning_restore_rejects_a_stale_readout(monkeypatch):
+    """Covers load_from_checkpoint and Trainer.fit(ckpt_path=...) alike."""
+    module = _stage2_module(monkeypatch)
+
+    with pytest.raises(SystemExit, match="readout unversioned"):
+        module.on_load_checkpoint({"state_dict": {"qbyt.dummy": torch.zeros(1)}})
+
+
+def test_lora_adapter_payloads_are_readout_checked(monkeypatch, tmp_path):
+    """A LoRA payload holds no ``qbyt.``-prefixed keys, so it needs its own probe."""
+    from dma_kws.training.checkpoint_io import assert_qbyt_readout_version
+
+    ckpt_path = tmp_path / "adapter.pt"
+    torch.save({"lora_state_dict": {"phone_matchor.layers.0.self_attn": torch.zeros(1)}}, ckpt_path)
+
+    with pytest.raises(SystemExit, match="readout unversioned"):
+        assert_qbyt_readout_version(torch.load(ckpt_path), source=ckpt_path)
+
+
 class _LoraReadyQbyT(nn.Module):
     """QbyT stub exposing the phone_matchor attention layers LoRA hooks into."""
 

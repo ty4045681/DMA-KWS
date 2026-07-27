@@ -16,7 +16,7 @@ from dma_kws.stage2.collate import test_collate_fn
 from dma_kws.stage2.dataset import LibriPhraseEvalDataset, resolve_stage2_eval_paths
 from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
 from dma_kws.tokenizer import load_char_tokenizer
-from dma_kws.training.checkpoint_io import extract_state_dict
+from dma_kws.training.checkpoint_io import assert_qbyt_readout_version, extract_state_dict
 from dma_kws.training.device import resolve_accelerator
 
 
@@ -25,6 +25,11 @@ def _load_model(config: dict, checkpoint_path: Path, vocab_size: int) -> Stage2L
 
     model = Stage2LightningModule(config, vocab_size=vocab_size)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    assert_qbyt_readout_version(
+        checkpoint,
+        source=checkpoint_path,
+        allow_legacy=bool(config["stage2"].get("allow_legacy_qbyt_readout", False)),
+    )
 
     if checkpoint_path.suffix == ".pt":
         state = extract_state_dict(checkpoint)

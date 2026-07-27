@@ -15,7 +15,12 @@ from dma_kws.config import resolve_stream_policy
 from dma_kws.nn import build_encoder, run_encoder
 from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage2.losses import compute_stage2_losses
-from dma_kws.training.checkpoint_io import assert_stream_policy_matches, extract_state_dict
+from dma_kws.training.checkpoint_io import (
+    assert_qbyt_readout_version,
+    assert_stream_policy_matches,
+    extract_state_dict,
+    stamp_qbyt_readout_version,
+)
 from dma_kws.training.scheduler import build_cosine_warmup_optimizer
 
 
@@ -125,6 +130,7 @@ class Stage2LightningModule(pl.LightningModule):
         self._stage2_cfg = stage2
         self._adapter_cfg = adapter_cfg
         self.freeze_encoder = freeze_encoder
+        self._allow_legacy_qbyt_readout = bool(stage2.get("allow_legacy_qbyt_readout", False))
         self._log_grad_norm = bool((stage2.get("logging", {}) or {}).get("grad_norm", True))
         gradient_diagnostics = stage2.get("gradient_diagnostics", {}) or {}
         self._gradient_diagnostics_enabled = bool(gradient_diagnostics.get("enabled", False))
@@ -169,6 +175,11 @@ class Stage2LightningModule(pl.LightningModule):
     def _load_init_checkpoint(self, checkpoint_path: Path) -> None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         assert_stream_policy_matches(checkpoint, self.stream_policy, source=checkpoint_path)
+        assert_qbyt_readout_version(
+            checkpoint,
+            source=checkpoint_path,
+            allow_legacy=self._allow_legacy_qbyt_readout,
+        )
         
         # Check if this is an icefall checkpoint (has "model" key)
         # vs standard DMA-KWS checkpoint (has "state_dict", "model_state_dict", etc)
@@ -263,6 +274,29 @@ class Stage2LightningModule(pl.LightningModule):
         self.adapter.load_state_dict(adapter_state, strict=True)
         self._adapter_weights_loaded = True
         print(f"Loaded phoneme adapter weights from {checkpoint_path}")
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Stamp the QbyT readout version onto every Lightning checkpoint.
+
+        Checkpoint averaging keeps the first payload as its template and only
+        replaces the state dict, so averaged checkpoints inherit this too.
+        """
+        stamp_qbyt_readout_version(checkpoint)
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Reject stale QbyT weights on both Lightning restore paths.
+
+        Covers ``load_from_checkpoint`` and ``Trainer.fit(ckpt_path=...)``; the
+        weights-only ``init_checkpoint`` path is guarded separately.
+        """
+        # Lightning does not hand the path to this hook, and touching
+        # ``self.trainer`` raises when the module is not attached to one, which is
+        # exactly the load_from_checkpoint case.
+        assert_qbyt_readout_version(
+            checkpoint,
+            source="the Stage II checkpoint being restored",
+            allow_legacy=self._allow_legacy_qbyt_readout,
+        )
 
     def forward(
         self,

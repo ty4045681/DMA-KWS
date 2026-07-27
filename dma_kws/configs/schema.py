@@ -382,6 +382,11 @@ class Stage2Config:
     log_interval: int = 10
     val_check_interval: int = 1000
     freeze_encoder: bool = False
+    #: Accept QbyT weights trained against the pre-fix pooled readout. Only the
+    #: encoder/adapter weights of such a checkpoint are meaningful, so this is a
+    #: warm-start escape hatch, not a compatibility mode: scores produced from it
+    #: are not comparable with the run it came from.
+    allow_legacy_qbyt_readout: bool = False
     checkpoint_dir: str = ""
     log_dir: str = ""
     run_name: str = "stage2_qbyt"

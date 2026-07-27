@@ -19,6 +19,12 @@ log_interval: 10
 val_check_interval: 1000
 freeze_encoder: false
 
+# Load QbyT weights trained before the pooled readout was fixed. Their parameter
+# shapes still match, so nothing else would notice, but they were trained to read
+# a different frame. Only the encoder/adapter weights survive a warm start this
+# way, and no score from such a checkpoint is comparable with its original run.
+allow_legacy_qbyt_readout: false
+
 # Phoneme-CTC trunk between the frozen encoder and QbyT (see configs/phoneme_adapter).
 # Off by default so pre-adapter checkpoints keep loading and stay comparable.
 phoneme_adapter:

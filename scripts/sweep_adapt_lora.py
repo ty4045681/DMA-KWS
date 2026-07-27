@@ -42,7 +42,10 @@ def _eval_lph_auc(
     from dma_kws.stage2.dataset import LibriPhraseEvalDataset, resolve_stage2_eval_paths
     from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
     from dma_kws.tokenizer import load_char_tokenizer
-    from dma_kws.training.checkpoint_io import extract_state_dict
+    from dma_kws.training.checkpoint_io import (
+        assert_qbyt_readout_version,
+        extract_state_dict,
+    )
 
     import torch
 
@@ -75,6 +78,11 @@ def _eval_lph_auc(
 
     model = Stage2LightningModule(config, vocab_size=vocab_size)
     ckpt = torch.load(checkpoint, map_location="cpu")
+    assert_qbyt_readout_version(
+        ckpt,
+        source=checkpoint,
+        allow_legacy=bool(config.get("stage2", {}).get("allow_legacy_qbyt_readout", False)),
+    )
     state = extract_state_dict(ckpt)
     missing, _ = model.load_state_dict(state, strict=False)
     assert_adapter_weights_loaded(model, missing)
@@ -102,7 +110,10 @@ def _eval_target_auc(
     from dma_kws.stage2.collate import test_collate_fn
     from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
     from dma_kws.tokenizer import load_char_tokenizer
-    from dma_kws.training.checkpoint_io import extract_state_dict
+    from dma_kws.training.checkpoint_io import (
+        assert_qbyt_readout_version,
+        extract_state_dict,
+    )
 
     import torch
 
@@ -130,6 +141,11 @@ def _eval_target_auc(
     )
 
     ckpt = torch.load(checkpoint, map_location="cpu")
+    assert_qbyt_readout_version(
+        ckpt,
+        source=checkpoint,
+        allow_legacy=bool(config.get("stage2", {}).get("allow_legacy_qbyt_readout", False)),
+    )
     state = extract_state_dict(ckpt)
 
     class _TargetValModule(Stage2LightningModule):

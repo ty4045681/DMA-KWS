@@ -1,4 +1,3 @@
-from models.encoder import ConformerEncoder
 import torch
 import torch.nn as nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
@@ -80,12 +79,15 @@ class QbyT(nn.Module):
         self.seq_fc = nn.Linear(embed_dim, 1)
 
 
-    def _padding_mask(self, lengths, max_len, device):
-        positions = torch.arange(max_len, device=device).unsqueeze(0)
-        return positions >= lengths.unsqueeze(1)
-
-
     def forward(self, speech, text, speech_lengths=None, text_lengths=None):
+        """Score each (text, speech) pair in the batch.
+
+        Pass ``speech_lengths`` and ``text_lengths`` whenever the batch is
+        padded. Omitting ``speech_lengths`` treats every audio frame -- including
+        padding -- as valid, which shifts the readout into the padded tail; the
+        ``text.ne(0)`` fallback for ``text_lengths`` assumes id 0 is only ever
+        padding.
+        """
         # 文本处理
         text_emb = self.text_projection(text)
         text_emb = self.pos_enc(text_emb)
@@ -115,22 +117,53 @@ class QbyT(nn.Module):
             text_lengths = text_lengths.to(device=speech.device, dtype=torch.long)
         text_lengths = text_lengths.clamp(min=0, max=text.size(1))
 
-        text_padding_mask = self._padding_mask(text_lengths, text.size(1), speech.device)
-        speech_padding_mask = self._padding_mask(speech_lengths, speech.size(1), speech.device)
-        padding_mask = torch.cat([text_padding_mask, speech_padding_mask], dim=1)
+        # Both blocks are padded to their batch maximum, so the naive concat is
+        # [valid text][text padding][valid audio][audio padding]. Re-pack each
+        # sample as [valid text][valid audio][padding] instead. Leaving the text
+        # padding in the middle would make the readout batch-dependent twice
+        # over: the last valid audio frame sits at a batch-dependent index, and
+        # the GRU -- which src_key_padding_mask does not reach, it only masks
+        # attention keys -- would walk that padding before reaching it.
+        text_width = text_emb.size(1)
+        total_width = combined_feat.size(1)
+        positions = torch.arange(total_width, device=speech.device).unsqueeze(0)
+        text_lengths_col = text_lengths.unsqueeze(1)
+        # clamp(min=1) keeps position 0 valid: an all-masked row makes the
+        # attention softmax produce NaN rather than fail.
+        valid_lengths = (text_lengths + speech_lengths).clamp(min=1, max=total_width)
+        valid = positions < valid_lengths.unsqueeze(1)
+        source_indices = torch.where(
+            positions < text_lengths_col,
+            positions.expand(batch_size, -1),
+            text_width + (positions - text_lengths_col).clamp(min=0),
+        ).clamp(max=total_width - 1)
+        combined_feat = combined_feat.gather(
+            1, source_indices.unsqueeze(-1).expand(-1, -1, combined_feat.size(-1))
+        ) * valid.unsqueeze(-1).to(combined_feat.dtype)
 
-        combined_feat = self.phone_matchor(combined_feat, src_key_padding_mask=padding_mask)
+        combined_feat = self.phone_matchor(combined_feat, src_key_padding_mask=~valid)
+        # No pack_padded_sequence needed: the readout below sits at the last
+        # valid frame, so the padding the GRU walks afterwards cannot reach it.
         gru_out, _ = self.gru(combined_feat)
-        combined_lengths = (text_lengths + speech_lengths).clamp(min=1, max=combined_feat.size(1))
-        last_valid_indices = (combined_lengths - 1).view(batch_size, 1, 1).expand(-1, 1, gru_out.size(-1))
+        last_valid_indices = (valid_lengths - 1).view(batch_size, 1, 1).expand(-1, 1, gru_out.size(-1))
         gru_out = gru_out.gather(1, last_valid_indices).squeeze(1)
         logits = self.fc(gru_out).squeeze(-1)
 
-        text_logits = self.seq_fc(combined_feat[:, :text_emb.shape[1], :]).squeeze(-1)
+        # After re-packing, positions [0, text_lengths) hold this sample's text
+        # and [text_lengths, text_width) hold audio frames. That is safe because
+        # build_seq_label emits one label per anchor token, so the Stage II
+        # sequence loss masks everything past text_lengths -- but it does mean
+        # this slice must not be read as "the text block".
+        text_logits = self.seq_fc(combined_feat[:, :text_width, :]).squeeze(-1)
         return logits, text_logits
 
 
 if __name__ == "__main__":
+    # Imported here rather than at module scope: the only use is this demo, and
+    # models.encoder pulls in whisper, which would make importing QbyT depend on
+    # a heavy optional dependency.
+    from models.encoder import ConformerEncoder
+
     encoder = ConformerEncoder(
         input_size=80,
         output_size=144,

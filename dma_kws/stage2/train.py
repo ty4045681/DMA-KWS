@@ -105,6 +105,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training import resolve_resume_path
     from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
+    from dma_kws.training.checkpoint_io import stamp_qbyt_readout_version
     from dma_kws.training.ddp import apply_step_based_validation, build_trainer_kwargs
     from dma_kws.training.metrics_history import (
         append_wide_row,
@@ -284,13 +285,15 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
 
     ckpt_path = checkpoint_dir / f"stage2_step{global_step:06d}.pt"
     torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "config": config,
-            "step": global_step,
-            "tokenizer_dict_path": str(dict_path),
-            "vocab_size": vocab_size,
-        },
+        stamp_qbyt_readout_version(
+            {
+                "model_state_dict": model.state_dict(),
+                "config": config,
+                "step": global_step,
+                "tokenizer_dict_path": str(dict_path),
+                "vocab_size": vocab_size,
+            }
+        ),
         ckpt_path,
     )
     print(f"Saved {ckpt_path}")

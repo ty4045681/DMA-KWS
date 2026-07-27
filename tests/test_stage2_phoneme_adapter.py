@@ -10,6 +10,7 @@ pytest.importorskip("pytorch_lightning")
 
 from dma_kws.stage2.losses import compute_stage2_losses
 from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
+from dma_kws.training.checkpoint_io import stamp_qbyt_readout_version
 
 ENCODER_DIM = 144
 TRUNK_DIM = 32
@@ -310,7 +311,9 @@ def test_verifier_architecture_matches_the_training_module(monkeypatch, tmp_path
     trained = Stage2LightningModule(config, vocab_size=VOCAB_SIZE, freeze_encoder=True)
 
     checkpoint = tmp_path / "stage2.pt"
-    torch.save({"model_state_dict": trained.state_dict()}, checkpoint)
+    torch.save(
+        stamp_qbyt_readout_version({"model_state_dict": trained.state_dict()}), checkpoint
+    )
 
     monkeypatch.setattr(
         "dma_kws.inference.stage2_verifier.build_encoder", lambda *_a, **_k: _FakeEncoder()
@@ -355,7 +358,12 @@ def test_init_checkpoint_without_adapter_weights_fails(monkeypatch, tmp_path):
     freezes the trunk immediately, so a checkpoint with no adapter.* would leave
     LoRA adapting on top of a random projection."""
     checkpoint = tmp_path / "stage2_no_adapter.pt"
-    torch.save({"model_state_dict": {"qbyt.proj.weight": torch.zeros(1, TRUNK_DIM)}}, checkpoint)
+    torch.save(
+        stamp_qbyt_readout_version(
+            {"model_state_dict": {"qbyt.proj.weight": torch.zeros(1, TRUNK_DIM)}}
+        ),
+        checkpoint,
+    )
 
     config = _config()
     with pytest.raises(SystemExit, match="carries no adapter"):

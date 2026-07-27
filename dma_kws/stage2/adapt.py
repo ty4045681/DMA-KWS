@@ -26,7 +26,11 @@ from dma_kws.training.adapt_params import (
     merge_adapt_params,
     resolve_adapt_lr,
 )
-from dma_kws.training.checkpoint_io import assert_stream_policy_matches
+from dma_kws.training.checkpoint_io import (
+    assert_qbyt_readout_version,
+    assert_stream_policy_matches,
+    stamp_qbyt_readout_version,
+)
 from dma_kws.training.lora import (
     count_lora_params,
     inject_qbyt_lora,
@@ -139,6 +143,14 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             state = torch.load(adapter_checkpoint, map_location="cpu")
             # LoRA weights are tuned against a specific encoder operating point.
             assert_stream_policy_matches(state, self.stream_policy, source=adapter_checkpoint)
+            # ...and against a specific QbyT readout: LoRA only moves the matcher
+            # attention, so a stale adapter would be re-pointed at a frame the
+            # base weights never learned to read.
+            assert_qbyt_readout_version(
+                state,
+                source=adapter_checkpoint,
+                allow_legacy=self._allow_legacy_qbyt_readout,
+            )
             adapter_state = state.get("lora_state_dict", state)
             load_lora_state_dict(self.qbyt, adapter_state, strict=False)
 
@@ -584,32 +596,36 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     global_step = int(trainer.global_step)
     adapter_out = adapt_paths["phase_dir"] / f"adapter_{adapt_paths['slug_str']}.pt"
     torch.save(
-        {
-            "lora_state_dict": lora_state_dict(model.qbyt),
-            "config": config,
-            "step": global_step,
-            "keyword": adapt_paths["keyword_str"],
-            "slug": adapt_paths["slug_str"],
-            "phase": phase,
-            "rank": lora_rank,
-            "alpha": lora_alpha,
-        },
+        stamp_qbyt_readout_version(
+            {
+                "lora_state_dict": lora_state_dict(model.qbyt),
+                "config": config,
+                "step": global_step,
+                "keyword": adapt_paths["keyword_str"],
+                "slug": adapt_paths["slug_str"],
+                "phase": phase,
+                "rank": lora_rank,
+                "alpha": lora_alpha,
+            }
+        ),
         adapter_out,
     )
 
     merge_lora(model.qbyt)
     merged_out = adapt_paths["merged_path"]
     torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "config": config,
-            "step": global_step,
-            "keyword": adapt_paths["keyword_str"],
-            "slug": adapt_paths["slug_str"],
-            "phase": phase,
-            "tokenizer_dict_path": str(dict_path),
-            "vocab_size": vocab_size,
-        },
+        stamp_qbyt_readout_version(
+            {
+                "model_state_dict": model.state_dict(),
+                "config": config,
+                "step": global_step,
+                "keyword": adapt_paths["keyword_str"],
+                "slug": adapt_paths["slug_str"],
+                "phase": phase,
+                "tokenizer_dict_path": str(dict_path),
+                "vocab_size": vocab_size,
+            }
+        ),
         merged_out,
     )
 

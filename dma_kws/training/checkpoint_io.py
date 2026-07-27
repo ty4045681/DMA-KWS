@@ -9,6 +9,19 @@ import torch
 
 from dma_kws.training.checkpoint_avg import average_lightning_checkpoints
 
+#: Bumped whenever QbyT's pooled readout changes what it means.
+#:
+#: Version 1 (unversioned) indexed the readout with ``text_lengths +
+#: speech_lengths - 1`` while the sequence was laid out as ``[text padded to the
+#: batch maximum][audio]``. That index is short by the batch's text padding, so a
+#: pair scored alone and the same pair scored next to a longer keyword disagreed,
+#: and for short keywords it landed in the text padding entirely -- the pooled GRU
+#: state had then consumed no audio at all. Version 2 re-packs each sample as
+#: ``[valid text][valid audio][padding]`` and reads the last valid frame.
+QBYT_READOUT_VERSION = 2
+
+QBYT_READOUT_VERSION_KEY = "qbyt_readout_version"
+
 
 def extract_state_dict(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:
     """Extract a model state dict from a Lightning or custom checkpoint."""
@@ -74,6 +87,75 @@ def assert_stream_policy_matches(
             "stage1.stream.chunk_size / stage1.stream.left_context_frames to match, "
             "or re-train at the new point."
         )
+
+
+def stamp_qbyt_readout_version(payload: dict[str, Any]) -> dict[str, Any]:
+    """Record the QbyT readout version in a checkpoint payload, in place."""
+    payload[QBYT_READOUT_VERSION_KEY] = QBYT_READOUT_VERSION
+    return payload
+
+
+def _carries_qbyt_weights(checkpoint: Any) -> bool:
+    """Whether a payload holds QbyT weights whose readout version matters.
+
+    Deliberately narrow: Stage I exports, icefall encoder checkpoints and Step A
+    adapter exports all flow through the same loaders, and none of them encodes a
+    readout convention.
+    """
+    if not isinstance(checkpoint, dict):
+        return False
+    if isinstance(checkpoint.get("lora_state_dict"), dict):
+        return True
+    state = extract_state_dict(checkpoint)
+    if not isinstance(state, dict):
+        return False
+    return any(isinstance(key, str) and key.startswith("qbyt.") for key in state)
+
+
+def assert_qbyt_readout_version(
+    checkpoint: Any,
+    *,
+    source: Any,
+    allow_legacy: bool = False,
+) -> None:
+    """Fail when a checkpoint's QbyT weights predate the current pooled readout.
+
+    Parameter shapes did not change across the readout fix, so a stale checkpoint
+    loads cleanly and then scores from a frame it was never trained to read. That
+    is the exact failure mode the fix removes, so it must not degrade to a
+    warning.
+    """
+    import warnings
+
+    if not _carries_qbyt_weights(checkpoint):
+        return
+
+    saved = checkpoint.get(QBYT_READOUT_VERSION_KEY)
+    if saved == QBYT_READOUT_VERSION:
+        return
+
+    described = "unversioned (pre-fix)" if saved is None else f"version {saved!r}"
+    if allow_legacy:
+        warnings.warn(
+            f"{source} carries QbyT weights at readout {described}, but this build reads "
+            f"version {QBYT_READOUT_VERSION}. Proceeding because "
+            "stage2.allow_legacy_qbyt_readout is set: only the encoder/adapter weights are "
+            "meaningful, and any score or metric produced from this checkpoint is not "
+            "comparable with the ones it was trained against.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return
+
+    raise SystemExit(
+        f"{source} carries QbyT weights at readout {described} but this build reads version "
+        f"{QBYT_READOUT_VERSION}. The pooled readout used to be indexed with "
+        "text_lengths + speech_lengths - 1 against a batch-padded layout, so these weights "
+        "were trained to read a different frame than the one they will now be scored from. "
+        "The parameter shapes still match, which is why this cannot be left to a warning. "
+        "Re-train Stage II, or set stage2.allow_legacy_qbyt_readout=true to reuse only the "
+        "encoder/adapter weights as a warm start."
+    )
 
 
 def extract_icefall_encoder_state(

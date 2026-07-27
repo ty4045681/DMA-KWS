@@ -23,12 +23,26 @@ from dma_kws.stage2.fbank import FbankExtractor
 from dma_kws.stage2.features import waveform_to_fbank
 
 
-def _load_model_state(model, ckpt_path: str, load_fn, *, stream_policy=None):
+def _load_model_state(
+    model,
+    ckpt_path: str,
+    load_fn,
+    *,
+    stream_policy=None,
+    allow_legacy_qbyt_readout: bool = False,
+):
     ckpt = load_fn(ckpt_path, map_location="cpu")
     if stream_policy is not None:
         from dma_kws.training.checkpoint_io import assert_stream_policy_matches
 
         assert_stream_policy_matches(ckpt, stream_policy, source=ckpt_path)
+    from dma_kws.training.checkpoint_io import assert_qbyt_readout_version
+
+    assert_qbyt_readout_version(
+        ckpt,
+        source=ckpt_path,
+        allow_legacy=allow_legacy_qbyt_readout,
+    )
     state = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state, strict=True)
     return model
@@ -122,7 +136,15 @@ class Stage2Verifier:
 
         model = Stage2Model()
         try:
-            _load_model_state(model, stage2_ckpt, torch.load, stream_policy=stream_policy)
+            _load_model_state(
+                model,
+                stage2_ckpt,
+                torch.load,
+                stream_policy=stream_policy,
+                allow_legacy_qbyt_readout=bool(
+                    stage2_cfg.get("allow_legacy_qbyt_readout", False)
+                ),
+            )
         except RuntimeError as exc:
             raise SystemExit(
                 f"Checkpoint {stage2_ckpt} is incompatible with the model architecture: {exc}"
