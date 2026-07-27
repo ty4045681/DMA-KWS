@@ -76,12 +76,20 @@ stage2:
   # Training hyperparams (tuned for downstream QbyT training)
   negative_ratio: 1
   hard_negative_ratio: 1
-  sample_lens: 5000
+  # Dataset __len__; __getitem__ maps index % num_anchors, so a value smaller
+  # than the anchor count silently restricts anchors to the first sample_lens
+  # rows of the parquet. Effectively-infinite like the paper configs; max_steps
+  # is what bounds training.
+  sample_lens: 100000000
   batch_size_per_gpu: 128
   num_workers: 4
 
   learning_rate: 0.0005
   warmup_steps: 500
+  # Keep max_steps == total_scheduler_steps: the schema default of 50000 would
+  # let the Trainer run past the cosine schedule, whose LR climbs back to peak
+  # after num_training_steps instead of staying at 0.
+  max_steps: 10000
   total_scheduler_steps: 10000
   accumulate_grad_batches: 1
   precision: bf16-mixed
