@@ -76,20 +76,49 @@ def main(cfg: DictConfig) -> None:
     )
     vocab_size = len(tokenizer._symbol_table)
 
+    # ``init_checkpoint`` is a constructor argument, not something the module reads
+    # out of the config, so it has to be passed explicitly here exactly as
+    # ``dma_kws.stage2.train`` does. Omitting it leaves the encoder randomly
+    # initialized while the adapter still loads its own weights from
+    # ``phoneme_adapter.init_checkpoint``, so nothing in the log looks wrong and
+    # every decode comes out as noise.
+    encoder_checkpoint = str(config["stage2"].get("init_checkpoint", "")).strip()
+    # A trained Stage II checkpoint carries encoder.* weights itself, so it is the
+    # other way to get a non-random encoder. Demanding both would refuse a run
+    # that already has everything it needs.
+    stage2_ckpt = str(prep.get("checkpoint", "")).strip()
+    if not encoder_checkpoint and not stage2_ckpt:
+        raise SystemExit(
+            "stage2.init_checkpoint is empty, so the encoder would stay randomly "
+            "initialized and this probe would measure noise. Export ICEFALL_CHECKPOINT "
+            "or pass stage2.init_checkpoint=/path/to/encoder.pt"
+        )
+    if encoder_checkpoint and not Path(encoder_checkpoint).is_file():
+        raise SystemExit(f"stage2.init_checkpoint not found: {encoder_checkpoint}")
+
     # No Stage II checkpoint on purpose: this measures the frozen encoder plus the
     # Step A trunk, which is exactly what every frozen Stage II run starts from.
     # QbyT stays random and is never called.
-    model = Stage2LightningModule(config, vocab_size=vocab_size)
+    model = Stage2LightningModule(
+        config, vocab_size=vocab_size, init_checkpoint=encoder_checkpoint or None
+    )
     if model.adapter is None:
         raise SystemExit(
             "This probe decodes the phoneme CTC head, so it needs the adapter: run with "
             "stage2.phoneme_adapter.enabled=true and an init_checkpoint."
         )
-    stage2_ckpt = str(prep.get("checkpoint", "")).strip()
     if stage2_ckpt:
-        from dma_kws.training.checkpoint_io import extract_state_dict
+        from dma_kws.training.checkpoint_io import (
+            assert_stream_policy_matches,
+            extract_state_dict,
+        )
 
         raw = torch.load(stage2_ckpt, map_location="cpu")
+        # The same guard the module applies to init_checkpoint. A .pt exported at
+        # another operating point loads cleanly and then decodes at a latency its
+        # weights never saw, so the PER would be measuring the mismatch rather
+        # than the representation.
+        assert_stream_policy_matches(raw, model.stream_policy, source=stage2_ckpt)
         state = (
             extract_state_dict(raw)
             if Path(stage2_ckpt).suffix == ".pt"
@@ -178,6 +207,19 @@ def main(cfg: DictConfig) -> None:
         }
         report[f"{num_words}word"] = entry
         print(f"{num_words}word: {json.dumps(entry)}", flush=True)
+
+        # A PER near or above 1.0 means the hypotheses carry no more information than
+        # an empty string would. Short clips can score badly, but not this badly:
+        # in practice this is a load failure (random encoder, mismatched feature
+        # space, wrong blank id), not a statement about the representation.
+        if entry["per"] is not None and entry["per"] >= 0.95:
+            print(
+                f"  WARNING: PER {entry['per']:.3f} is at noise level. Before reading this "
+                "as a property of the frozen representation, check that the encoder "
+                "weights actually loaded (look for 'Loaded encoder weights' above) and "
+                "that the fbank features match the ones training uses.",
+                flush=True,
+            )
 
     print(
         "\n"
