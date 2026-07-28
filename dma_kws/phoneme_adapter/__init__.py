@@ -13,6 +13,7 @@ from typing import Any
 __all__ = [
     "PhonemeAdapter",
     "build_phoneme_adapter",
+    "ctc_min_input_lengths",
     "build_trunk",
     "TRUNK_TYPES",
 ]
@@ -20,6 +21,7 @@ __all__ = [
 _EXPORTS = {
     "PhonemeAdapter": "dma_kws.phoneme_adapter.module",
     "build_phoneme_adapter": "dma_kws.phoneme_adapter.module",
+    "ctc_min_input_lengths": "dma_kws.phoneme_adapter.module",
     "build_trunk": "dma_kws.phoneme_adapter.trunk",
     "TRUNK_TYPES": "dma_kws.phoneme_adapter.trunk",
 }

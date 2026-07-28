@@ -3,7 +3,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from dma_kws.metrics import collapse_ctc
-from dma_kws.phoneme_adapter.module import build_phoneme_adapter
+from dma_kws.phoneme_adapter.module import build_phoneme_adapter, ctc_min_input_lengths
 
 VOCAB_SIZE = 71
 
@@ -67,6 +67,59 @@ def test_ctc_loss_returns_zero_when_every_sample_is_skipped():
 
     assert num_skipped == 1
     assert float(loss.detach()) == 0.0
+
+
+def test_ctc_loss_skips_repeated_labels_without_a_blank_frame():
+    """Equal adjacent labels need an extra frame for an intervening CTC blank."""
+    adapter = _adapter()
+    mask = _mask([3], 3)
+    _features, log_probs = adapter(torch.randn(1, 3, 16), mask)
+    targets = torch.tensor([[3, 3, 4]], dtype=torch.long)
+    target_lengths = torch.tensor([3], dtype=torch.long)
+
+    loss, num_skipped = adapter.ctc_loss(log_probs, mask, targets, target_lengths)
+
+    assert num_skipped == 1
+    assert float(loss.detach()) == 0.0
+
+
+def test_ctc_loss_keeps_repeated_labels_when_a_blank_frame_fits():
+    adapter = _adapter()
+    mask = _mask([4], 4)
+    _features, log_probs = adapter(torch.randn(1, 4, 16), mask)
+    targets = torch.tensor([[3, 3, 4]], dtype=torch.long)
+    target_lengths = torch.tensor([3], dtype=torch.long)
+
+    loss, num_skipped = adapter.ctc_loss(log_probs, mask, targets, target_lengths)
+
+    assert num_skipped == 0
+    assert torch.isfinite(loss)
+
+
+def test_ctc_min_input_lengths_ignores_repeated_padding():
+    targets = torch.tensor(
+        [
+            [3, 4, 0, 0, 0],
+            [5, 5, 6, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    target_lengths = torch.tensor([2, 3], dtype=torch.long)
+
+    result = ctc_min_input_lengths(targets, target_lengths)
+
+    assert result.tolist() == [2, 4]
+
+
+def test_ctc_loss_rejects_blank_inside_a_valid_target():
+    adapter = _adapter()
+    mask = _mask([4], 4)
+    _features, log_probs = adapter(torch.randn(1, 4, 16), mask)
+    targets = torch.tensor([[3, 0, 4]], dtype=torch.long)
+    target_lengths = torch.tensor([3], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="blank_id"):
+        adapter.ctc_loss(log_probs, mask, targets, target_lengths)
 
 
 def test_ctc_loss_is_finite_for_ragged_batches():

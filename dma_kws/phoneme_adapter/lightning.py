@@ -120,6 +120,14 @@ class PhonemeAdapterCtcModule(pl.LightningModule):
         batch_size = batch["feats"].size(0)
         self.log("train/loss", loss, on_step=True, prog_bar=True, batch_size=batch_size)
         self.log("train/ctc_skipped", float(num_skipped), on_step=True, batch_size=batch_size)
+        self.log(
+            "train/ctc_skip_rate",
+            num_skipped / max(batch_size, 1),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch_size,
+        )
 
         optimizer = self.optimizers()
         self.log(

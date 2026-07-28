@@ -26,6 +26,49 @@ def _load_ctc():
     return CTC
 
 
+def ctc_min_input_lengths(
+    targets: torch.Tensor,
+    target_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Return the minimum number of frames needed to align each CTC target.
+
+    CTC has to emit a blank between adjacent identical labels, so a target such
+    as ``[AA, AA, K]`` needs four input frames rather than three. ``targets`` is
+    the padded ``[batch, max_target_length]`` representation used throughout
+    this project; padding beyond each entry in ``target_lengths`` is ignored.
+    """
+    if targets.ndim != 2:
+        raise ValueError(
+            f"Expected padded 2-D CTC targets [B, U], got shape {tuple(targets.shape)}"
+        )
+    if target_lengths.ndim != 1 or target_lengths.numel() != targets.size(0):
+        raise ValueError(
+            "target_lengths must be a 1-D tensor with one entry per target row; "
+            f"got shape {tuple(target_lengths.shape)} for targets {tuple(targets.shape)}"
+        )
+
+    target_lengths = target_lengths.to(device=targets.device, dtype=torch.long)
+    max_target_length = targets.size(1)
+    invalid_lengths = (target_lengths < 0) | (target_lengths > max_target_length)
+    if bool(invalid_lengths.any()):
+        raise ValueError(
+            f"target_lengths must be in [0, {max_target_length}], got "
+            f"{target_lengths.detach().cpu().tolist()}"
+        )
+
+    if max_target_length < 2:
+        return target_lengths
+
+    # Pair position j compares targets[j - 1] with targets[j]. A pair is valid
+    # only when its right-hand label is inside the unpadded target sequence.
+    pair_positions = torch.arange(1, max_target_length, device=targets.device)
+    valid_pairs = pair_positions.unsqueeze(0) < target_lengths.unsqueeze(1)
+    adjacent_repeats = (
+        (targets[:, 1:] == targets[:, :-1]) & valid_pairs
+    ).sum(dim=1)
+    return target_lengths + adjacent_repeats
+
+
 class PhonemeAdapter(nn.Module):
     """Trunk + phoneme CTC output projection.
 
@@ -109,11 +152,11 @@ class PhonemeAdapter(nn.Module):
         different tensors, which is precisely the coupling this module exists to
         create.
 
-        Returns ``(loss, num_skipped)``. CTC cannot align a label sequence longer
-        than the input, and at 25 Hz a short phrase clip can genuinely have fewer
-        frames than phonemes. Those samples are dropped rather than left to
-        ``zero_infinity`` so the count stays visible: a high skip rate means the
-        auxiliary loss is quietly training on long clips only.
+        Returns ``(loss, num_skipped)``. In addition to needing at least one
+        frame per label, CTC needs an intervening blank frame for every adjacent
+        repeated label. At 25 Hz a short phrase clip can genuinely fail either
+        requirement. Those samples are dropped explicitly so the count stays
+        visible instead of being silently zeroed by ``zero_infinity``.
         """
         batch, frames = log_probs.size(0), log_probs.size(1)
         if encoder_mask is None:
@@ -121,10 +164,22 @@ class PhonemeAdapter(nn.Module):
                 (batch,), frames, dtype=torch.long, device=log_probs.device
             )
         else:
-            input_lengths = encoder_mask.squeeze(1).sum(dim=1).to(dtype=torch.long)
+            input_lengths = encoder_mask.squeeze(1).sum(dim=1).to(
+                device=log_probs.device, dtype=torch.long
+            )
 
+        targets = targets.to(device=log_probs.device, dtype=torch.long)
         target_lengths = target_lengths.to(device=log_probs.device, dtype=torch.long)
-        keep = target_lengths <= input_lengths
+        min_input_lengths = ctc_min_input_lengths(targets, target_lengths)
+
+        target_positions = torch.arange(targets.size(1), device=targets.device).unsqueeze(0)
+        valid_target_mask = target_positions < target_lengths.unsqueeze(1)
+        if bool(((targets == self.blank_id) & valid_target_mask).any()):
+            raise ValueError(
+                f"CTC targets contain blank_id={self.blank_id} inside valid target positions"
+            )
+
+        keep = (target_lengths > 0) & (min_input_lengths <= input_lengths)
         num_skipped = int((~keep).sum().item())
         if not bool(keep.any()):
             return log_probs.sum() * 0.0, num_skipped
@@ -137,8 +192,13 @@ class PhonemeAdapter(nn.Module):
             target_lengths[keep],
             blank=self.blank_id,
             reduction="sum",
-            zero_infinity=True,
+            zero_infinity=False,
         )
+        if not bool(torch.isfinite(loss)):
+            raise FloatingPointError(
+                "CTC loss became non-finite after infeasible targets were filtered; "
+                "check target ids, lengths, and log-probabilities"
+            )
         return loss / int(keep.sum()), num_skipped
 
 

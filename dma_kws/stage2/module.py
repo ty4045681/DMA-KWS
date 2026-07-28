@@ -403,7 +403,20 @@ class Stage2LightningModule(pl.LightningModule):
             ctc_log_probs, encoder_mask, targets, target_lengths
         )
         # A high skip rate means the auxiliary loss only ever sees long clips.
-        self.log("train/ctc_skipped", float(num_skipped), on_step=True)
+        batch_size = int(target_lengths.numel())
+        self.log(
+            "train/ctc_skipped",
+            float(num_skipped),
+            on_step=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train/ctc_skip_rate",
+            num_skipped / max(batch_size, 1),
+            on_step=True,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
         return ctc_loss
 
     def _forward_train_losses(

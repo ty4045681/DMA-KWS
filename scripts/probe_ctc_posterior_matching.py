@@ -61,6 +61,7 @@ def main(cfg: DictConfig) -> None:
         raise SystemExit("Missing torch/torchmetrics on this machine.") from exc
 
     from dma_kws.nn import run_encoder
+    from dma_kws.phoneme_adapter.module import ctc_min_input_lengths
     from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
     from dma_kws.training.checkpoint_io import assert_qbyt_readout_version, extract_state_dict
 
@@ -184,7 +185,8 @@ def main(cfg: DictConfig) -> None:
                 qbyt_eer.update(torch.sigmoid(logits), labels)
 
                 # CTC score: -log P(anchor phonemes | audio), per sample.
-                keep = (target_lengths <= input_lengths) & (target_lengths > 0)
+                min_input_lengths = ctc_min_input_lengths(anchor, target_lengths)
+                keep = (target_lengths > 0) & (min_input_lengths <= input_lengths)
                 skipped += int((~keep).sum().item())
                 if not bool(keep.any()):
                     continue
@@ -196,8 +198,13 @@ def main(cfg: DictConfig) -> None:
                     target_lengths[idx],
                     blank=blank_id,
                     reduction="none",
-                    zero_infinity=True,
+                    zero_infinity=False,
                 )
+                if not bool(torch.isfinite(per_sample).all()):
+                    raise FloatingPointError(
+                        "CTC probe produced non-finite losses after infeasible "
+                        "targets were filtered"
+                    )
                 # Length-normalize, then negate: a low CTC loss means the phrase is
                 # present, so the higher-is-better score AUC expects is its negative.
                 score = -(per_sample / target_lengths[idx].clamp(min=1).float())
