@@ -1,3 +1,4 @@
+import random
 from pathlib import Path
 
 import numpy as np
@@ -158,3 +159,61 @@ def test_dataset_loads_tokenizer_from_dict_path(mock_npy_loader):
     _, expected = anchor_ids.tokenize("HH AH0 L OW1")
 
     assert sample["anchor_seq"].tolist() == expected
+
+
+def test_worker_init_fn_reseeds_dataset_rng_per_worker(monkeypatch):
+    """Each DataLoader worker must draw a different random stream.
+
+    The dataset is forked into every worker with its ``random.Random(seed)``
+    already constructed, so without a ``worker_init_fn`` all workers replay the
+    identical sequence of positive/negative decisions, hard-negative picks and
+    clip choices. The bug is invisible in any loss curve: batches still look
+    varied because each one comes from a single worker.
+    """
+    from dma_kws.stage2.dataset import stage2_worker_init_fn
+
+    dataset = LibriPhraseTrainDataset(
+        wav_dir="/data/segments",
+        tokenizer=_FakeTokenizer(),
+        df=_mock_dataframe(),
+        sample_lens=4,
+        seed=2025,
+    )
+
+    class _FakeWorkerInfo:
+        def __init__(self, seed: int) -> None:
+            self.dataset = dataset
+            self.seed = seed
+
+    drawn: list[list[float]] = []
+    for worker_seed in (11, 22, 33):
+        monkeypatch.setattr(
+            "dma_kws.stage2.dataset.torch.utils.data.get_worker_info",
+            lambda seed=worker_seed: _FakeWorkerInfo(seed),
+        )
+        stage2_worker_init_fn(0)
+        drawn.append([dataset._rng.random() for _ in range(5)])
+
+    assert drawn[0] != drawn[1]
+    assert drawn[1] != drawn[2]
+
+
+def test_worker_init_fn_is_a_noop_outside_workers(monkeypatch):
+    """num_workers=0 runs in the main process, where the configured seed stands."""
+    from dma_kws.stage2.dataset import stage2_worker_init_fn
+
+    dataset = LibriPhraseTrainDataset(
+        wav_dir="/data/segments",
+        tokenizer=_FakeTokenizer(),
+        df=_mock_dataframe(),
+        sample_lens=4,
+        seed=2025,
+    )
+    expected = random.Random(2025).random()
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.dataset.torch.utils.data.get_worker_info", lambda: None
+    )
+    stage2_worker_init_fn(0)
+
+    assert dataset._rng.random() == expected

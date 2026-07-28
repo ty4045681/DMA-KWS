@@ -301,7 +301,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     from dma_kws.runlog import build_loggers
     from dma_kws.stage2 import adapt_console
     from dma_kws.stage2.collate import test_collate_fn, train_collate_fn
-    from dma_kws.stage2.dataset import LibriPhraseTrainDataset
+    from dma_kws.stage2.dataset import LibriPhraseTrainDataset, stage2_worker_init_fn
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training import resolve_resume_path
     from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
@@ -423,6 +423,9 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         num_workers=num_workers,
         collate_fn=train_collate_fn,
         drop_last=True,
+        # Reseeds both the mixed wrapper and the LibriPhrase dataset it holds;
+        # otherwise every worker draws the same mix decisions and negatives.
+        worker_init_fn=stage2_worker_init_fn,
         **loader_kwargs,
     )
 

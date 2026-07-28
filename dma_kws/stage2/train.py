@@ -100,7 +100,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     from dma_kws.config import get_tokenizer_config, require_sections
     from dma_kws.runlog import build_loggers
     from dma_kws.stage2.collate import train_collate_fn
-    from dma_kws.stage2.dataset import LibriPhraseTrainDataset
+    from dma_kws.stage2.dataset import LibriPhraseTrainDataset, stage2_worker_init_fn
     from dma_kws.stage2.module import Stage2LightningModule
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training import resolve_resume_path
@@ -162,6 +162,9 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         num_workers=num_workers,
         collate_fn=train_collate_fn,
         drop_last=True,
+        # Without this the dataset's RNG is forked in an identical state into every
+        # worker, so all of them draw the same negatives and clips.
+        worker_init_fn=stage2_worker_init_fn,
         **loader_kwargs,
     )
 

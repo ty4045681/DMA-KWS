@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import torch.utils.data
 from torch.utils.data import Dataset
 
 from dma_kws.g2p import make_g2p, text_to_phonemes
@@ -44,6 +45,49 @@ def _resolve_fbank_path(wav_dir: str | Path, query_wav: str) -> str:
     for prefix in ("LP-460", "GP-1000", "LP-100"):
         path = path.replace(prefix, f"{prefix}-fbank")
     return path.replace(".wav", ".npy")
+
+
+#: Attributes on a dataset that may hold another dataset with its own ``_rng``.
+#: ``MixedAdaptDataset`` wraps a ``LibriPhraseTrainDataset``, so reseeding only the
+#: outer object would leave the inner negative sampling replicated across workers.
+_NESTED_DATASET_ATTRS = ("keyword_dataset", "libri_dataset", "dataset")
+
+
+def _reseed_rng_holders(obj: Any, seed: int, seen: set[int]) -> None:
+    if obj is None or id(obj) in seen:
+        return
+    seen.add(id(obj))
+    if isinstance(getattr(obj, "_rng", None), random.Random):
+        # Offset per holder so a wrapper and the dataset it wraps do not draw the
+        # identical stream, which would correlate the mix decision with the
+        # negative it selects.
+        obj._rng = random.Random(seed + 7919 * len(seen))
+    for attr in _NESTED_DATASET_ATTRS:
+        _reseed_rng_holders(getattr(obj, attr, None), seed, seen)
+
+
+def stage2_worker_init_fn(worker_id: int) -> None:
+    """Give every DataLoader worker its own random stream.
+
+    ``LibriPhraseTrainDataset`` builds ``random.Random(seed)`` in the parent
+    process, so each worker inherits a copy whose state is already identical.
+    Without this hook all ``num_workers`` replicas replay the same
+    positive/negative decisions, hard-negative picks and clip choices, and the
+    only randomness left across workers is which anchor index they are handed.
+    Nothing in the loss curves reveals it: a batch is produced by a single
+    worker, so each batch still looks varied.
+
+    ``get_worker_info().seed`` is derived by PyTorch as ``base_seed + worker_id``
+    and the base changes per epoch, so the streams stay distinct, reproducible,
+    and non-repeating across epochs. It also already differs per DDP rank, so two
+    GPUs do not sample in lockstep either.
+    """
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        # num_workers=0: the dataset runs in the main process and the seed passed
+        # to the constructor is already the intended one.
+        return
+    _reseed_rng_holders(info.dataset, int(info.seed), set())
 
 
 class LibriPhraseTrainDataset(Dataset):
