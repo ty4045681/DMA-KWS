@@ -12,6 +12,13 @@ _DEFAULT_SAVE_TOP_K = -1
 _INIT_FILENAME = "step_{step:06d}"
 _FINETUNE_FILENAME = "step_{step:06d}_auc_{val_auc:.6f}"
 
+#: Metric that decides which checkpoint is "best". ``val_auc`` is the logger-free
+#: alias ``Stage2LightningModule.on_validation_epoch_end`` publishes alongside
+#: ``val/auc`` precisely so a filename and a monitor can reference it without a
+#: slash. Set ``stage2.checkpoint.monitor`` to "" to go back to a plain step grid.
+_DEFAULT_MONITOR = "val_auc"
+_DEFAULT_MONITOR_MODE = "max"
+
 
 def build_stage2_checkpoint_callback(
     config: dict[str, Any],
@@ -41,9 +48,16 @@ def build_stage2_checkpoint_callback(
     else:
         filename = str(ckpt_cfg.get("init_filename", _INIT_FILENAME))
 
+    # Empty string is the opt-out, so ``.get`` cannot collapse it into the default.
+    raw_monitor = ckpt_cfg.get("monitor", _DEFAULT_MONITOR)
+    monitor = str(raw_monitor).strip() or None
+    mode = str(ckpt_cfg.get("mode", _DEFAULT_MONITOR_MODE))
+
     return ModelCheckpoint(
         dirpath=str(checkpoint_dir),
         filename=filename,
+        monitor=monitor,
+        mode=mode,
         save_top_k=save_top_k,
         save_on_train_epoch_end=False,
         every_n_train_steps=every_n_train_steps,

@@ -67,3 +67,35 @@ def test_frozen_encoder_recipe_uses_init_filename(tmp_path):
     callback = build_stage2_checkpoint_callback(_base_config(tmp_path), "frozen-wenet-encoder")
 
     assert callback.filename == "step_{step:06d}"
+
+
+def test_validation_metric_is_monitored_by_default(tmp_path):
+    """Stage II must keep the best-AUC checkpoint, not only periodic snapshots.
+
+    ``every_n_train_steps`` alone saves on a step grid; when val/auc peaks early
+    and then degrades, nothing marks the peak, and picking it after the fact means
+    re-reading the logs and guessing which step file matches.
+    """
+    callback = build_stage2_checkpoint_callback(_base_config(tmp_path), "init-ls-460")
+
+    assert callback.monitor == "val_auc"
+    assert callback.mode == "max"
+
+
+def test_monitor_can_be_disabled_for_step_grid_only_runs(tmp_path):
+    config = _base_config(tmp_path)
+    config["stage2"]["checkpoint"] = {"monitor": ""}
+
+    callback = build_stage2_checkpoint_callback(config, "init-ls-460")
+
+    assert callback.monitor is None
+
+
+def test_monitor_and_mode_are_configurable(tmp_path):
+    config = _base_config(tmp_path)
+    config["stage2"]["checkpoint"] = {"monitor": "val/eer", "mode": "min"}
+
+    callback = build_stage2_checkpoint_callback(config, "init-ls-460")
+
+    assert callback.monitor == "val/eer"
+    assert callback.mode == "min"
