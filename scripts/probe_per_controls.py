@@ -30,6 +30,20 @@ Usage:
     stage2.init_checkpoint=/path/to/encoder.pt \
     stage2.phoneme_adapter.init_checkpoint=/path/to/adapter.pt \
     prep.limit=600
+
+Optional boundary/context diagnostic:
+  python scripts/probe_per_controls.py \
+    +experiment=icefall_zipformer_stage2_adapter \
+    stage2.init_checkpoint=/path/to/encoder.pt \
+    stage2.phoneme_adapter.init_checkpoint=/path/to/adapter.pt \
+    prep.limit=600 \
+    +prep.context_padding_ms=320
+
+The optional run adds the same amount of zero-valued waveform padding on the
+left, right, and both sides in three separate measurements. Left padding tests
+first-chunk history/boundary effects; right padding gives delayed CTC emissions
+time to appear; both tests their combination. The original wav and fbank files
+are never modified.
 """
 
 from __future__ import annotations
@@ -85,6 +99,9 @@ def main(cfg: DictConfig) -> None:
     limit = int(prep.get("limit", 0))
     if limit <= 0:
         limit = 600
+    context_padding_ms = int(prep.get("context_padding_ms", 0))
+    if context_padding_ms < 0:
+        raise SystemExit("prep.context_padding_ms must be >= 0")
 
     tokenizer_cfg = get_tokenizer_config(config)
     dict_path = resolve_dict_path(config)
@@ -241,6 +258,41 @@ def main(cfg: DictConfig) -> None:
             yield train_extractor.extract(waveform, sr), references[rel]
 
     score("3_libriphrase_onthefly", onthefly_pairs())
+
+    # --- Optional clip-boundary controls ----------------------------------------
+    if context_padding_ms:
+
+        def padded_onthefly_pairs(*, left_ms: int, right_ms: int):
+            for rel in clips["comparison"]:
+                wav = Path(eval_paths["test_dir"]) / rel
+                if not wav.is_file():
+                    continue
+                try:
+                    waveform, sr = load_audio(str(wav), sample_rate=sample_rate)
+                except Exception:
+                    continue
+                left_samples = round(sr * left_ms / 1000)
+                right_samples = round(sr * right_ms / 1000)
+                waveform = torch.nn.functional.pad(
+                    waveform, (left_samples, right_samples)
+                )
+                yield train_extractor.extract(waveform, sr), references[rel]
+
+        score(
+            f"4_libriphrase_left_pad_{context_padding_ms}ms",
+            padded_onthefly_pairs(left_ms=context_padding_ms, right_ms=0),
+        )
+        score(
+            f"5_libriphrase_right_pad_{context_padding_ms}ms",
+            padded_onthefly_pairs(left_ms=0, right_ms=context_padding_ms),
+        )
+        score(
+            f"6_libriphrase_both_pad_{context_padding_ms}ms",
+            padded_onthefly_pairs(
+                left_ms=context_padding_ms,
+                right_ms=context_padding_ms,
+            ),
+        )
 
     print("\n" + json.dumps({"step_a_reference_per": STEP_A_REFERENCE_PER, "results": results}))
 
