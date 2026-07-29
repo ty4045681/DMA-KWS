@@ -105,6 +105,8 @@ def compute_fbank_for_clip(
     *,
     waveform: np.ndarray | None = None,
     sample_rate: int = 16000,
+    left_padding_ms: int = 0,
+    right_padding_ms: int = 0,
     num_mel_bins: int = 80,
     frame_length: int = 25,
     frame_shift: int = 10,
@@ -117,10 +119,18 @@ def compute_fbank_for_clip(
     high_freq: float = 0.0,
     extractor: Any | None = None,
 ) -> str:
-    """Compute fbank for one clip and save it as ``.npy``."""
+    """Compute fbank for one clip and save it as ``.npy``.
+
+    Optional padding is added to the waveform in memory before feature
+    extraction. The source waveform (whether decoded from parquet or read from
+    disk) is never modified.
+    """
     import torch
 
     from dma_kws.stage2.features import compute_fbank
+
+    if left_padding_ms < 0 or right_padding_ms < 0:
+        raise ValueError("left_padding_ms and right_padding_ms must be >= 0")
 
     fbank_out_path = Path(fbank_out_path)
     fbank_out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,12 +145,16 @@ def compute_fbank_for_clip(
         )
         array = np.asarray(array, dtype=np.float32).mean(axis=1)
         sample_rate = int(sr)
-        waveform_tensor = torch.from_numpy(array).unsqueeze(0)
     else:
         array = np.asarray(waveform, dtype=np.float32)
         if array.ndim != 1:
             raise ValueError(f"Expected mono 1-D waveform, got shape {array.shape}")
-        waveform_tensor = torch.from_numpy(array).unsqueeze(0)
+
+    left_samples = round(int(sample_rate) * left_padding_ms / 1000)
+    right_samples = round(int(sample_rate) * right_padding_ms / 1000)
+    if left_samples or right_samples:
+        array = np.pad(array, (left_samples, right_samples))
+    waveform_tensor = torch.from_numpy(array).unsqueeze(0)
 
     sample = compute_fbank(
         {

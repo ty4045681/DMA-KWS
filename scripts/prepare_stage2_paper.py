@@ -124,6 +124,33 @@ def resolve_output_subdir(prep: dict[str, Any], config: dict) -> str:
     return stage2_prep.get("output_subdir", "stage2_qbyt")
 
 
+def resolve_training_fbank_plan(
+    prep: dict[str, Any],
+    stage2: dict[str, Any],
+    feature_root: Path,
+) -> tuple[Path, int, int]:
+    """Resolve a safe output tree and waveform padding for training features."""
+    left_padding_ms = int(prep.get("left_padding_ms", 0))
+    right_padding_ms = int(prep.get("right_padding_ms", 0))
+    if left_padding_ms < 0 or right_padding_ms < 0:
+        raise SystemExit("prep.left_padding_ms and prep.right_padding_ms must be >= 0")
+
+    explicit_fbank_dir = str(prep.get("fbank_dir", "")).strip()
+    if (left_padding_ms or right_padding_ms) and not explicit_fbank_dir:
+        raise SystemExit(
+            "Padded training features require +prep.fbank_dir=/a/separate/output/directory "
+            "so the baseline fbank tree cannot be overwritten."
+        )
+
+    if explicit_fbank_dir:
+        fbank_dir = Path(explicit_fbank_dir)
+    elif stage2.get("wav_dir"):
+        fbank_dir = Path(stage2["wav_dir"])
+    else:
+        fbank_dir = feature_root / "fbank"
+    return fbank_dir, left_padding_ms, right_padding_ms
+
+
 def load_decoded_audio(
     decoded_parquet_paths: list[Path],
     needed_keys: set[str],
@@ -218,7 +245,11 @@ def main(cfg: DictConfig) -> None:
     output_dir = processed_root / output_subdir
     clips_dir = output_dir / "clips"
     distances_dir = output_dir / "distances"
-    fbank_dir = Path(stage2["wav_dir"]) if stage2.get("wav_dir") else feature_root / "fbank"
+    fbank_dir, left_padding_ms, right_padding_ms = resolve_training_fbank_plan(
+        prep,
+        stage2,
+        feature_root,
+    )
     output_parquet = output_dir / OUTPUT_PARQUET_NAME
 
     reporter.section("Plan")
@@ -232,6 +263,8 @@ def main(cfg: DictConfig) -> None:
             ("fbank_dir", str(fbank_dir)),
             ("fbank_backend", fbank_cfg.backend),
             ("target_sample_rate", str(fbank_cfg.target_sample_rate or "source")),
+            ("left_padding_ms", str(left_padding_ms)),
+            ("right_padding_ms", str(right_padding_ms)),
             ("limit_anchors", str(limit_anchors or "all")),
             ("num_workers", str(num_workers)),
         ]
@@ -260,6 +293,8 @@ def main(cfg: DictConfig) -> None:
     compute_fbank_fn = partial(
         compute_fbank_for_clip,
         extractor=fbank_extractor,
+        left_padding_ms=left_padding_ms,
+        right_padding_ms=right_padding_ms,
         **fbank_params,
     )
 

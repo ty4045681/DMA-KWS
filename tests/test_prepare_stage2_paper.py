@@ -7,12 +7,17 @@ import pytest
 
 from dma_kws.config import FbankConfig, fbank_kwargs
 from dma_kws.stage2.dataset import LibriPhraseTrainDataset
-from scripts.prepare_stage2_paper import collect_needed_audio_keys, find_decoded_parquets
+from scripts.prepare_stage2_paper import (
+    collect_needed_audio_keys,
+    find_decoded_parquets,
+    resolve_training_fbank_plan,
+)
 from dma_kws.stage2.prepare_paper import (
     PARQUET_COLUMNS,
     build_anchor_metadata,
     build_clips_npy,
     build_distances_npy,
+    compute_fbank_for_clip,
     compute_hard_negatives_from_phonemes,
     convert_aggregated_to_paper_parquet,
     resolve_fbank_rel_path,
@@ -142,6 +147,62 @@ def test_find_decoded_parquets_falls_back_when_glob_misses(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "WARNING" in captured.out
     assert "GP-1000-decoded-*.parquet" in captured.out
+
+
+def test_resolve_training_fbank_plan_requires_separate_tree_for_padding(tmp_path):
+    with pytest.raises(SystemExit, match="separate/output/directory"):
+        resolve_training_fbank_plan(
+            {"left_padding_ms": 160, "right_padding_ms": 160},
+            {"wav_dir": str(tmp_path / "baseline")},
+            tmp_path / "features",
+        )
+
+
+def test_resolve_training_fbank_plan_accepts_explicit_padded_tree(tmp_path):
+    padded = tmp_path / "fbank_both160"
+
+    result = resolve_training_fbank_plan(
+        {
+            "fbank_dir": str(padded),
+            "left_padding_ms": 160,
+            "right_padding_ms": 160,
+        },
+        {"wav_dir": str(tmp_path / "baseline")},
+        tmp_path / "features",
+    )
+
+    assert result == (padded, 160, 160)
+
+
+def test_compute_fbank_for_clip_pads_decoded_waveform_in_memory(tmp_path, monkeypatch):
+    import torch
+
+    source = np.array([0.25, -0.5, 0.75], dtype=np.float32)
+    captured: dict[str, object] = {}
+
+    def fake_compute(sample, **_kwargs):
+        captured.update(sample)
+        return {"feat": torch.ones(2, 80)}
+
+    monkeypatch.setattr("dma_kws.stage2.features.compute_fbank", fake_compute)
+    output = tmp_path / "features" / "sample.npy"
+
+    compute_fbank_for_clip(
+        "LP-100/sample.wav",
+        output,
+        waveform=source,
+        sample_rate=1000,
+        left_padding_ms=2,
+        right_padding_ms=3,
+        dither=0.0,
+    )
+
+    np.testing.assert_allclose(
+        captured["wav"].squeeze(0).numpy(),
+        np.array([0.0, 0.0, 0.25, -0.5, 0.75, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+    np.testing.assert_allclose(source, np.array([0.25, -0.5, 0.75], dtype=np.float32))
+    assert np.load(output).shape == (2, 80)
 
 
 def test_build_clips_and_distances_npy_roundtrip(tmp_path):
