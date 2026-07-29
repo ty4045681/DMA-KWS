@@ -9,6 +9,45 @@ from dma_kws.stage2.dataset import _DEFAULT_EVAL_CSV
 from dma_kws.stage2.prepare_paper import compute_fbank_for_clip
 
 
+def compute_fbank_for_padded_clip(
+    waveform_path: Path | str,
+    fbank_out_path: Path,
+    *,
+    left_padding_ms: int = 0,
+    right_padding_ms: int = 0,
+    compute_fn: Callable[..., str] = compute_fbank_for_clip,
+    **fbank_kwargs,
+) -> str:
+    """Compute fbank after adding zero-valued waveform context in memory.
+
+    This is a diagnostic for isolated LibriPhrase clips. The source wav is never
+    modified; callers should also use a separate ``fbank_dir`` so the derived
+    features cannot overwrite the baseline feature tree.
+    """
+    if left_padding_ms < 0 or right_padding_ms < 0:
+        raise ValueError("left_padding_ms and right_padding_ms must be >= 0")
+
+    import numpy as np
+    import soundfile as sf
+
+    array, sample_rate = sf.read(
+        str(waveform_path),
+        dtype="float32",
+        always_2d=True,
+    )
+    waveform = np.asarray(array, dtype=np.float32).mean(axis=1)
+    left_samples = round(int(sample_rate) * left_padding_ms / 1000)
+    right_samples = round(int(sample_rate) * right_padding_ms / 1000)
+    waveform = np.pad(waveform, (left_samples, right_samples))
+    return compute_fn(
+        waveform_path,
+        fbank_out_path,
+        waveform=waveform,
+        sample_rate=int(sample_rate),
+        **fbank_kwargs,
+    )
+
+
 def iter_eval_wav_files(test_dir: Path) -> Iterable[Path]:
     """Yield all ``.wav`` files under a LibriPhrase eval ``test_dir``."""
     return sorted(test_dir.rglob("*.wav"))

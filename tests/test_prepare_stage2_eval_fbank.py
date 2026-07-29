@@ -1,11 +1,15 @@
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from dma_kws.stage2.prepare_eval_fbank import (
     collect_eval_wav_relpaths,
+    compute_fbank_for_padded_clip,
     prepare_eval_fbank,
     prepare_eval_fbank_from_csv,
     resolve_eval_fbank_path_from_wav,
@@ -54,6 +58,36 @@ def test_collect_eval_wav_relpaths_reads_anchor_and_comparison(tmp_path):
     )
 
     assert rel_paths == {"a/foo.wav", "b/bar.wav"}
+
+
+def test_compute_fbank_for_padded_clip_pads_without_modifying_source(tmp_path, monkeypatch):
+    wav_path = tmp_path / "sample.wav"
+    wav_path.write_bytes(b"original wav bytes")
+    source = np.array([0.25, -0.5, 0.75], dtype=np.float32)
+    fake_soundfile = SimpleNamespace(
+        read=MagicMock(return_value=(source[:, np.newaxis], 1000))
+    )
+    monkeypatch.setitem(sys.modules, "soundfile", fake_soundfile)
+    output_path = tmp_path / "features" / "sample.npy"
+    fake_compute = MagicMock(return_value=str(output_path))
+
+    result = compute_fbank_for_padded_clip(
+        wav_path,
+        output_path,
+        left_padding_ms=2,
+        right_padding_ms=3,
+        compute_fn=fake_compute,
+        dither=0.0,
+    )
+
+    assert result == str(output_path)
+    kwargs = fake_compute.call_args.kwargs
+    assert kwargs["sample_rate"] == 1000
+    np.testing.assert_allclose(
+        kwargs["waveform"],
+        np.array([0.0, 0.0, 0.25, -0.5, 0.75, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+    assert wav_path.read_bytes() == b"original wav bytes"
 
 
 def test_prepare_eval_fbank_passes_fbank_params_to_compute(tmp_path):
