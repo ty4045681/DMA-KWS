@@ -330,6 +330,9 @@ def test_saved_checkpoints_carry_the_readout_version(monkeypatch):
     module.on_save_checkpoint(checkpoint)
 
     assert checkpoint[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION
+    assert checkpoint["checkpoint_kind"] == "stage2"
+    assert checkpoint["config"] == _minimal_config()
+    assert checkpoint["vocab_size"] == 71
     module.on_load_checkpoint(checkpoint)
 
 
@@ -339,6 +342,21 @@ def test_lightning_restore_rejects_a_stale_readout(monkeypatch):
 
     with pytest.raises(SystemExit, match="readout unversioned"):
         module.on_load_checkpoint({"state_dict": {"qbyt.dummy": torch.zeros(1)}})
+
+
+def test_lightning_restore_rejects_a_different_stream_point(monkeypatch):
+    from dma_kws.training.checkpoint_io import stamp_qbyt_readout_version
+
+    module = _stage2_module(monkeypatch, _icefall_config())
+    checkpoint = stamp_qbyt_readout_version(
+        {
+            "state_dict": module.state_dict(),
+            "config": _icefall_config(chunk_size=32, left_context_frames=128),
+        }
+    )
+
+    with pytest.raises(ValueError, match="Streaming operating point mismatch"):
+        module.on_load_checkpoint(checkpoint)
 
 
 def test_lora_adapter_payloads_are_readout_checked(monkeypatch, tmp_path):
@@ -386,6 +404,28 @@ def test_lora_validation_step_pins_the_deployment_point(monkeypatch):
     module.validation_step(_random_batch(), 0, dataloader_idx=1)
 
     assert encoder.applied == [(16,), (16,)]
+
+    checkpoint = {"state_dict": module.state_dict()}
+    module.on_save_checkpoint(checkpoint)
+    assert checkpoint["checkpoint_kind"] == "stage2_lora"
+    assert checkpoint["keyword"] == "hey eva"
+    assert checkpoint["slug"] == "hey_eva"
+    assert checkpoint["phase"] == "tts"
+    assert checkpoint["rank"] == 2
+    assert checkpoint["alpha"] == 4.0
+    assert checkpoint["lora_targets"] == ["in_proj_weight", "out_proj.weight"]
+    assert checkpoint["config"]["adapt"]["rank"] == 2
+    assert checkpoint["config"]["adapt"]["alpha"] == 4.0
+    assert checkpoint["config"]["adapt"]["lora_targets"] == [
+        "in_proj_weight",
+        "out_proj.weight",
+    ]
+    module.on_load_checkpoint(checkpoint)
+
+    wrong_alpha = dict(checkpoint)
+    wrong_alpha["alpha"] = 8.0
+    with pytest.raises(SystemExit, match="alpha=8.0"):
+        module.on_load_checkpoint(wrong_alpha)
 
 
 def test_load_init_checkpoint_detects_icefall_model_keys(monkeypatch, tmp_path):

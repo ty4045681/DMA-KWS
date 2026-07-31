@@ -139,6 +139,15 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             alpha=lora_alpha,
             targets=lora_targets,
         )
+        self._lora_rank = int(lora_rank)
+        self._lora_alpha = float(lora_alpha)
+        self._lora_targets = tuple(
+            lora_targets or ("in_proj_weight", "out_proj.weight")
+        )
+        checkpoint_adapt = _adapt_section(self._checkpoint_config)
+        checkpoint_adapt["rank"] = self._lora_rank
+        checkpoint_adapt["alpha"] = self._lora_alpha
+        checkpoint_adapt["lora_targets"] = list(self._lora_targets)
         if adapter_checkpoint:
             state = torch.load(adapter_checkpoint, map_location="cpu")
             # LoRA weights are tuned against a specific encoder operating point.
@@ -158,6 +167,61 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         self._adapt_cfg = _adapt_section(config)
         self.target_auc_metric = torchmetrics.AUROC(task="binary")
         self.target_eer_metric = torchmetrics.classification.EER(task="binary")
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Make LoRA Lightning checkpoints self-describing for later export."""
+        super().on_save_checkpoint(checkpoint)
+        adapt = _adapt_section(self._checkpoint_config)
+        keyword = str(adapt.get("keyword", ""))
+        checkpoint.update(
+            {
+                "checkpoint_kind": "stage2_lora",
+                "keyword": keyword,
+                "slug": str(adapt.get("slug", "")) or slugify(keyword),
+                "phase": str(adapt.get("phase", "tts")),
+                "rank": self._lora_rank,
+                "alpha": self._lora_alpha,
+                "lora_targets": list(self._lora_targets),
+            }
+        )
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Reject a resume whose Python-only LoRA scaling metadata changed."""
+        super().on_load_checkpoint(checkpoint)
+        adapt = _adapt_section(self._checkpoint_config)
+        keyword = str(adapt.get("keyword", ""))
+        current = {
+            "checkpoint_kind": "stage2_lora",
+            "keyword": keyword,
+            "slug": str(adapt.get("slug", "")) or slugify(keyword),
+            "phase": str(adapt.get("phase", "tts")),
+            "rank": self._lora_rank,
+            "alpha": self._lora_alpha,
+        }
+        for key, expected in current.items():
+            saved = checkpoint.get(key)
+            if saved is not None and saved != expected:
+                raise SystemExit(
+                    f"Cannot resume LoRA checkpoint: {key}={saved!r} in the "
+                    f"checkpoint but the current run resolves to {expected!r}."
+                )
+
+        saved_targets = checkpoint.get("lora_targets")
+        if saved_targets is not None:
+            def normalize(target: Any) -> str:
+                return "out_proj.weight" if str(target) == "out_proj" else str(target)
+
+            expected_targets = {normalize(target) for target in self._lora_targets}
+            target_values = (
+                [saved_targets] if isinstance(saved_targets, str) else saved_targets
+            )
+            actual_targets = {normalize(target) for target in target_values}
+            if actual_targets != expected_targets:
+                raise SystemExit(
+                    "Cannot resume LoRA checkpoint: lora_targets="
+                    f"{sorted(actual_targets)} in the checkpoint but the current "
+                    f"run resolves to {sorted(expected_targets)}."
+                )
 
     def configure_optimizers(self) -> dict:
         trainable = [param for param in self.parameters() if param.requires_grad]

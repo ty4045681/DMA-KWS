@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import warnings
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,11 @@ class Stage2LightningModule(pl.LightningModule):
         init_checkpoint: str | Path | None = None,
     ) -> None:
         super().__init__()
+        # Lightning's hyper_parameters currently hold only constructor scalars.
+        # Keep the resolved config separately so every future .ckpt is
+        # self-describing enough to be converted to the inference .pt format.
+        self._checkpoint_config = copy.deepcopy(config)
+        self._checkpoint_vocab_size = int(vocab_size)
         self.save_hyperparameters(
             {
                 "vocab_size": vocab_size,
@@ -276,12 +282,15 @@ class Stage2LightningModule(pl.LightningModule):
         print(f"Loaded phoneme adapter weights from {checkpoint_path}")
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        """Stamp the QbyT readout version onto every Lightning checkpoint.
+        """Embed the metadata required for a safe ``.ckpt`` -> ``.pt`` export.
 
         Checkpoint averaging keeps the first payload as its template and only
-        replaces the state dict, so averaged checkpoints inherit this too.
+        replaces the state dict, so averaged checkpoints inherit these fields.
         """
         stamp_qbyt_readout_version(checkpoint)
+        checkpoint["checkpoint_kind"] = "stage2"
+        checkpoint["config"] = copy.deepcopy(self._checkpoint_config)
+        checkpoint["vocab_size"] = self._checkpoint_vocab_size
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         """Reject stale QbyT weights on both Lightning restore paths.
@@ -289,6 +298,11 @@ class Stage2LightningModule(pl.LightningModule):
         Covers ``load_from_checkpoint`` and ``Trainer.fit(ckpt_path=...)``; the
         weights-only ``init_checkpoint`` path is guarded separately.
         """
+        assert_stream_policy_matches(
+            checkpoint,
+            self.stream_policy,
+            source="the Stage II checkpoint being restored",
+        )
         # Lightning does not hand the path to this hook, and touching
         # ``self.trainer`` raises when the module is not attached to one, which is
         # exactly the load_from_checkpoint case.

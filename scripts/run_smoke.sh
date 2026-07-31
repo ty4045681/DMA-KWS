@@ -22,6 +22,7 @@ PYTHON_SCRIPTS=(
   train_stage2_qbyt.py
   train_stage2_recipe.py
   average_checkpoints.py
+  convert_stage2_checkpoints.py
   eval_stage2_libriphrase.py
   run_two_stage_demo.py
 )
