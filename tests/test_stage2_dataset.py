@@ -198,6 +198,35 @@ def test_worker_init_fn_reseeds_dataset_rng_per_worker(monkeypatch):
     assert drawn[1] != drawn[2]
 
 
+def test_worker_init_fn_reseeds_same_worker_differently_per_ddp_rank(monkeypatch):
+    from dma_kws.stage2.dataset import stage2_worker_init_fn
+
+    dataset = LibriPhraseTrainDataset(
+        wav_dir="/data/segments",
+        tokenizer=_FakeTokenizer(),
+        df=_mock_dataframe(),
+        sample_lens=4,
+        seed=2025,
+    )
+
+    class _FakeWorkerInfo:
+        def __init__(self) -> None:
+            self.dataset = dataset
+            self.seed = 123
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.dataset.torch.utils.data.get_worker_info",
+        lambda: _FakeWorkerInfo(),
+    )
+    draws = []
+    for rank in ("0", "1"):
+        monkeypatch.setenv("RANK", rank)
+        stage2_worker_init_fn(0)
+        draws.append([dataset._rng.random() for _ in range(5)])
+
+    assert draws[0] != draws[1]
+
+
 def test_worker_init_fn_is_a_noop_outside_workers(monkeypatch):
     """num_workers=0 runs in the main process, where the configured seed stands."""
     from dma_kws.stage2.dataset import stage2_worker_init_fn

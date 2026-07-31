@@ -1,6 +1,7 @@
 from dma_kws.training.ddp import (
     apply_step_based_validation,
     build_trainer_kwargs,
+    process_rank,
     resolve_precision,
 )
 
@@ -28,6 +29,14 @@ def test_build_trainer_kwargs_reads_stage2_config():
     assert kwargs["val_check_interval"] == 500
     assert kwargs["max_steps"] == 50000
     assert kwargs["log_every_n_steps"] == 25
+
+
+def test_process_rank_supports_slurm_when_torchrun_rank_is_absent(monkeypatch):
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.setenv("SLURM_PROCID", "3")
+
+    assert process_rank() == 3
 
 
 def test_build_trainer_kwargs_uses_validation_val_check_interval():
@@ -58,6 +67,14 @@ def test_step_based_validation_keeps_epoch_semantics_when_interval_fits():
     apply_step_based_validation(kwargs, batches_per_epoch=1000)
 
     assert "check_val_every_n_epoch" not in kwargs
+
+
+def test_step_based_validation_can_be_forced_before_ddp_shards_the_loader():
+    kwargs = {"val_check_interval": 1000}
+
+    apply_step_based_validation(kwargs, batches_per_epoch=1000, force=True)
+
+    assert kwargs["check_val_every_n_epoch"] is None
 
 
 def test_step_based_validation_ignores_fractional_interval():

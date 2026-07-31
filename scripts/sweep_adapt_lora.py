@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 from pathlib import Path
 
@@ -176,6 +177,13 @@ def _eval_target_auc(
     return float(metrics.get("val/target_auc", 0.0))
 
 
+def _release_cuda_cache(torch_module) -> None:
+    """Release controller-side eval memory before a torchrun trial starts."""
+    gc.collect()
+    if torch_module.cuda.is_available():
+        torch_module.cuda.empty_cache()
+
+
 @hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="config")
 def main(cfg: DictConfig) -> None:
     try:
@@ -244,6 +252,7 @@ def main(cfg: DictConfig) -> None:
     reporter.section(f"LoRA hyperparameter sweep · {keyword}")
     reporter.info("Measuring LibriPhrase baseline AUC for the un-adapted checkpoint...")
     lph_base = _eval_lph_auc(config, base_ckpt, subset=lph_subset, accelerator=eval_accelerator)
+    _release_cuda_cache(torch)
     reporter.print_plan(
         adapt_console.sweep_baseline_rows(
             keyword=keyword,
@@ -273,21 +282,33 @@ def main(cfg: DictConfig) -> None:
     def objective(trial: optuna.Trial) -> float:
         params = suggest_adapt_params(trial, search_mix=search_mix)
         params["_trial_number"] = trial.number
-        reporter.section(f"Trial {trial.number + 1}/{n_trials}")
-        reporter.print_plan(adapt_console.trial_param_rows(params), title="Trial Parameters")
-        metrics = run_adaptation_trial(
-            config,
-            params=params,
-            base_args=base_args,
-            single_phase=single_phase,
-            eval_lph_fn=lambda ckpt: _eval_lph_auc(
-                config, ckpt, subset=lph_subset, accelerator=eval_accelerator
-            ),
-            eval_target_fn=lambda cfg, ckpt, kw: _eval_target_auc(
-                cfg, ckpt, kw, accelerator=eval_accelerator
-            ),
-            on_event=lambda stage, detail: reporter.info(f"trial {trial.number}: {stage} {detail}"),
+        completed = sum(
+            existing.state == optuna.trial.TrialState.COMPLETE
+            for existing in trial.study.trials
         )
+        reporter.section(
+            f"Completed trial target {completed + 1}/{n_trials} "
+            f"(Optuna trial #{trial.number})"
+        )
+        reporter.print_plan(adapt_console.trial_param_rows(params), title="Trial Parameters")
+        try:
+            metrics = run_adaptation_trial(
+                config,
+                params=params,
+                base_args=base_args,
+                single_phase=single_phase,
+                eval_lph_fn=lambda ckpt: _eval_lph_auc(
+                    config, ckpt, subset=lph_subset, accelerator=eval_accelerator
+                ),
+                eval_target_fn=lambda cfg, ckpt, kw: _eval_target_auc(
+                    cfg, ckpt, kw, accelerator=eval_accelerator
+                ),
+                on_event=lambda stage, detail: reporter.info(
+                    f"trial {trial.number}: {stage} {detail}"
+                ),
+            )
+        finally:
+            _release_cuda_cache(torch)
         score = compute_sweep_score(
             target_auc=metrics["target_auc"],
             lph_auc_adapted=metrics["lph_auc"],
@@ -321,9 +342,18 @@ def main(cfg: DictConfig) -> None:
         sampler=optuna.samplers.TPESampler(),
         pruner=optuna.pruners.MedianPruner(),
     )
-    # A single crashed trial (OOM, fd exhaustion, ...) must not throw away the trials
-    # that already landed in the study storage.
-    study.optimize(objective, n_trials=n_trials, catch=(Exception,))
+    # ``Optuna.optimize(n_trials=N)`` means N *additional* trials, not N total.
+    # Count only successful trials so rerunning after this DDP infrastructure
+    # failure fills the configured target instead of adding another full sweep.
+    completed_before = sum(
+        trial.state == optuna.trial.TrialState.COMPLETE
+        for trial in study.trials
+    )
+    remaining_trials = max(0, n_trials - completed_before)
+    if remaining_trials:
+        # Completed trials already live in durable storage. Stop on infrastructure
+        # or data errors instead of repeating the same broken setup for every trial.
+        study.optimize(objective, n_trials=remaining_trials)
 
     if not any(trial.state == optuna.trial.TrialState.COMPLETE for trial in study.trials):
         raise SystemExit(

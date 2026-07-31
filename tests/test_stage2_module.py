@@ -1,3 +1,4 @@
+import copy
 from unittest.mock import MagicMock
 
 import pytest
@@ -307,6 +308,116 @@ def test_init_checkpoint_without_qbyt_weights_skips_the_readout_check(monkeypatc
     module._load_init_checkpoint(ckpt_path)
 
 
+def test_lora_base_requires_complete_encoder_and_qbyt_state(monkeypatch, tmp_path):
+    from dma_kws.training.checkpoint_io import stamp_qbyt_readout_version
+
+    module = _stage2_module(monkeypatch)
+    complete_path = tmp_path / "complete_stage2.pt"
+    torch.save(
+        stamp_qbyt_readout_version(
+            {
+                "model_state_dict": {
+                    "encoder.dummy": torch.ones_like(module.encoder.dummy),
+                    "qbyt.dummy": torch.ones_like(module.qbyt.dummy),
+                }
+            }
+        ),
+        complete_path,
+    )
+    module._load_init_checkpoint(complete_path, require_full_qbyt=True)
+    torch.testing.assert_close(
+        module.encoder.dummy,
+        torch.ones_like(module.encoder.dummy),
+    )
+    torch.testing.assert_close(module.qbyt.dummy, torch.ones_like(module.qbyt.dummy))
+
+    missing_qbyt_path = tmp_path / "encoder_only.pt"
+    torch.save(
+        {"model_state_dict": {"encoder.dummy": torch.zeros(1)}},
+        missing_qbyt_path,
+    )
+    with pytest.raises(SystemExit, match="qbyt"):
+        module._load_init_checkpoint(missing_qbyt_path, require_full_qbyt=True)
+
+    missing_encoder_path = tmp_path / "qbyt_only.pt"
+    torch.save(
+        stamp_qbyt_readout_version(
+            {"model_state_dict": {"qbyt.dummy": torch.zeros(1)}}
+        ),
+        missing_encoder_path,
+    )
+    with pytest.raises(SystemExit, match="encoder"):
+        module._load_init_checkpoint(missing_encoder_path, require_full_qbyt=True)
+
+    partial_encoder_path = tmp_path / "partial_encoder.pt"
+    torch.save(
+        stamp_qbyt_readout_version(
+            {
+                "model_state_dict": {
+                    "encoder.unexpected": torch.zeros(1),
+                    "qbyt.dummy": torch.zeros(1),
+                }
+            }
+        ),
+        partial_encoder_path,
+    )
+    with pytest.raises(RuntimeError, match="state_dict"):
+        module._load_init_checkpoint(partial_encoder_path, require_full_qbyt=True)
+
+    partial_qbyt_path = tmp_path / "partial_qbyt.pt"
+    torch.save(
+        stamp_qbyt_readout_version(
+            {
+                "model_state_dict": {
+                    "encoder.dummy": torch.zeros(1),
+                    "qbyt.unexpected": torch.zeros(1),
+                }
+            }
+        ),
+        partial_qbyt_path,
+    )
+    with pytest.raises(RuntimeError, match="state_dict"):
+        module._load_init_checkpoint(partial_qbyt_path, require_full_qbyt=True)
+
+
+def test_full_stage2_model_container_is_not_misclassified_as_icefall(
+    monkeypatch,
+    tmp_path,
+):
+    from dma_kws.training.checkpoint_io import stamp_qbyt_readout_version
+
+    module = _stage2_module(monkeypatch)
+    checkpoint_path = tmp_path / "full_model_container.pt"
+    torch.save(
+        stamp_qbyt_readout_version(
+            {
+                "model": {
+                    "encoder.dummy": torch.ones_like(module.encoder.dummy),
+                    "qbyt.dummy": torch.ones_like(module.qbyt.dummy),
+                }
+            }
+        ),
+        checkpoint_path,
+    )
+
+    module._load_init_checkpoint(checkpoint_path, require_full_qbyt=True)
+
+    torch.testing.assert_close(
+        module.encoder.dummy,
+        torch.ones_like(module.encoder.dummy),
+    )
+    torch.testing.assert_close(module.qbyt.dummy, torch.ones_like(module.qbyt.dummy))
+
+
+def test_lora_base_rejects_encoder_only_icefall_checkpoint(monkeypatch, tmp_path):
+    module = _stage2_module(monkeypatch)
+    checkpoint_path = tmp_path / "icefall_encoder.pt"
+    torch.save({"model": {"encoder.layer.weight": torch.zeros(1)}}, checkpoint_path)
+
+    with pytest.raises(SystemExit, match="encoder-only Icefall"):
+        module._load_init_checkpoint(checkpoint_path, require_full_qbyt=True)
+
+
 def test_stale_qbyt_readout_can_be_opted_into_with_a_warning(monkeypatch, tmp_path):
     config = _minimal_config()
     config["stage2"]["allow_legacy_qbyt_readout"] = True
@@ -316,6 +427,23 @@ def test_stale_qbyt_readout_can_be_opted_into_with_a_warning(monkeypatch, tmp_pa
 
     with pytest.warns(UserWarning, match="not comparable"):
         module._load_init_checkpoint(ckpt_path)
+
+
+def test_lora_base_cannot_opt_into_a_stale_qbyt_readout(monkeypatch, tmp_path):
+    config = _minimal_config()
+    config["stage2"]["allow_legacy_qbyt_readout"] = True
+    module = _stage2_module(monkeypatch, config)
+    checkpoint_path = tmp_path / "legacy_readout.pt"
+    torch.save(
+        {"model_state_dict": {"qbyt.dummy": torch.zeros(1)}},
+        checkpoint_path,
+    )
+
+    with pytest.raises(SystemExit, match="readout unversioned"):
+        module._load_init_checkpoint(
+            checkpoint_path,
+            require_full_qbyt=True,
+        )
 
 
 def test_saved_checkpoints_carry_the_readout_version(monkeypatch):
@@ -387,6 +515,53 @@ class _LoraReadyQbyT(nn.Module):
         return zero.expand(batch_size), zero.expand(batch_size, text.size(1))
 
 
+def test_lora_adam_honors_weight_decay(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from dma_kws.stage2.adapt import Stage2LoraAdaptationModule
+
+    encoder = _StreamSpyEncoder()
+    monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_a, **_k: encoder)
+    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _LoraReadyQbyT)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            get_cosine_schedule_with_warmup=lambda optimizer, **_kwargs: (
+                torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+            )
+        ),
+    )
+
+    config = _icefall_config()
+    config["adapt"] = {
+        "keyword": "hey eva",
+        "optimizer": "adam",
+        "learning_rate": 1e-3,
+        "weight_decay": 0.125,
+        "warmup_steps": 1,
+        "max_steps": 10,
+    }
+    module = Stage2LoraAdaptationModule(
+        config,
+        vocab_size=71,
+        lora_rank=2,
+        lora_alpha=4.0,
+    )
+    optimizer = module.configure_optimizers()["optimizer"]
+
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.125)
+    optimized = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
+    expected = {id(parameter) for parameter in module.parameters() if parameter.requires_grad}
+    assert optimized == expected
+
+    module.train()
+    assert module.training is True
+    assert module.qbyt.training is True
+    assert module.encoder.training is False
+
+
 def test_lora_validation_step_pins_the_deployment_point(monkeypatch):
     """The LoRA module overrides validation_step; it must still land on eval."""
     from dma_kws.stage2.adapt import Stage2LoraAdaptationModule
@@ -396,14 +571,24 @@ def test_lora_validation_step_pins_the_deployment_point(monkeypatch):
     monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _LoraReadyQbyT)
 
     config = _icefall_config()
-    config["adapt"] = {"keyword": "hey eva"}
+    config["adapt"] = {"keyword": "hey eva", "slug": ""}
     module = Stage2LoraAdaptationModule(config, vocab_size=71, lora_rank=2, lora_alpha=4.0)
     module.log = MagicMock()
+
+    assert module.target_auc_metric.sync_on_compute is True
+    assert module.target_eer_metric.sync_on_compute is True
+    assert module.auc_metric.sync_on_compute is True
+    assert module.eer_metric.sync_on_compute is True
 
     module.validation_step(_random_batch(), 0, dataloader_idx=0)
     module.validation_step(_random_batch(), 0, dataloader_idx=1)
 
     assert encoder.applied == [(16,), (16,)]
+    validation_logs = {
+        call.args[0]: call.kwargs for call in module.log.call_args_list
+    }
+    assert validation_logs["val/target_utt_loss"]["sync_dist"] is True
+    assert validation_logs["val/utt_loss"]["sync_dist"] is True
 
     checkpoint = {"state_dict": module.state_dict()}
     module.on_save_checkpoint(checkpoint)
@@ -426,6 +611,17 @@ def test_lora_validation_step_pins_the_deployment_point(monkeypatch):
     wrong_alpha["alpha"] = 8.0
     with pytest.raises(SystemExit, match="alpha=8.0"):
         module.on_load_checkpoint(wrong_alpha)
+
+    conflicting_alpha = copy.deepcopy(checkpoint)
+    conflicting_alpha["config"]["adapt"]["alpha"] = 8.0
+    with pytest.raises(SystemExit, match="config.adapt.alpha"):
+        module.on_load_checkpoint(conflicting_alpha)
+
+    missing_alpha = copy.deepcopy(checkpoint)
+    missing_alpha.pop("alpha")
+    missing_alpha["config"]["adapt"].pop("alpha")
+    with pytest.raises(SystemExit, match="required metadata.*alpha"):
+        module.on_load_checkpoint(missing_alpha)
 
 
 def test_load_init_checkpoint_detects_icefall_model_keys(monkeypatch, tmp_path):

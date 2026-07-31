@@ -42,6 +42,7 @@ adapt:
   lora_targets:
     - in_proj_weight
     - out_proj.weight
+  allow_legacy_adapter: false
 
   # --- optimization (the sweep overrides learning_rate/max_steps per trial) ---
   learning_rate: 4.0e-4
@@ -73,6 +74,8 @@ adapt:
     limit_val_batches: 50
 
   sweep:
+    # Target number of successfully completed trials in durable study storage;
+    # reruns only fill the remaining quota.
     n_trials: 10
     # score = target_auc - lambda_forget * max(0, lph_auc_base - lph_auc_adapted)
     lambda_forget: 1.0

@@ -27,6 +27,9 @@ from dma_kws.tokenizer import validate_lang_char_dict
 from dma_kws.training.checkpoint_io import (
     QBYT_READOUT_VERSION,
     QBYT_READOUT_VERSION_KEY,
+    STAGE2_BASE_FINGERPRINT_KEY,
+    canonical_stage2_base_state,
+    fingerprint_stage2_base,
 )
 
 CheckpointKind = Literal["stage2", "lora"]
@@ -847,6 +850,27 @@ def convert_checkpoint(
         alpha=lora_alpha,
     )
     identity = _lora_identity(checkpoint, config)
+    try:
+        base_state = canonical_stage2_base_state(state)
+        base_model_sha256 = fingerprint_stage2_base(base_state)
+    except (TypeError, ValueError) as exc:
+        raise CheckpointConversionError(str(exc)) from exc
+    if lora_output == "adapter":
+        _validate_deployable_model_state(
+            base_state,
+            config,
+            vocab_size=_state_vocab_size(base_state),
+            validate_encoder=validate_encoder,
+        )
+    saved_base_model_sha256 = checkpoint.get(STAGE2_BASE_FINGERPRINT_KEY)
+    if (
+        saved_base_model_sha256 is not None
+        and str(saved_base_model_sha256) != base_model_sha256
+    ):
+        raise CheckpointConversionError(
+            f"checkpoint.{STAGE2_BASE_FINGERPRINT_KEY} does not match the "
+            "frozen Stage II weights in the checkpoint"
+        )
     step = _checkpoint_step(checkpoint)
     outputs: list[Path] = []
     merged_state: dict[str, torch.Tensor] | None = None
@@ -896,6 +920,7 @@ def convert_checkpoint(
     if lora_output in {"adapter", "both"}:
         assert resolved_adapter_path is not None
         adapter_payload = {
+            "checkpoint_kind": "stage2_lora_adapter",
             "lora_state_dict": _adapter_state(state),
             "config": config,
             "step": step,
@@ -903,6 +928,7 @@ def convert_checkpoint(
             "rank": rank,
             "alpha": alpha,
             "lora_targets": targets,
+            STAGE2_BASE_FINGERPRINT_KEY: base_model_sha256,
             QBYT_READOUT_VERSION_KEY: readout_version,
         }
         outputs.append(

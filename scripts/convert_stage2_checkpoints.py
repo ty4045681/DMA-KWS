@@ -137,7 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--lora-output",
         choices=("merged", "adapter", "both"),
         default="both",
-        help="LoRA artifact(s) to write (default: both).",
+        help=(
+            "LoRA artifact(s) to write (default: both). Adapter output still "
+            "requires a complete frozen Stage II base in the checkpoint so its "
+            "identity can be verified."
+        ),
     )
     parser.add_argument(
         "--adapter-output",

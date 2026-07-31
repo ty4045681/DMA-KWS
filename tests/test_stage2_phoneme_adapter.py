@@ -267,11 +267,18 @@ def test_lora_adaptation_freezes_the_trunk_and_drops_the_ctc_loss(monkeypatch):
     must not move it; otherwise the two stages stop agreeing on one encoder pass."""
     from dma_kws.stage2.adapt import Stage2LoraAdaptationModule
 
-    encoder = nn.Linear(80, ENCODER_DIM)
-    fake_encoder = MagicMock(side_effect=_mock_encoder_output)
-    fake_encoder.parameters = encoder.parameters
-    fake_encoder.eval = MagicMock()
-    monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_a, **_k: fake_encoder)
+    class _FakeEncoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(80, ENCODER_DIM)
+
+        def forward(self, feat, feat_lengths):
+            return _mock_encoder_output(feat, feat_lengths)
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_encoder",
+        lambda *_a, **_k: _FakeEncoder(),
+    )
     monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _LoraReadyQbyT)
 
     config = _config(ctc_weight=0.5)
@@ -285,6 +292,40 @@ def test_lora_adaptation_freezes_the_trunk_and_drops_the_ctc_loss(monkeypatch):
     module.log = MagicMock()
     _total, losses, _ = module._forward_train_losses(_batch())
     assert "ctc_loss" not in losses
+
+
+def test_lora_full_resume_does_not_require_external_adapter_init(monkeypatch):
+    from dma_kws.stage2.adapt import Stage2LoraAdaptationModule
+
+    class _FakeEncoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(80, ENCODER_DIM)
+
+        def forward(self, feat, feat_lengths):
+            return _mock_encoder_output(feat, feat_lengths)
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_encoder",
+        lambda *_a, **_k: _FakeEncoder(),
+    )
+    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _LoraReadyQbyT)
+
+    config = _config(
+        ctc_weight=0.0,
+        init_checkpoint="/checkpoint/that/no/longer/exists.pt",
+    )
+    config["adapt"] = {"keyword": "hey eva"}
+    module = Stage2LoraAdaptationModule(
+        config,
+        vocab_size=VOCAB_SIZE,
+        lora_rank=2,
+        lora_alpha=4.0,
+        restoring_full_checkpoint=True,
+    )
+
+    assert module.adapter is not None
+    assert module._checkpoint_config["stage2"]["phoneme_adapter"]["init_checkpoint"] == ""
 
 
 def test_verifier_architecture_matches_the_training_module(monkeypatch, tmp_path):

@@ -2,7 +2,24 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
+
+
+def process_rank() -> int:
+    """Return the initialized or launcher-provided global process rank."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank())
+    except (ImportError, RuntimeError):
+        pass
+
+    for name in ("RANK", "SLURM_PROCID", "LOCAL_RANK"):
+        if name in os.environ:
+            return int(os.environ[name])
+    return 0
 
 
 def resolve_precision(stage2: dict[str, Any], accelerator: str) -> str:
@@ -20,7 +37,10 @@ def resolve_precision(stage2: dict[str, Any], accelerator: str) -> str:
 
 
 def apply_step_based_validation(
-    trainer_kwargs: dict[str, Any], batches_per_epoch: int
+    trainer_kwargs: dict[str, Any],
+    batches_per_epoch: int,
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Make an integer ``val_check_interval`` count global steps when it spans epochs.
 
@@ -28,12 +48,14 @@ def apply_step_based_validation(
     epoch and raises if it exceeds the epoch length. Virtual epochs (``sample_lens``
     divided by the batch size) are often much shorter than the configured interval,
     so switch Lightning to step-based validation instead of failing or validating
-    dozens of times per run. Mutates and returns ``trainer_kwargs``.
+    dozens of times per run. ``force=True`` is for callers whose interval is always
+    defined across epoch boundaries (such as adaptation under DDP). Mutates and
+    returns ``trainer_kwargs``.
     """
     interval = trainer_kwargs.get("val_check_interval")
     if not isinstance(interval, int) or isinstance(interval, bool):
         return trainer_kwargs
-    if batches_per_epoch > 0 and interval > batches_per_epoch:
+    if force or (batches_per_epoch > 0 and interval > batches_per_epoch):
         trainer_kwargs["check_val_every_n_epoch"] = None
     return trainer_kwargs
 

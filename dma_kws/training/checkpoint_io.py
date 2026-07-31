@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 
@@ -21,6 +23,71 @@ from dma_kws.training.checkpoint_avg import average_lightning_checkpoints
 QBYT_READOUT_VERSION = 2
 
 QBYT_READOUT_VERSION_KEY = "qbyt_readout_version"
+
+STAGE2_BASE_FINGERPRINT_KEY = "base_model_sha256"
+
+_LORA_PARAMETER_SUFFIXES = (".lora_A", ".lora_B")
+_PARAMETRIZED_ORIGINAL_RE = re.compile(
+    r"^(?P<module>.+)\.parametrizations\.(?P<parameter>[^.]+)\.original$"
+)
+
+
+def canonical_stage2_base_state(
+    state: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Return frozen Stage II tensors under their pre-LoRA parameter names."""
+    canonical: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        if not isinstance(key, str) or not key.startswith(("encoder.", "adapter.", "qbyt.")):
+            continue
+        if key.endswith(_LORA_PARAMETER_SUFFIXES):
+            continue
+
+        normalized_key = key
+        match = _PARAMETRIZED_ORIGINAL_RE.fullmatch(key)
+        if match is not None:
+            normalized_key = f"{match.group('module')}.{match.group('parameter')}"
+        elif ".parametrizations." in key:
+            raise ValueError(f"Unsupported parametrized Stage II state key: {key}")
+
+        if normalized_key in canonical:
+            raise ValueError(
+                f"Duplicate Stage II base key after LoRA normalization: {normalized_key}"
+            )
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Stage II state entry {key!r} is not a tensor")
+        canonical[normalized_key] = value
+
+    for prefix in ("encoder.", "qbyt."):
+        if not any(key.startswith(prefix) for key in canonical):
+            raise ValueError(
+                f"Cannot identify an incomplete Stage II base: no {prefix} weights"
+            )
+    return canonical
+
+
+def fingerprint_stage2_base(state: Mapping[str, torch.Tensor]) -> str:
+    """Hash the frozen Stage II base represented by a plain or LoRA state dict.
+
+    LoRA checkpoints store targeted weights under PyTorch parametrization keys.
+    Canonicalize those ``original`` tensors back to their ordinary names and
+    exclude A/B tensors so a base loaded directly and the same base embedded in
+    a LoRA Lightning checkpoint produce the same identity.
+    """
+    canonical = canonical_stage2_base_state(state)
+
+    digest = hashlib.sha256()
+    for key in sorted(canonical):
+        tensor = canonical[key].detach().cpu().contiguous()
+        metadata = (
+            f"{key}\0{tensor.dtype}\0{tuple(tensor.shape)}\0{tensor.layout}\0"
+        ).encode("utf-8")
+        raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        digest.update(len(metadata).to_bytes(8, "big"))
+        digest.update(metadata)
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
 
 
 def extract_state_dict(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:

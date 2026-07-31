@@ -16,8 +16,10 @@ from dma_kws.training.checkpoint_convert import (
 from dma_kws.training.checkpoint_io import (
     QBYT_READOUT_VERSION,
     QBYT_READOUT_VERSION_KEY,
+    STAGE2_BASE_FINGERPRINT_KEY,
     assert_qbyt_readout_version,
     extract_state_dict,
+    fingerprint_stage2_base,
 )
 from dma_kws.training.lora import inject_qbyt_lora, merge_lora
 from dma_kws.pathing import load_qbyt_class
@@ -164,6 +166,23 @@ def _lora_state() -> tuple[
             lora_b=lora_b,
         )
     return state, groups
+
+
+def test_stage2_base_fingerprint_is_stable_across_lora_parametrization() -> None:
+    lora_state, groups = _lora_state()
+    plain_state = {
+        key: value
+        for key, value in lora_state.items()
+        if ".parametrizations." not in key
+    }
+    for target, (original, _lora_a, _lora_b) in groups.items():
+        plain_state[target] = original
+
+    assert fingerprint_stage2_base(lora_state) == fingerprint_stage2_base(plain_state)
+
+    changed = dict(plain_state)
+    changed["encoder.bias"] = changed["encoder.bias"] + 1
+    assert fingerprint_stage2_base(changed) != fingerprint_stage2_base(plain_state)
 
 
 def test_convert_stage2_checkpoint_writes_only_inference_payload(tmp_path: Path) -> None:
@@ -392,6 +411,8 @@ def test_convert_lora_checkpoint_writes_merged_and_adapter_payloads(
     assert adapter["keyword"] == "hey eva"
     assert adapter["slug"] == "hey_eva"
     assert adapter["phase"] == "tts"
+    assert adapter["checkpoint_kind"] == "stage2_lora_adapter"
+    assert adapter[STAGE2_BASE_FINGERPRINT_KEY] == fingerprint_stage2_base(state)
     assert adapter["lora_state_dict"]
     assert all(
         not key.startswith("qbyt.") for key in adapter["lora_state_dict"]
@@ -424,19 +445,15 @@ def test_convert_lora_checkpoint_supports_single_artifact_modes(
     assert not output.with_name(f"{output.stem}.adapter.pt").exists()
 
 
-def test_adapter_only_skips_irrelevant_full_model_validation(tmp_path: Path) -> None:
+def test_adapter_only_skips_tokenizer_validation_but_requires_a_complete_base(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "adapter_only.ckpt"
     adapter_output = tmp_path / "adapter_only.pt"
-    merged_output = tmp_path / "merged.pt"
     state, _ = _lora_state()
-    adapter_relevant_state = {
-        key: value
-        for key, value in state.items()
-        if key == "encoder.weight" or ".parametrizations." in key
-    }
     config = _config()
     config["tokenizer"]["dict_path"] = "/nonexistent/lang_char.txt"
-    torch.save(_checkpoint(adapter_relevant_state, config=config), source)
+    torch.save(_checkpoint(state, config=config), source)
 
     result = convert_checkpoint(
         source,
@@ -450,8 +467,15 @@ def test_adapter_only_skips_irrelevant_full_model_validation(tmp_path: Path) -> 
     assert "model_state_dict" not in payload
     assert payload["config"] == config
 
-    with pytest.raises(CheckpointConversionError, match="not a complete Stage II"):
-        convert_checkpoint(source, merged_output, lora_output="merged")
+    truncated = dict(state)
+    truncated.pop("qbyt.fc.bias")
+    torch.save(_checkpoint(truncated, config=config), source)
+    with pytest.raises(CheckpointConversionError, match="QbyT weights do not match"):
+        convert_checkpoint(
+            source,
+            tmp_path / "truncated_adapter.pt",
+            lora_output="adapter",
+        )
 
 
 def test_conversion_can_select_current_model_state(tmp_path: Path) -> None:

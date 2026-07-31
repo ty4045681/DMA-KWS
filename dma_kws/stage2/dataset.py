@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 
 from dma_kws.g2p import make_g2p, text_to_phonemes
 from dma_kws.tokenizer import build_seq_label, load_char_tokenizer, tokenize_phoneme_string
+from dma_kws.training.ddp import process_rank
 
 _PARQUET_COLUMNS = ["ngram", "ngram_g2p", "clips_file", "distances_file"]
 
@@ -79,15 +80,18 @@ def stage2_worker_init_fn(worker_id: int) -> None:
 
     ``get_worker_info().seed`` is derived by PyTorch as ``base_seed + worker_id``
     and the base changes per epoch, so the streams stay distinct, reproducible,
-    and non-repeating across epochs. It also already differs per DDP rank, so two
-    GPUs do not sample in lockstep either.
+    and non-repeating across epochs. Explicit ``seed_everything(seed)`` gives each
+    DDP rank the same base seed, however, so fold the rank in ourselves; otherwise
+    ``MixedAdaptationDataset`` ignores the sampler index and two GPUs replay the
+    exact same random samples.
     """
     info = torch.utils.data.get_worker_info()
     if info is None:
         # num_workers=0: the dataset runs in the main process and the seed passed
         # to the constructor is already the intended one.
         return
-    _reseed_rng_holders(info.dataset, int(info.seed), set())
+    rank_seed = int(info.seed) + 1_000_003 * process_rank()
+    _reseed_rng_holders(info.dataset, rank_seed, set())
 
 
 class LibriPhraseTrainDataset(Dataset):

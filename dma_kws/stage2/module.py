@@ -71,6 +71,7 @@ class Stage2LightningModule(pl.LightningModule):
         vocab_size: int,
         freeze_encoder: bool = False,
         init_checkpoint: str | Path | None = None,
+        require_full_qbyt_init: bool = False,
     ) -> None:
         super().__init__()
         # Lightning's hyper_parameters currently hold only constructor scalars.
@@ -83,6 +84,7 @@ class Stage2LightningModule(pl.LightningModule):
                 "vocab_size": vocab_size,
                 "freeze_encoder": freeze_encoder,
                 "init_checkpoint": str(init_checkpoint) if init_checkpoint else None,
+                "require_full_qbyt_init": require_full_qbyt_init,
             }
         )
 
@@ -146,7 +148,10 @@ class Stage2LightningModule(pl.LightningModule):
 
         self._adapter_weights_loaded = False
         if init_checkpoint:
-            self._load_init_checkpoint(Path(init_checkpoint))
+            self._load_init_checkpoint(
+                Path(init_checkpoint),
+                require_full_qbyt=require_full_qbyt_init,
+            )
 
         adapter_checkpoint = str(adapter_cfg.get("init_checkpoint", "")).strip()
         if self.adapter_enabled and adapter_checkpoint:
@@ -175,16 +180,29 @@ class Stage2LightningModule(pl.LightningModule):
             for param in self.adapter.parameters():
                 param.requires_grad = False
 
-        self.auc_metric = torchmetrics.AUROC(task="binary")
-        self.eer_metric = torchmetrics.classification.EER(task="binary")
+        # AUC/EER are non-decomposable: averaging per-rank scalar metrics is
+        # mathematically wrong.  Keep TorchMetrics' state synchronization
+        # explicit so compute() gathers predictions/targets before scoring.
+        self.auc_metric = torchmetrics.AUROC(task="binary", sync_on_compute=True)
+        self.eer_metric = torchmetrics.classification.EER(
+            task="binary",
+            sync_on_compute=True,
+        )
 
-    def _load_init_checkpoint(self, checkpoint_path: Path) -> None:
+    def _load_init_checkpoint(
+        self,
+        checkpoint_path: Path,
+        *,
+        require_full_qbyt: bool = False,
+    ) -> None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         assert_stream_policy_matches(checkpoint, self.stream_policy, source=checkpoint_path)
         assert_qbyt_readout_version(
             checkpoint,
             source=checkpoint_path,
-            allow_legacy=self._allow_legacy_qbyt_readout,
+            # A legacy readout is only useful as a warm start when QbyT will be
+            # retrained. LoRA freezes QbyT, so its strict base path must reject it.
+            allow_legacy=self._allow_legacy_qbyt_readout and not require_full_qbyt,
         )
         
         # Check if this is an icefall checkpoint (has "model" key)
@@ -192,12 +210,26 @@ class Stage2LightningModule(pl.LightningModule):
         from dma_kws.training.checkpoint_io import extract_icefall_encoder_state
 
         model_state = checkpoint.get("model")
-        is_icefall_format = isinstance(model_state, dict) and any(
-            key.startswith("encoder_embed.") or key.startswith("encoder.")
-            for key in model_state
+        has_qbyt_model_state = isinstance(model_state, dict) and any(
+            key.startswith("qbyt.") for key in model_state
+        )
+        is_icefall_format = (
+            isinstance(model_state, dict)
+            and not has_qbyt_model_state
+            and any(
+                key.startswith("encoder_embed.") or key.startswith("encoder.")
+                for key in model_state
+            )
         )
         
         if is_icefall_format:
+            if require_full_qbyt:
+                raise SystemExit(
+                    "LoRA adaptation requires a complete Stage II checkpoint with "
+                    f"QbyT weights, but {checkpoint_path} is an encoder-only Icefall "
+                    "checkpoint. Supply the trained Stage II .pt/.ckpt (or a merged "
+                    "LoRA export) as the adaptation base."
+                )
             # Load from icefall Zipformer checkpoint
             icefall_states = extract_icefall_encoder_state(checkpoint_path)
             
@@ -228,8 +260,28 @@ class Stage2LightningModule(pl.LightningModule):
             qbyt_state = _split_submodule_state(state, "qbyt")
             adapter_state = _split_submodule_state(state, "adapter")
 
+            if require_full_qbyt:
+                missing_roots = [
+                    root
+                    for root, submodule_state in (
+                        ("encoder.*", encoder_state),
+                        ("qbyt.*", qbyt_state),
+                    )
+                    if not submodule_state
+                ]
+                if missing_roots:
+                    raise SystemExit(
+                        "LoRA adaptation requires a complete Stage II checkpoint, "
+                        f"but {checkpoint_path} has no {', '.join(missing_roots)} "
+                        "weights. The encoder and QbyT base are frozen during LoRA "
+                        "training, so missing weights would remain random."
+                    )
+
             if encoder_state:
-                missing, unexpected = self.encoder.load_state_dict(encoder_state, strict=False)
+                missing, unexpected = self.encoder.load_state_dict(
+                    encoder_state,
+                    strict=require_full_qbyt,
+                )
                 print(
                     f"Loaded encoder weights from {checkpoint_path}: "
                     f"missing={len(missing)} unexpected={len(unexpected)}"
@@ -249,7 +301,10 @@ class Stage2LightningModule(pl.LightningModule):
                     stacklevel=2,
                 )
             if qbyt_state:
-                missing, unexpected = self.qbyt.load_state_dict(qbyt_state, strict=False)
+                missing, unexpected = self.qbyt.load_state_dict(
+                    qbyt_state,
+                    strict=require_full_qbyt,
+                )
                 print(
                     f"Loaded QbyT weights from {checkpoint_path}: "
                     f"missing={len(missing)} unexpected={len(unexpected)}"

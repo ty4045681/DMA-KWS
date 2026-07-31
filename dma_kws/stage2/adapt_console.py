@@ -207,7 +207,10 @@ def adapt_plan_rows(
         ("exp_root", str(adapt_paths["exp_root"])),
         ("train_manifest", str(adapt_paths["train_manifest"])),
         ("eval_manifest", str(adapt_paths["eval_manifest"])),
-        ("init_checkpoint", init_checkpoint),
+        (
+            "init_checkpoint",
+            init_checkpoint if init_checkpoint else "restored from full checkpoint",
+        ),
         ("adapter_resume", str(adapter_resume) if adapter_resume else "none (fresh LoRA)"),
     ]
     if resume_path is not None:
@@ -284,7 +287,8 @@ def sweep_baseline_rows(
         ("slug", slug),
         ("base_checkpoint", base_checkpoint),
         ("lph_auc_base", _metric(lph_auc_base)),
-        ("n_trials", str(n_trials)),
+        ("completed_trial_target", str(n_trials)),
+        ("failure_policy", "stop on first error; rerun resumes completed trials"),
         ("lambda_forget", str(lambda_forget)),
         ("lph_subset", str(lph_subset) if lph_subset else "all"),
         ("search_mix", str(search_mix)),

@@ -33,6 +33,9 @@ adapt:
   eval_seed: 2025
   init_checkpoint: ""
   params_file: ""
+  # Old adapter-only files do not identify the frozen Stage II base they were
+  # trained against. Keep unsafe loading opt-in.
+  allow_legacy_adapter: false
   lora_targets:
     - in_proj_weight
     - out_proj.weight
@@ -46,6 +49,8 @@ adapt:
     limit_val_batches: null
   sweep:
     enabled: false
+    # Target number of successfully completed trials in durable study storage;
+    # reruns only fill the remaining quota.
     n_trials: 20
     lambda_forget: 1.0
     lph_subset: 2000

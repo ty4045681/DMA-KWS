@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Iterable
 
 import torch
@@ -23,6 +24,8 @@ class LoRAParametrization(nn.Module):
         super().__init__()
         if rank <= 0:
             raise ValueError(f"LoRA rank must be positive, got {rank}")
+        if not math.isfinite(float(alpha)) or float(alpha) <= 0:
+            raise ValueError(f"LoRA alpha must be finite and positive, got {alpha}")
         self.rank = rank
         self.scaling = alpha / rank
         self.lora_A = nn.Parameter(torch.empty(rank, features_in))
@@ -36,15 +39,31 @@ class LoRAParametrization(nn.Module):
 
 
 _DEFAULT_LORA_TARGETS = ("in_proj_weight", "out_proj.weight")
+_SUPPORTED_LORA_TARGETS = frozenset(_DEFAULT_LORA_TARGETS)
 
 
-def _normalize_lora_targets(targets: Iterable[str] | None) -> set[str]:
-    normalized: set[str] = set()
-    for target in targets or _DEFAULT_LORA_TARGETS:
-        if target == "out_proj":
-            normalized.add("out_proj.weight")
-        else:
-            normalized.add(target)
+def normalize_lora_targets(targets: Iterable[str] | None) -> tuple[str, ...]:
+    """Normalize aliases and reject empty or misspelled LoRA target lists."""
+    if targets is None:
+        source = _DEFAULT_LORA_TARGETS
+    elif isinstance(targets, str):
+        source = (targets,)
+    else:
+        source = tuple(str(target) for target in targets)
+    normalized = tuple(
+        dict.fromkeys(
+            "out_proj.weight" if target == "out_proj" else target
+            for target in source
+        )
+    )
+    if not normalized:
+        raise ValueError("At least one LoRA target is required")
+    unsupported = sorted(set(normalized) - _SUPPORTED_LORA_TARGETS)
+    if unsupported:
+        raise ValueError(
+            f"Unsupported LoRA targets: {unsupported}; "
+            f"supported={sorted(_SUPPORTED_LORA_TARGETS)}"
+        )
     return normalized
 
 
@@ -62,7 +81,7 @@ def inject_qbyt_lora(
     targets: Iterable[str] | None = None,
 ) -> list[str]:
     """Freeze QbyT base weights and inject LoRA on matcher self-attention matrices."""
-    target_set = _normalize_lora_targets(targets)
+    target_set = set(normalize_lora_targets(targets))
     qbyt.requires_grad_(False)
     injected: list[str] = []
 
@@ -97,7 +116,7 @@ def inject_qbyt_lora(
             injected.append(f"{prefix}.out_proj.weight")
 
     for name, param in qbyt.named_parameters():
-        param.requires_grad = ".parametrizations." in name and ("lora_A" in name or "lora_B" in name)
+        param.requires_grad = ".parametrizations." in name and _is_lora_parameter_name(name)
 
     return injected
 
@@ -110,6 +129,10 @@ def _iter_parametrized_modules(model: nn.Module) -> Iterable[tuple[nn.Module, st
             yield module, param_name
 
 
+def _is_lora_parameter_name(name: str) -> bool:
+    return name.endswith((".lora_A", ".lora_B"))
+
+
 def merge_lora(model: nn.Module) -> None:
     """Merge LoRA deltas into base weights in-place."""
     for module, param_name in _iter_parametrized_modules(model):
@@ -120,22 +143,39 @@ def lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     """Export only LoRA adapter parameters (A/B tensors)."""
     state: dict[str, torch.Tensor] = {}
     for name, param in model.named_parameters():
-        if "lora_A" in name or "lora_B" in name:
+        if _is_lora_parameter_name(name):
             state[name] = param.detach().cpu().clone()
     return state
 
 
-def load_lora_state_dict(model: nn.Module, state: dict[str, torch.Tensor], *, strict: bool = True) -> None:
+def load_lora_state_dict(
+    model: nn.Module,
+    state: dict[str, torch.Tensor],
+    *,
+    strict: bool = True,
+) -> None:
     """Load LoRA adapter weights into a model that already has LoRA injected."""
+    adapter_state = {
+        key: value
+        for key, value in state.items()
+        if _is_lora_parameter_name(key)
+    }
+    non_adapter = sorted(set(state) - set(adapter_state))
+    if strict and non_adapter:
+        raise KeyError(f"LoRA state contains non-adapter parameters: {non_adapter}")
+
     current = lora_state_dict(model)
     if strict:
-        missing = set(current) - set(state)
-        unexpected = set(state) - set(current)
+        missing = set(current) - set(adapter_state)
+        unexpected = set(adapter_state) - set(current)
         if missing or unexpected:
-            raise KeyError(f"LoRA state mismatch: missing={sorted(missing)} unexpected={sorted(unexpected)}")
+            raise KeyError(
+                "LoRA state mismatch: "
+                f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
+            )
 
     model_state = model.state_dict()
-    for key, value in state.items():
+    for key, value in adapter_state.items():
         if key not in model_state:
             if strict:
                 raise KeyError(f"Missing LoRA parameter in model: {key}")
@@ -154,7 +194,7 @@ def count_lora_params(model: nn.Module) -> dict[str, int]:
         total += n
         if param.requires_grad:
             trainable += n
-            if "lora_A" in name or "lora_B" in name:
+            if _is_lora_parameter_name(name):
                 lora += n
     return {
         "lora_trainable": lora,
