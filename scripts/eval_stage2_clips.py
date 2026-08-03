@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Evaluate Stage II-only DMA-KWS inference on a manifest of keyword clips."""
+"""Evaluate Stage II-only DMA-KWS inference on a manifest of keyword clips.
+
+Each clip receives 160 ms of zero-valued waveform context on both sides by
+default. Override with ``+prep.left_padding_ms=...`` and
+``+prep.right_padding_ms=...``; use zero to disable either side.
+Padding is part of the scored model input and counts toward its minimum length.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +22,9 @@ from dma_kws.inference.manifest import load_manifest
 from dma_kws.inference.metrics import summarize_labeled_results
 from dma_kws.inference.stage2_clip import Stage2ClipRunner
 from dma_kws.training.device import resolve_accelerator
+
+
+DEFAULT_PADDING_MS = 160
 
 
 def _result_record(manifest_row: dict, runner_result: dict) -> dict:
@@ -46,6 +55,14 @@ def _metrics_record(record: dict) -> dict:
     return metrics_row
 
 
+def _resolve_audio_padding_ms(prep: dict) -> tuple[int, int]:
+    left_padding_ms = int(prep.get("left_padding_ms", DEFAULT_PADDING_MS))
+    right_padding_ms = int(prep.get("right_padding_ms", DEFAULT_PADDING_MS))
+    if left_padding_ms < 0 or right_padding_ms < 0:
+        raise SystemExit("prep.left_padding_ms and prep.right_padding_ms must be >= 0")
+    return left_padding_ms, right_padding_ms
+
+
 def run_eval(cfg: DictConfig) -> dict:
     try:
         import torch
@@ -69,6 +86,7 @@ def run_eval(cfg: DictConfig) -> dict:
     stage2_ckpt = str(prep.get("stage2_ckpt", ""))
     if not stage2_ckpt:
         raise SystemExit("prep.stage2_ckpt is required")
+    left_padding_ms, right_padding_ms = _resolve_audio_padding_ms(prep)
     output_dir_override = str(prep.get("output_dir", ""))
     if output_dir_override == "outputs/eval_two_stage_kws":
         output_dir_override = ""
@@ -88,7 +106,11 @@ def run_eval(cfg: DictConfig) -> dict:
         num_workers = min(8, os.cpu_count() or 1)
 
     runner_results = runner.run_batch(
-        rows, batch_size=batch_size, num_workers=num_workers
+        rows,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        left_padding_ms=left_padding_ms,
+        right_padding_ms=right_padding_ms,
     )
     results = [
         _result_record(row, runner_result)
@@ -104,6 +126,10 @@ def run_eval(cfg: DictConfig) -> dict:
         "manifest": str(Path(manifest_path).resolve()),
         "num_samples": len(results),
         "output_dir": str(output_dir.resolve()),
+        "audio_padding_ms": {
+            "left": left_padding_ms,
+            "right": right_padding_ms,
+        },
         "stream": runner.stream_policy.describe(),
     }
     labeled_summary = summarize_labeled_results(

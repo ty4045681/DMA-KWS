@@ -22,6 +22,131 @@ def test_clip_feature_loading_api_is_public():
     assert collate_clip_feature_batch(batch) is batch
 
 
+def test_clip_feature_dataset_padding_precedes_min_frame_guard(monkeypatch):
+    torch = pytest.importorskip("torch")
+    source = torch.tensor([[0.25, -0.5, 0.75]])
+    captured = {}
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.load_audio",
+        lambda _path, *, sample_rate: (source, sample_rate),
+    )
+
+    def fake_has_min_fbank_frames(num_samples, **_kwargs):
+        captured["num_samples"] = num_samples
+        return True
+
+    monkeypatch.setattr(
+        "dma_kws.inference.audio_utils.has_min_fbank_frames",
+        fake_has_min_fbank_frames,
+    )
+
+    def fake_waveform_to_fbank(waveform, *, sample_rate, **_kwargs):
+        captured["waveform"] = waveform.clone()
+        captured["sample_rate"] = sample_rate
+        return torch.ones(1, 80)
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.waveform_to_fbank",
+        fake_waveform_to_fbank,
+    )
+
+    class ResamplingExtractor:
+        @staticmethod
+        def prepare_waveform(waveform, sample_rate):
+            return waveform.repeat_interleave(2, dim=1), sample_rate * 2
+
+    dataset = ClipFeatureDataset(
+        audio_paths=["clip.wav"],
+        sample_rate=1000,
+        fbank_extractor=ResamplingExtractor(),
+        fbank_kwargs={
+            "frame_length": 25,
+            "frame_shift": 10,
+            "snip_edges": True,
+        },
+        min_fbank_frames=1,
+        left_padding_ms=2,
+        right_padding_ms=3,
+    )
+
+    index, feat, end_sec = dataset[0]
+
+    assert index == 0
+    assert feat.shape == (1, 80)
+    assert end_sec == pytest.approx(0.003)
+    assert captured["num_samples"] == 16
+    assert captured["sample_rate"] == 2000
+    expected = torch.tensor(
+        [[0.0] * 4 + [0.25, 0.25, -0.5, -0.5, 0.75, 0.75] + [0.0] * 6]
+    )
+    assert torch.equal(captured["waveform"], expected)
+    assert torch.equal(source, torch.tensor([[0.25, -0.5, 0.75]]))
+
+
+def test_clip_feature_dataset_padding_can_satisfy_encoder_length_guard(monkeypatch):
+    torch = pytest.importorskip("torch")
+    source = torch.ones(1, 10)
+    captured = {}
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.load_audio",
+        lambda _path, *, sample_rate: (source, sample_rate),
+    )
+
+    def fake_waveform_to_fbank(waveform, *, sample_rate, **_kwargs):
+        captured["num_samples"] = waveform.size(1)
+        captured["sample_rate"] = sample_rate
+        return torch.ones(2, 80)
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.waveform_to_fbank",
+        fake_waveform_to_fbank,
+    )
+
+    class PassthroughExtractor:
+        @staticmethod
+        def prepare_waveform(waveform, sample_rate):
+            return waveform, sample_rate
+
+    dataset = ClipFeatureDataset(
+        audio_paths=["short.wav"],
+        sample_rate=1000,
+        fbank_extractor=PassthroughExtractor(),
+        fbank_kwargs={
+            "frame_length": 25,
+            "frame_shift": 10,
+            "snip_edges": True,
+        },
+        min_fbank_frames=2,
+        left_padding_ms=20,
+        right_padding_ms=20,
+    )
+
+    index, feat, end_sec = dataset[0]
+
+    assert index == 0
+    assert feat.shape == (2, 80)
+    assert end_sec == pytest.approx(0.01)
+    assert captured == {"num_samples": 50, "sample_rate": 1000}
+
+
+@pytest.mark.parametrize("left_padding_ms,right_padding_ms", [(-1, 0), (0, -1)])
+def test_clip_feature_dataset_rejects_negative_padding(
+    left_padding_ms, right_padding_ms
+):
+    with pytest.raises(ValueError, match="must be >= 0"):
+        ClipFeatureDataset(
+            audio_paths=[],
+            sample_rate=16000,
+            fbank_extractor=None,
+            fbank_kwargs={},
+            min_fbank_frames=1,
+            left_padding_ms=left_padding_ms,
+            right_padding_ms=right_padding_ms,
+        )
+
+
 def _fake_g2p():
     return _fake_phonemes
 

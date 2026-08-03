@@ -1,16 +1,114 @@
+import json
 from pathlib import Path
 
-import pytest
-
 import numpy as np
+import pytest
+from omegaconf import OmegaConf
 
 from dma_kws.inference.manifest import load_manifest
 from dma_kws.inference.metrics import binary_eer, summarize_labeled_results
-from scripts.eval_stage2_clips import _result_record as stage2_clip_result_record
+import scripts.eval_stage2_clips as eval_stage2_clips
+from scripts.eval_stage2_clips import (
+    _resolve_audio_padding_ms,
+    _result_record as stage2_clip_result_record,
+)
 from scripts.eval_two_stage_kws import _result_record as two_stage_result_record
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def test_stage2_clip_audio_padding_defaults_to_160ms_per_side():
+    assert _resolve_audio_padding_ms({}) == (160, 160)
+
+
+def test_stage2_clip_audio_padding_can_be_overridden_per_side():
+    assert _resolve_audio_padding_ms(
+        {"left_padding_ms": 0, "right_padding_ms": 240}
+    ) == (0, 240)
+
+
+@pytest.mark.parametrize(
+    "prep",
+    [
+        {"left_padding_ms": -1},
+        {"right_padding_ms": -1},
+    ],
+)
+def test_stage2_clip_audio_padding_rejects_negative_values(prep):
+    with pytest.raises(SystemExit, match="must be >= 0"):
+        _resolve_audio_padding_ms(prep)
+
+
+def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypatch):
+    rows = [{"audio_path": "clip.wav", "keyword": "hello"}]
+    captured = {}
+
+    class FakeStreamPolicy:
+        @staticmethod
+        def describe():
+            return {"mode": "test"}
+
+    class FakeRunner:
+        _demo_cfg = {"qbyt_threshold": 0.5}
+        stream_policy = FakeStreamPolicy()
+
+        def run_batch(self, batch_rows, **kwargs):
+            captured["rows"] = batch_rows
+            captured["kwargs"] = kwargs
+            return [
+                {
+                    "qbyt_score": 0.75,
+                    "detected": True,
+                    "threshold": 0.5,
+                    "skipped": False,
+                }
+            ]
+
+    runner = FakeRunner()
+
+    class FakeRunnerFactory:
+        @staticmethod
+        def from_config(_config, _prep, _device):
+            return runner
+
+    monkeypatch.setattr(
+        eval_stage2_clips,
+        "resolved_config",
+        lambda _cfg: {
+            "paths": {},
+            "stage1": {},
+            "stage2": {},
+            "demo": {},
+            "tokenizer": {},
+        },
+    )
+    monkeypatch.setattr(eval_stage2_clips, "load_manifest", lambda _path: rows)
+    monkeypatch.setattr(
+        eval_stage2_clips, "resolve_accelerator", lambda _device: ("cpu", 1)
+    )
+    monkeypatch.setattr(eval_stage2_clips, "Stage2ClipRunner", FakeRunnerFactory)
+
+    cfg = OmegaConf.create(
+        {
+            "prep": {
+                "manifest": "manifest.csv",
+                "stage2_ckpt": "stage2.pt",
+                "output_dir": str(tmp_path),
+                "num_workers": 1,
+            },
+            "run": {"device": "cpu"},
+        }
+    )
+
+    summary = eval_stage2_clips.run_eval(cfg)
+
+    assert captured["rows"] == rows
+    assert captured["kwargs"]["left_padding_ms"] == 160
+    assert captured["kwargs"]["right_padding_ms"] == 160
+    assert summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    saved_summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert saved_summary["audio_padding_ms"] == {"left": 160, "right": 160}
 
 
 def test_load_manifest_csv_smoke():

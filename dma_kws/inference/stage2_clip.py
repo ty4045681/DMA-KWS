@@ -20,7 +20,12 @@ __all__ = ["ClipFeatureDataset", "Stage2ClipRunner", "collate_clip_feature_batch
 
 
 class ClipFeatureDataset:
-    """Map-style dataset that loads clips and computes full-clip fbank features."""
+    """Load clips and compute full-clip fbank features.
+
+    Waveform padding is part of the encoder input, so the encoder-length guard
+    is evaluated after padding. It is not a source-duration quality filter: an
+    otherwise too-short source clip can become scoreable after padding.
+    """
 
     def __init__(
         self,
@@ -30,12 +35,20 @@ class ClipFeatureDataset:
         fbank_extractor,
         fbank_kwargs: Mapping[str, Any],
         min_fbank_frames: int,
+        left_padding_ms: int = 0,
+        right_padding_ms: int = 0,
     ) -> None:
+        left_padding_ms = int(left_padding_ms)
+        right_padding_ms = int(right_padding_ms)
+        if left_padding_ms < 0 or right_padding_ms < 0:
+            raise ValueError("left_padding_ms and right_padding_ms must be >= 0")
         self._audio_paths = list(audio_paths)
         self._sample_rate = int(sample_rate)
         self._extractor = fbank_extractor
         self._fbank_kwargs = dict(fbank_kwargs)
         self._min_fbank_frames = int(min_fbank_frames)
+        self._left_padding_ms = left_padding_ms
+        self._right_padding_ms = right_padding_ms
 
     def __len__(self) -> int:
         return len(self._audio_paths)
@@ -47,8 +60,18 @@ class ClipFeatureDataset:
         waveform, sample_rate = load_audio(
             self._audio_paths[index], sample_rate=self._sample_rate
         )
+        # Keep result spans in source-audio coordinates; padding is synthetic
+        # context used only by the model input.
         end_sec = waveform.size(1) / sample_rate
         waveform, sample_rate = self._extractor.prepare_waveform(waveform, sample_rate)
+        left_samples = round(sample_rate * self._left_padding_ms / 1000)
+        right_samples = round(sample_rate * self._right_padding_ms / 1000)
+        if left_samples or right_samples:
+            from torch.nn.functional import pad
+
+            waveform = pad(waveform, (left_samples, right_samples))
+        # This guard prevents an input from subsampling to zero encoder frames;
+        # it intentionally validates the transformed model input.
         if not has_min_fbank_frames(
             waveform.size(1),
             min_frames=self._min_fbank_frames,
@@ -167,11 +190,17 @@ class Stage2ClipRunner:
         *,
         batch_size: int = 64,
         num_workers: int = 0,
+        left_padding_ms: int = 0,
+        right_padding_ms: int = 0,
     ) -> list[dict]:
         """Run Stage II verification on many clips with batched GPU scoring.
 
         ``rows`` are mappings with ``audio_path`` and ``keyword`` keys. Results
-        are returned in the same order as ``rows`` and match ``run`` output.
+        are returned in the same order as ``rows`` and use the ``run`` schema.
+        Optional zero-valued waveform padding is applied in memory before fbank
+        extraction; source audio files are not modified. The padding counts
+        toward the minimum encoder-input length and can make a short clip
+        scoreable.
         """
         try:
             from torch.utils.data import DataLoader
@@ -198,6 +227,8 @@ class Stage2ClipRunner:
             fbank_extractor=self._verifier.fbank_extractor,
             fbank_kwargs=self._verifier.fbank_kwargs,
             min_fbank_frames=self._verifier.min_fbank_frames,
+            left_padding_ms=left_padding_ms,
+            right_padding_ms=right_padding_ms,
         )
         loader = DataLoader(
             dataset,
