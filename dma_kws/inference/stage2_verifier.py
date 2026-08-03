@@ -239,6 +239,65 @@ class Stage2Verifier:
             )
         return [float(value) for value in scores.reshape(-1).cpu()]
 
+    def decode_phoneme_feats(self, feats: Sequence) -> list[list[int]]:
+        """Greedily decode phoneme ids from full-clip fbank features.
+
+        This uses the encoder and phoneme adapter already loaded for Stage II
+        scoring, so checkpoint weights, fbank settings, and streaming policy are
+        identical to :meth:`score_clip_feats`.
+        """
+        torch = self._torch
+        if not feats:
+            return []
+
+        adapter = getattr(self._model, "adapter", None)
+        if adapter is None:
+            raise RuntimeError(
+                "Phoneme PER requires stage2.phoneme_adapter.enabled=true and a "
+                "Stage II checkpoint containing adapter weights"
+            )
+
+        from torch.nn.utils.rnn import pad_sequence
+
+        from dma_kws.metrics import collapse_ctc
+
+        padded_feats = pad_sequence(list(feats), batch_first=True, padding_value=0)
+        feat_lengths = torch.tensor(
+            [feat.size(0) for feat in feats],
+            dtype=torch.long,
+        )
+        with torch.no_grad():
+            encoder_out, encoder_mask = run_encoder(
+                self._model.encoder,
+                padded_feats.to(self._device),
+                feat_lengths.to(self._device),
+                policy=self._stream_policy,
+                mode="eval",
+            )
+            _hidden, log_probs = adapter(
+                encoder_out,
+                encoder_mask,
+                with_log_probs=True,
+            )
+
+        if log_probs is None:
+            raise RuntimeError("Phoneme adapter did not return CTC log-probabilities")
+
+        frame_lengths = (
+            encoder_mask.squeeze(1)
+            .sum(dim=1)
+            .to(dtype=torch.long)
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        frame_ids = log_probs.argmax(dim=-1).detach().cpu().tolist()
+        blank_id = int(adapter.blank_id)
+        return [
+            collapse_ctc(ids[: int(length)], blank_id=blank_id)
+            for ids, length in zip(frame_ids, frame_lengths)
+        ]
+
     def verify_candidates(
         self,
         waveform,

@@ -175,3 +175,64 @@ def test_stage2_verifier_resamples_before_candidate_slicing(monkeypatch):
     assert captured["num_samples"] == 8000
     assert captured["kwargs"]["snip_edges"] is False
     assert scores[0]["qbyt_score"] == pytest.approx(0.75)
+
+
+def test_stage2_verifier_decodes_batched_adapter_ctc(monkeypatch):
+    calls: list[dict] = []
+
+    class _FakeAdapter:
+        blank_id = 0
+
+        def __call__(self, encoder_out, encoder_mask, *, with_log_probs):
+            del encoder_out, encoder_mask
+            assert with_log_probs is True
+            frame_ids = torch.tensor(
+                [
+                    [0, 2, 2, 4],
+                    [3, 3, 0, 4],
+                ]
+            )
+            log_probs = torch.nn.functional.one_hot(frame_ids, num_classes=5).float()
+            return torch.zeros(2, 4, 8), log_probs
+
+    class _FakeModel:
+        encoder = object()
+        adapter = _FakeAdapter()
+
+    def _fake_run_encoder(encoder, feats, feat_lengths, *, policy, mode):
+        calls.append({"encoder": encoder, "policy": policy, "mode": mode})
+        positions = torch.arange(feats.size(1), device=feats.device)
+        mask = positions.unsqueeze(0) < feat_lengths.unsqueeze(1)
+        return torch.zeros(feats.size(0), feats.size(1), 8), mask.unsqueeze(1)
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_verifier.run_encoder",
+        _fake_run_encoder,
+    )
+    verifier = Stage2Verifier.__new__(Stage2Verifier)
+    verifier._torch = torch
+    verifier._device = torch.device("cpu")
+    verifier._model = _FakeModel()
+    verifier._stream_policy = "deployment-policy"
+
+    hypotheses = verifier.decode_phoneme_feats(
+        [torch.zeros(3, 80), torch.zeros(4, 80)]
+    )
+
+    assert hypotheses == [[2], [3, 4]]
+    assert calls == [
+        {
+            "encoder": verifier._model.encoder,
+            "policy": "deployment-policy",
+            "mode": "eval",
+        }
+    ]
+
+
+def test_stage2_verifier_per_decode_requires_adapter():
+    verifier = Stage2Verifier.__new__(Stage2Verifier)
+    verifier._torch = torch
+    verifier._model = _FakeStage2Model()
+
+    with pytest.raises(RuntimeError, match="phoneme_adapter.enabled=true"):
+        verifier.decode_phoneme_feats([torch.zeros(3, 80)])

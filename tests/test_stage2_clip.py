@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from dma_kws.inference.stage2_clip import Stage2ClipRunner
+from dma_kws.inference.stage2_clip import (
+    ClipFeatureDataset,
+    Stage2ClipRunner,
+    collate_clip_feature_batch,
+)
 from dma_kws.tokenizer import load_char_tokenizer
 
 
@@ -10,6 +14,12 @@ def _fake_phonemes(text: str) -> list[str]:
     """Mimic g2p_en: upper-case ARPAbet with stress digits on vowels."""
     phones = {"hey eva": ["HH", "EY1", "IY1", "V", "AH0"]}
     return phones.get(text.lower(), text.upper().split())
+
+
+def test_clip_feature_loading_api_is_public():
+    assert ClipFeatureDataset.__name__ == "ClipFeatureDataset"
+    batch = [(0, "feature", 1.0)]
+    assert collate_clip_feature_batch(batch) is batch
 
 
 def _fake_g2p():

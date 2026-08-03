@@ -109,6 +109,31 @@ def test_write_manifest_jsonl_roundtrip(tmp_path):
     assert loaded[0]["label"] == 0
 
 
+def test_load_manifest_csv_invalid_label_reports_file_row(tmp_path):
+    manifest_path = tmp_path / "manifest.csv"
+    manifest_path.write_text(
+        "audio_path,keyword,label\n"
+        "a.wav,hey eva,1\n"
+        "b.wav,hey eva,pos\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Manifest row 3 has invalid label 'pos'"):
+        load_manifest(manifest_path)
+
+
+def test_load_manifest_jsonl_invalid_label_reports_file_row(tmp_path):
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        '{"audio_path":"a.wav","keyword":"hey eva","label":1}\n'
+        '{"audio_path":"b.wav","keyword":"hey eva","label":"pos"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Manifest row 2 has invalid label 'pos'"):
+        load_manifest(manifest_path)
+
+
 def test_write_manifest_empty_rows(tmp_path):
     with pytest.raises(ValueError, match="empty manifest"):
         write_manifest(tmp_path / "manifest.csv", [])

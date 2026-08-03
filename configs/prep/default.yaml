@@ -1,6 +1,11 @@
 manifest: ""
 output_dir: outputs/eval_two_stage_kws
 stage2_clip_output_dir: outputs/eval_stage2_clips
+per_output_dir: outputs/eval_phoneme_adapter_per
+# PER reads the text actually spoken in each clip from this manifest column.
+# For legacy KWS-only manifests, keyword is allowed only with per_label_filter=1.
+per_reference_column: text_variant
+per_label_filter: null
 limit: 0
 input_format: librispeech-dir
 parquet_root: ""

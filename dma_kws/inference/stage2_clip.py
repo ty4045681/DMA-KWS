@@ -16,8 +16,10 @@ from dma_kws.tokenizer import load_char_tokenizer, tokenize_phoneme_string
 if TYPE_CHECKING:
     from dma_kws.inference.stage2_verifier import Stage2Verifier
 
+__all__ = ["ClipFeatureDataset", "Stage2ClipRunner", "collate_clip_feature_batch"]
 
-class _ClipFeatureDataset:
+
+class ClipFeatureDataset:
     """Map-style dataset that loads clips and computes full-clip fbank features."""
 
     def __init__(
@@ -65,8 +67,15 @@ class _ClipFeatureDataset:
         return index, feat, end_sec
 
 
-def _list_collate(batch):
+def collate_clip_feature_batch(batch):
+    """Keep variable-length clip feature records as a list for runner batching."""
     return batch
+
+
+# Compatibility aliases for any out-of-tree callers that imported the old
+# private names before the feature-loading path became shared by PER evaluation.
+_ClipFeatureDataset = ClipFeatureDataset
+_list_collate = collate_clip_feature_batch
 
 
 class Stage2ClipRunner:
@@ -183,7 +192,7 @@ class Stage2ClipRunner:
                 )
                 keyword_cache[keyword] = (phonemes, keyword_ids)
 
-        dataset = _ClipFeatureDataset(
+        dataset = ClipFeatureDataset(
             audio_paths=[row["audio_path"] for row in rows],
             sample_rate=self._sample_rate,
             fbank_extractor=self._verifier.fbank_extractor,
@@ -195,7 +204,7 @@ class Stage2ClipRunner:
             batch_size=max(1, int(batch_size)),
             shuffle=False,
             num_workers=max(0, int(num_workers)),
-            collate_fn=_list_collate,
+            collate_fn=collate_clip_feature_batch,
         )
 
         results: list[dict | None] = [None] * len(rows)

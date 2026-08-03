@@ -5,21 +5,35 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 
 _REQUIRED_COLUMNS = ("audio_path", "keyword")
 _DEFAULT_AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a")
 
 
-def _normalize_row(row: dict[str, str], base_dir: Path | None) -> dict:
-    normalized = {key.strip(): (value.strip() if isinstance(value, str) else value) for key, value in row.items()}
+def _normalize_row(
+    row: Mapping[str, Any],
+    base_dir: Path | None,
+    *,
+    row_number: int,
+) -> dict:
+    normalized = {
+        key.strip(): (value.strip() if isinstance(value, str) else value)
+        for key, value in row.items()
+    }
     audio_path = normalized.get("audio_path", "")
     if audio_path and base_dir is not None and not Path(audio_path).is_absolute():
         normalized["audio_path"] = str((base_dir / audio_path).resolve())
 
     if "label" in normalized and normalized["label"] != "":
-        normalized["label"] = int(normalized["label"])
+        try:
+            normalized["label"] = int(normalized["label"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Manifest row {row_number} has invalid label {normalized['label']!r}; "
+                "expected an integer"
+            ) from exc
     elif "label" in normalized:
         normalized.pop("label")
 
@@ -48,7 +62,11 @@ def load_manifest(path: str | Path) -> list[dict]:
                 line = line.strip()
                 if not line:
                     continue
-                row = _normalize_row(json.loads(line), base_dir)
+                row = _normalize_row(
+                    json.loads(line),
+                    base_dir,
+                    row_number=line_number,
+                )
                 _validate_row(row, line_number)
                 rows.append(row)
         return rows
@@ -57,7 +75,11 @@ def load_manifest(path: str | Path) -> list[dict]:
         with manifest_path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             for line_number, row in enumerate(reader, start=2):
-                normalized = _normalize_row(row, base_dir)
+                normalized = _normalize_row(
+                    row,
+                    base_dir,
+                    row_number=line_number,
+                )
                 _validate_row(normalized, line_number)
                 rows.append(normalized)
         return rows
