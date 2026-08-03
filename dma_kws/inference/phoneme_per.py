@@ -196,8 +196,15 @@ class PhonemePerRunner:
         reference_column: str,
         batch_size: int = 64,
         num_workers: int = 0,
+        left_padding_ms: int = 0,
+        right_padding_ms: int = 0,
     ) -> list[dict[str, Any]]:
-        """Compute full-clip greedy CTC hypotheses and utterance PER records."""
+        """Compute full-clip greedy CTC hypotheses and PER records.
+
+        Optional zero-valued waveform padding is applied in memory before fbank
+        extraction. It counts toward the minimum encoder-input length and can
+        make a short clip decodable; source audio files are not modified.
+        """
         try:
             from torch.utils.data import DataLoader
         except ImportError as exc:
@@ -228,6 +235,8 @@ class PhonemePerRunner:
             fbank_extractor=self._verifier.fbank_extractor,
             fbank_kwargs=self._verifier.fbank_kwargs,
             min_fbank_frames=self._verifier.min_fbank_frames,
+            left_padding_ms=left_padding_ms,
+            right_padding_ms=right_padding_ms,
         )
         loader = DataLoader(
             dataset,

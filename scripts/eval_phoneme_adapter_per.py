@@ -5,6 +5,11 @@ By default, the true transcript is read from the manifest's ``text_variant``
 column. Evaluation can also be restricted to positive rows before using
 ``keyword`` as the reference for legacy manifests.
 
+Each clip receives 160 ms of zero-valued waveform context on both sides by
+default. Override with ``+prep.left_padding_ms=...`` and
+``+prep.right_padding_ms=...``; use zero to disable either side. Padding is part
+of the decoded model input and counts toward its minimum length.
+
 Example for a manifest containing ``audio_path,keyword,label,text_variant``::
 
     python scripts/eval_phoneme_adapter_per.py \
@@ -42,10 +47,21 @@ from dma_kws.inference.phoneme_per import (
 from dma_kws.training.device import resolve_accelerator
 
 
+DEFAULT_PADDING_MS = 160
+
+
 def _optional_int(value) -> int | None:
     if value is None or str(value).strip() == "":
         return None
     return int(value)
+
+
+def _resolve_audio_padding_ms(prep: dict) -> tuple[int, int]:
+    left_padding_ms = int(prep.get("left_padding_ms", DEFAULT_PADDING_MS))
+    right_padding_ms = int(prep.get("right_padding_ms", DEFAULT_PADDING_MS))
+    if left_padding_ms < 0 or right_padding_ms < 0:
+        raise SystemExit("prep.left_padding_ms and prep.right_padding_ms must be >= 0")
+    return left_padding_ms, right_padding_ms
 
 
 def run_eval(cfg: DictConfig) -> dict:
@@ -70,6 +86,7 @@ def run_eval(cfg: DictConfig) -> dict:
     stage2_ckpt = str(prep.get("stage2_ckpt", "")).strip()
     if not stage2_ckpt:
         raise SystemExit("prep.stage2_ckpt is required")
+    left_padding_ms, right_padding_ms = _resolve_audio_padding_ms(prep)
 
     reference_column = str(prep.get("per_reference_column", "text_variant")).strip()
     label_filter = _optional_int(prep.get("per_label_filter"))
@@ -105,6 +122,8 @@ def run_eval(cfg: DictConfig) -> dict:
             reference_column=reference_column,
             batch_size=batch_size,
             num_workers=num_workers,
+            left_padding_ms=left_padding_ms,
+            right_padding_ms=right_padding_ms,
         )
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
@@ -125,6 +144,10 @@ def run_eval(cfg: DictConfig) -> dict:
         "label_filter": label_filter,
         "num_manifest_rows": len(all_rows),
         "num_selected_rows": len(rows),
+        "audio_padding_ms": {
+            "left": left_padding_ms,
+            "right": right_padding_ms,
+        },
         "stream": runner.stream_policy.describe(),
         "metrics": summarize_per_results(results),
         "results_path": str(results_path.resolve()),

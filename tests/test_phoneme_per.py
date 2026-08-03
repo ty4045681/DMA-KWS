@@ -1,8 +1,13 @@
 from __future__ import annotations
 
-import pytest
+import json
 
+import pytest
+from omegaconf import OmegaConf
+
+import scripts.eval_phoneme_adapter_per as eval_phoneme_adapter_per
 from dma_kws.inference.phoneme_per import (
+    PhonemePerRunner,
     build_per_record,
     select_per_rows,
     summarize_per_results,
@@ -24,6 +29,194 @@ def _rows():
             "text_variant": "turn on the lights",
         },
     ]
+
+
+@pytest.mark.parametrize(
+    "prep",
+    [
+        {"left_padding_ms": -1},
+        {"right_padding_ms": -1},
+    ],
+)
+def test_per_audio_padding_rejects_negative_values(prep):
+    with pytest.raises(SystemExit, match="must be >= 0"):
+        eval_phoneme_adapter_per._resolve_audio_padding_ms(prep)
+
+
+def test_phoneme_per_runner_applies_waveform_padding(monkeypatch):
+    torch = pytest.importorskip("torch")
+    captured = {}
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.load_audio",
+        lambda _path, *, sample_rate: (torch.ones(1, 10), sample_rate),
+    )
+
+    def fake_waveform_to_fbank(waveform, *, sample_rate, **_kwargs):
+        captured["num_samples"] = waveform.size(1)
+        captured["sample_rate"] = sample_rate
+        return torch.ones(2, 80)
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.waveform_to_fbank",
+        fake_waveform_to_fbank,
+    )
+
+    class PassthroughExtractor:
+        @staticmethod
+        def prepare_waveform(waveform, sample_rate):
+            return waveform, sample_rate
+
+    class FakeVerifier:
+        fbank_extractor = PassthroughExtractor()
+        fbank_kwargs = {
+            "frame_length": 25,
+            "frame_shift": 10,
+            "snip_edges": True,
+        }
+        min_fbank_frames = 2
+
+        @staticmethod
+        def decode_phoneme_feats(feats):
+            assert len(feats) == 1
+            captured["decoded"] = True
+            return [[2]]
+
+    class FakeTokenizer:
+        @staticmethod
+        def ids2tokens(ids):
+            assert ids in ([], [2])
+            return ["HH"] if ids else []
+
+    monkeypatch.setattr(
+        "dma_kws.inference.phoneme_per.text_to_phonemes",
+        lambda _g2p, _text: ["HH"],
+    )
+    monkeypatch.setattr(
+        "dma_kws.inference.phoneme_per.tokenize_phoneme_string",
+        lambda _tokenizer, _text: [2],
+    )
+    runner = PhonemePerRunner(
+        verifier=FakeVerifier(),
+        tokenizer=FakeTokenizer(),
+        sample_rate=1000,
+        g2p=object(),
+    )
+
+    default_results = runner.run_batch(
+        _rows()[:1], reference_column="text_variant", num_workers=0
+    )
+    padded_results = runner.run_batch(
+        _rows()[:1],
+        reference_column="text_variant",
+        num_workers=0,
+        left_padding_ms=20,
+        right_padding_ms=20,
+    )
+
+    assert default_results[0]["skipped"] is True
+    assert padded_results[0]["skipped"] is False
+    assert padded_results[0]["per"] == 0.0
+    assert captured == {
+        "num_samples": 50,
+        "sample_rate": 1000,
+        "decoded": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "padding_overrides,expected_padding",
+    [
+        ({}, (160, 160)),
+        ({"left_padding_ms": 0, "right_padding_ms": 240}, (0, 240)),
+    ],
+)
+def test_per_eval_applies_and_records_padding(
+    tmp_path,
+    monkeypatch,
+    padding_overrides,
+    expected_padding,
+):
+    rows = _rows()[:1]
+    captured = {}
+
+    class FakeStreamPolicy:
+        @staticmethod
+        def describe():
+            return {"mode": "test"}
+
+    class FakeRunner:
+        stream_policy = FakeStreamPolicy()
+
+        def run_batch(self, batch_rows, **kwargs):
+            captured["rows"] = batch_rows
+            captured["kwargs"] = kwargs
+            return [
+                {
+                    "audio_path": batch_rows[0]["audio_path"],
+                    "keyword": batch_rows[0]["keyword"],
+                    "reference_column": "text_variant",
+                    "reference_text": batch_rows[0]["text_variant"],
+                    "reference_phonemes": ["HH"],
+                    "hypothesis_phonemes": ["HH"],
+                    "edit_distance": 0,
+                    "reference_length": 1,
+                    "per": 0.0,
+                    "skipped": False,
+                }
+            ]
+
+    runner = FakeRunner()
+
+    class FakeRunnerFactory:
+        @staticmethod
+        def from_config(_config, _prep, _device):
+            return runner
+
+    monkeypatch.setattr(
+        eval_phoneme_adapter_per,
+        "resolved_config",
+        lambda _cfg: {
+            "paths": {},
+            "stage1": {},
+            "stage2": {},
+            "tokenizer": {},
+        },
+    )
+    monkeypatch.setattr(
+        eval_phoneme_adapter_per, "load_manifest", lambda _path: rows
+    )
+    monkeypatch.setattr(
+        eval_phoneme_adapter_per,
+        "resolve_accelerator",
+        lambda _device: ("cpu", 1),
+    )
+    monkeypatch.setattr(
+        eval_phoneme_adapter_per, "PhonemePerRunner", FakeRunnerFactory
+    )
+    cfg = OmegaConf.create(
+        {
+            "prep": {
+                "manifest": "manifest.csv",
+                "stage2_ckpt": "stage2.pt",
+                "per_output_dir": str(tmp_path),
+                "num_workers": 1,
+                **padding_overrides,
+            },
+            "run": {"device": "cpu"},
+        }
+    )
+
+    summary = eval_phoneme_adapter_per.run_eval(cfg)
+
+    assert captured["rows"] == rows
+    left_padding_ms, right_padding_ms = expected_padding
+    expected_summary = {"left": left_padding_ms, "right": right_padding_ms}
+    assert captured["kwargs"]["left_padding_ms"] == left_padding_ms
+    assert captured["kwargs"]["right_padding_ms"] == right_padding_ms
+    assert summary["audio_padding_ms"] == expected_summary
+    saved_summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert saved_summary["audio_padding_ms"] == expected_summary
 
 
 def test_keyword_reference_requires_positive_filter():
