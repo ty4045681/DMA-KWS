@@ -2,6 +2,7 @@ from dma_kws.training.ddp import (
     apply_step_based_validation,
     build_trainer_kwargs,
     process_rank,
+    rank_zero_print,
     resolve_precision,
 )
 
@@ -37,6 +38,14 @@ def test_process_rank_supports_slurm_when_torchrun_rank_is_absent(monkeypatch):
     monkeypatch.setenv("SLURM_PROCID", "3")
 
     assert process_rank() == 3
+
+
+def test_rank_zero_print_is_silent_on_nonzero_launcher_rank(monkeypatch, capsys):
+    monkeypatch.setenv("RANK", "1")
+
+    rank_zero_print("only once")
+
+    assert capsys.readouterr().out == ""
 
 
 def test_build_trainer_kwargs_uses_validation_val_check_interval():

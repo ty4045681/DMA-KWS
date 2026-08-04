@@ -45,6 +45,34 @@ class FbankConfig:
 
 
 @dataclass
+class Stage2ConsoleConfig:
+    rich: bool = True
+    device_stats: bool = False
+    throughput: bool = False
+    refresh_rate: int | None = None
+    leave: bool = True
+
+
+@dataclass
+class Stage2WandbConfig:
+    project: str = "dma-kws"
+    mode: str = "online"
+
+
+@dataclass
+class Stage2TrackioConfig:
+    project: str = "dma-kws"
+
+
+@dataclass
+class Stage2LoggingConfig:
+    backends: list[str] = field(default_factory=lambda: ["csv", "tensorboard"])
+    grad_norm: bool = True
+    wandb: Stage2WandbConfig = field(default_factory=Stage2WandbConfig)
+    trackio: Stage2TrackioConfig = field(default_factory=Stage2TrackioConfig)
+
+
+@dataclass
 class Stage1CheckpointAvgConfig:
     enabled: bool = False
     last_k: int = 10
@@ -164,6 +192,8 @@ class Stage1Config:
     cmvn_conf: Stage1CmvnConfConfig = field(default_factory=Stage1CmvnConfConfig)
     checkpoint_avg: Stage1CheckpointAvgConfig = field(default_factory=Stage1CheckpointAvgConfig)
     validation: Stage1ValidationConfig = field(default_factory=Stage1ValidationConfig)
+    console: Stage2ConsoleConfig = field(default_factory=Stage2ConsoleConfig)
+    logging: Stage2LoggingConfig = field(default_factory=Stage2LoggingConfig)
 
 
 @dataclass
@@ -219,34 +249,11 @@ class Stage2EmaConfig:
 
 
 @dataclass
-class Stage2ConsoleConfig:
-    rich: bool = True
-    device_stats: bool = False
-    throughput: bool = False
-
-
-@dataclass
-class Stage2WandbConfig:
-    project: str = "dma-kws"
-    mode: str = "online"
-
-
-@dataclass
-class Stage2TrackioConfig:
-    project: str = "dma-kws"
-
-
-@dataclass
-class Stage2LoggingConfig:
-    backends: list[str] = field(default_factory=lambda: ["csv", "tensorboard"])
-    wandb: Stage2WandbConfig = field(default_factory=Stage2WandbConfig)
-    trackio: Stage2TrackioConfig = field(default_factory=Stage2TrackioConfig)
-
-
-@dataclass
 class Stage2ValidationConfig:
     batch_size: int = 256
     val_check_interval: int = 1000
+    ece_num_bins: int = 15
+    seq_diagnostic_threshold: float = 0.5
 
 
 @dataclass
@@ -279,6 +286,8 @@ class Stage2EvalConfig:
 class Stage2CheckpointConfig:
     every_n_train_steps: int = 1000
     save_top_k: int = -1
+    monitor: str = "val_auc"
+    mode: str = "max"
     init_filename: str = "step_{step:06d}"
     finetune_filename: str = "step_{step:06d}_auc_{val_auc:.6f}"
 
@@ -332,6 +341,7 @@ class PhonemeAdapterConfig:
         default_factory=PhonemeAdapterValidationConfig
     )
     logging: Stage2LoggingConfig = field(default_factory=Stage2LoggingConfig)
+    console: Stage2ConsoleConfig = field(default_factory=Stage2ConsoleConfig)
     checkpoint: Stage2CheckpointConfig = field(default_factory=Stage2CheckpointConfig)
 
 
@@ -527,9 +537,13 @@ class AdaptConfig:
     eval_seed: int = 2025
     init_checkpoint: str = ""
     params_file: str = ""
+    checkpoint_monitor: str = "val_target_auc"
+    checkpoint_filename: str = "step_{step:06d}_target_auc_{val_target_auc:.6f}"
     lora_targets: list[str] = field(default_factory=lambda: ["in_proj_weight", "out_proj.weight"])
     validation: AdaptValidationConfig = field(default_factory=AdaptValidationConfig)
     sweep: AdaptSweepConfig = field(default_factory=AdaptSweepConfig)
+    console: Stage2ConsoleConfig = field(default_factory=Stage2ConsoleConfig)
+    logging: Stage2LoggingConfig = field(default_factory=Stage2LoggingConfig)
 
 
 @dataclass

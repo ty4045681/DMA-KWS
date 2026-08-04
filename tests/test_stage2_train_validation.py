@@ -83,7 +83,14 @@ def test_build_val_dataloader_uses_test_collate_fn(mock_eval_npy, mock_g2p, tmp_
     dataloader = _build_val_dataloader(_base_config(test_dir), _FakeTokenizer())
     batch = next(iter(dataloader))
 
-    assert set(batch.keys()) == {"anchor", "feat", "feat_lengths", "label"}
+    assert dataloader.drop_last is False
+    assert set(batch.keys()) == {
+        "sample_id",
+        "anchor",
+        "feat",
+        "feat_lengths",
+        "label",
+    }
     assert "seq_label" not in batch
     assert batch["label"].tolist() == [1, 0]
 

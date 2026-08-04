@@ -13,9 +13,11 @@ __all__ = [
     "build_optimizer_config",
     "build_stage2_callbacks",
     "build_stage2_checkpoint_callback",
+    "build_training_result_rows",
     "build_trainer_kwargs",
     "normalize_adapt_params",
     "print_run_summary",
+    "print_training_result_summary",
     "resolve_adapt_lr",
     "resolve_precision",
     "resolve_resume_path",
@@ -35,6 +37,14 @@ def __getattr__(name: str):
         from dma_kws.training.callbacks import print_run_summary
 
         return print_run_summary
+    if name == "build_training_result_rows":
+        from dma_kws.training.callbacks import build_training_result_rows
+
+        return build_training_result_rows
+    if name == "print_training_result_summary":
+        from dma_kws.training.callbacks import print_training_result_summary
+
+        return print_training_result_summary
     if name == "build_stage2_checkpoint_callback":
         from dma_kws.training.checkpoint_callback import build_stage2_checkpoint_callback
 

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from dma_kws.phoneme_adapter.runner import build_adapter_callbacks, resolve_val_check_interval
+from dma_kws.training.checkpoint_callback import FreshValidationModelCheckpoint
 from dma_kws.training.ddp import apply_step_based_validation
 
 # Neither module imports torch or pytorch_lightning at module level, so the
@@ -22,16 +23,17 @@ def test_resolve_val_check_interval_prefers_the_validation_section():
     assert resolve_val_check_interval({"val_check_interval": 500}) == 500
 
 
-def test_checkpoint_cadence_must_be_a_multiple_of_the_validation_cadence(tmp_path):
-    """Otherwise ModelCheckpoint degrades to "monitor val/per not available,
-    skipping" and quietly never writes a best checkpoint."""
+def test_checkpoint_cadence_need_not_be_a_multiple_of_validation(tmp_path):
     cfg = {
         "validation": {"val_check_interval": 2000},
         "checkpoint": {"every_n_train_steps": 1500, "save_top_k": 3},
     }
 
-    with pytest.raises(SystemExit, match="multiple of the validation interval"):
-        build_adapter_callbacks(tmp_path, cfg)
+    _, checkpoint_callback = build_adapter_callbacks(tmp_path, cfg)
+
+    assert isinstance(checkpoint_callback, FreshValidationModelCheckpoint)
+    assert checkpoint_callback.fresh_every_n_train_steps == 1500
+    assert checkpoint_callback._every_n_train_steps == 0
 
 
 def test_aligned_checkpoint_cadence_is_accepted(tmp_path):
@@ -44,6 +46,7 @@ def test_aligned_checkpoint_cadence_is_accepted(tmp_path):
 
     assert callbacks == [checkpoint_callback]
     assert checkpoint_callback.monitor == "val/per"
+    assert isinstance(checkpoint_callback, FreshValidationModelCheckpoint)
 
 
 def test_epoch_only_checkpointing_skips_the_cadence_check(tmp_path):
@@ -52,6 +55,17 @@ def test_epoch_only_checkpointing_skips_the_cadence_check(tmp_path):
     )
 
     assert len(callbacks) == 1
+
+
+def test_adapter_checkpoint_rejects_a_misleading_monitor_override(tmp_path):
+    with pytest.raises(SystemExit, match="requires.*val/per.*min"):
+        build_adapter_callbacks(
+            tmp_path,
+            {
+                "validation": {"val_check_interval": 100},
+                "checkpoint": {"monitor": "val/loss", "mode": "min"},
+            },
+        )
 
 
 def test_step_based_validation_is_applied_for_short_epochs():

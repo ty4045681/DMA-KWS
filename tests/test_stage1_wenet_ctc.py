@@ -102,6 +102,25 @@ def _stage1_batch():
     )
 
 
+def test_collate_propagates_optional_stable_sample_ids():
+    batch = stage1_collate_fn(
+        [
+            {
+                "feat": torch.randn(4, 80),
+                "target": torch.tensor([3, 4]),
+                "sample_id": torch.tensor(10),
+            },
+            {
+                "feat": torch.randn(5, 80),
+                "target": torch.tensor([5]),
+                "sample_id": torch.tensor(11),
+            },
+        ]
+    )
+
+    assert batch["sample_id"].tolist() == [10, 11]
+
+
 def test_training_step_delegates_to_the_dynamic_chunk_sampler(stream_spy_module):
     module, encoder = stream_spy_module
     fake_optimizer = MagicMock()
@@ -158,6 +177,26 @@ def test_forward_and_training_step_smoke(patched_module):
     assert torch.isfinite(loss)
 
 
+def test_validation_boundary_logs_mean_training_window(patched_module):
+    module = patched_module
+    module.log = MagicMock()
+    module.optimizers = MagicMock(
+        return_value=MagicMock(param_groups=[{"lr": 1e-3}])
+    )
+    module.ctc.forward = MagicMock(
+        side_effect=[(torch.tensor(2.0), None), (torch.tensor(4.0), None)]
+    )
+    batch = _stage1_batch()
+
+    module.training_step(batch, 0)
+    module.training_step(batch, 1)
+    module.on_validation_epoch_start()
+
+    values = {call.args[0]: call.args[1] for call in module.log.call_args_list}
+    assert float(values["train/window/loss_total"]) == pytest.approx(3.0)
+    assert values["train/window/microbatches"] == 2.0
+
+
 def test_export_stage1_encoder_pt_roundtrip(tmp_path, monkeypatch):
     pytest.importorskip("pytorch_lightning")
 
@@ -204,3 +243,62 @@ def test_validation_step_accumulates_per(patched_module):
     module.on_validation_epoch_end()
 
     assert module._val_total_ref > 0
+
+
+def test_validation_per_is_global_edit_sum_over_global_reference_sum(
+    patched_module, monkeypatch
+):
+    """Do not average rank-local PERs when reference-token counts differ."""
+    module = patched_module
+    module.log = MagicMock()
+    module.on_validation_epoch_start()
+    module._val_total_dist = 1
+    module._val_total_ref = 2
+
+    # Peer PER is 9/10. Mean(local PERs)=0.7, while global PER=10/12.
+    monkeypatch.setattr(
+        "dma_kws.stage1.module.sum_across_processes",
+        lambda values: values + torch.tensor([9, 10], device=values.device),
+    )
+    module.on_validation_epoch_end()
+
+    values = {call.args[0]: float(call.args[1]) for call in module.log.call_args_list}
+    assert values["val/per_edit_distance"] == 10
+    assert values["val/per_reference_tokens"] == 12
+    assert values["val/per"] == pytest.approx(10 / 12)
+    assert values["val/per"] != pytest.approx((1 / 2 + 9 / 10) / 2)
+    alias_call = next(call for call in module.log.call_args_list if call.args[0] == "val_per")
+    assert alias_call.kwargs["logger"] is False
+
+
+def test_validation_per_deduplicates_distributed_sampler_padding(
+    patched_module, monkeypatch
+):
+    module = patched_module
+    module.log = MagicMock()
+    module.on_validation_epoch_start()
+    module._val_per_records = [(0, 1, 2), (2, 0, 3)]
+
+    def fake_gather(local_rows):
+        peer_rows = torch.tensor(
+            [
+                [1.0, 2.0, 5.0],
+                # Sampler padding repeats sample 0 on the peer rank.  Deliberately
+                # different values make a failure to de-duplicate unambiguous.
+                [0.0, 99.0, 99.0],
+            ],
+            dtype=local_rows.dtype,
+            device=local_rows.device,
+        )
+        return torch.cat([local_rows, peer_rows], dim=0)
+
+    monkeypatch.setattr(
+        "dma_kws.training.distributed_metrics.gather_variable_rows",
+        fake_gather,
+    )
+    module.on_validation_epoch_end()
+
+    values = {call.args[0]: float(call.args[1]) for call in module.log.call_args_list}
+    assert values["val/per_edit_distance"] == 3
+    assert values["val/per_reference_tokens"] == 10
+    assert values["val/per"] == pytest.approx(0.3)

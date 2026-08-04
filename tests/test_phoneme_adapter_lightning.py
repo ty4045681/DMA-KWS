@@ -88,6 +88,29 @@ def test_training_step_returns_a_finite_ctc_loss(module):
     assert torch.isfinite(loss)
 
 
+def test_validation_boundary_logs_valid_weighted_training_window(module):
+    module.optimizers = MagicMock(
+        return_value=MagicMock(param_groups=[{"lr": 1e-3}])
+    )
+    module._ctc_step = MagicMock(
+        side_effect=[
+            (torch.tensor(2.0, requires_grad=True), None, None, 0),
+            (torch.tensor(8.0, requires_grad=True), None, None, 1),
+        ]
+    )
+
+    module.training_step(_batch(), 0)
+    module.training_step(_batch(), 1)
+    module.on_validation_epoch_start()
+
+    values = {call.args[0]: call.args[1] for call in module.log.call_args_list}
+    assert float(values["train/window/loss_total"]) == pytest.approx(4.0)
+    assert values["train/window/ctc_valid"] == 3.0
+    assert values["train/window/ctc_skipped"] == 1.0
+    assert values["train/window/ctc_skip_rate"] == pytest.approx(0.25)
+    assert values["train/window/microbatches"] == 2.0
+
+
 def test_encoder_receives_no_gradients(module):
     fake_optimizer = MagicMock()
     fake_optimizer.param_groups = [{"lr": 1e-3}]
@@ -109,3 +132,128 @@ def test_validation_accumulates_per(module):
     module.on_validation_epoch_end()
     logged = {call.args[0] for call in module.log.call_args_list}
     assert "val/per" in logged
+
+
+def test_validation_metrics_are_ratios_of_global_sums(module, monkeypatch):
+    """Global PER/loss must weight ranks by their token/valid-sample counts.
+
+    Local PERs would be 1/2 and 9/10, whose mean is 0.7. The correct global
+    result is (1 + 9) / (2 + 10) = 5/6.
+    """
+    module.on_validation_epoch_start()
+    module._val_ctc_loss_sum = 4.0
+    module._val_ctc_valid = 2
+    module._val_ctc_skipped = 0
+    module._val_total_dist = 1
+    module._val_total_ref = 2
+
+    peer_stats = torch.tensor([18.0, 3.0, 1.0, 9.0, 10.0], dtype=torch.float64)
+
+    def fake_sum(values):
+        return values + peer_stats.to(values)
+
+    monkeypatch.setattr(
+        "dma_kws.phoneme_adapter.lightning.sum_across_processes",
+        fake_sum,
+    )
+    module.on_validation_epoch_end()
+
+    values = {call.args[0]: float(call.args[1]) for call in module.log.call_args_list}
+    assert values["val/loss"] == pytest.approx((4.0 + 18.0) / (2 + 3))
+    assert values["val/ctc_valid"] == 5
+    assert values["val/ctc_skipped"] == 1
+    assert values["val/ctc_skip_rate"] == pytest.approx(1 / 6)
+    assert values["val/per"] == pytest.approx((1 + 9) / (2 + 10))
+    assert values["val/per"] != pytest.approx((1 / 2 + 9 / 10) / 2)
+
+
+def test_validation_loss_is_weighted_by_valid_ctc_samples(module):
+    module.on_validation_epoch_start()
+    module._ctc_step = MagicMock(
+        side_effect=[
+            (torch.tensor(2.0), None, None, 0),
+            (torch.tensor(10.0), None, None, 1),
+        ]
+    )
+
+    # ``batch_idx`` is beyond the configured decode budget, so only CTC loss
+    # accounting runs. The two local means represent 2 and 1 valid samples.
+    module.validation_step(_batch(), 2)
+    module.validation_step(_batch(), 3)
+    module.on_validation_epoch_end()
+
+    values = {call.args[0]: float(call.args[1]) for call in module.log.call_args_list}
+    assert values["val/loss"] == pytest.approx((2.0 * 2 + 10.0 * 1) / 3)
+    assert values["val/ctc_valid"] == 3
+    assert values["val/ctc_skipped"] == 1
+
+
+def test_validation_metrics_deduplicate_distributed_sampler_padding(module, monkeypatch):
+    module.on_validation_epoch_start()
+    module._val_ctc_records = [
+        (0, 2.0, 1, 0),
+        (2, 0.0, 0, 1),
+    ]
+    module._val_per_records = [
+        (0, 1, 2),
+        (2, 0, 3),
+    ]
+
+    def fake_gather(local_rows):
+        if local_rows.size(1) == 4:
+            peer_rows = torch.tensor(
+                [[1.0, 4.0, 1.0, 0.0], [0.0, 99.0, 1.0, 0.0]],
+                dtype=local_rows.dtype,
+                device=local_rows.device,
+            )
+        else:
+            peer_rows = torch.tensor(
+                [[1.0, 2.0, 5.0], [0.0, 99.0, 99.0]],
+                dtype=local_rows.dtype,
+                device=local_rows.device,
+            )
+        return torch.cat([local_rows, peer_rows], dim=0)
+
+    monkeypatch.setattr(
+        "dma_kws.training.distributed_metrics.gather_variable_rows",
+        fake_gather,
+    )
+    module.on_validation_epoch_end()
+
+    values = {call.args[0]: float(call.args[1]) for call in module.log.call_args_list}
+    assert values["val/loss"] == pytest.approx(3.0)
+    assert values["val/ctc_valid"] == 2
+    assert values["val/ctc_skipped"] == 1
+    assert values["val/ctc_skip_rate"] == pytest.approx(1 / 3)
+    assert values["val/per_edit_distance"] == 3
+    assert values["val/per_reference_tokens"] == 10
+    assert values["val/per"] == pytest.approx(0.3)
+
+
+def test_training_ctc_counts_are_global_per_step(module, monkeypatch):
+    loss = torch.tensor(2.0, requires_grad=True)
+    module._ctc_step = MagicMock(return_value=(loss, None, None, 1))
+    module.optimizers = MagicMock(
+        return_value=MagicMock(param_groups=[{"lr": 1e-3}])
+    )
+
+    # Local batch: loss sum=2, valid=1, skipped=1. Peer: the same loss sum,
+    # valid=1, skipped=3.
+    monkeypatch.setattr(
+        "dma_kws.phoneme_adapter.lightning.sum_across_processes",
+        lambda values: values
+        + torch.tensor([2.0, 1.0, 3.0], device=values.device),
+    )
+    returned = module.training_step(_batch(), 0)
+
+    values = {
+        call.args[0]: float(
+            call.args[1].detach() if torch.is_tensor(call.args[1]) else call.args[1]
+        )
+        for call in module.log.call_args_list
+    }
+    assert float(returned.detach()) == pytest.approx(2.0)
+    assert values["train/microbatch/ctc_valid"] == 2
+    assert values["train/microbatch/ctc_skipped"] == 4
+    assert values["train/microbatch/ctc_skip_rate"] == pytest.approx(4 / 6)
+    assert values["train/epoch/ctc_skip_rate"] == pytest.approx(4 / 6)

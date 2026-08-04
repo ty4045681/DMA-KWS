@@ -183,3 +183,106 @@ def test_stage2_summary_rows_unchanged():
     assert rows["warmup_steps"] == "2500"
     assert rows["max_steps"] == "50000"
     assert rows["batch_size_per_gpu"] == "64"
+    assert rows["qbyt_deployment_threshold"] == "0.5"
+    assert rows["score_ece_num_bins"] == "15"
+    assert rows["seq_diagnostic_threshold"] == "0.5"
+
+
+def test_summary_can_report_effective_logging_backends():
+    rows = _rows_to_dict(
+        build_run_summary_rows(
+            config={
+                "stage2": {
+                    **STAGE2_SECTION,
+                    "logging": {"backends": ["csv", "tensorboard", "wandb"]},
+                },
+                "training": {},
+            },
+            devices=1,
+            accelerator="cpu",
+            train_samples=1,
+            val_samples=1,
+            effective_logging_backends=["csv"],
+        )
+    )
+
+    assert rows["logging_backends"] == "csv"
+
+
+def test_stage1_summary_uses_stage1_runtime_contract():
+    config = {
+        "stage1": {
+            "learning_rate": 0.003,
+            "warmup_steps": 0,
+            "max_train_steps": 0,
+            "batch_size_per_gpu": 8,
+            "accumulate_grad_batches": 3,
+            "precision": "32-true",
+            "num_workers": 2,
+            "logging": {"backends": ["csv"]},
+            "validation": {"check_val_every_n_epoch": 1},
+        },
+        # Deliberately conflicting values: Stage I must not report these.
+        "stage2": {
+            "accumulate_grad_batches": 9,
+            "precision": "bf16-mixed",
+        },
+        "training": {},
+    }
+    rows = _rows_to_dict(
+        build_run_summary_rows(
+            config=config,
+            devices=2,
+            accelerator="gpu",
+            train_samples=10,
+            val_samples=5,
+            section="stage1",
+            effective_max_steps=-1,
+        )
+    )
+
+    assert rows["effective_batch"] == "48"
+    assert rows["accumulate_grad_batches"] == "3"
+    assert rows["precision"] == "32-true"
+    assert rows["optimizer"] == "adam"
+    assert rows["max_epochs"] == "1"
+    assert rows["stop_condition"] == "max_epochs=1"
+    assert rows["checkpoint_monitor"] == "val/per"
+    assert "ema" not in rows
+    assert "scheduler_total_steps" not in rows
+
+
+def test_phoneme_adapter_summary_uses_its_own_section():
+    config = {
+        "phoneme_adapter": {
+            "learning_rate": 0.002,
+            "optimizer": "adamw",
+            "weight_decay": 0.01,
+            "warmup_steps": 50,
+            "max_steps": 600,
+            "batch_size_per_gpu": 4,
+            "accumulate_grad_batches": 2,
+            "precision": "16-mixed",
+            "num_workers": 1,
+            "logging": {"backends": ["csv", "tensorboard"]},
+        },
+        "stage2": {"accumulate_grad_batches": 7},
+        "training": {},
+    }
+    rows = _rows_to_dict(
+        build_run_summary_rows(
+            config=config,
+            devices=2,
+            accelerator="gpu",
+            train_samples=10,
+            val_samples=5,
+            section="phoneme_adapter",
+        )
+    )
+
+    assert rows["effective_batch"] == "16"
+    assert rows["precision"] == "16-mixed"
+    assert rows["optimizer"] == "adamw"
+    assert rows["checkpoint_monitor"] == "val/per"
+    assert rows["logging_backends"] == "csv, tensorboard"
+    assert "ema" not in rows

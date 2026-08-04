@@ -335,10 +335,16 @@ def select_and_average_checkpoints(
     """Average the last ``last_k`` checkpoints matching ``pattern``."""
     candidates = sorted(checkpoint_dir.glob(pattern))
     if not candidates:
-        print(f"No checkpoints matched {pattern!r} in {checkpoint_dir}; skipping average.")
+        from dma_kws.training.ddp import rank_zero_print
+
+        rank_zero_print(
+            f"No checkpoints matched {pattern!r} in {checkpoint_dir}; skipping average."
+        )
         return None
     selected = candidates[-last_k:]
     output_path = checkpoint_dir / output_name
     average_lightning_checkpoints(selected, output_path)
-    print(f"Averaged {len(selected)} checkpoints -> {output_path}")
+    from dma_kws.training.ddp import rank_zero_print
+
+    rank_zero_print(f"Averaged {len(selected)} checkpoints -> {output_path}")
     return output_path

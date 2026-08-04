@@ -22,6 +22,12 @@ def process_rank() -> int:
     return 0
 
 
+def rank_zero_print(*values: Any, **kwargs: Any) -> None:
+    """Use ordinary ``print`` once under both initialized and launcher DDP."""
+    if process_rank() == 0:
+        print(*values, **kwargs)
+
+
 def resolve_precision(stage2: dict[str, Any], accelerator: str) -> str:
     """Resolve Lightning ``precision`` from config and accelerator.
 
@@ -42,14 +48,16 @@ def apply_step_based_validation(
     *,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Make an integer ``val_check_interval`` count global steps when it spans epochs.
+    """Make an integer ``val_check_interval`` count train batches across epochs.
 
     Lightning reads an integer ``val_check_interval`` as a batch index *inside* one
     epoch and raises if it exceeds the epoch length. Virtual epochs (``sample_lens``
     divided by the batch size) are often much shorter than the configured interval,
-    so switch Lightning to step-based validation instead of failing or validating
-    dozens of times per run. ``force=True`` is for callers whose interval is always
-    defined across epoch boundaries (such as adaptation under DDP). Mutates and
+    so switch Lightning to a cross-epoch train-batch counter instead of failing or
+    validating at every short epoch boundary. This does *not* turn the unit into
+    optimizer steps: with gradient accumulation ``k``, ``N`` train batches are
+    approximately ``N / k`` optimizer steps. ``force=True`` also avoids validating
+    against the pre-DDP DataLoader length before Lightning shards it. Mutates and
     returns ``trainer_kwargs``.
     """
     interval = trainer_kwargs.get("val_check_interval")

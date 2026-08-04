@@ -104,7 +104,8 @@ def test_eval_dataset_getitem_keys_and_shapes(mock_eval_npy):
 
     sample = dataset[0]
 
-    assert set(sample.keys()) == {"anchor_seq", "feat", "label"}
+    assert set(sample.keys()) == {"sample_id", "anchor_seq", "feat", "label"}
+    assert sample["sample_id"].item() == 0
     assert sample["anchor_seq"].dtype == torch.long
     assert sample["feat"].shape == (4, 80)
     assert sample["label"].item() == 1
@@ -113,11 +114,13 @@ def test_eval_dataset_getitem_keys_and_shapes(mock_eval_npy):
 def test_test_collate_fn_shapes():
     batch = [
         {
+            "sample_id": torch.tensor(10),
             "anchor_seq": torch.tensor([1, 2, 3], dtype=torch.long),
             "feat": torch.ones(4, 80),
             "label": torch.tensor(1, dtype=torch.long),
         },
         {
+            "sample_id": torch.tensor(11),
             "anchor_seq": torch.tensor([4, 5], dtype=torch.long),
             "feat": torch.ones(6, 80),
             "label": torch.tensor(0, dtype=torch.long),
@@ -130,6 +133,7 @@ def test_test_collate_fn_shapes():
     assert collated["anchor"].shape == (2, 3)
     assert collated["feat_lengths"].tolist() == [4, 6]
     assert collated["label"].tolist() == [1, 0]
+    assert collated["sample_id"].tolist() == [10, 11]
     assert "seq_label" not in collated
 
 
@@ -194,7 +198,8 @@ def test_eval_metrics_smoke(monkeypatch, mock_eval_npy):
     with torch.no_grad():
         module.test_step(batch, 0)
 
-    auc = float(module.auc_metric.compute())
-    eer = float(module.eer_metric.compute())
+    diagnostics = module.score_diagnostics.compute()
+    auc = float(diagnostics["auc"])
+    eer = float(diagnostics["eer"])
     assert 0.0 <= auc <= 1.0
     assert 0.0 <= eer <= 1.0

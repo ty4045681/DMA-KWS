@@ -69,6 +69,13 @@ validation:
   num_decode_batches: 0
   batch_size: 32
 
+console:
+  rich: true
+  device_stats: false
+  throughput: false
+  refresh_rate: null
+  leave: true
+
 logging:
   backends: [csv, tensorboard]
   wandb:
@@ -78,3 +85,5 @@ logging:
 checkpoint:
   every_n_train_steps: 2000
   save_top_k: 3
+  monitor: val/per
+  mode: min

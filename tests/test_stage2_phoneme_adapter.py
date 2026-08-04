@@ -172,6 +172,35 @@ def test_auxiliary_ctc_loss_is_reported_when_weighted(monkeypatch):
     assert torch.isfinite(total_loss)
 
 
+def test_auxiliary_ctc_skip_metrics_use_global_counts(monkeypatch):
+    module = _build(monkeypatch, _config(ctc_weight=0.3))
+    module.log = MagicMock()
+    module.adapter.ctc_loss = MagicMock(
+        return_value=(torch.tensor(2.0, requires_grad=True), 1)
+    )
+
+    # Local batch: loss sum=2, valid=1, skipped=1. Peer: the same loss sum,
+    # valid=1, skipped=3.
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.sum_across_processes",
+        lambda values: values
+        + torch.tensor([2.0, 1.0, 3.0], device=values.device),
+    )
+    batch = _batch()
+    loss = module._auxiliary_ctc_loss(
+        batch,
+        torch.randn(2, 12, VOCAB_SIZE),
+        torch.ones(2, 1, 12, dtype=torch.bool),
+    )
+
+    values = {call.args[0]: float(call.args[1]) for call in module.log.call_args_list}
+    assert float(loss.detach()) == 2.0
+    assert values["train/microbatch/ctc_valid"] == 2
+    assert values["train/microbatch/ctc_skipped"] == 4
+    assert values["train/microbatch/ctc_skip_rate"] == pytest.approx(4 / 6)
+    assert values["train/epoch/ctc_skip_rate"] == pytest.approx(4 / 6)
+
+
 def test_auxiliary_ctc_loss_is_off_by_default(monkeypatch):
     module = _build(monkeypatch, _config())
     module.log = MagicMock()
@@ -179,6 +208,44 @@ def test_auxiliary_ctc_loss_is_off_by_default(monkeypatch):
     _total, losses, _ = module._forward_train_losses(_batch())
 
     assert "ctc_loss" not in losses
+
+
+def test_train_logs_raw_weighted_and_windowed_loss_contract(monkeypatch):
+    module = _build(monkeypatch, _config())
+    module.log = MagicMock()
+    module.optimizers = MagicMock(
+        return_value=MagicMock(param_groups=[{"lr": 1e-3}])
+    )
+    total, losses = compute_stage2_losses(
+        logits=torch.tensor([0.2, -0.4]),
+        seq_logits=torch.tensor([[0.3, -0.2], [0.1, 0.6]]),
+        labels=torch.tensor([1, 0]),
+        seq_labels=torch.tensor([[1, 0], [1, 1]]),
+        seq_label_mask=torch.ones(2, 2),
+        seq_progress_weight=0.25,
+        seq_completion_weight=0.75,
+    )
+
+    module._log_train_losses(total, losses)
+    microbatch_names = {call.args[0] for call in module.log.call_args_list}
+
+    assert "train/microbatch/loss_total" in microbatch_names
+    assert "train/microbatch/loss_seq_progress_raw" in microbatch_names
+    assert "train/microbatch/loss_seq_progress_weighted" in microbatch_names
+    assert "train/microbatch/loss_seq_completion_raw" in microbatch_names
+    assert "train/microbatch/loss_seq_completion_weighted" in microbatch_names
+
+    module.log.reset_mock()
+    module._log_train_window_metrics()
+    window_values = {
+        call.args[0]: float(call.args[1]) for call in module.log.call_args_list
+    }
+
+    assert window_values["train/window/loss_total"] == pytest.approx(float(total))
+    assert window_values["train/window/loss_seq_weighted"] == pytest.approx(
+        float(losses["seq_loss"])
+    )
+    assert window_values["train/window/microbatches"] == 1
 
 
 @pytest.mark.parametrize("ctc_weight", [0.0, 0.3])

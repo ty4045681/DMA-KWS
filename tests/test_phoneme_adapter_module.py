@@ -56,6 +56,27 @@ def test_ctc_loss_skips_samples_with_more_labels_than_frames():
     assert torch.isfinite(loss)
 
 
+def test_ctc_loss_can_return_per_sample_validation_details():
+    adapter = _adapter()
+    encoder_mask = _mask([5, 2], 5)
+    _features, log_probs = adapter(torch.randn(2, 5, 16), encoder_mask)
+    targets = torch.tensor([[3, 4, 5, 0, 0], [3, 4, 5, 6, 7]], dtype=torch.long)
+    target_lengths = torch.tensor([3, 5], dtype=torch.long)
+
+    loss, num_skipped, per_sample_loss, valid_mask = adapter.ctc_loss(
+        log_probs,
+        encoder_mask,
+        targets,
+        target_lengths,
+        return_details=True,
+    )
+
+    assert num_skipped == 1
+    assert valid_mask.tolist() == [True, False]
+    assert per_sample_loss[1].item() == 0.0
+    torch.testing.assert_close(loss, per_sample_loss[valid_mask].mean())
+
+
 def test_ctc_loss_returns_zero_when_every_sample_is_skipped():
     adapter = _adapter()
     mask = _mask([2], 2)

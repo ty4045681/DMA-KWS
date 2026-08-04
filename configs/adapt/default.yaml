@@ -33,6 +33,10 @@ adapt:
   eval_seed: 2025
   init_checkpoint: ""
   params_file: ""
+  # Explicit model-selection objective for Lightning's crash-safety checkpoints.
+  # Alternatives: val_lph_auc, or a future logged composite score.
+  checkpoint_monitor: val_target_auc
+  checkpoint_filename: step_{step:06d}_target_auc_{val_target_auc:.6f}
   # Old adapter-only files do not identify the frozen Stage II base they were
   # trained against. Keep unsafe loading opt-in.
   allow_legacy_adapter: false
@@ -40,13 +44,26 @@ adapt:
     - in_proj_weight
     - out_proj.weight
   validation:
-    # Counted in optimizer steps: adaptation epochs are virtual (sample_lens /
-    # batch_size) and usually shorter than the interval, so Lightning is switched
-    # to step-based validation automatically.
+    # Counted in training-batch iterations per rank. With gradient accumulation
+    # k, this is approximately val_check_interval/k optimizer steps. The counter
+    # continues across virtual epoch boundaries.
     val_check_interval: 1000
     # null = full validation set; an int caps batches per val dataloader, which
     # matters because the LibriPhrase eval split has ~270k pairs.
     limit_val_batches: null
+  console:
+    rich: true
+    device_stats: false
+    throughput: false
+    refresh_rate: null
+    leave: true
+  logging:
+    backends: [csv, tensorboard]
+    wandb:
+      project: dma-kws
+      mode: online
+    trackio:
+      project: dma-kws
   sweep:
     enabled: false
     # Target number of successfully completed trials in durable study storage;

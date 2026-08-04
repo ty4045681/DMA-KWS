@@ -152,7 +152,9 @@ def build_encoder(stage1_cfg: dict[str, Any], *, output_dim: int):
     """
     encoder_type = stage1_cfg.get("encoder_type", "conformer").lower()
     policy = resolve_stream_policy(stage1_cfg)
-    print(f"Encoder stream policy: {policy.describe()}")
+    from dma_kws.training.ddp import rank_zero_print
+
+    rank_zero_print(f"Encoder stream policy: {policy.describe()}")
 
     if encoder_type == "icefall_zipformer":
         from dma_kws.stage2.icefall_encoder import IcefallZipformerEncoder
@@ -163,10 +165,13 @@ def build_encoder(stage1_cfg: dict[str, Any], *, output_dim: int):
     # Default: Wenet ConformerEncoder
     if encoder_type != "conformer":
         import warnings
-        warnings.warn(
-            f"Unknown encoder_type {encoder_type!r}, falling back to 'conformer'",
-            UserWarning,
-        )
+        from dma_kws.training.ddp import process_rank
+
+        if process_rank() == 0:
+            warnings.warn(
+                f"Unknown encoder_type {encoder_type!r}, falling back to 'conformer'",
+                UserWarning,
+            )
     
     ensure_qbyt_on_path()
     try:

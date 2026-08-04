@@ -460,6 +460,7 @@ class LibriPhraseEvalDataset(Dataset):
         anchor_seq = tokenize_phoneme_string(self.tokenizer, anchor_g2p)
 
         return {
+            "sample_id": torch.tensor(index, dtype=torch.long),
             "anchor_seq": torch.tensor(anchor_seq, dtype=torch.long),
             "feat": feats,
             "label": torch.tensor(target, dtype=torch.long),

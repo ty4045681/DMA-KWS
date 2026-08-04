@@ -65,6 +65,19 @@ def test_demo_config_loads_with_tokenizer_and_training_seed():
         "completion_weight": 0.5,
         "normalization": "sample",
     }
+    assert stage2["checkpoint"]["monitor"] == "val_auc"
+    assert stage2["checkpoint"]["mode"] == "max"
+
+
+def test_checkpoint_monitor_and_mode_accept_structured_overrides():
+    config = config_to_dict(
+        compose_config(
+            overrides=["stage2.checkpoint.monitor=", "stage2.checkpoint.mode=min"]
+        )
+    )
+
+    assert config["stage2"]["checkpoint"]["monitor"] == ""
+    assert config["stage2"]["checkpoint"]["mode"] == "min"
 
 
 @pytest.mark.parametrize(

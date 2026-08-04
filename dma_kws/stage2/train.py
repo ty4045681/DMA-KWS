@@ -81,7 +81,10 @@ def _build_val_dataloader(config: dict[str, Any], tokenizer: Any) -> Any:
         shuffle=False,
         num_workers=num_workers,
         collate_fn=test_collate_fn,
-        drop_last=True,
+        # AUC/EER must cover the complete validation split. Dropping the final
+        # partial batch silently changes the evaluated population (and can
+        # remove an entire class on small smoke sets).
+        drop_last=False,
         **loader_kwargs,
     )
 
@@ -98,7 +101,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         ) from exc
 
     from dma_kws.config import get_tokenizer_config, require_sections
-    from dma_kws.runlog import build_loggers
+    from dma_kws.runlog import build_loggers, logger_backend_names
     from dma_kws.stage2.collate import train_collate_fn
     from dma_kws.stage2.dataset import LibriPhraseTrainDataset, stage2_worker_init_fn
     from dma_kws.stage2.module import Stage2LightningModule
@@ -107,10 +110,14 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         resolve_sequence_objective,
     )
     from dma_kws.tokenizer import load_char_tokenizer
-    from dma_kws.training import resolve_resume_path
-    from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
+    from dma_kws.training.callbacks import (
+        build_stage2_callbacks,
+        print_run_summary,
+        print_training_result_summary,
+    )
     from dma_kws.training.checkpoint_io import stamp_qbyt_readout_version
     from dma_kws.training.ddp import apply_step_based_validation, build_trainer_kwargs
+    from dma_kws.training.ddp import rank_zero_print
     from dma_kws.training.metrics_history import (
         append_wide_row,
         build_metrics_history_callback,
@@ -118,6 +125,9 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         collect_hparams,
         numeric_callback_metrics,
     )
+    from dma_kws.training.run_context import build_run_context, stamp_run_context
+    from dma_kws.training.run_context_callback import RunContextCheckpointCallback
+    from dma_kws.training.resume import resolve_versioned_resume_path
 
     require_sections(config, ["paths", "stage1", "stage2", "tokenizer", "training"])
     paths = config["paths"]
@@ -181,11 +191,23 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     freeze_encoder = bool(stage2.get("freeze_encoder", False))
 
     limit_steps = args.limit_steps or None
-    checkpoint_dir = Path(stage2.get("checkpoint_dir", Path(paths["exp_root"]) / "stage2_qbyt" / "checkpoints"))
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_root = Path(
+        stage2.get(
+            "checkpoint_dir",
+            Path(paths["exp_root"]) / "stage2_qbyt" / "checkpoints",
+        )
+    )
+    log_dir = stage2.get(
+        "log_dir", Path(paths["exp_root"]) / "stage2_qbyt" / "logs"
+    )
+    run_name = str(stage2.get("run_name", "stage2_qbyt"))
+    resume_path = resolve_versioned_resume_path(
+        args.resume_from,
+        checkpoint_root,
+        run_name,
+    )
 
-    resume_path = resolve_resume_path(args.resume_from, checkpoint_dir)
-
+    resume_payload = None
     if resume_path is not None:
         resume_payload = torch.load(resume_path, map_location="cpu")
         assert_sequence_objective_matches(
@@ -194,9 +216,21 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
             source=resume_path,
         )
 
+    run_context = build_run_context(
+        config,
+        section="stage2",
+        log_dir=log_dir,
+        run_name=run_name,
+        limit_steps=limit_steps,
+        resume_from=resume_path,
+        resume_checkpoint=resume_payload,
+    )
+    checkpoint_dir = checkpoint_root / run_context.run_id
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     if resume_path is not None:
         if resume_checkpoint or init_checkpoint:
-            print(
+            rank_zero_print(
                 "Resuming full training state via ckpt_path; ignoring "
                 "init_checkpoint/resume_checkpoint weight init (ckpt_path restores full state)."
             )
@@ -225,21 +259,38 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     if accelerator == "gpu":
         torch.set_float32_matmul_precision("high")
 
-    log_dir = stage2.get("log_dir", Path(paths["exp_root"]) / "stage2_qbyt" / "logs")
-    run_name = str(stage2.get("run_name", "stage2_qbyt"))
-    loggers = build_loggers(log_dir, run_name, config=config)
+    loggers = build_loggers(
+        log_dir,
+        run_name,
+        config=config,
+        section="stage2",
+        version=run_context.version,
+    )
 
-    hparams = collect_hparams(config)
+    hparams = collect_hparams(
+        config,
+        effective_max_steps=run_context.effective_max_steps,
+        extra={**run_context.identity(), "checkpoint_dir": str(checkpoint_dir)},
+    )
     for train_logger in loggers:
         train_logger.log_hyperparams(hparams)
 
     recipe = str(training.get("recipe", ""))
-    callbacks = build_stage2_callbacks(config, recipe)
+    callbacks = build_stage2_callbacks(
+        config,
+        recipe,
+        checkpoint_dir=checkpoint_dir,
+    )
+    checkpoint_callback = callbacks[0]
+    callbacks.append(RunContextCheckpointCallback(run_context))
     history_callback = build_metrics_history_callback(
         run_name=run_name,
-        default_dir=Path(log_dir) / run_name,
+        run_id=run_context.run_id,
+        default_dir=run_context.run_dir,
     )
-    callbacks.append(history_callback)
+    # History must update before ModelCheckpoint serializes callback state at
+    # validation end, otherwise a resume starts one validation behind.
+    callbacks.insert(0, history_callback)
 
     trainer_kwargs = build_trainer_kwargs(
         config,
@@ -247,11 +298,21 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         limit_steps=limit_steps,
         accelerator=accelerator,
     )
-    apply_step_based_validation(trainer_kwargs, len(train_dataloader))
+    # Keep Lightning's integer interval on one cross-epoch train-batch clock.
+    # This also avoids validating it against the unsharded DataLoader length
+    # before DDP replaces the sampler.
+    apply_step_based_validation(trainer_kwargs, len(train_dataloader), force=True)
 
     param_counts = {
         "encoder": sum(p.numel() for p in model.encoder.parameters()),
+        "adapter": (
+            sum(p.numel() for p in model.adapter.parameters())
+            if model.adapter is not None
+            else 0
+        ),
         "qbyt": sum(p.numel() for p in model.qbyt.parameters()),
+        "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "frozen": sum(p.numel() for p in model.parameters() if not p.requires_grad),
         "total": sum(p.numel() for p in model.parameters()),
     }
     print_run_summary(
@@ -262,11 +323,25 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         val_samples=len(val_dataloader.dataset),
         param_counts=param_counts,
         paths={
+            "run_id": run_context.run_id,
             "parquet": parquet_file,
             "wav_dir": wav_dir,
             "checkpoint_dir": checkpoint_dir,
             "log_dir": log_dir,
+            "run_dir": run_context.run_dir,
+            **(
+                {"resume_from": run_context.resume_from}
+                if run_context.resume_from
+                else {}
+            ),
+            **(
+                {"parent_run_id": run_context.parent_run_id}
+                if run_context.parent_run_id
+                else {}
+            ),
         },
+        effective_max_steps=run_context.effective_max_steps,
+        effective_logging_backends=logger_backend_names(loggers),
     )
 
     trainer = pl.Trainer(
@@ -284,33 +359,73 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
 
     global_step = int(trainer.global_step)
 
+    # With externally launched DDP every process returns from ``fit`` and keeps
+    # executing this function. Keep the entire artifact transaction on rank 0:
+    # concurrent CSV appends and torch.save calls can otherwise duplicate rows
+    # or corrupt a checkpoint while ranks overwrite the same path.
     runs_csv = Path(paths["exp_root"]) / "stage2_qbyt" / "runs.csv"
-    append_wide_row(
-        runs_csv,
-        build_run_record(
-            run_name=run_name,
-            hparams=hparams,
-            final_metrics=numeric_callback_metrics(dict(trainer.callback_metrics)),
-            best_metrics=history_callback.best,
-            global_step=global_step,
-            duration_seconds=history_callback.duration_seconds,
-        ),
-    )
-    if history_callback.csv_path is not None:
-        print(f"Eval history: {history_callback.csv_path}")
-    print(f"Run record appended to {runs_csv}")
-
     ckpt_path = checkpoint_dir / f"stage2_step{global_step:06d}.pt"
-    torch.save(
-        stamp_qbyt_readout_version(
-            {
-                "model_state_dict": model.state_dict(),
-                "config": model._checkpoint_config,
-                "step": global_step,
-                "tokenizer_dict_path": str(dict_path),
-                "vocab_size": vocab_size,
-            }
-        ),
-        ckpt_path,
-    )
-    print(f"Saved {ckpt_path}")
+    if trainer.is_global_zero:
+        final_metrics = numeric_callback_metrics(dict(trainer.callback_metrics))
+        append_wide_row(
+            runs_csv,
+            build_run_record(
+                run_name=run_name,
+                hparams=hparams,
+                final_metrics=final_metrics,
+                best_metrics=history_callback.best,
+                global_step=global_step,
+                duration_seconds=history_callback.duration_seconds,
+                metric_step=history_callback.last_validation_step,
+                best_steps=history_callback.best_steps,
+                identity=run_context.identity(),
+                provenance={
+                    "metrics_source": "last_trainer_state",
+                    "primary_artifact_source": f"final_weights@step={global_step}",
+                    "primary_artifact_step": global_step,
+                    "primary_artifact_path": str(ckpt_path),
+                },
+            ),
+        )
+        torch.save(
+            stamp_run_context(
+                stamp_qbyt_readout_version(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "config": model._checkpoint_config,
+                        "step": global_step,
+                        "tokenizer_dict_path": str(dict_path),
+                        "vocab_size": vocab_size,
+                    }
+                ),
+                run_context,
+            ),
+            ckpt_path,
+        )
+        print_training_result_summary(
+            run_context=run_context,
+            global_step=global_step,
+            last_validation_step=history_callback.last_validation_step,
+            best_checkpoint_monitor=getattr(checkpoint_callback, "monitor", None),
+            best_checkpoint_path=getattr(
+                checkpoint_callback, "best_model_path", None
+            ),
+            best_checkpoint_score=getattr(
+                checkpoint_callback, "best_model_score", None
+            ),
+            final_metrics=final_metrics,
+            artifact_paths={
+                "final_checkpoint": ckpt_path,
+                "eval_history": history_callback.csv_path,
+                "runs_csv": runs_csv,
+            },
+            artifact_sources={
+                "final_checkpoint": f"final_weights@step={global_step}"
+            },
+            title="Stage II QbyT Training Result",
+            rich=bool((stage2.get("console", {}) or {}).get("rich", True)),
+        )
+
+    # Do not let a non-zero rank return (or a following phase start) while rank
+    # 0 is still writing the shared run record and final checkpoint.
+    trainer.strategy.barrier("stage2_training_artifacts_saved")

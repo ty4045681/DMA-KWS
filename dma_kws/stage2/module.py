@@ -23,7 +23,10 @@ from dma_kws.training.checkpoint_io import (
     extract_state_dict,
     stamp_qbyt_readout_version,
 )
+from dma_kws.training.distributed_metrics import ddp_global_mean_loss, sum_across_processes
+from dma_kws.training.ddp import process_rank, rank_zero_print
 from dma_kws.training.scheduler import build_cosine_warmup_optimizer
+from dma_kws.training.score_diagnostics import BinaryScoreDiagnostics
 
 
 def _load_qbyt():
@@ -193,14 +196,50 @@ class Stage2LightningModule(pl.LightningModule):
             for param in self.adapter.parameters():
                 param.requires_grad = False
 
-        # AUC/EER are non-decomposable: averaging per-rank scalar metrics is
-        # mathematically wrong.  Keep TorchMetrics' state synchronization
-        # explicit so compute() gathers predictions/targets before scoring.
-        self.auc_metric = torchmetrics.AUROC(task="binary", sync_on_compute=True)
-        self.eer_metric = torchmetrics.classification.EER(
-            task="binary",
+        # All score diagnostics are non-decomposable. One shared accumulator
+        # gathers probabilities/labels before computing AUC, EER/threshold,
+        # low-FPR and calibration statistics, avoiding several duplicate state
+        # buffers with subtly different semantics.
+        self.deployment_threshold = float(
+            (config.get("demo", {}) or {}).get("qbyt_threshold", 0.5)
+        )
+        validation_cfg = stage2.get("validation", {}) or {}
+        self.ece_num_bins = int(validation_cfg.get("ece_num_bins", 15))
+        self.sequence_diagnostic_threshold = float(
+            validation_cfg.get("seq_diagnostic_threshold", 0.5)
+        )
+        self.sequence_diagnostic_namespace = (
+            "completion_"
+            if self.seq_label_mode == "ordered_contiguous_prefix"
+            else "last_token_"
+        )
+        self.score_diagnostics = BinaryScoreDiagnostics(
+            deployment_threshold=self.deployment_threshold,
+            ece_num_bins=self.ece_num_bins,
             sync_on_compute=True,
         )
+        self.completion_score_diagnostics = BinaryScoreDiagnostics(
+            deployment_threshold=self.sequence_diagnostic_threshold,
+            ece_num_bins=self.ece_num_bins,
+            sync_on_compute=True,
+        )
+        self._train_window_metrics = torch.nn.ModuleDict(
+            {
+                name: torchmetrics.MeanMetric(sync_on_compute=True)
+                for name in (
+                    "loss_total",
+                    "loss_utt_raw",
+                    "loss_seq_weighted",
+                    "loss_seq_progress_raw",
+                    "loss_seq_progress_weighted",
+                    "loss_seq_completion_raw",
+                    "loss_seq_completion_weighted",
+                    "loss_ctc_raw",
+                    "loss_ctc_weighted",
+                )
+            }
+        )
+        self._train_window_updates = 0
 
     def _load_init_checkpoint(
         self,
@@ -254,14 +293,14 @@ class Stage2LightningModule(pl.LightningModule):
                 missing, unexpected = self.encoder.encoder_embed.load_state_dict(
                     encoder_embed_state, strict=False
                 )
-                print(
+                rank_zero_print(
                     f"Loaded encoder_embed weights from {checkpoint_path}: "
                     f"missing={len(missing)} unexpected={len(unexpected)}"
                 )
             
             if hasattr(self.encoder, "encoder") and encoder_state:
                 missing, unexpected = self.encoder.encoder.load_state_dict(encoder_state, strict=False)
-                print(
+                rank_zero_print(
                     f"Loaded encoder weights from {checkpoint_path}: "
                     f"missing={len(missing)} unexpected={len(unexpected)}"
                 )
@@ -295,7 +334,7 @@ class Stage2LightningModule(pl.LightningModule):
                     encoder_state,
                     strict=require_full_qbyt,
                 )
-                print(
+                rank_zero_print(
                     f"Loaded encoder weights from {checkpoint_path}: "
                     f"missing={len(missing)} unexpected={len(unexpected)}"
                 )
@@ -305,20 +344,21 @@ class Stage2LightningModule(pl.LightningModule):
                 # path above would reduce that to a "missing=N" line.
                 self.adapter.load_state_dict(adapter_state, strict=True)
                 self._adapter_weights_loaded = True
-                print(f"Loaded phoneme adapter weights from {checkpoint_path}")
+                rank_zero_print(f"Loaded phoneme adapter weights from {checkpoint_path}")
             elif adapter_state and self.adapter is None:
-                warnings.warn(
-                    f"{checkpoint_path} carries phoneme adapter weights but "
-                    "stage2.phoneme_adapter.enabled is false, so they are ignored.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+                if process_rank() == 0:
+                    warnings.warn(
+                        f"{checkpoint_path} carries phoneme adapter weights but "
+                        "stage2.phoneme_adapter.enabled is false, so they are ignored.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
             if qbyt_state:
                 missing, unexpected = self.qbyt.load_state_dict(
                     qbyt_state,
                     strict=require_full_qbyt,
                 )
-                print(
+                rank_zero_print(
                     f"Loaded QbyT weights from {checkpoint_path}: "
                     f"missing={len(missing)} unexpected={len(unexpected)}"
                 )
@@ -347,7 +387,7 @@ class Stage2LightningModule(pl.LightningModule):
         adapter_state = _split_submodule_state(state, "adapter") or state
         self.adapter.load_state_dict(adapter_state, strict=True)
         self._adapter_weights_loaded = True
-        print(f"Loaded phoneme adapter weights from {checkpoint_path}")
+        rank_zero_print(f"Loaded phoneme adapter weights from {checkpoint_path}")
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         """Embed the metadata required for a safe ``.ckpt`` -> ``.pt`` export.
@@ -444,14 +484,15 @@ class Stage2LightningModule(pl.LightningModule):
         # Only warn once a fit actually starts; eval scripts build this module with
         # the default freeze_encoder=False and must stay quiet.
         if not self.freeze_encoder and self.stream_policy.backend == "icefall_zipformer":
-            warnings.warn(
-                "Fine-tuning an icefall Zipformer encoder: icefall's set_batch_count() is never "
-                "called here, so every ScheduledFloat (dropout, Balancer limits, layerdrop, "
-                "whitening) stays pinned to its `default` and the icefall training recipe is not "
-                "reproduced.",
-                UserWarning,
-                stacklevel=2,
-            )
+            if process_rank() == 0:
+                warnings.warn(
+                    "Fine-tuning an icefall Zipformer encoder: icefall's set_batch_count() is never "
+                    "called here, so every ScheduledFloat (dropout, Balancer limits, layerdrop, "
+                    "whitening) stays pinned to its `default` and the icefall training recipe is not "
+                    "reproduced.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
     def on_train_epoch_start(self) -> None:
         self._set_frozen_submodules_to_eval()
@@ -486,18 +527,48 @@ class Stage2LightningModule(pl.LightningModule):
         )
         # A high skip rate means the auxiliary loss only ever sees long clips.
         batch_size = int(target_lengths.numel())
-        self.log(
-            "train/ctc_skipped",
-            float(num_skipped),
-            on_step=True,
-            batch_size=batch_size,
+        local_valid = batch_size - num_skipped
+        global_stats = sum_across_processes(
+            torch.tensor(
+                [float(ctc_loss.detach()) * local_valid, local_valid, num_skipped],
+                device=ctc_loss.device,
+                dtype=torch.float64,
+            )
+        )
+        global_loss_sum, valid_total, skipped_total = global_stats.unbind()
+        global_valid = int(valid_total.item())
+        global_skipped = int(skipped_total.item())
+        global_batch_size = global_valid + global_skipped
+        ctc_loss = ddp_global_mean_loss(
+            ctc_loss,
+            local_count=local_valid,
+            global_sum=global_loss_sum,
+            global_count=global_valid,
         )
         self.log(
-            "train/ctc_skip_rate",
-            num_skipped / max(batch_size, 1),
+            "train/microbatch/ctc_valid",
+            float(global_valid),
             on_step=True,
+            batch_size=global_batch_size,
+        )
+        self.log(
+            "train/microbatch/ctc_skipped",
+            float(global_skipped),
+            on_step=True,
+            batch_size=global_batch_size,
+        )
+        self.log(
+            "train/microbatch/ctc_skip_rate",
+            global_skipped / max(global_batch_size, 1),
+            on_step=True,
+            batch_size=global_batch_size,
+        )
+        self.log(
+            "train/epoch/ctc_skip_rate",
+            global_skipped / max(global_batch_size, 1),
+            on_step=False,
             on_epoch=True,
-            batch_size=batch_size,
+            batch_size=global_batch_size,
         )
         return ctc_loss
 
@@ -524,19 +595,119 @@ class Stage2LightningModule(pl.LightningModule):
         return total_loss, losses, logits
 
     def _log_train_losses(self, total_loss: torch.Tensor, losses: dict[str, torch.Tensor]) -> None:
-        self.log("train/loss", total_loss, on_step=True, prog_bar=True)
-        self.log("train/utt_loss", losses["utt_loss"], on_step=True, prog_bar=True)
-        self.log("train/seq_loss", losses["seq_loss"], on_step=True, prog_bar=True)
-        if self.seq_progress_weight:
-            self.log("train/seq_progress_loss", losses["seq_progress_loss"], on_step=True)
-        if self.seq_completion_weight:
-            self.log("train/seq_completion_loss", losses["seq_completion_loss"], on_step=True)
+        metrics = {
+            "loss_total": total_loss,
+            "loss_utt_raw": losses["utt_loss"],
+            "loss_seq_weighted": losses["seq_loss"],
+            "loss_seq_progress_raw": losses["seq_progress_loss"],
+            "loss_seq_progress_weighted": losses[
+                "seq_progress_weighted_loss"
+            ],
+            "loss_seq_completion_raw": losses["seq_completion_loss"],
+            "loss_seq_completion_weighted": losses[
+                "seq_completion_weighted_loss"
+            ],
+        }
         if "ctc_loss" in losses:
-            self.log("train/ctc_loss", losses["ctc_loss"], on_step=True, prog_bar=True)
+            metrics["loss_ctc_raw"] = losses["ctc_loss"]
+            metrics["loss_ctc_weighted"] = losses["ctc_weighted_loss"]
+
+        progress_metrics = {
+            "loss_total",
+            "loss_utt_raw",
+            "loss_seq_weighted",
+            "loss_ctc_weighted",
+        }
+        for name, value in metrics.items():
+            self.log(
+                f"train/microbatch/{name}",
+                value,
+                on_step=True,
+                prog_bar=name in progress_metrics,
+            )
+            self._train_window_metrics[name].update(value.detach())
+        self._train_window_updates += 1
+
+        # Keep the released top-level names for one compatibility cycle. They
+        # are hidden from the progress bar; new dashboards should consume the
+        # explicit microbatch/window hierarchy above.
+        self.log(
+            "train/loss", total_loss, on_step=True, prog_bar=False, logger=False
+        )
+        self.log(
+            "train/utt_loss",
+            losses["utt_loss"],
+            on_step=True,
+            prog_bar=False,
+            logger=False,
+        )
+        self.log(
+            "train/seq_loss",
+            losses["seq_loss"],
+            on_step=True,
+            prog_bar=False,
+            logger=False,
+        )
+        if self.seq_progress_weight:
+            self.log(
+                "train/seq_progress_loss",
+                losses["seq_progress_loss"],
+                on_step=True,
+                logger=False,
+            )
+        if self.seq_completion_weight:
+            self.log(
+                "train/seq_completion_loss",
+                losses["seq_completion_loss"],
+                on_step=True,
+                logger=False,
+            )
+        if "ctc_loss" in losses:
+            self.log(
+                "train/ctc_loss",
+                losses["ctc_loss"],
+                on_step=True,
+                prog_bar=False,
+                logger=False,
+            )
 
         optimizer = self.optimizers()
         lr = optimizer.param_groups[0]["lr"]
-        self.log("train/lr", lr, on_step=True, prog_bar=True)
+        self.log("train/optimizer/lr", lr, on_step=True, prog_bar=True)
+        self.log("train/lr", lr, on_step=True, prog_bar=False, logger=False)
+
+    def _consume_train_window_metrics(self) -> dict[str, torch.Tensor]:
+        if self._train_window_updates <= 0:
+            return {}
+        values: dict[str, torch.Tensor] = {}
+        for name, metric in self._train_window_metrics.items():
+            # Optional CTC metrics receive no updates when the adapter/auxiliary
+            # loss is disabled; MeanMetric.compute() would otherwise emit NaN.
+            if name.startswith("loss_ctc") and not self.ctc_weight:
+                continue
+            values[f"train/window/{name}"] = metric.compute()
+            metric.reset()
+        values["train/window/microbatches"] = torch.tensor(
+            float(self._train_window_updates),
+            device=self.device,
+        )
+        self._train_window_updates = 0
+        return values
+
+    def _log_train_window_metrics(self) -> None:
+        for name, value in self._consume_train_window_metrics().items():
+            self.log(name, value, sync_dist=True)
+
+    def on_train_end(self) -> None:
+        """Flush a trailing window directly because Lightning forbids self.log here."""
+        values = self._consume_train_window_metrics()
+        if not values or not self.trainer.is_global_zero:
+            return
+        payload = {
+            name: float(value.detach().cpu()) for name, value in values.items()
+        }
+        for train_logger in self.trainer.loggers:
+            train_logger.log_metrics(payload, step=int(self.global_step))
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         total_loss, losses, _ = self._forward_train_losses(batch)
@@ -551,7 +722,8 @@ class Stage2LightningModule(pl.LightningModule):
         norms = grad_norm(self, norm_type=2)
         total = norms.get("grad_2.0_norm_total")
         if total is not None:
-            self.log("train/grad_norm", total, on_step=True)
+            self.log("train/optimizer/grad_norm_pre_clip", total, on_step=True)
+            self.log("train/grad_norm", total, on_step=True, logger=False)
 
     def _parameters_without_gradients(self) -> tuple[str, ...]:
         return tuple(
@@ -583,43 +755,154 @@ class Stage2LightningModule(pl.LightningModule):
         else:
             self.print(f"Gradient diagnostics at step {step}: all trainable parameters have gradients.")
 
+    @staticmethod
+    def _completion_probabilities(
+        seq_logits: torch.Tensor,
+        anchor: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the final valid anchor-position score and matching labels."""
+        if seq_logits.size(1) == 0:
+            valid = torch.zeros(labels.shape, device=labels.device, dtype=torch.bool)
+            return seq_logits.new_empty(0), labels.new_empty(0), valid
+        anchor_lengths = anchor.ne(0).sum(dim=1)
+        valid = anchor_lengths.gt(0)
+        indices = anchor_lengths.sub(1).clamp_min(0).unsqueeze(1)
+        completion_logits = seq_logits.gather(1, indices).squeeze(1)
+        return torch.sigmoid(completion_logits[valid]), labels[valid], valid
+
+    def _update_score_diagnostics(
+        self,
+        score_metric: BinaryScoreDiagnostics,
+        completion_metric: BinaryScoreDiagnostics,
+        *,
+        logits: torch.Tensor,
+        seq_logits: torch.Tensor,
+        anchor: torch.Tensor,
+        labels: torch.Tensor,
+        sample_ids: torch.Tensor | None = None,
+    ) -> None:
+        score_metric.update(torch.sigmoid(logits), labels, sample_ids)
+        completion_scores, completion_labels, completion_valid = (
+            self._completion_probabilities(
+                seq_logits,
+                anchor,
+                labels,
+            )
+        )
+        completion_metric.update(
+            completion_scores,
+            completion_labels,
+            sample_ids[completion_valid] if sample_ids is not None else None,
+        )
+
+    def _log_score_diagnostics(
+        self,
+        metric: BinaryScoreDiagnostics,
+        *,
+        namespace: str,
+        progress_bar: bool = False,
+        deployment_metric: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Log one already-DDP-global diagnostic dictionary."""
+        diagnostics = metric.compute()
+        progress_names = {"auc", "eer", "eer_threshold"}
+        for name, value in diagnostics.items():
+            if name == "log_loss":
+                # Callers give the utterance loss a dataset-specific canonical
+                # name (val/utt_loss, val/target_utt_loss, ...).
+                continue
+            output_name = name
+            if not deployment_metric and name.startswith("deploy_"):
+                output_name = f"diagnostic_{name.removeprefix('deploy_')}"
+            # Lightning reduces every tensor passed to ``self.log`` and warns
+            # when integer/bool values need an implicit float conversion. Keep
+            # the public diagnostics dictionary strongly typed, but make the
+            # logging boundary explicit and quiet.
+            logged_value = (
+                value
+                if torch.is_floating_point(value)
+                else value.to(dtype=torch.float32)
+            )
+            self.log(
+                f"{namespace}{output_name}",
+                logged_value,
+                prog_bar=progress_bar and name in progress_names,
+                # BinaryScoreDiagnostics synchronized the raw sample state, so
+                # every rank holds the same scalar. Lightning cannot be told
+                # that explicitly; an identity mean silences its per-metric DDP
+                # warning while preserving the value used by all callbacks.
+                sync_dist=True,
+            )
+        return diagnostics
+
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> None:
-        logits, _ = self(batch["feat"], batch["feat_lengths"], batch["anchor"])
-        preds = torch.sigmoid(logits)
+        logits, seq_logits = self(
+            batch["feat"], batch["feat_lengths"], batch["anchor"]
+        )
         labels = batch["label"].int()
-        utt_loss = F.binary_cross_entropy_with_logits(logits, labels.float())
-        self.log("val/utt_loss", utt_loss, prog_bar=True, on_epoch=True, sync_dist=True)
-        self.auc_metric.update(preds, labels)
-        self.eer_metric.update(preds, labels)
+        self._update_score_diagnostics(
+            self.score_diagnostics,
+            self.completion_score_diagnostics,
+            logits=logits,
+            seq_logits=seq_logits,
+            anchor=batch["anchor"],
+            labels=labels,
+            sample_ids=batch.get("sample_id"),
+        )
 
     def on_validation_epoch_end(self) -> None:
-        auc = self.auc_metric.compute()
-        eer = self.eer_metric.compute()
-
-        self.log("val/auc", auc, prog_bar=True, sync_dist=True)
-        self.log("val/eer", eer, prog_bar=True, sync_dist=True)
+        score_metrics = self._log_score_diagnostics(
+            self.score_diagnostics,
+            namespace="val/",
+            progress_bar=True,
+        )
+        self.log(
+            "val/utt_loss",
+            score_metrics["log_loss"],
+            prog_bar=True,
+            sync_dist=True,
+        )
+        self._log_score_diagnostics(
+            self.completion_score_diagnostics,
+            namespace=f"val/{self.sequence_diagnostic_namespace}",
+            deployment_metric=False,
+        )
         # Checkpoint-filename alias of val/auc; kept out of CSV/TensorBoard.
-        self.log("val_auc", auc, sync_dist=True, logger=False)
+        self.log("val_auc", score_metrics["auc"], sync_dist=True, logger=False)
+        self._log_train_window_metrics()
 
-        self.auc_metric.reset()
-        self.eer_metric.reset()
+        self.score_diagnostics.reset()
+        self.completion_score_diagnostics.reset()
 
     def test_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> None:
-        logits, _ = self(batch["feat"], batch["feat_lengths"], batch["anchor"])
-        preds = torch.sigmoid(logits)
+        logits, seq_logits = self(
+            batch["feat"], batch["feat_lengths"], batch["anchor"]
+        )
         labels = batch["label"].int()
-        self.auc_metric.update(preds, labels)
-        self.eer_metric.update(preds, labels)
+        self._update_score_diagnostics(
+            self.score_diagnostics,
+            self.completion_score_diagnostics,
+            logits=logits,
+            seq_logits=seq_logits,
+            anchor=batch["anchor"],
+            labels=labels,
+            sample_ids=batch.get("sample_id"),
+        )
 
     def on_test_epoch_end(self) -> None:
-        auc = self.auc_metric.compute()
-        eer = self.eer_metric.compute()
-
-        self.log("test/auc", auc, prog_bar=True, sync_dist=True)
-        self.log("test/eer", eer, prog_bar=True, sync_dist=True)
-
-        self.auc_metric.reset()
-        self.eer_metric.reset()
+        self._log_score_diagnostics(
+            self.score_diagnostics,
+            namespace="test/",
+            progress_bar=True,
+        )
+        self._log_score_diagnostics(
+            self.completion_score_diagnostics,
+            namespace=f"test/{self.sequence_diagnostic_namespace}",
+            deployment_metric=False,
+        )
+        self.score_diagnostics.reset()
+        self.completion_score_diagnostics.reset()
 
     def trainable_module(self) -> torch.nn.Module:
         """Return the module whose parameters the optimizer should own.

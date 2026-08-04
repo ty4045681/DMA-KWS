@@ -67,7 +67,8 @@ adapt:
   val_num_workers: 2
 
   validation:
-    # Counted in optimizer steps (adaptation epochs are virtual and short).
+    # Counted in train batches/rank, across virtual epoch boundaries. Divide by
+    # accumulate_grad_batches for the approximate optimizer-step interval.
     val_check_interval: 1000
     # The LibriPhrase val split has ~270k pairs; in-loop validation is only for
     # the curves, sweep scoring is computed separately after training.

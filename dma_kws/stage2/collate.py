@@ -52,12 +52,18 @@ def test_collate_fn(batch: list[dict]) -> dict:
 
     labels = torch.tensor([item["label"] for item in batch])
 
-    return {
+    out = {
         "anchor": anchor,
         "feat": padded_feats,
         "feat_lengths": feat_lengths,
         "label": labels,
     }
+    if "sample_id" in batch[0]:
+        out["sample_id"] = torch.tensor(
+            [int(item["sample_id"]) for item in batch],
+            dtype=torch.long,
+        )
+    return out
 
 
 test_collate_fn.__test__ = False  # not a pytest test; name matches main qbyt API

@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import warnings
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,6 @@ from typing import Any
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
-import torchmetrics
 
 from dma_kws.pathing import resolve_dict_path
 from dma_kws.phonemes import normalize_english_text
@@ -41,6 +42,7 @@ from dma_kws.training.checkpoint_io import (
     fingerprint_stage2_base,
     stamp_qbyt_readout_version,
 )
+from dma_kws.training.distributed_metrics import sum_across_processes
 from dma_kws.training.ddp import process_rank
 from dma_kws.training.lora import (
     count_lora_params,
@@ -50,6 +52,7 @@ from dma_kws.training.lora import (
     merge_lora,
     normalize_lora_targets,
 )
+from dma_kws.training.score_diagnostics import BinaryScoreDiagnostics
 
 
 @dataclass
@@ -105,6 +108,26 @@ def _resolve_adapt_paths(config: dict[str, Any]) -> dict[str, Path]:
         "train_manifest": phase_manifest(data_root, phase, split="train"),
         "eval_manifest": phase_manifest(data_root, phase, split="eval"),
     }
+
+
+def _atomic_torch_save(payload: Any, destination: Path) -> Path:
+    """Publish a torch payload without exposing a partially written alias."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        torch.save(payload, temporary)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return destination
 
 
 def _apply_adapt_overrides(config: dict[str, Any], args: Stage2AdaptArgs) -> dict[str, Any]:
@@ -393,12 +416,14 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
 
         self.lora_param_counts = count_lora_params(self)
         self._adapt_cfg = _adapt_section(config)
-        self.target_auc_metric = torchmetrics.AUROC(
-            task="binary",
+        self.target_score_diagnostics = BinaryScoreDiagnostics(
+            deployment_threshold=self.deployment_threshold,
+            ece_num_bins=self.ece_num_bins,
             sync_on_compute=True,
         )
-        self.target_eer_metric = torchmetrics.classification.EER(
-            task="binary",
+        self.target_completion_score_diagnostics = BinaryScoreDiagnostics(
+            deployment_threshold=self.sequence_diagnostic_threshold,
+            ece_num_bins=self.ece_num_bins,
             sync_on_compute=True,
         )
 
@@ -534,11 +559,42 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             per_sample = F.binary_cross_entropy_with_logits(
                 logits, batch["label"].float(), reduction="none"
             )
-            self.log("train/keyword_frac", keyword_mask.float().mean(), on_step=True)
-            if keyword_mask.any():
-                self.log("train/keyword_utt_loss", per_sample[keyword_mask].mean(), on_step=True)
-            if (~keyword_mask).any():
-                self.log("train/libri_utt_loss", per_sample[~keyword_mask].mean(), on_step=True)
+            lph_mask = ~keyword_mask
+            global_stats = sum_across_processes(
+                torch.stack(
+                    (
+                        per_sample.detach()[keyword_mask].sum(),
+                        keyword_mask.sum().to(per_sample),
+                        per_sample.detach()[lph_mask].sum(),
+                        lph_mask.sum().to(per_sample),
+                    )
+                ).to(dtype=torch.float64)
+            )
+            keyword_loss_sum, keyword_count, lph_loss_sum, lph_count = (
+                global_stats.unbind()
+            )
+            total_count = keyword_count + lph_count
+            no_value = global_stats.new_tensor(float("nan"))
+            self.log(
+                "train/microbatch/source_keyword_fraction",
+                keyword_count / total_count if total_count.item() > 0 else no_value,
+                on_step=True,
+                sync_dist=True,
+            )
+            self.log(
+                "train/microbatch/loss_keyword_utt_raw",
+                keyword_loss_sum / keyword_count
+                if keyword_count.item() > 0
+                else no_value,
+                on_step=True,
+                sync_dist=True,
+            )
+            self.log(
+                "train/microbatch/loss_lph_utt_raw",
+                lph_loss_sum / lph_count if lph_count.item() > 0 else no_value,
+                on_step=True,
+                sync_dist=True,
+            )
         return total_loss
 
     def validation_step(
@@ -547,52 +603,79 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
-        logits, _ = self(batch["feat"], batch["feat_lengths"], batch["anchor"])
-        preds = torch.sigmoid(logits)
+        logits, seq_logits = self(
+            batch["feat"], batch["feat_lengths"], batch["anchor"]
+        )
         labels = batch["label"].int()
 
         if dataloader_idx == 0:
-            utt_loss = F.binary_cross_entropy_with_logits(logits, labels.float())
-            self.log(
-                "val/target_utt_loss",
-                utt_loss,
-                prog_bar=True,
-                on_epoch=True,
-                add_dataloader_idx=False,
-                sync_dist=True,
+            self._update_score_diagnostics(
+                self.target_score_diagnostics,
+                self.target_completion_score_diagnostics,
+                logits=logits,
+                seq_logits=seq_logits,
+                anchor=batch["anchor"],
+                labels=labels,
+                sample_ids=batch.get("sample_id"),
             )
-            self.target_auc_metric.update(preds, labels)
-            self.target_eer_metric.update(preds, labels)
         else:
-            utt_loss = F.binary_cross_entropy_with_logits(logits, labels.float())
-            self.log(
-                "val/utt_loss",
-                utt_loss,
-                prog_bar=True,
-                on_epoch=True,
-                add_dataloader_idx=False,
-                sync_dist=True,
+            self._update_score_diagnostics(
+                self.score_diagnostics,
+                self.completion_score_diagnostics,
+                logits=logits,
+                seq_logits=seq_logits,
+                anchor=batch["anchor"],
+                labels=labels,
+                sample_ids=batch.get("sample_id"),
             )
-            self.auc_metric.update(preds, labels)
-            self.eer_metric.update(preds, labels)
 
     def on_validation_epoch_end(self) -> None:
-        target_auc = self.target_auc_metric.compute()
-        target_eer = self.target_eer_metric.compute()
-        self.log("val/target_auc", target_auc, prog_bar=True, sync_dist=True)
-        self.log("val/target_eer", target_eer, prog_bar=True, sync_dist=True)
+        target_metrics = self._log_score_diagnostics(
+            self.target_score_diagnostics,
+            namespace="val/target_",
+            progress_bar=True,
+        )
+        self.log(
+            "val/target_utt_loss",
+            target_metrics["log_loss"],
+            prog_bar=True,
+            sync_dist=True,
+        )
+        self._log_score_diagnostics(
+            self.target_completion_score_diagnostics,
+            namespace=f"val/target_{self.sequence_diagnostic_namespace}",
+            deployment_metric=False,
+        )
+        lph_metrics = self._log_score_diagnostics(
+            self.score_diagnostics,
+            namespace="val/lph_",
+            progress_bar=True,
+        )
+        self.log(
+            "val/lph_utt_loss",
+            lph_metrics["log_loss"],
+            prog_bar=True,
+            sync_dist=True,
+        )
+        self._log_score_diagnostics(
+            self.completion_score_diagnostics,
+            namespace=f"val/lph_{self.sequence_diagnostic_namespace}",
+            deployment_metric=False,
+        )
+        # Filename/monitor aliases are kept out of CSV/TensorBoard because a
+        # slash cannot be used safely in a checkpoint format field.
+        self.log(
+            "val_target_auc", target_metrics["auc"], sync_dist=True, logger=False
+        )
+        self.log("val_lph_auc", lph_metrics["auc"], sync_dist=True, logger=False)
+        # Legacy alias: old adaptation checkpoints monitored LPh via val_auc.
+        self.log("val_auc", lph_metrics["auc"], sync_dist=True, logger=False)
+        self._log_train_window_metrics()
 
-        lph_auc = self.auc_metric.compute()
-        lph_eer = self.eer_metric.compute()
-        self.log("val/auc", lph_auc, prog_bar=True, sync_dist=True)
-        self.log("val/eer", lph_eer, prog_bar=True, sync_dist=True)
-        # Checkpoint-filename alias of val/auc; kept out of CSV/TensorBoard.
-        self.log("val_auc", lph_auc, sync_dist=True, logger=False)
-
-        self.target_auc_metric.reset()
-        self.target_eer_metric.reset()
-        self.auc_metric.reset()
-        self.eer_metric.reset()
+        self.target_score_diagnostics.reset()
+        self.target_completion_score_diagnostics.reset()
+        self.score_diagnostics.reset()
+        self.completion_score_diagnostics.reset()
 
 
 def _resolve_init_checkpoint(config: dict[str, Any], adapt_paths: dict[str, Any], args: Stage2AdaptArgs) -> str:
@@ -640,13 +723,16 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         ) from exc
 
     from dma_kws.config import get_tokenizer_config, require_sections
-    from dma_kws.runlog import build_loggers
+    from dma_kws.runlog import build_loggers, logger_backend_names
     from dma_kws.stage2 import adapt_console
     from dma_kws.stage2.collate import test_collate_fn, train_collate_fn
     from dma_kws.stage2.dataset import LibriPhraseTrainDataset, stage2_worker_init_fn
     from dma_kws.tokenizer import load_char_tokenizer
-    from dma_kws.training import resolve_resume_path
-    from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
+    from dma_kws.training.callbacks import (
+        build_stage2_callbacks,
+        print_run_summary,
+        print_training_result_summary,
+    )
     from dma_kws.training.metrics_history import (
         append_wide_row,
         build_metrics_history_callback,
@@ -654,6 +740,9 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         collect_hparams,
         numeric_callback_metrics,
     )
+    from dma_kws.training.run_context import build_run_context, stamp_run_context
+    from dma_kws.training.run_context_callback import RunContextCheckpointCallback
+    from dma_kws.training.resume import resolve_versioned_resume_path
     from dma_kws.training.ddp import apply_step_based_validation, build_trainer_kwargs
     from dma_kws.training.device import resolve_accelerator_and_devices
 
@@ -686,9 +775,14 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     accelerator, devices = resolve_accelerator_and_devices(args.device, args.devices)
 
     adapt_paths["phase_dir"].mkdir(parents=True, exist_ok=True)
-    checkpoint_dir = adapt_paths["phase_dir"] / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    resume_path = resolve_resume_path(args.resume_from, checkpoint_dir)
+    checkpoint_root = adapt_paths["phase_dir"] / "checkpoints"
+    log_dir = adapt_paths["phase_dir"] / "logs"
+    run_name = f"adapt_{adapt_paths['slug_str']}_{phase}"
+    resume_path = resolve_versioned_resume_path(
+        args.resume_from,
+        checkpoint_root,
+        run_name,
+    )
     if resume_path is not None and args.resume_checkpoint:
         raise ValueError(
             "Choose either run.resume_from (full Lightning state) or "
@@ -708,27 +802,26 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             args.resume_checkpoint,
         )
 
+    resume_payload = None
     if resume_path is not None:
+        resume_payload = torch.load(resume_path, map_location="cpu")
         assert_sequence_objective_matches(
-            torch.load(resume_path, map_location="cpu"),
+            resume_payload,
             stage2,
             source=resume_path,
         )
 
-    if is_primary_process:
-        reporter.section(f"LoRA adaptation · {adapt_paths['keyword_str']} · phase={phase}")
-        reporter.print_plan(
-            adapt_console.adapt_plan_rows(
-                adapt_paths=adapt_paths,
-                accelerator=accelerator,
-                devices=devices,
-                init_checkpoint=init_checkpoint,
-                adapter_resume=adapter_resume,
-                resume_path=resume_path,
-                params_file=args.params_file,
-            ),
-            title="Adaptation Plan",
-        )
+    run_context = build_run_context(
+        config,
+        section="adapt",
+        log_dir=log_dir,
+        run_name=run_name,
+        limit_steps=args.limit_steps or None,
+        resume_from=resume_path,
+        resume_checkpoint=resume_payload,
+    )
+    checkpoint_dir = checkpoint_root / run_context.run_id
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     dict_path = resolve_dict_path(config)
     tokenizer = load_char_tokenizer(dict_path, split_with_space=tokenizer_cfg.get("split_with_space", " "))
@@ -887,37 +980,30 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             adapter_checkpoint=adapter_resume,
         )
 
-    if is_primary_process:
-        reporter.print_plan(
-            adapt_console.lora_rows(
-                rank=lora_rank,
-                alpha=lora_alpha,
-                targets=lora_targets,
-                injected=getattr(model, "lora_injected", None),
-                param_counts=model.lora_param_counts,
-            ),
-            title="LoRA Adapters",
-        )
-
     if accelerator == "gpu":
         torch.set_float32_matmul_precision("high")
 
-    log_dir = adapt_paths["phase_dir"] / "logs"
-    run_name = f"adapt_{adapt_paths['slug_str']}_{phase}"
-    loggers = build_loggers(log_dir, run_name, config=config)
+    loggers = build_loggers(
+        log_dir,
+        run_name,
+        config=config,
+        section="adapt",
+        version=run_context.version,
+    )
 
-    hparams = collect_hparams(config, section="adapt", extra={"slug": adapt_paths["slug_str"]})
+    hparams = collect_hparams(
+        config,
+        section="adapt",
+        effective_max_steps=run_context.effective_max_steps,
+        extra={
+            "slug": adapt_paths["slug_str"],
+            **run_context.identity(),
+            "checkpoint_dir": str(checkpoint_dir),
+        },
+    )
     if is_primary_process:
         for train_logger in loggers:
             train_logger.log_hyperparams(hparams)
-
-    recipe = str(training.get("recipe", "adapt"))
-    callbacks = build_stage2_callbacks(config, recipe, checkpoint_dir=checkpoint_dir)
-    history_callback = build_metrics_history_callback(
-        run_name=run_name,
-        default_dir=log_dir / run_name,
-    )
-    callbacks.append(history_callback)
 
     limit_steps = args.limit_steps or int(adapt.get("max_steps", 3000)) or None
     trainer_kwargs = build_trainer_kwargs(
@@ -935,14 +1021,38 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         trainer_kwargs["val_check_interval"] = int(adapt_validation["val_check_interval"])
     if adapt_validation.get("limit_val_batches") is not None:
         trainer_kwargs["limit_val_batches"] = adapt_validation["limit_val_batches"]
-    # Adaptation validation is configured in global training steps. Always use
-    # Lightning's step-based mode: the dataloader is sharded only later during
-    # DDP setup, so comparing against its pre-DDP length is incorrect.
+    # Keep Lightning's train-batch interval on one counter across virtual
+    # epochs. The dataloader is sharded only later during DDP setup, so
+    # comparing against its pre-DDP length is also incorrect.
     apply_step_based_validation(
         trainer_kwargs,
         len(train_dataloader),
         force=True,
     )
+
+    recipe = str(training.get("recipe", "adapt"))
+    callbacks = build_stage2_callbacks(
+        config,
+        recipe,
+        checkpoint_dir=checkpoint_dir,
+        val_check_interval=int(trainer_kwargs["val_check_interval"]),
+        monitor_override=str(adapt.get("checkpoint_monitor", "val_target_auc")),
+        filename_override=str(
+            adapt.get(
+                "checkpoint_filename",
+                "step_{step:06d}_target_auc_{val_target_auc:.6f}",
+            )
+        ),
+        section="adapt",
+    )
+    checkpoint_callback = callbacks[0]
+    callbacks.append(RunContextCheckpointCallback(run_context))
+    history_callback = build_metrics_history_callback(
+        run_name=run_name,
+        run_id=run_context.run_id,
+        default_dir=run_context.run_dir,
+    )
+    callbacks.insert(0, history_callback)
 
     if is_primary_process:
         print_run_summary(
@@ -954,32 +1064,41 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             val_samples=len(target_val_dataset) + len(lph_val_loader.dataset),
             param_counts=model.lora_param_counts,
             extra_rows=[
+                ("keyword", adapt_paths["keyword_str"]),
                 ("phase", phase),
                 ("batches_per_epoch", str(len(train_dataloader))),
-                (
-                    "val_check_interval",
-                    f"{trainer_kwargs['val_check_interval']} "
-                    f"({'steps' if trainer_kwargs.get('check_val_every_n_epoch', 1) is None else 'batches/epoch'})",
-                ),
                 ("mix_ratio", str(mix_ratio)),
                 ("lora_rank", str(lora_rank)),
                 ("lora_alpha", str(lora_alpha)),
+                ("lora_targets", ", ".join(lora_targets)),
+                (
+                    "lora_injected_modules",
+                    str(len(getattr(model, "lora_injected", ()) or ())),
+                ),
+                ("params_file", str(args.params_file or "(none)")),
             ],
             paths={
+                "run_id": run_context.run_id,
                 "train_manifest": train_manifest,
                 "eval_manifest": eval_manifest,
                 "checkpoint_dir": checkpoint_dir,
                 "log_dir": log_dir,
+                "run_dir": run_context.run_dir,
+                **(
+                    {"parent_run_id": run_context.parent_run_id}
+                    if run_context.parent_run_id
+                    else {}
+                ),
                 **(
                     {"init_checkpoint": Path(init_checkpoint)}
                     if init_checkpoint
                     else {"resume_checkpoint": resume_path}
                 ),
             },
+            effective_max_steps=run_context.effective_max_steps,
+            effective_logging_backends=logger_backend_names(loggers),
         )
 
-    if is_primary_process:
-        reporter.section(f"Training · {run_name}")
     trainer = pl_mod.Trainer(
         accelerator=accelerator,
         callbacks=callbacks,
@@ -994,13 +1113,19 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     )
 
     global_step = int(trainer.global_step)
-    adapter_out = adapt_paths["phase_dir"] / f"adapter_{adapt_paths['slug_str']}.pt"
-    merged_out = adapt_paths["merged_path"]
-    final_adapter = adapt_paths["adapter_path"]
+    adapter_out = checkpoint_dir / f"adapter_{adapt_paths['slug_str']}.pt"
+    merged_out = checkpoint_dir / "stage2_adapted.pt"
+    final_adapter = adapter_out
     artifacts = {
         "adapter": adapter_out,
         "merged": merged_out,
         "final_adapter": final_adapter,
+    }
+    compatibility_aliases = {
+        "phase_adapter": adapt_paths["phase_dir"]
+        / f"adapter_{adapt_paths['slug_str']}.pt",
+        "final_adapter": adapt_paths["adapter_path"],
+        "merged": adapt_paths["merged_path"],
     }
 
     if trainer.is_global_zero:
@@ -1010,7 +1135,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 "The frozen Stage II base changed during LoRA training. Refusing "
                 "to save an adapter whose recorded base identity would be false."
             )
-        torch.save(
+        adapter_payload = stamp_run_context(
             stamp_qbyt_readout_version(
                 {
                     "checkpoint_kind": "stage2_lora_adapter",
@@ -1026,11 +1151,12 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     STAGE2_BASE_FINGERPRINT_KEY: base_model_sha256,
                 }
             ),
-            adapter_out,
+            run_context,
         )
+        _atomic_torch_save(adapter_payload, adapter_out)
 
         merge_lora(model.qbyt)
-        torch.save(
+        merged_payload = stamp_run_context(
             stamp_qbyt_readout_version(
                 {
                     "model_state_dict": model.state_dict(),
@@ -1043,11 +1169,17 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     "vocab_size": vocab_size,
                 }
             ),
-            merged_out,
+            run_context,
         )
+        _atomic_torch_save(merged_payload, merged_out)
 
-        if adapter_out.resolve() != final_adapter.resolve():
-            torch.save(torch.load(adapter_out, map_location="cpu"), final_adapter)
+        # These aliases preserve the existing standalone TTS -> real handoff and
+        # evaluation CLI contract. They are last-writer compatibility pointers,
+        # not authoritative run artifacts; atomic replacement prevents concurrent
+        # publishers from exposing a partially written checkpoint.
+        _atomic_torch_save(adapter_payload, compatibility_aliases["phase_adapter"])
+        _atomic_torch_save(adapter_payload, compatibility_aliases["final_adapter"])
+        _atomic_torch_save(merged_payload, compatibility_aliases["merged"])
 
         final_metrics = numeric_callback_metrics(dict(trainer.callback_metrics))
         runs_csv = Path(paths["exp_root"]) / "stage2_adapt" / "runs.csv"
@@ -1060,38 +1192,79 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 best_metrics=history_callback.best,
                 global_step=global_step,
                 duration_seconds=history_callback.duration_seconds,
+                metric_step=history_callback.last_validation_step,
+                best_steps=history_callback.best_steps,
+                identity=run_context.identity(),
+                provenance={
+                    "metrics_source": "last_trainer_state",
+                    "primary_artifact_source": f"final_weights@step={global_step}",
+                    "primary_artifact_step": global_step,
+                    "primary_artifact_path": str(merged_out),
+                    "compatibility_alias": json.dumps(
+                        {
+                            name: str(path)
+                            for name, path in compatibility_aliases.items()
+                        },
+                        sort_keys=True,
+                    ),
+                },
             ),
         )
 
-        reporter.section("Artifacts")
-        reporter.print_table(*adapt_console.artifact_rows(artifacts), title="Saved Checkpoints")
         log_files = {"runs_csv": runs_csv}
         if history_callback.csv_path is not None:
             log_files["eval_history"] = history_callback.csv_path
-        reporter.print_plan(
-            [(name, str(path)) for name, path in sorted(log_files.items())],
-            title="Metrics CSVs",
-        )
         metrics = {
             key: round(value, 6)
             for key, value in final_metrics.items()
             if key.startswith("val/")
         }
-        if metrics:
-            reporter.print_plan(
-                [(key, f"{value:.4f}") for key, value in sorted(metrics.items())],
-                title="Final Validation Metrics",
-            )
-        reporter.done(f"LoRA adaptation complete for phase {phase!r} at step {global_step}.")
+        print_training_result_summary(
+            run_context=run_context,
+            global_step=global_step,
+            last_validation_step=history_callback.last_validation_step,
+            best_checkpoint_monitor=getattr(checkpoint_callback, "monitor", None),
+            best_checkpoint_path=getattr(
+                checkpoint_callback, "best_model_path", None
+            ),
+            best_checkpoint_score=getattr(
+                checkpoint_callback, "best_model_score", None
+            ),
+            final_metrics=final_metrics,
+            artifact_paths={
+                **artifacts,
+                **log_files,
+                **{
+                    f"compatibility_alias/{name}": path
+                    for name, path in compatibility_aliases.items()
+                },
+            },
+            artifact_sources={
+                "adapter": f"final_lora_weights@step={global_step}",
+                "merged": f"final_merged_weights@step={global_step}",
+                "final_adapter": f"final_lora_weights@step={global_step}",
+                **{
+                    f"compatibility_alias/{name}": "compatibility_alias (atomic last-writer pointer)"
+                    for name in compatibility_aliases
+                },
+            },
+            title=f"Stage II LoRA Adaptation Result · {phase}",
+            rich=bool((adapt.get("console", {}) or {}).get("rich", True)),
+        )
         print(
             json.dumps(
                 {
                     "keyword": adapt_paths["keyword_str"],
                     "slug": adapt_paths["slug_str"],
                     "phase": phase,
+                    "run_id": run_context.run_id,
                     "step": global_step,
                     "metrics": metrics,
                     "artifacts": {name: str(path) for name, path in artifacts.items()},
+                    "compatibility_aliases": {
+                        name: str(path)
+                        for name, path in compatibility_aliases.items()
+                    },
                     "logs": {name: str(path) for name, path in log_files.items()},
                 }
             )

@@ -146,20 +146,25 @@ def compute_stage2_losses(
         seq_labels,
         seq_label_mask,
     )
-    seq_loss = (
-        seq_progress_weight * seq_progress_loss
-        + seq_completion_weight * seq_completion_loss
-    )
+    seq_progress_weighted_loss = seq_progress_weight * seq_progress_loss
+    seq_completion_weighted_loss = seq_completion_weight * seq_completion_loss
+    seq_loss = seq_progress_weighted_loss + seq_completion_weighted_loss
     total_loss = utt_loss + seq_loss
     losses = {
         "utt_loss": utt_loss,
         "seq_loss": seq_loss,
         "seq_progress_loss": seq_progress_loss,
         "seq_completion_loss": seq_completion_loss,
+        "seq_progress_weighted_loss": seq_progress_weighted_loss,
+        "seq_completion_weighted_loss": seq_completion_weighted_loss,
     }
 
     if ctc_loss is not None and ctc_weight:
-        total_loss = total_loss + ctc_weight * ctc_loss
+        ctc_weighted_loss = ctc_weight * ctc_loss
+        total_loss = total_loss + ctc_weighted_loss
         losses["ctc_loss"] = ctc_loss
+        losses["ctc_weighted_loss"] = ctc_weighted_loss
+
+    losses["total_loss"] = total_loss
 
     return total_loss, losses

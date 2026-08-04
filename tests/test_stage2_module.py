@@ -106,6 +106,48 @@ def test_forward_and_training_step_smoke(patched_module):
     assert torch.isfinite(loss)
 
 
+def test_train_end_flushes_partial_window_once(patched_module):
+    module = patched_module
+    module.log = MagicMock()
+    train_logger = MagicMock()
+    module._trainer = MagicMock(
+        is_global_zero=True,
+        loggers=[train_logger],
+        global_step=7,
+    )
+    module.optimizers = MagicMock(
+        return_value=MagicMock(param_groups=[{"lr": 1e-3}])
+    )
+
+    module.training_step(_random_batch(), 0)
+    module.log.reset_mock()
+
+    module.on_train_end()
+
+    train_logger.log_metrics.assert_called_once()
+    payload = train_logger.log_metrics.call_args.args[0]
+    assert "train/window/loss_total" in payload
+    assert payload["train/window/microbatches"] == 1.0
+    assert train_logger.log_metrics.call_args.kwargs["step"] == 7
+
+    train_logger.log_metrics.reset_mock()
+    module.on_train_end()
+    assert not train_logger.log_metrics.called
+
+    # A validation-end flush immediately before train end is likewise not
+    # emitted a second time.
+    module.training_step(_random_batch(), 1)
+    module.log.reset_mock()
+    module._log_train_window_metrics()
+    assert any(
+        call.args[0] == "train/window/loss_total"
+        for call in module.log.call_args_list
+    )
+    train_logger.log_metrics.reset_mock()
+    module.on_train_end()
+    assert not train_logger.log_metrics.called
+
+
 def test_gradient_diagnostics_reports_missing_gradient_changes(patched_module):
     module = patched_module
     module._gradient_diagnostics_enabled = True
@@ -126,24 +168,55 @@ def test_gradient_diagnostics_reports_missing_gradient_changes(patched_module):
 def test_validation_logs_are_synchronized(patched_module):
     module = patched_module
     module.log = MagicMock()
-    module.auc_metric.update = MagicMock()
-    module.eer_metric.update = MagicMock()
 
     module.validation_step(_random_batch(), 0)
-
-    loss_call = next(call for call in module.log.call_args_list if call.args[0] == "val/utt_loss")
-    assert loss_call.kwargs["sync_dist"] is True
-
-    module.auc_metric.compute = MagicMock(return_value=torch.tensor(0.75))
-    module.eer_metric.compute = MagicMock(return_value=torch.tensor(0.25))
-    module.log.reset_mock()
+    assert not module.log.called
 
     module.on_validation_epoch_end()
 
     calls = {call.args[0]: call.kwargs for call in module.log.call_args_list}
+    # The custom metric synchronizes raw scores first. Every rank therefore has
+    # the same scalar and Lightning's second mean is an identity operation that
+    # avoids noisy DDP sync warnings.
     assert calls["val/auc"]["sync_dist"] is True
     assert calls["val/eer"]["sync_dist"] is True
+    assert calls["val/eer_threshold"]["sync_dist"] is True
+    assert calls["val/completion_auc"]["sync_dist"] is True
+    assert "val/completion_diagnostic_threshold" in calls
+    assert "val/completion_deploy_threshold" not in calls
+    assert calls["val/utt_loss"]["sync_dist"] is True
     assert calls["val_auc"]["sync_dist"] is True
+    logged_values = {
+        call.args[0]: call.args[1] for call in module.log.call_args_list
+    }
+    for name in (
+        "val/num_samples",
+        "val/num_pos",
+        "val/num_neg",
+        "val/has_both_classes",
+    ):
+        assert torch.is_floating_point(logged_values[name])
+
+
+def test_membership_objective_names_endpoint_as_last_token(monkeypatch):
+    fake_encoder = MagicMock(side_effect=_mock_encoder_output)
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_encoder", lambda *_args, **_kwargs: fake_encoder
+    )
+    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _FakeQbyT)
+    config = _minimal_config()
+    config["stage2"]["sequence_loss"].update(
+        {"target_mode": "membership", "progress_weight": 1.0, "completion_weight": 0.0}
+    )
+    module = Stage2LightningModule(config, vocab_size=71)
+    module.log = MagicMock()
+
+    module.validation_step(_random_batch(), 0)
+    module.on_validation_epoch_end()
+
+    names = {call.args[0] for call in module.log.call_args_list}
+    assert "val/last_token_auc" in names
+    assert "val/completion_auc" not in names
 
 
 def test_freeze_encoder_disables_encoder_gradients(monkeypatch):
@@ -521,6 +594,62 @@ class _LoraReadyQbyT(nn.Module):
         return zero.expand(batch_size), zero.expand(batch_size, text.size(1))
 
 
+def test_lora_source_metrics_are_global_and_fields_are_stable(monkeypatch):
+    from dma_kws.stage2.adapt import Stage2LoraAdaptationModule
+
+    encoder = _StreamSpyEncoder()
+    monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_a, **_k: encoder)
+    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _LoraReadyQbyT)
+
+    config = _icefall_config()
+    config["adapt"] = {"keyword": "hey eva"}
+    module = Stage2LoraAdaptationModule(
+        config,
+        vocab_size=71,
+        lora_rank=2,
+        lora_alpha=4.0,
+    )
+    logits = torch.tensor([0.0, 1.0])
+    labels = torch.tensor([1, 0])
+    module._forward_train_losses = MagicMock(
+        return_value=(torch.tensor(1.0, requires_grad=True), {}, logits)
+    )
+    module._log_train_losses = MagicMock()
+    module.log = MagicMock()
+
+    # This rank contains only keyword examples. The peer contributes one LPh
+    # example with loss sum 3, so all three fields must still exist globally.
+    monkeypatch.setattr(
+        "dma_kws.stage2.adapt.sum_across_processes",
+        lambda values: values
+        + torch.tensor([0.0, 0.0, 3.0, 1.0], device=values.device),
+    )
+    module.training_step(
+        {"label": labels, "source": torch.tensor([1, 1])},
+        0,
+    )
+
+    calls = {call.args[0]: call for call in module.log.call_args_list}
+    expected_keyword_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        labels.float(),
+        reduction="none",
+    ).mean()
+    assert float(calls["train/microbatch/source_keyword_fraction"].args[1]) == pytest.approx(
+        2 / 3
+    )
+    assert float(calls["train/microbatch/loss_keyword_utt_raw"].args[1]) == pytest.approx(
+        float(expected_keyword_loss)
+    )
+    assert float(calls["train/microbatch/loss_lph_utt_raw"].args[1]) == pytest.approx(3.0)
+    for name in (
+        "train/microbatch/source_keyword_fraction",
+        "train/microbatch/loss_keyword_utt_raw",
+        "train/microbatch/loss_lph_utt_raw",
+    ):
+        assert calls[name].kwargs["sync_dist"] is True
+
+
 def test_lora_adam_honors_weight_decay(monkeypatch):
     import sys
     from types import SimpleNamespace
@@ -581,20 +710,27 @@ def test_lora_validation_step_pins_the_deployment_point(monkeypatch):
     module = Stage2LoraAdaptationModule(config, vocab_size=71, lora_rank=2, lora_alpha=4.0)
     module.log = MagicMock()
 
-    assert module.target_auc_metric.sync_on_compute is True
-    assert module.target_eer_metric.sync_on_compute is True
-    assert module.auc_metric.sync_on_compute is True
-    assert module.eer_metric.sync_on_compute is True
+    assert module.target_score_diagnostics.sync_on_compute is True
+    assert module.target_completion_score_diagnostics.sync_on_compute is True
+    assert module.score_diagnostics.sync_on_compute is True
+    assert module.completion_score_diagnostics.sync_on_compute is True
 
     module.validation_step(_random_batch(), 0, dataloader_idx=0)
     module.validation_step(_random_batch(), 0, dataloader_idx=1)
 
     assert encoder.applied == [(16,), (16,)]
+    assert not module.log.called
+
+    module.on_validation_epoch_end()
     validation_logs = {
         call.args[0]: call.kwargs for call in module.log.call_args_list
     }
+    assert validation_logs["val/target_eer_threshold"]["sync_dist"] is True
+    assert validation_logs["val/lph_eer_threshold"]["sync_dist"] is True
     assert validation_logs["val/target_utt_loss"]["sync_dist"] is True
-    assert validation_logs["val/utt_loss"]["sync_dist"] is True
+    assert validation_logs["val/lph_utt_loss"]["sync_dist"] is True
+    assert validation_logs["val/target_completion_auc"]["sync_dist"] is True
+    assert validation_logs["val/lph_completion_auc"]["sync_dist"] is True
 
     checkpoint = {"state_dict": module.state_dict()}
     module.on_save_checkpoint(checkpoint)

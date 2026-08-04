@@ -15,6 +15,21 @@ checkpoint_dir: ${paths.exp_root}/stage1_phoneme_ctc/checkpoints
 log_dir: ${paths.exp_root}/stage1_phoneme_ctc/logs
 run_name: stage1_phoneme_ctc
 
+console:
+  rich: true
+  device_stats: false
+  throughput: false
+  refresh_rate: null
+  leave: true
+
+logging:
+  backends: [csv, tensorboard]
+  wandb:
+    project: dma-kws
+    mode: online
+  trackio:
+    project: dma-kws
+
 checkpoint_avg:
   enabled: false
   last_k: 10

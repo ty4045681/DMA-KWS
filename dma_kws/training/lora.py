@@ -207,7 +207,9 @@ def print_lora_param_counts(model: nn.Module, *, prefix: str = "") -> dict[str, 
     """Print and return LoRA parameter statistics."""
     counts = count_lora_params(model)
     label = f"{prefix} " if prefix else ""
-    print(
+    from dma_kws.training.ddp import rank_zero_print
+
+    rank_zero_print(
         f"{label}LoRA params: trainable={counts['trainable']:,} "
         f"(lora={counts['lora_trainable']:,}) / total={counts['total']:,}"
     )

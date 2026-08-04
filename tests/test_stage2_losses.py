@@ -150,6 +150,20 @@ def test_total_loss_uses_configured_progress_completion_and_ctc_weights():
         total_loss,
         losses["utt_loss"] + losses["seq_loss"] + 0.2 * ctc_loss,
     )
+    assert torch.allclose(
+        losses["seq_loss"],
+        losses["seq_progress_weighted_loss"]
+        + losses["seq_completion_weighted_loss"],
+    )
+    assert torch.allclose(losses["ctc_weighted_loss"], 0.2 * ctc_loss)
+    assert torch.allclose(losses["total_loss"], total_loss)
+    assert torch.allclose(
+        losses["total_loss"],
+        losses["utt_loss"]
+        + losses["seq_progress_weighted_loss"]
+        + losses["seq_completion_weighted_loss"]
+        + losses["ctc_weighted_loss"],
+    )
 
 
 def test_legacy_weights_and_token_normalization_reproduce_masked_seq_bce():

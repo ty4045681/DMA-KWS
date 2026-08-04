@@ -142,7 +142,12 @@ class PhonemeAdapter(nn.Module):
         encoder_mask: torch.Tensor | None,
         targets: torch.Tensor,
         target_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, int]:
+        *,
+        return_details: bool = False,
+    ) -> (
+        tuple[torch.Tensor, int]
+        | tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]
+    ):
         """CTC loss over log-probabilities already produced by :meth:`forward`.
 
         Taking ``log_probs`` rather than the encoder output is deliberate: it
@@ -152,7 +157,10 @@ class PhonemeAdapter(nn.Module):
         different tensors, which is precisely the coupling this module exists to
         create.
 
-        Returns ``(loss, num_skipped)``. In addition to needing at least one
+        Returns ``(loss, num_skipped)`` by default.  ``return_details=True``
+        additionally returns ``(per_sample_loss, valid_mask)`` so validation
+        can remove DistributedSampler padding before aggregating metrics.
+        In addition to needing at least one
         frame per label, CTC needs an intervening blank frame for every adjacent
         repeated label. At 25 Hz a short phrase clip can genuinely fail either
         requirement. Those samples are dropped explicitly so the count stays
@@ -182,24 +190,34 @@ class PhonemeAdapter(nn.Module):
         keep = (target_lengths > 0) & (min_input_lengths <= input_lengths)
         num_skipped = int((~keep).sum().item())
         if not bool(keep.any()):
-            return log_probs.sum() * 0.0, num_skipped
+            loss = log_probs.sum() * 0.0
+            if return_details:
+                return loss, num_skipped, log_probs.new_zeros(batch), keep
+            return loss, num_skipped
 
-        # Batch-size average, matching qbyt/models/ctc.py.
-        loss = F.ctc_loss(
+        # The mean still matches qbyt/models/ctc.py.  Keeping the unreduced
+        # values is necessary for exact validation aggregation after padded
+        # DDP samples are removed.
+        valid_losses = F.ctc_loss(
             log_probs[keep].transpose(0, 1),
             targets[keep],
             input_lengths[keep],
             target_lengths[keep],
             blank=self.blank_id,
-            reduction="sum",
+            reduction="none",
             zero_infinity=False,
         )
-        if not bool(torch.isfinite(loss)):
+        if not bool(torch.isfinite(valid_losses).all()):
             raise FloatingPointError(
                 "CTC loss became non-finite after infeasible targets were filtered; "
                 "check target ids, lengths, and log-probabilities"
             )
-        return loss / int(keep.sum()), num_skipped
+        loss = valid_losses.mean()
+        if return_details:
+            per_sample_losses = log_probs.new_zeros(batch)
+            per_sample_losses[keep] = valid_losses
+            return loss, num_skipped, per_sample_losses, keep
+        return loss, num_skipped
 
 
 def build_phoneme_adapter(

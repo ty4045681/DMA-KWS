@@ -106,6 +106,7 @@ def test_stage1_dataset_loads_precomputed_fbank(tmp_path):
     sample = dataset[0]
     assert sample["feat"].shape == (4, 80)
     assert torch.allclose(sample["feat"], torch.full((4, 80), 2.0))
+    assert sample["sample_id"].item() == 0
 
 
 def test_stage1_dataset_derives_fbank_from_root(tmp_path):

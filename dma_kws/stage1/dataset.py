@@ -122,15 +122,27 @@ class Stage1Dataset(Dataset):
             encode_manifest_target(record, self.tokenizer),
             dtype=torch.long,
         )
-        return {"feat": feat, "target": target}
+        return {
+            "feat": feat,
+            "target": target,
+            # A stable manifest-row id lets validation remove the samples that
+            # DistributedSampler repeats to make all ranks equally long.
+            "sample_id": torch.tensor(index, dtype=torch.long),
+        }
 
 
 def stage1_collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     feats = [item["feat"] for item in batch]
     targets = [item["target"] for item in batch]
-    return {
+    collated = {
         "feats": pad_sequence(feats, batch_first=True, padding_value=0.0),
         "feat_lengths": torch.tensor([feat.size(0) for feat in feats], dtype=torch.long),
         "targets": pad_sequence(targets, batch_first=True, padding_value=0),
         "target_lengths": torch.tensor([target.size(0) for target in targets], dtype=torch.long),
     }
+    # Keep hand-built/test batches that predate the sample-id contract valid.
+    if all("sample_id" in item for item in batch):
+        collated["sample_id"] = torch.stack(
+            [torch.as_tensor(item["sample_id"], dtype=torch.long).reshape(()) for item in batch]
+        )
+    return collated

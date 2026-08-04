@@ -156,6 +156,7 @@ class TargetKeywordValDataset(Dataset):
         feats = torch.from_numpy(np.load(fbank_path))
 
         return {
+            "sample_id": torch.tensor(index, dtype=torch.long),
             "anchor_seq": torch.tensor(self._anchor_seq, dtype=torch.long),
             "feat": feats,
             "label": torch.tensor(label, dtype=torch.long),
