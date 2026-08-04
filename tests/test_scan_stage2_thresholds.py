@@ -107,6 +107,46 @@ def test_parallel_and_single_thread_scans_are_identical(tmp_path):
         assert parallel[key] == pytest.approx(serial[key])
 
 
+def test_threshold_scan_excludes_and_reports_skipped_rows(tmp_path):
+    output_dir = tmp_path / "clips"
+    results = output_dir / "results.jsonl"
+    rows = _clip_rows() + [
+        {
+            "audio_path": "skipped-positive.wav",
+            "keyword": "hey eva",
+            "label": 1,
+            "qbyt_score": 0.0,
+            "skipped": True,
+        }
+    ]
+    _write_jsonl(results, rows)
+
+    scan_input = load_scan_input(results, mode="clips")
+
+    assert scan_input.scores.size == 4
+    assert scan_input.num_skipped == 1
+
+    summary = run_scan(
+        argparse.Namespace(
+            results=results,
+            mode="clips",
+            summary=None,
+            total_hours=None,
+            workers=1,
+            threshold_step=None,
+            max_fpr=None,
+            min_recall=None,
+            max_fa_per_hour=None,
+            no_subsets=False,
+            out_csv=tmp_path / "curve.csv",
+            out_summary=tmp_path / "scan.json",
+        )
+    )
+    assert summary["num_samples"] == 4
+    assert summary["num_input_rows"] == 5
+    assert summary["num_skipped_excluded"] == 1
+
+
 def test_musan_scan_uses_summary_hours_and_writes_subset_metrics(tmp_path):
     output_dir = tmp_path / "musan"
     results = output_dir / "results.jsonl"

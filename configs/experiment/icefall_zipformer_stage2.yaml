@@ -5,7 +5,7 @@
 #   export ICEFALL_ROOT=/path/to/icefall
 #   export ICEFALL_CHECKPOINT=/path/to/icefall_checkpoint.pt
 #   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2 \
-#     run.freeze_encoder=true
+#     stage2.freeze_encoder=true
 #
 # This config:
 # - Uses icefall Zipformer2 encoder as Stage II encoder (instead of Wenet Conformer)

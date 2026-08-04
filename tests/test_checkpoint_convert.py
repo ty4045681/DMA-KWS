@@ -215,6 +215,47 @@ def test_convert_stage2_checkpoint_writes_only_inference_payload(tmp_path: Path)
     assert extract_state_dict(payload) is payload["model_state_dict"]
 
 
+def test_convert_v2_gru_checkpoint_preserves_v2_provenance(tmp_path: Path) -> None:
+    source = tmp_path / "v2_gru.ckpt"
+    output = tmp_path / "v2_gru.pt"
+    config = _config()
+    torch.save(
+        _checkpoint(
+            _stage2_state(),
+            config=config,
+            readout_version=2,
+        ),
+        source,
+    )
+
+    convert_checkpoint(source, output)
+
+    payload = torch.load(output, map_location="cpu")
+    assert payload[QBYT_READOUT_VERSION_KEY] == 2
+    assert_qbyt_readout_version(
+        payload,
+        source=output,
+        expected_mode="gru_last",
+    )
+
+
+def test_convert_v2_checkpoint_rejects_eps_mode(tmp_path: Path) -> None:
+    source = tmp_path / "v2_eps.ckpt"
+    config = _config()
+    config["stage2"]["qbyt_readout"] = {"mode": "eps_mean"}
+    torch.save(
+        _checkpoint(
+            _stage2_state(),
+            config=config,
+            readout_version=2,
+        ),
+        source,
+    )
+
+    with pytest.raises(CheckpointConversionError, match="version 2 only with mode"):
+        convert_checkpoint(source, tmp_path / "v2_eps.pt")
+
+
 def test_historical_checkpoint_uses_explicit_fallback_config(tmp_path: Path) -> None:
     source = tmp_path / "old.ckpt"
     output = tmp_path / "old.pt"

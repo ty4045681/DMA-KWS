@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from dma_kws.inference.stage2_clip import (
@@ -282,6 +284,18 @@ class FakeBatchVerifier:
         self._scores = self._scores[len(feats):]
         return scores
 
+    def score_clip_feats_detailed(self, feats, keyword_ids_batch):
+        scores = self.score_clip_feats(feats, keyword_ids_batch)
+        return [
+            {
+                "qbyt_score": score,
+                "qbyt_logit": math.log(score / (1.0 - score)),
+                "completion_score": 0.25,
+                "completion_logit": math.log(0.25 / 0.75),
+            }
+            for score in scores
+        ]
+
 
 def test_clip_runner_run_batch(monkeypatch):
     torch = pytest.importorskip("torch")
@@ -339,6 +353,50 @@ def test_clip_runner_run_batch(monkeypatch):
         "detected",
         "skipped",
     }
+
+
+def test_clip_runner_run_batch_can_include_score_details(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchaudio")
+
+    def loader(path: str, *, sample_rate: int):
+        if path.endswith("short.wav"):
+            return torch.zeros(1, 10), sample_rate
+        return torch.zeros(1, sample_rate * 2), sample_rate
+
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.load_audio", loader)
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.make_g2p", _fake_g2p)
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.text_to_phonemes",
+        lambda _g2p, text: _fake_phonemes(text),
+    )
+    verifier = FakeBatchVerifier(scores=[0.9])
+    tokenizer = load_char_tokenizer("data/dict/lang_char.txt", split_with_space=" ")
+    runner = Stage2ClipRunner(
+        verifier=verifier,
+        tokenizer=tokenizer,
+        demo_cfg={"qbyt_threshold": 0.5},
+        sample_rate=16000,
+    )
+
+    results = runner.run_batch(
+        [
+            {"audio_path": "/tmp/a.wav", "keyword": "hello"},
+            {"audio_path": "/tmp/short.wav", "keyword": "hello"},
+        ],
+        batch_size=8,
+        num_workers=0,
+        include_score_details=True,
+    )
+
+    assert results[0]["qbyt_logit"] == pytest.approx(math.log(9.0))
+    assert results[0]["completion_score"] == pytest.approx(0.25)
+    assert results[0]["completion_logit"] == pytest.approx(
+        math.log(1.0 / 3.0)
+    )
+    assert results[1]["qbyt_logit"] is None
+    assert results[1]["completion_score"] is None
+    assert results[1]["completion_logit"] is None
 
 
 def test_clip_runner_result_record_shape(monkeypatch):

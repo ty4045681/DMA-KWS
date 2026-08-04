@@ -25,7 +25,7 @@ AUDIO_LEN = 20
 assert SHORT_TEXT_LEN + AUDIO_LEN - 1 < LONG_TEXT_LEN
 
 
-def _model(seed: int = 0):
+def _model(seed: int = 0, *, readout_mode: str = "gru_last"):
     QbyT = load_qbyt_class()
     torch.manual_seed(seed)
     model = QbyT(
@@ -33,6 +33,7 @@ def _model(seed: int = 0):
         num_embeds=73,
         embed_dim=EMBED_DIM,
         post_num_layers=2,
+        readout_mode=readout_mode,
     )
     return model.eval()
 
@@ -196,3 +197,106 @@ def test_valid_text_logits_are_invariant_to_batch_companions():
         atol=1e-5,
         rtol=1e-4,
     )
+
+
+def test_eps_score_is_masked_mean_of_valid_position_logits():
+    model = _model(readout_mode="eps_mean")
+    short_text, short_audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
+    long_text, long_audio = _sample(LONG_TEXT_LEN, AUDIO_LEN, seed=3)
+    text_batch = torch.zeros(2, LONG_TEXT_LEN, dtype=torch.long)
+    text_batch[0, :SHORT_TEXT_LEN] = short_text
+    text_batch[1] = long_text
+    captured = {}
+
+    def capture_position_logits(_module, _inputs, output):
+        captured["position_logits"] = output.squeeze(-1).detach()
+
+    handle = model.final_pos_fc.register_forward_hook(capture_position_logits)
+    try:
+        with torch.no_grad():
+            logits, _ = model(
+                torch.stack([short_audio, long_audio]),
+                text_batch,
+                speech_lengths=torch.tensor([AUDIO_LEN, AUDIO_LEN]),
+                text_lengths=torch.tensor([SHORT_TEXT_LEN, LONG_TEXT_LEN]),
+            )
+    finally:
+        handle.remove()
+
+    position_logits = captured["position_logits"]
+    expected = torch.stack(
+        [
+            position_logits[0, :SHORT_TEXT_LEN].mean(),
+            position_logits[1, :LONG_TEXT_LEN].mean(),
+        ]
+    )
+    torch.testing.assert_close(logits, expected)
+
+
+def test_eps_score_is_invariant_to_batch_companions():
+    model = _model(readout_mode="eps_mean")
+    text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
+    short_companion, short_audio = _sample(SHORT_TEXT_LEN + 1, AUDIO_LEN, seed=2)
+    long_companion, long_audio = _sample(LONG_TEXT_LEN, AUDIO_LEN, seed=3)
+
+    with_short = _score(
+        model,
+        [text, short_companion],
+        [audio, short_audio],
+        [SHORT_TEXT_LEN, SHORT_TEXT_LEN + 1],
+        [AUDIO_LEN, AUDIO_LEN],
+    )[0]
+    with_long = _score(
+        model,
+        [text, long_companion],
+        [audio, long_audio],
+        [SHORT_TEXT_LEN, LONG_TEXT_LEN],
+        [AUDIO_LEN, AUDIO_LEN],
+    )[0]
+
+    torch.testing.assert_close(with_short, with_long, atol=1e-5, rtol=1e-4)
+
+
+def test_eps_readout_registers_only_its_active_final_head():
+    model = _model(readout_mode="eps_mean")
+    state_keys = set(model.state_dict())
+
+    assert "final_pos_fc.weight" in state_keys
+    assert "final_pos_fc.bias" in state_keys
+    assert not any(key.startswith("gru.") for key in state_keys)
+    assert not any(key.startswith("fc.") for key in state_keys)
+    assert model.gru is None
+    assert model.fc is None
+
+
+def test_eps_final_position_scorer_receives_utterance_gradient():
+    model = _model(readout_mode="eps_mean").train()
+    text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
+
+    logits, _ = model(
+        audio.unsqueeze(0),
+        text.unsqueeze(0),
+        speech_lengths=torch.tensor([AUDIO_LEN]),
+        text_lengths=torch.tensor([SHORT_TEXT_LEN]),
+    )
+    logits.sum().backward()
+
+    assert model.final_pos_fc.weight.grad is not None
+    assert torch.isfinite(model.final_pos_fc.weight.grad).all()
+
+
+def test_eps_empty_anchor_has_finite_neutral_logit_without_device_sync():
+    model = _model(readout_mode="eps_mean")
+    with torch.no_grad():
+        logits, _ = model(
+            torch.randn(1, AUDIO_LEN, ENCODER_DIM),
+            torch.zeros(1, 1, dtype=torch.long),
+            speech_lengths=torch.tensor([AUDIO_LEN]),
+            text_lengths=torch.tensor([0]),
+        )
+    torch.testing.assert_close(logits, torch.zeros_like(logits))
+
+
+def test_unknown_readout_mode_is_rejected():
+    with pytest.raises(ValueError, match="Unsupported QbyT readout mode"):
+        _model(readout_mode="unknown")

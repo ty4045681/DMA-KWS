@@ -3,6 +3,24 @@ import torch.nn as nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 import math
 
+# Keep this vendored model importable on its own (for example from ``qbyt/``).
+# These public mode spellings intentionally mirror ``dma_kws.stage2.readout``;
+# the application layer validates/configures them before constructing QbyT, and
+# this local guard prevents the vendored model from depending back on dma_kws.
+GRU_LAST_READOUT = "gru_last"
+EPS_MEAN_READOUT = "eps_mean"
+_QBYT_READOUT_MODES = frozenset({GRU_LAST_READOUT, EPS_MEAN_READOUT})
+
+
+def _normalize_qbyt_readout_mode(value):
+    mode = str(value).strip().lower()
+    if mode not in _QBYT_READOUT_MODES:
+        choices = ", ".join(sorted(_QBYT_READOUT_MODES))
+        raise ValueError(
+            f"Unsupported QbyT readout mode {value!r}; expected one of: {choices}"
+        )
+    return mode
+
 
 class PositionalEncoding(nn.Module):
     """位置编码模块"""
@@ -57,6 +75,7 @@ class QbyT(nn.Module):
         num_embeds=73, # 其中0,1,2均不会使用 <blank> <unk> <sos/eos>
         embed_dim=128,
         post_num_layers=2,
+        readout_mode=GRU_LAST_READOUT,
     ):
         super().__init__()
         self.audio_projection = nn.Linear(encoder_output_size, embed_dim)
@@ -74,8 +93,15 @@ class QbyT(nn.Module):
             ),
             num_layers=post_num_layers
         )
-        self.gru = nn.GRU(embed_dim, embed_dim, batch_first=True)
-        self.fc = nn.Linear(embed_dim, 1)
+        self.readout_mode = _normalize_qbyt_readout_mode(readout_mode)
+        if self.readout_mode == GRU_LAST_READOUT:
+            self.gru = nn.GRU(embed_dim, embed_dim, batch_first=True)
+            self.fc = nn.Linear(embed_dim, 1)
+            self.final_pos_fc = None
+        else:
+            self.gru = None
+            self.fc = None
+            self.final_pos_fc = nn.Linear(embed_dim, 1)
         self.seq_fc = nn.Linear(embed_dim, 1)
 
 
@@ -142,19 +168,37 @@ class QbyT(nn.Module):
         ) * valid.unsqueeze(-1).to(combined_feat.dtype)
 
         combined_feat = self.phone_matchor(combined_feat, src_key_padding_mask=~valid)
-        # No pack_padded_sequence needed: the readout below sits at the last
-        # valid frame, so the padding the GRU walks afterwards cannot reach it.
-        gru_out, _ = self.gru(combined_feat)
-        last_valid_indices = (valid_lengths - 1).view(batch_size, 1, 1).expand(-1, 1, gru_out.size(-1))
-        gru_out = gru_out.gather(1, last_valid_indices).squeeze(1)
-        logits = self.fc(gru_out).squeeze(-1)
-
         # After re-packing, positions [0, text_lengths) hold this sample's text
         # and [text_lengths, text_width) hold audio frames. That is safe because
         # build_seq_label emits one label per anchor token, so the Stage II
         # sequence loss masks everything past text_lengths -- but it does mean
         # this slice must not be read as "the text block".
-        text_logits = self.seq_fc(combined_feat[:, :text_width, :]).squeeze(-1)
+        text_states = combined_feat[:, :text_width, :]
+        text_logits = self.seq_fc(text_states).squeeze(-1)
+
+        if self.readout_mode == GRU_LAST_READOUT:
+            # No pack_padded_sequence needed: the readout below sits at the last
+            # valid frame, so padding walked afterwards cannot reach it.
+            gru_out, _ = self.gru(combined_feat)
+            last_valid_indices = (valid_lengths - 1).view(batch_size, 1, 1).expand(
+                -1, 1, gru_out.size(-1)
+            )
+            gru_out = gru_out.gather(1, last_valid_indices).squeeze(1)
+            logits = self.fc(gru_out).squeeze(-1)
+        elif self.readout_mode == EPS_MEAN_READOUT:
+            position_logits = self.final_pos_fc(text_states).squeeze(-1)
+            text_positions = torch.arange(text_width, device=text.device).unsqueeze(0)
+            text_mask = text_positions < text_lengths.unsqueeze(1)
+            # For a short anchor, [text_length, text_width) contains re-packed
+            # audio frames rather than text padding. Masking is part of the
+            # readout definition, not only a numerical optimization.
+            logits = torch.where(
+                text_mask,
+                position_logits,
+                torch.zeros_like(position_logits),
+            ).sum(dim=1) / text_mask.sum(dim=1).clamp_min(1)
+        else:  # normalize_qbyt_readout_mode makes this unreachable.
+            raise RuntimeError(f"Unhandled QbyT readout mode: {self.readout_mode}")
         return logits, text_logits
 
 

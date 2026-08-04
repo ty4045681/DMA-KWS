@@ -192,6 +192,7 @@ class Stage2ClipRunner:
         num_workers: int = 0,
         left_padding_ms: int = 0,
         right_padding_ms: int = 0,
+        include_score_details: bool = False,
     ) -> list[dict]:
         """Run Stage II verification on many clips with batched GPU scoring.
 
@@ -255,6 +256,15 @@ class Stage2ClipRunner:
                         0.0,
                         threshold,
                         skipped=True,
+                        score_details=(
+                            {
+                                "qbyt_logit": None,
+                                "completion_logit": None,
+                                "completion_score": None,
+                            }
+                            if include_score_details
+                            else None
+                        ),
                     )
                     continue
                 feats.append(feat)
@@ -262,8 +272,17 @@ class Stage2ClipRunner:
                 pending.append((index, end_sec))
             if not feats:
                 continue
-            scores = self._verifier.score_clip_feats(feats, keyword_ids_batch)
-            for (index, end_sec), score in zip(pending, scores):
+            if include_score_details:
+                detailed_scores = self._verifier.score_clip_feats_detailed(
+                    feats,
+                    keyword_ids_batch,
+                )
+            else:
+                detailed_scores = [
+                    {"qbyt_score": score}
+                    for score in self._verifier.score_clip_feats(feats, keyword_ids_batch)
+                ]
+            for (index, end_sec), score_details in zip(pending, detailed_scores):
                 keyword = rows[index]["keyword"]
                 phonemes, _ = keyword_cache[keyword]
                 results[index] = self._clip_result(
@@ -271,9 +290,10 @@ class Stage2ClipRunner:
                     keyword,
                     phonemes,
                     end_sec,
-                    float(score),
+                    float(score_details["qbyt_score"]),
                     threshold,
                     skipped=False,
+                    score_details=score_details if include_score_details else None,
                 )
         return results
 
@@ -288,8 +308,9 @@ class Stage2ClipRunner:
         *,
         skipped: bool,
         start_sec: float = 0.0,
+        score_details: Mapping[str, Any] | None = None,
     ) -> dict:
-        return {
+        result = {
             "audio": audio_path,
             "keyword": keyword,
             "keyword_phonemes": keyword_phonemes,
@@ -299,6 +320,15 @@ class Stage2ClipRunner:
             "detected": qbyt_score >= threshold,
             "skipped": skipped,
         }
+        if score_details is not None:
+            result.update(
+                {
+                    "qbyt_logit": score_details.get("qbyt_logit"),
+                    "completion_logit": score_details.get("completion_logit"),
+                    "completion_score": score_details.get("completion_score"),
+                }
+            )
+        return result
 
     def run_file_windows(
         self,

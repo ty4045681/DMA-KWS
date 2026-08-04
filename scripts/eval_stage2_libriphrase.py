@@ -28,7 +28,8 @@ def _load_model(config: dict, checkpoint_path: Path, vocab_size: int) -> Stage2L
     assert_qbyt_readout_version(
         checkpoint,
         source=checkpoint_path,
-        allow_legacy=bool(config["stage2"].get("allow_legacy_qbyt_readout", False)),
+        allow_legacy=False,
+        expected_mode=model.qbyt_readout_mode,
     )
 
     if checkpoint_path.suffix == ".pt":
@@ -38,6 +39,15 @@ def _load_model(config: dict, checkpoint_path: Path, vocab_size: int) -> Stage2L
 
     missing, unexpected = model.load_state_dict(state, strict=False)
     assert_adapter_weights_loaded(model, missing)
+    readout_roots = ("qbyt.gru.", "qbyt.fc.", "qbyt.final_pos_fc.")
+    readout_mismatch = [
+        key for key in (*missing, *unexpected) if key.startswith(readout_roots)
+    ]
+    if readout_mismatch:
+        raise SystemExit(
+            f"Checkpoint {checkpoint_path} does not carry the configured "
+            f"{model.qbyt_readout_mode!r} QbyT readout weights: {readout_mismatch}"
+        )
     if missing:
         print(f"Warning: missing keys when loading checkpoint: {len(missing)}")
     if unexpected:
@@ -105,11 +115,17 @@ def main(cfg: DictConfig) -> None:
     metrics = results[0] if results else {}
     auc = float(metrics.get("test/auc", 0.0))
     eer = float(metrics.get("test/eer", 0.0))
+    test_metrics = {
+        str(name).removeprefix("test/"): float(value)
+        for name, value in metrics.items()
+        if str(name).startswith("test/")
+    }
 
     output = {
         "split": split,
         "auc": auc,
         "eer": eer,
+        "metrics": test_metrics,
         "stream": model.stream_policy.describe(),
     }
     print(json.dumps(output))

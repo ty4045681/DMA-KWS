@@ -47,6 +47,7 @@ def main(cfg: DictConfig) -> None:
 
     # Imported here so the friendly ImportError above fires first on a CPU box.
     from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
+    from dma_kws.stage2.readout import assert_qbyt_readout_state_loaded
     from dma_kws.training.checkpoint_io import assert_qbyt_readout_version, extract_state_dict
 
     config = resolved_config(cfg)
@@ -77,7 +78,8 @@ def main(cfg: DictConfig) -> None:
     assert_qbyt_readout_version(
         checkpoint,
         source=checkpoint_path,
-        allow_legacy=bool(config["stage2"].get("allow_legacy_qbyt_readout", False)),
+        allow_legacy=False,
+        expected_mode=model.qbyt_readout_mode,
     )
     state = (
         extract_state_dict(checkpoint)
@@ -86,6 +88,12 @@ def main(cfg: DictConfig) -> None:
     )
     missing, unexpected = model.load_state_dict(state, strict=False)
     assert_adapter_weights_loaded(model, missing)
+    assert_qbyt_readout_state_loaded(
+        missing,
+        unexpected,
+        source=checkpoint_path,
+        expected_mode=model.qbyt_readout_mode,
+    )
     if missing:
         print(f"Warning: {len(missing)} missing keys when loading checkpoint")
     if unexpected:

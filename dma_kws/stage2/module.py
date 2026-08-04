@@ -17,6 +17,8 @@ from dma_kws.nn import build_encoder, run_encoder
 from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage2.losses import compute_stage2_losses
 from dma_kws.stage2.objective import resolve_sequence_objective
+from dma_kws.stage2.readout import resolve_qbyt_readout_mode
+from dma_kws.stage2.scoring import gather_completion_logits
 from dma_kws.training.checkpoint_io import (
     assert_qbyt_readout_version,
     assert_stream_policy_matches,
@@ -97,6 +99,7 @@ class Stage2LightningModule(pl.LightningModule):
         encoder_dim = int(stage2.get("encoder_output_dim", stage1.get("encoder_output_dim", 144)))
 
         sequence_objective = resolve_sequence_objective(stage2)
+        self.qbyt_readout_mode = resolve_qbyt_readout_mode(stage2)
         self.seq_label_mode = sequence_objective.target_mode
         self.seq_progress_weight = sequence_objective.progress_weight
         self.seq_completion_weight = sequence_objective.completion_weight
@@ -149,6 +152,7 @@ class Stage2LightningModule(pl.LightningModule):
             num_embeds=vocab_size,
             embed_dim=int(stage2.get("qbyt_embed_dim", 128)),
             post_num_layers=int(stage2.get("qbyt_layers", 2)),
+            readout_mode=self.qbyt_readout_mode,
         )
 
         self._stage2_cfg = stage2
@@ -252,6 +256,7 @@ class Stage2LightningModule(pl.LightningModule):
         assert_qbyt_readout_version(
             checkpoint,
             source=checkpoint_path,
+            expected_mode=self.qbyt_readout_mode,
             # A legacy readout is only useful as a warm start when QbyT will be
             # retrained. LoRA freezes QbyT, so its strict base path must reject it.
             allow_legacy=self._allow_legacy_qbyt_readout and not require_full_qbyt,
@@ -417,7 +422,12 @@ class Stage2LightningModule(pl.LightningModule):
         assert_qbyt_readout_version(
             checkpoint,
             source="the Stage II checkpoint being restored",
-            allow_legacy=self._allow_legacy_qbyt_readout,
+            expected_mode=self.qbyt_readout_mode,
+            # Full Lightning restore also restores optimizer/scheduler state.
+            # The legacy escape hatch is weights-only and belongs exclusively
+            # to _load_init_checkpoint; a v2 gru_last checkpoint is accepted by
+            # the explicit compatibility rule without this flag.
+            allow_legacy=False,
         )
 
     def forward(
@@ -762,13 +772,8 @@ class Stage2LightningModule(pl.LightningModule):
         labels: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the final valid anchor-position score and matching labels."""
-        if seq_logits.size(1) == 0:
-            valid = torch.zeros(labels.shape, device=labels.device, dtype=torch.bool)
-            return seq_logits.new_empty(0), labels.new_empty(0), valid
         anchor_lengths = anchor.ne(0).sum(dim=1)
-        valid = anchor_lengths.gt(0)
-        indices = anchor_lengths.sub(1).clamp_min(0).unsqueeze(1)
-        completion_logits = seq_logits.gather(1, indices).squeeze(1)
+        completion_logits, valid = gather_completion_logits(seq_logits, anchor_lengths)
         return torch.sigmoid(completion_logits[valid]), labels[valid], valid
 
     def _update_score_diagnostics(

@@ -45,6 +45,7 @@ class _FakeQbyT(nn.Module):
     def __init__(self, encoder_output_size: int = 144, num_embeds: int = 73, **kwargs):
         super().__init__()
         self.dummy = nn.Parameter(torch.zeros(1))
+        self.readout_mode = kwargs.get("readout_mode", "gru_last")
 
     def forward(self, speech, text, speech_lengths=None, text_lengths=None):
         batch_size = speech.size(0)
@@ -104,6 +105,21 @@ def test_forward_and_training_step_smoke(patched_module):
     loss = module.training_step(batch, 0)
     assert loss.ndim == 0
     assert torch.isfinite(loss)
+
+
+def test_stage2_module_passes_eps_readout_to_qbyt(monkeypatch):
+    config = _minimal_config()
+    config["stage2"]["qbyt_readout"] = {"mode": "eps_mean"}
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_encoder",
+        lambda *_args, **_kwargs: MagicMock(side_effect=_mock_encoder_output),
+    )
+    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _FakeQbyT)
+
+    module = Stage2LightningModule(config, vocab_size=71)
+
+    assert module.qbyt_readout_mode == "eps_mean"
+    assert module.qbyt.readout_mode == "eps_mean"
 
 
 def test_train_end_flushes_partial_window_once(patched_module):
@@ -546,6 +562,15 @@ def test_saved_checkpoints_carry_the_readout_version(monkeypatch):
 def test_lightning_restore_rejects_a_stale_readout(monkeypatch):
     """Covers load_from_checkpoint and Trainer.fit(ckpt_path=...) alike."""
     module = _stage2_module(monkeypatch)
+
+    with pytest.raises(SystemExit, match="readout unversioned"):
+        module.on_load_checkpoint({"state_dict": {"qbyt.dummy": torch.zeros(1)}})
+
+
+def test_legacy_flag_does_not_allow_full_lightning_restore(monkeypatch):
+    config = _minimal_config()
+    config["stage2"]["allow_legacy_qbyt_readout"] = True
+    module = _stage2_module(monkeypatch, config)
 
     with pytest.raises(SystemExit, match="readout unversioned"):
         module.on_load_checkpoint({"state_dict": {"qbyt.dummy": torch.zeros(1)}})

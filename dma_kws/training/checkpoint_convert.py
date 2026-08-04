@@ -199,7 +199,19 @@ def _resolved_config(
     )
 
 
-def _require_current_readout(checkpoint: Mapping[str, Any]) -> int:
+def _require_compatible_readout(
+    checkpoint: Mapping[str, Any],
+    config: Mapping[str, Any],
+) -> int:
+    """Return the saved version when this build can reproduce its readout.
+
+    Version 2 GRU-last is still implemented byte-for-byte so historical models
+    can be evaluated and converted safely.  Preserve version 2 in the output;
+    relabeling those weights as version 3 would falsify their provenance.
+    """
+
+    from dma_kws.stage2.readout import GRU_LAST_READOUT, resolve_qbyt_readout_mode
+
     raw_saved = checkpoint.get(QBYT_READOUT_VERSION_KEY)
     if raw_saved is None:
         raise CheckpointConversionError(
@@ -211,11 +223,20 @@ def _require_current_readout(checkpoint: Mapping[str, Any]) -> int:
         "QbyT readout version",
         [(f"checkpoint.{QBYT_READOUT_VERSION_KEY}", raw_saved)],
     )
+    stage2 = config.get("stage2")
+    if not isinstance(stage2, Mapping):
+        raise CheckpointConversionError("Resolved config has no stage2 mapping")
+    mode = resolve_qbyt_readout_mode(stage2)
+    if saved == QBYT_READOUT_VERSION:
+        return saved
+    if saved == 2 and mode == GRU_LAST_READOUT:
+        return saved
     if saved != QBYT_READOUT_VERSION:
         raise CheckpointConversionError(
-            f"Checkpoint QbyT readout version is {saved!r}; this build requires "
-            f"{QBYT_READOUT_VERSION}. Refusing to stamp current metadata onto weights "
-            "trained against a different or unknown readout."
+            f"Checkpoint QbyT readout version is {saved!r}, while its resolved mode is "
+            f"{mode!r}; this build supports version {QBYT_READOUT_VERSION}, plus version "
+            "2 only with mode 'gru_last'. Refusing to stamp incompatible metadata onto "
+            "weights trained against a different or unknown readout."
         )
     return saved
 
@@ -421,6 +442,7 @@ def _validate_deployable_model_state(
 
     try:
         from dma_kws.pathing import load_qbyt_class
+        from dma_kws.stage2.readout import resolve_qbyt_readout_mode
 
         QbyT = load_qbyt_class()
         qbyt = QbyT(
@@ -428,6 +450,7 @@ def _validate_deployable_model_state(
             num_embeds=vocab_size,
             embed_dim=int(stage2.get("qbyt_embed_dim", 128)),
             post_num_layers=int(stage2.get("qbyt_layers", 2)),
+            readout_mode=resolve_qbyt_readout_mode(stage2),
         )
         qbyt.load_state_dict(_submodule_state(state, "qbyt"), strict=True)
     except (ImportError, RuntimeError, SystemExit, TypeError, ValueError) as exc:
@@ -461,7 +484,7 @@ def _base_model_metadata(
         "step": _checkpoint_step(checkpoint),
         "tokenizer_dict_path": tokenizer_dict_path,
         "vocab_size": vocab_size,
-        QBYT_READOUT_VERSION_KEY: _require_current_readout(checkpoint),
+        QBYT_READOUT_VERSION_KEY: _require_compatible_readout(checkpoint, config),
     }
 
 
@@ -813,7 +836,7 @@ def convert_checkpoint(
     kind = detect_checkpoint_kind(state)
     _validate_checkpoint_kind_metadata(checkpoint, kind)
     config = _resolved_config(checkpoint, fallback_config)
-    readout_version = _require_current_readout(checkpoint)
+    readout_version = _require_compatible_readout(checkpoint, config)
 
     if kind == "stage2":
         if lora_output == "adapter":

@@ -383,6 +383,15 @@ class Stage2SequenceLossConfig:
 
 
 @dataclass
+class Stage2QbyTReadoutConfig:
+    """Final utterance-score readout applied after the QbyT matcher."""
+
+    #: ``gru_last`` reproduces readout v2. ``eps_mean`` applies one shared
+    #: position scorer to valid anchor states and averages its raw logits.
+    mode: str = "gru_last"
+
+
+@dataclass
 class Stage2Config:
     encoder_output_dim: int = 144
     qbyt_embed_dim: int = 128
@@ -429,6 +438,9 @@ class Stage2Config:
     prep: Stage2PrepConfig = field(default_factory=Stage2PrepConfig)
     sequence_loss: Stage2SequenceLossConfig = field(
         default_factory=Stage2SequenceLossConfig
+    )
+    qbyt_readout: Stage2QbyTReadoutConfig = field(
+        default_factory=Stage2QbyTReadoutConfig
     )
     phoneme_adapter: Stage2PhonemeAdapterConfig = field(
         default_factory=Stage2PhonemeAdapterConfig

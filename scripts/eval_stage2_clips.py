@@ -9,35 +9,131 @@ Padding is part of the scored model input and counts toward its minimum length.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from dma_kws.config import require_sections
+from dma_kws.config import (
+    fbank_kwargs,
+    get_eval_fbank_config,
+    get_tokenizer_config,
+    require_sections,
+)
 from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.inference.manifest import load_manifest
 from dma_kws.inference.metrics import summarize_labeled_results
 from dma_kws.inference.stage2_clip import Stage2ClipRunner
+from dma_kws.pathing import resolve_dict_path
+from dma_kws.stage2.objective import checkpoint_sequence_objective
+from dma_kws.stage2.readout import resolve_qbyt_readout_mode
+from dma_kws.training.score_diagnostics import binary_score_diagnostics
 from dma_kws.training.device import resolve_accelerator
 
 
 DEFAULT_PADDING_MS = 160
+_PROVENANCE_SCHEMA_VERSION = 1
+
+
+def _file_identity(path: str | Path, *, kind: str) -> dict[str, str | int]:
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise SystemExit(f"{kind} file not found: {resolved}")
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "path": str(resolved),
+        "size_bytes": resolved.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _score_provenance(
+    config: dict,
+    *,
+    checkpoint_path: str | Path,
+    stream: object,
+    left_padding_ms: int,
+    right_padding_ms: int,
+) -> dict:
+    """Return the small, semantic fingerprint needed to compare score files."""
+
+    stage2 = config.get("stage2", {}) or {}
+    tokenizer = get_tokenizer_config(config)
+    tokenizer_identity = _file_identity(
+        resolve_dict_path(config),
+        kind="Tokenizer dictionary",
+    )
+    tokenizer_identity["split_with_space"] = str(
+        tokenizer.get("split_with_space", " ")
+    )
+    try:
+        import torch
+
+        checkpoint = torch.load(
+            Path(checkpoint_path).expanduser().resolve(),
+            map_location="cpu",
+        )
+    except Exception as exc:
+        raise SystemExit(
+            f"Failed to read Stage II checkpoint objective metadata: {exc}"
+        ) from exc
+    sequence_objective = checkpoint_sequence_objective(checkpoint)
+
+    return {
+        "schema_version": _PROVENANCE_SCHEMA_VERSION,
+        "checkpoint": _file_identity(checkpoint_path, kind="Stage II checkpoint"),
+        "qbyt_readout_mode": resolve_qbyt_readout_mode(stage2),
+        "stream": stream,
+        "audio_padding_ms": {
+            "left": int(left_padding_ms),
+            "right": int(right_padding_ms),
+        },
+        "fbank": fbank_kwargs(get_eval_fbank_config(config)),
+        "tokenizer": tokenizer_identity,
+        # Derive this from the checkpoint, not the runtime config. A checkpoint
+        # without embedded objective metadata is intentionally classified as
+        # the released membership/zero-completion legacy objective.
+        "sequence_objective": sequence_objective.as_dict(),
+    }
+
+
+def _finite_float(value: object, *, field: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a finite number, got {value!r}") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be finite, got {number!r}")
+    return number
 
 
 def _result_record(manifest_row: dict, runner_result: dict) -> dict:
     record = {
         "audio_path": manifest_row["audio_path"],
         "keyword": manifest_row["keyword"],
-        "qbyt_score": float(runner_result.get("qbyt_score", 0.0)),
+        "qbyt_score": _finite_float(
+            runner_result.get("qbyt_score", 0.0),
+            field="qbyt_score",
+        ),
         "detected": bool(runner_result["detected"]),
-        "threshold": float(runner_result["threshold"]),
+        "threshold": _finite_float(runner_result["threshold"], field="threshold"),
         "skipped": bool(runner_result.get("skipped", False)),
     }
     if "label" in manifest_row:
         record["label"] = int(manifest_row["label"])
+    for name in ("qbyt_logit", "completion_logit", "completion_score"):
+        if name in runner_result:
+            value = runner_result[name]
+            record[name] = (
+                None if value is None else _finite_float(value, field=name)
+            )
 
     manifest_meta = {
         key: value
@@ -53,6 +149,47 @@ def _metrics_record(record: dict) -> dict:
     metrics_row = dict(record)
     metrics_row["best_qbyt_score"] = float(record.get("qbyt_score", 0.0))
     return metrics_row
+
+
+def _score_head_diagnostics(
+    records: list[dict],
+    *,
+    score_field: str,
+    threshold: float,
+    ece_num_bins: int,
+) -> dict:
+    import torch
+
+    usable = [
+        record
+        for record in records
+        if "label" in record
+        and not bool(record.get("skipped", False))
+        and record.get(score_field) is not None
+    ]
+    if not usable:
+        return {}
+    scores = torch.tensor(
+        [float(record[score_field]) for record in usable],
+        dtype=torch.float64,
+    )
+    labels = torch.tensor(
+        [int(record["label"]) for record in usable],
+        dtype=torch.long,
+    )
+    diagnostics = binary_score_diagnostics(
+        scores,
+        labels,
+        deployment_threshold=threshold,
+        ece_num_bins=ece_num_bins,
+    )
+    result = {}
+    for name, value in diagnostics.items():
+        item = value.item() if value.numel() == 1 else value.detach().cpu().tolist()
+        if isinstance(item, float) and not math.isfinite(item):
+            item = None
+        result[name] = item
+    return result
 
 
 def _resolve_audio_padding_ms(prep: dict) -> tuple[int, int]:
@@ -111,16 +248,27 @@ def run_eval(cfg: DictConfig) -> dict:
         num_workers=num_workers,
         left_padding_ms=left_padding_ms,
         right_padding_ms=right_padding_ms,
+        include_score_details=True,
     )
     results = [
         _result_record(row, runner_result)
         for row, runner_result in zip(rows, runner_results)
     ]
 
+    stream_description = runner.stream_policy.describe()
+    provenance = _score_provenance(
+        config,
+        checkpoint_path=stage2_ckpt,
+        stream=stream_description,
+        left_padding_ms=left_padding_ms,
+        right_padding_ms=right_padding_ms,
+    )
     results_path = output_dir / "results.jsonl"
     with results_path.open("w", encoding="utf-8") as handle:
         for record in results:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.write(
+                json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+            )
 
     summary = {
         "manifest": str(Path(manifest_path).resolve()),
@@ -130,20 +278,54 @@ def run_eval(cfg: DictConfig) -> dict:
             "left": left_padding_ms,
             "right": right_padding_ms,
         },
-        "stream": runner.stream_policy.describe(),
+        "stream": stream_description,
+        "num_skipped": sum(bool(record.get("skipped", False)) for record in results),
+        "provenance": provenance,
+    }
+    scored_results = [record for record in results if not record.get("skipped", False)]
+    deployment_threshold = float(runner._demo_cfg.get("qbyt_threshold", 0.5))
+    validation_cfg = (config.get("stage2", {}) or {}).get("validation", {}) or {}
+    completion_threshold = float(
+        validation_cfg.get("seq_diagnostic_threshold", 0.5)
+    )
+    ece_num_bins = int(validation_cfg.get("ece_num_bins", 15))
+    summary["score_diagnostic_config"] = {
+        "utterance_threshold": deployment_threshold,
+        "completion_threshold": completion_threshold,
+        "ece_num_bins": ece_num_bins,
     }
     labeled_summary = summarize_labeled_results(
-        [_metrics_record(record) for record in results],
-        threshold=float(runner._demo_cfg.get("qbyt_threshold", 0.5)),
+        [_metrics_record(record) for record in scored_results],
+        threshold=deployment_threshold,
     )
     if labeled_summary:
         summary["metrics"] = labeled_summary
+        summary["score_heads"] = {
+            "utterance": _score_head_diagnostics(
+                results,
+                score_field="qbyt_score",
+                threshold=deployment_threshold,
+                ece_num_bins=ece_num_bins,
+            ),
+            "completion": _score_head_diagnostics(
+                results,
+                score_field="completion_score",
+                threshold=completion_threshold,
+                ece_num_bins=ece_num_bins,
+            ),
+        }
 
     summary_path = output_dir / "summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, ensure_ascii=False, indent=2)
+        json.dump(
+            summary,
+            handle,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
 
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False))
     return summary
 
 

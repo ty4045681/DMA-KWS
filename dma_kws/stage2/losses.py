@@ -7,6 +7,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from dma_kws.stage2.scoring import gather_last_valid_logits
+
 
 SEQ_LOSS_NORMALIZATIONS = frozenset({"sample", "token"})
 
@@ -78,18 +80,11 @@ def _completion_bce(
     anchor occurs in order and contiguously in the query.
     """
     valid = seq_label_mask.bool()
-    if seq_logits.size(1) == 0:
-        return seq_logits.sum() * 0.0
-
-    positions = torch.arange(
-        seq_logits.size(1),
-        device=seq_logits.device,
-    ).unsqueeze(0)
-    last_indices = torch.where(valid, positions, -1).amax(dim=1)
-    valid_samples = last_indices.ge(0)
-    gather_indices = last_indices.clamp_min(0).unsqueeze(1)
-    completion_logits = seq_logits.gather(1, gather_indices).squeeze(1)
-    completion_labels = seq_labels.gather(1, gather_indices).squeeze(1).float()
+    completion_logits, valid_samples = gather_last_valid_logits(seq_logits, valid)
+    completion_labels, _ = gather_last_valid_logits(
+        seq_labels.to(dtype=seq_logits.dtype),
+        valid,
+    )
     safe_logits = torch.where(
         valid_samples,
         completion_logits,

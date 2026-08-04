@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -9,8 +10,9 @@ from dma_kws.inference.manifest import load_manifest
 from dma_kws.inference.metrics import binary_eer, summarize_labeled_results
 import scripts.eval_stage2_clips as eval_stage2_clips
 from scripts.eval_stage2_clips import (
-    _resolve_audio_padding_ms,
     _result_record as stage2_clip_result_record,
+    _resolve_audio_padding_ms,
+    _score_provenance,
 )
 from scripts.eval_two_stage_kws import _result_record as two_stage_result_record
 
@@ -41,6 +43,25 @@ def test_stage2_clip_audio_padding_rejects_negative_values(prep):
 
 
 def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    checkpoint_path = tmp_path / "stage2.pt"
+    torch.save(
+        {
+            "config": {
+                "stage2": {
+                    "sequence_loss": {
+                        "target_mode": "ordered_contiguous_prefix",
+                        "progress_weight": 0.5,
+                        "completion_weight": 0.5,
+                        "normalization": "sample",
+                    }
+                }
+            }
+        },
+        checkpoint_path,
+    )
+    tokenizer_path = tmp_path / "lang_char.txt"
+    tokenizer_path.write_text("<blank> 0\nHH 1\n", encoding="utf-8")
     rows = [{"audio_path": "clip.wav", "keyword": "hello"}]
     captured = {}
 
@@ -78,9 +99,22 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
         lambda _cfg: {
             "paths": {},
             "stage1": {},
-            "stage2": {},
+            "stage2": {
+                "qbyt_readout": {"mode": "gru_last"},
+                "sequence_loss": {
+                    "target_mode": "ordered_contiguous_prefix",
+                    "completion_weight": 0.5,
+                },
+                "validation": {
+                    "ece_num_bins": 9,
+                    "seq_diagnostic_threshold": 0.4,
+                },
+            },
             "demo": {},
-            "tokenizer": {},
+            "tokenizer": {
+                "dict_path": str(tokenizer_path),
+                "split_with_space": " ",
+            },
         },
     )
     monkeypatch.setattr(eval_stage2_clips, "load_manifest", lambda _path: rows)
@@ -93,7 +127,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
         {
             "prep": {
                 "manifest": "manifest.csv",
-                "stage2_ckpt": "stage2.pt",
+                "stage2_ckpt": str(checkpoint_path),
                 "output_dir": str(tmp_path),
                 "num_workers": 1,
             },
@@ -107,8 +141,57 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert captured["kwargs"]["left_padding_ms"] == 160
     assert captured["kwargs"]["right_padding_ms"] == 160
     assert summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    assert summary["provenance"]["checkpoint"]["path"] == str(
+        checkpoint_path.resolve()
+    )
+    assert summary["provenance"]["checkpoint"]["sha256"] == hashlib.sha256(
+        checkpoint_path.read_bytes()
+    ).hexdigest()
+    assert summary["provenance"]["sequence_objective"]["target_mode"] == (
+        "ordered_contiguous_prefix"
+    )
+    assert summary["score_diagnostic_config"] == {
+        "utterance_threshold": 0.5,
+        "completion_threshold": 0.4,
+        "ece_num_bins": 9,
+    }
     saved_summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert saved_summary["audio_padding_ms"] == {"left": 160, "right": 160}
+
+
+def test_score_provenance_classifies_missing_checkpoint_config_as_legacy(tmp_path):
+    torch = pytest.importorskip("torch")
+    checkpoint_path = tmp_path / "legacy.pt"
+    torch.save({"state_dict": {}}, checkpoint_path)
+    tokenizer_path = tmp_path / "lang_char.txt"
+    tokenizer_path.write_text("<blank> 0\nHH 1\n", encoding="utf-8")
+    config = {
+        "stage1": {},
+        "stage2": {"qbyt_readout": {"mode": "gru_last"}},
+        "fbank": {},
+        "tokenizer": {
+            "dict_path": str(tokenizer_path),
+            "split_with_space": " ",
+        },
+    }
+
+    provenance = _score_provenance(
+        config,
+        checkpoint_path=checkpoint_path,
+        stream="full-context",
+        left_padding_ms=160,
+        right_padding_ms=160,
+    )
+
+    assert provenance["sequence_objective"] == {
+        "target_mode": "membership",
+        "progress_weight": 1.0,
+        "completion_weight": 0.0,
+        "normalization": "token",
+    }
+    assert provenance["tokenizer"]["sha256"] == hashlib.sha256(
+        tokenizer_path.read_bytes()
+    ).hexdigest()
 
 
 def test_load_manifest_csv_smoke():
@@ -285,3 +368,38 @@ def test_stage2_clip_result_record_includes_manifest_meta_for_extra_columns():
         "speaker_id": "spk-002",
         "utterance_id": "utt-77",
     }
+
+
+def test_stage2_clip_result_record_preserves_raw_head_logits():
+    record = stage2_clip_result_record(
+        {"audio_path": "/tmp/audio.wav", "keyword": "hello", "label": 0},
+        {
+            "qbyt_score": 0.9,
+            "qbyt_logit": 2.1972246,
+            "completion_score": 0.25,
+            "completion_logit": -1.0986123,
+            "detected": True,
+            "threshold": 0.5,
+            "skipped": False,
+        },
+    )
+
+    assert record["qbyt_logit"] == pytest.approx(2.1972246)
+    assert record["completion_score"] == pytest.approx(0.25)
+    assert record["completion_logit"] == pytest.approx(-1.0986123)
+
+
+def test_stage2_clip_result_record_rejects_non_finite_scores():
+    with pytest.raises(ValueError, match="qbyt_logit must be finite"):
+        stage2_clip_result_record(
+            {"audio_path": "/tmp/audio.wav", "keyword": "hello", "label": 0},
+            {
+                "qbyt_score": 0.9,
+                "qbyt_logit": float("nan"),
+                "completion_score": 0.25,
+                "completion_logit": -1.0,
+                "detected": True,
+                "threshold": 0.5,
+                "skipped": False,
+            },
+        )

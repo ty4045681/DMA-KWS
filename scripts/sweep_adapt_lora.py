@@ -42,6 +42,7 @@ def _eval_lph_auc(
     from dma_kws.stage2.collate import test_collate_fn
     from dma_kws.stage2.dataset import LibriPhraseEvalDataset, resolve_stage2_eval_paths
     from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
+    from dma_kws.stage2.readout import assert_qbyt_readout_state_loaded
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training.checkpoint_io import (
         assert_qbyt_readout_version,
@@ -82,11 +83,18 @@ def _eval_lph_auc(
     assert_qbyt_readout_version(
         ckpt,
         source=checkpoint,
-        allow_legacy=bool(config.get("stage2", {}).get("allow_legacy_qbyt_readout", False)),
+        allow_legacy=False,
+        expected_mode=model.qbyt_readout_mode,
     )
     state = extract_state_dict(ckpt)
-    missing, _ = model.load_state_dict(state, strict=False)
+    missing, unexpected = model.load_state_dict(state, strict=False)
     assert_adapter_weights_loaded(model, missing)
+    assert_qbyt_readout_state_loaded(
+        missing,
+        unexpected,
+        source=checkpoint,
+        expected_mode=model.qbyt_readout_mode,
+    )
     trainer = pl.Trainer(
         accelerator=accelerator, devices=1, logger=False, enable_checkpointing=False
     )
@@ -110,6 +118,10 @@ def _eval_target_auc(
     from dma_kws.stage2.adapt_paths import adapt_data_root, phase_manifest
     from dma_kws.stage2.collate import test_collate_fn
     from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
+    from dma_kws.stage2.readout import (
+        assert_qbyt_readout_state_loaded,
+        resolve_qbyt_readout_mode,
+    )
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training.checkpoint_io import (
         assert_qbyt_readout_version,
@@ -142,10 +154,12 @@ def _eval_target_auc(
     )
 
     ckpt = torch.load(checkpoint, map_location="cpu")
+    expected_readout_mode = resolve_qbyt_readout_mode(config.get("stage2", {}))
     assert_qbyt_readout_version(
         ckpt,
         source=checkpoint,
-        allow_legacy=bool(config.get("stage2", {}).get("allow_legacy_qbyt_readout", False)),
+        allow_legacy=False,
+        expected_mode=expected_readout_mode,
     )
     state = extract_state_dict(ckpt)
 
@@ -166,8 +180,14 @@ def _eval_target_auc(
             self.target_auc_metric.reset()
 
     model = _TargetValModule(config, vocab_size=vocab_size)
-    missing, _ = model.load_state_dict(state, strict=False)
+    missing, unexpected = model.load_state_dict(state, strict=False)
     assert_adapter_weights_loaded(model, missing)
+    assert_qbyt_readout_state_loaded(
+        missing,
+        unexpected,
+        source=checkpoint,
+        expected_mode=model.qbyt_readout_mode,
+    )
 
     trainer = pl.Trainer(
         accelerator=accelerator, devices=1, logger=False, enable_checkpointing=False

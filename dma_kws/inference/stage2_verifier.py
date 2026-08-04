@@ -30,6 +30,7 @@ def _load_model_state(
     *,
     stream_policy=None,
     allow_legacy_qbyt_readout: bool = False,
+    expected_qbyt_readout_mode: str | None = None,
 ):
     ckpt = load_fn(ckpt_path, map_location="cpu")
     if stream_policy is not None:
@@ -42,6 +43,7 @@ def _load_model_state(
         ckpt,
         source=ckpt_path,
         allow_legacy=allow_legacy_qbyt_readout,
+        expected_mode=expected_qbyt_readout_mode,
     )
     state = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state, strict=True)
@@ -81,6 +83,9 @@ class Stage2Verifier:
         self._stream_policy = stream_policy
         adapter_cfg = stage2_cfg.get("phoneme_adapter", {}) or {}
         adapter_enabled = bool(adapter_cfg.get("enabled", False))
+        from dma_kws.stage2.readout import resolve_qbyt_readout_mode
+
+        qbyt_readout_mode = resolve_qbyt_readout_mode(stage2_cfg)
 
         class Stage2Model(torch.nn.Module):
             def __init__(self):
@@ -107,9 +112,10 @@ class Stage2Verifier:
                     num_embeds=vocab_size,
                     embed_dim=int(stage2_cfg.get("qbyt_embed_dim", 128)),
                     post_num_layers=int(stage2_cfg.get("qbyt_layers", 2)),
+                    readout_mode=qbyt_readout_mode,
                 )
 
-            def forward(self, feats, feat_lengths, anchors, anchor_lengths):
+            def _encode_and_score(self, feats, feat_lengths, anchors, anchor_lengths):
                 # Inference always runs at the deployment operating point.
                 encoder_out, encoder_mask = run_encoder(
                     self.encoder,
@@ -126,11 +132,35 @@ class Stage2Verifier:
                     speech, _ = self.adapter(
                         encoder_out, encoder_mask, with_log_probs=False
                     )
-                logits, _ = self.qbyt(
+                return self.qbyt(
                     speech,
                     anchors,
                     speech_lengths=encoder_lens,
                     text_lengths=anchor_lengths,
+                )
+
+            def forward_logits(self, feats, feat_lengths, anchors, anchor_lengths):
+                """Return unsquashed utterance/completion logits for analysis."""
+                from dma_kws.stage2.scoring import gather_completion_logits
+
+                logits, seq_logits = self._encode_and_score(
+                    feats,
+                    feat_lengths,
+                    anchors,
+                    anchor_lengths,
+                )
+                completion_logits, completion_valid = gather_completion_logits(
+                    seq_logits,
+                    anchor_lengths,
+                )
+                return logits, completion_logits, completion_valid
+
+            def forward(self, feats, feat_lengths, anchors, anchor_lengths):
+                logits, _ = self._encode_and_score(
+                    feats,
+                    feat_lengths,
+                    anchors,
+                    anchor_lengths,
                 )
                 return torch.sigmoid(logits)
 
@@ -141,9 +171,10 @@ class Stage2Verifier:
                 stage2_ckpt,
                 torch.load,
                 stream_policy=stream_policy,
-                allow_legacy_qbyt_readout=bool(
-                    stage2_cfg.get("allow_legacy_qbyt_readout", False)
-                ),
+                # Inference must never score a random or semantically stale
+                # readout. The legacy flag is reserved for training warm starts.
+                allow_legacy_qbyt_readout=False,
+                expected_qbyt_readout_mode=qbyt_readout_mode,
             )
         except RuntimeError as exc:
             raise SystemExit(
@@ -238,6 +269,71 @@ class Stage2Verifier:
                 anchor_lengths.to(self._device),
             )
         return [float(value) for value in scores.reshape(-1).cpu()]
+
+    def score_clip_feats_detailed(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+    ) -> list[dict[str, float | None]]:
+        """Return raw and probability scores for both Stage II heads.
+
+        This analysis-only API deliberately leaves :meth:`score_clip_feats`
+        unchanged, so enabling diagnostics cannot alter deployed decisions.
+        Empty anchors have no completion score and are represented by ``None``.
+        """
+
+        torch = self._torch
+        if not feats:
+            return []
+        if len(feats) != len(keyword_ids_batch):
+            raise ValueError("feats and keyword_ids_batch must have the same length")
+
+        from torch.nn.utils.rnn import pad_sequence
+
+        padded_feats = pad_sequence(list(feats), batch_first=True, padding_value=0)
+        feat_lengths = torch.tensor([f.size(0) for f in feats], dtype=torch.long)
+        anchors = pad_sequence(
+            [torch.tensor(list(ids), dtype=torch.long) for ids in keyword_ids_batch],
+            batch_first=True,
+            padding_value=0,
+        )
+        anchor_lengths = torch.tensor(
+            [len(ids) for ids in keyword_ids_batch], dtype=torch.long
+        )
+        with torch.no_grad():
+            utt_logits, completion_logits, completion_valid = self._model.forward_logits(
+                padded_feats.to(self._device),
+                feat_lengths.to(self._device),
+                anchors.to(self._device),
+                anchor_lengths.to(self._device),
+            )
+            utt_scores = torch.sigmoid(utt_logits)
+            completion_scores = torch.sigmoid(completion_logits)
+
+        utt_logits = utt_logits.reshape(-1).detach().cpu()
+        utt_scores = utt_scores.reshape(-1).detach().cpu()
+        completion_logits = completion_logits.reshape(-1).detach().cpu()
+        completion_scores = completion_scores.reshape(-1).detach().cpu()
+        completion_valid = completion_valid.reshape(-1).detach().cpu()
+        return [
+            {
+                "qbyt_logit": float(utt_logit),
+                "qbyt_score": float(utt_score),
+                "completion_logit": (
+                    float(completion_logit) if bool(is_valid) else None
+                ),
+                "completion_score": (
+                    float(completion_score) if bool(is_valid) else None
+                ),
+            }
+            for utt_logit, utt_score, completion_logit, completion_score, is_valid in zip(
+                utt_logits,
+                utt_scores,
+                completion_logits,
+                completion_scores,
+                completion_valid,
+            )
+        ]
 
     def decode_phoneme_feats(self, feats: Sequence) -> list[list[int]]:
         """Greedily decode phoneme ids from full-clip fbank features.

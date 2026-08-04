@@ -69,6 +69,7 @@ class ScanInput:
     subset_scores: dict[str, np.ndarray]
     subset_hours: dict[str, float]
     subset_names: dict[str, str]
+    num_skipped: int
 
 
 def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
@@ -226,9 +227,14 @@ def load_scan_input(
     records = _read_results(results_path)
     resolved_mode = _infer_mode(mode, records, summary)
 
+    scored_records: list[dict[str, Any]] = []
     scores: list[float] = []
     labels: list[int] = []
+    num_skipped = 0
     for index, record in enumerate(records, start=1):
+        if bool(record.get("skipped", False)):
+            num_skipped += 1
+            continue
         if "qbyt_score" not in record:
             raise SystemExit(
                 f"{results_path}:{index} has no qbyt_score; this is not a supported "
@@ -247,6 +253,13 @@ def load_scan_input(
             raise SystemExit(f"{results_path}:{index} has invalid label={label}; expected 0 or 1")
         scores.append(score)
         labels.append(label)
+        scored_records.append(record)
+
+    if not scored_records:
+        raise SystemExit(
+            f"No scored rows remain in {results_path} after excluding "
+            f"{num_skipped} skipped row(s)"
+        )
 
     score_array = np.asarray(scores, dtype=np.float64)
     label_array = np.asarray(labels, dtype=np.int64)
@@ -277,7 +290,10 @@ def load_scan_input(
     subset_hours: dict[str, float] = {}
     subset_names: dict[str, str] = {}
     if resolved_mode == "musan" and include_subsets:
-        subset_scores, subset_hours, subset_names = _extract_subsets(records, summary)
+        subset_scores, subset_hours, subset_names = _extract_subsets(
+            scored_records,
+            summary,
+        )
 
     return ScanInput(
         results_path=results_path,
@@ -289,6 +305,7 @@ def load_scan_input(
         subset_scores=subset_scores,
         subset_hours=subset_hours,
         subset_names=subset_names,
+        num_skipped=num_skipped,
     )
 
 
@@ -668,6 +685,8 @@ def run_scan(args: argparse.Namespace) -> dict[str, Any]:
         "source_summary": str(scan_input.summary_path) if scan_input.summary_path else None,
         "mode": scan_input.mode,
         "num_samples": int(scan_input.scores.size),
+        "num_input_rows": int(scan_input.scores.size + scan_input.num_skipped),
+        "num_skipped_excluded": scan_input.num_skipped,
         "positives": positives,
         "negatives": negatives,
         "score_min": float(np.min(scan_input.scores)),
@@ -715,6 +734,8 @@ def run_scan(args: argparse.Namespace) -> dict[str, Any]:
         f"Scanned {summary['num_samples']} {scan_input.mode} rows at "
         f"{summary['num_thresholds']} thresholds with {actual_workers} thread(s)."
     )
+    if scan_input.num_skipped:
+        print(f"Excluded: {scan_input.num_skipped} skipped row(s).")
     print(f"Curve:   {output_csv}")
     print(f"Summary: {output_summary}")
     if selection is not None:

@@ -236,3 +236,46 @@ def test_stage2_verifier_per_decode_requires_adapter():
 
     with pytest.raises(RuntimeError, match="phoneme_adapter.enabled=true"):
         verifier.decode_phoneme_feats([torch.zeros(3, 80)])
+
+
+def test_stage2_verifier_detailed_scores_preserve_raw_logits():
+    class _DetailedModel:
+        def __call__(self, feats, feat_lengths, anchors, anchor_lengths):
+            del feats, feat_lengths, anchors, anchor_lengths
+            return torch.sigmoid(torch.tensor([8.0, -8.0]))
+
+        def forward_logits(self, feats, feat_lengths, anchors, anchor_lengths):
+            del feats, feat_lengths, anchors, anchor_lengths
+            return (
+                torch.tensor([8.0, -8.0]),
+                torch.tensor([1.5, 0.0]),
+                torch.tensor([True, False]),
+            )
+
+    verifier = Stage2Verifier.__new__(Stage2Verifier)
+    verifier._torch = torch
+    verifier._device = torch.device("cpu")
+    verifier._model = _DetailedModel()
+
+    details = verifier.score_clip_feats_detailed(
+        [torch.zeros(3, 80), torch.zeros(5, 80)],
+        [[1, 2], []],
+    )
+
+    assert details[0]["qbyt_logit"] == pytest.approx(8.0)
+    assert details[0]["qbyt_score"] == pytest.approx(float(torch.sigmoid(torch.tensor(8.0))))
+    assert details[0]["completion_logit"] == pytest.approx(1.5)
+    assert details[0]["completion_score"] == pytest.approx(
+        float(torch.sigmoid(torch.tensor(1.5)))
+    )
+    assert details[1]["qbyt_logit"] == pytest.approx(-8.0)
+    assert details[1]["completion_logit"] is None
+    assert details[1]["completion_score"] is None
+
+    legacy_scores = verifier.score_clip_feats(
+        [torch.zeros(3, 80), torch.zeros(5, 80)],
+        [[1, 2], []],
+    )
+    assert legacy_scores == pytest.approx(
+        [float(torch.sigmoid(torch.tensor(8.0))), float(torch.sigmoid(torch.tensor(-8.0)))]
+    )

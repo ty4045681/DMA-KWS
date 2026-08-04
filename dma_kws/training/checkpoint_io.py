@@ -19,8 +19,10 @@ from dma_kws.training.checkpoint_avg import average_lightning_checkpoints
 #: pair scored alone and the same pair scored next to a longer keyword disagreed,
 #: and for short keywords it landed in the text padding entirely -- the pooled GRU
 #: state had then consumed no audio at all. Version 2 re-packs each sample as
-#: ``[valid text][valid audio][padding]`` and reads the last valid frame.
-QBYT_READOUT_VERSION = 2
+#: ``[valid text][valid audio][padding]`` and reads the final valid audio state
+#: with GRU+FC. Version 3 makes the readout mode checkpoint-configured and adds
+#: EPS mean pooling over a shared scorer at valid anchor positions.
+QBYT_READOUT_VERSION = 3
 
 QBYT_READOUT_VERSION_KEY = "qbyt_readout_version"
 
@@ -162,6 +164,43 @@ def stamp_qbyt_readout_version(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _checkpoint_qbyt_readout_mode(checkpoint: Mapping[str, Any], saved: Any) -> str:
+    """Infer the score semantics carried by a versioned QbyT checkpoint."""
+
+    from dma_kws.stage2.readout import (
+        EPS_MEAN_READOUT,
+        GRU_LAST_READOUT,
+        resolve_qbyt_readout_mode,
+    )
+
+    # Version 2 predates configurable readouts and is unambiguously GRU-last.
+    if saved == 2:
+        return GRU_LAST_READOUT
+
+    config = checkpoint.get("config")
+    if isinstance(config, Mapping):
+        stage2 = config.get("stage2")
+        if isinstance(stage2, Mapping):
+            return resolve_qbyt_readout_mode(stage2)
+
+    state = extract_state_dict(dict(checkpoint))
+    if isinstance(state, Mapping):
+        if any(
+            isinstance(key, str) and key.startswith("qbyt.final_pos_fc.")
+            for key in state
+        ):
+            return EPS_MEAN_READOUT
+        if any(
+            isinstance(key, str) and key.startswith(("qbyt.gru.", "qbyt.fc."))
+            for key in state
+        ):
+            return GRU_LAST_READOUT
+
+    # Hand-built fixtures and adapter-only payloads may not expose a full base.
+    # GRU-last is the backward-compatible default used by their configs.
+    return GRU_LAST_READOUT
+
+
 def _carries_qbyt_weights(checkpoint: Any) -> bool:
     """Whether a payload holds QbyT weights whose readout version matters.
 
@@ -184,44 +223,62 @@ def assert_qbyt_readout_version(
     *,
     source: Any,
     allow_legacy: bool = False,
+    expected_mode: str | None = None,
 ) -> None:
-    """Fail when a checkpoint's QbyT weights predate the current pooled readout.
-
-    Parameter shapes did not change across the readout fix, so a stale checkpoint
-    loads cleanly and then scores from a frame it was never trained to read. That
-    is the exact failure mode the fix removes, so it must not degrade to a
-    warning.
-    """
+    """Fail when checkpoint and configured QbyT score semantics disagree."""
     import warnings
 
     if not _carries_qbyt_weights(checkpoint):
         return
 
+    from dma_kws.stage2.readout import GRU_LAST_READOUT, normalize_qbyt_readout_mode
+
     saved = checkpoint.get(QBYT_READOUT_VERSION_KEY)
-    if saved == QBYT_READOUT_VERSION:
+    expected = (
+        normalize_qbyt_readout_mode(expected_mode)
+        if expected_mode is not None
+        else None
+    )
+    saved_mode = (
+        _checkpoint_qbyt_readout_mode(checkpoint, saved)
+        if saved in (2, QBYT_READOUT_VERSION)
+        else None
+    )
+
+    compatible = saved == QBYT_READOUT_VERSION and (
+        expected is None or saved_mode == expected
+    )
+    # A v2 GRU checkpoint remains score-compatible when the current model
+    # explicitly selects gru_last. This lets A inspect existing checkpoints
+    # after EPS support is added without ever scoring them as EPS.
+    compatible = compatible or (
+        saved == 2
+        and saved_mode == GRU_LAST_READOUT
+        and (expected is None or expected == GRU_LAST_READOUT)
+    )
+    if compatible:
         return
 
     described = "unversioned (pre-fix)" if saved is None else f"version {saved!r}"
+    mode_detail = f" ({saved_mode})" if saved_mode is not None else ""
+    expected_detail = f"; current config expects {expected}" if expected else ""
     if allow_legacy:
         warnings.warn(
-            f"{source} carries QbyT weights at readout {described}, but this build reads "
-            f"version {QBYT_READOUT_VERSION}. Proceeding because "
-            "stage2.allow_legacy_qbyt_readout is set: only the encoder/adapter weights are "
-            "meaningful, and any score or metric produced from this checkpoint is not "
-            "comparable with the ones it was trained against.",
+            f"{source} carries QbyT weights at readout {described}{mode_detail}, but this "
+            f"build uses version {QBYT_READOUT_VERSION}{expected_detail}. Proceeding "
+            "because stage2.allow_legacy_qbyt_readout is set: this is a training warm "
+            "start only, and any score produced before retraining is not comparable.",
             UserWarning,
             stacklevel=2,
         )
         return
 
     raise SystemExit(
-        f"{source} carries QbyT weights at readout {described} but this build reads version "
-        f"{QBYT_READOUT_VERSION}. The pooled readout used to be indexed with "
-        "text_lengths + speech_lengths - 1 against a batch-padded layout, so these weights "
-        "were trained to read a different frame than the one they will now be scored from. "
-        "The parameter shapes still match, which is why this cannot be left to a warning. "
-        "Re-train Stage II, or set stage2.allow_legacy_qbyt_readout=true to reuse only the "
-        "encoder/adapter weights as a warm start."
+        f"{source} carries QbyT weights at readout {described}{mode_detail}, but this build "
+        f"uses version {QBYT_READOUT_VERSION}{expected_detail}. Readout semantics differ, "
+        "so loading these weights would silently change the meaning of the deployed score. "
+        "Select the matching qbyt_readout mode, re-train Stage II, or set "
+        "stage2.allow_legacy_qbyt_readout=true only for a training warm start."
     )
 
 
