@@ -271,6 +271,7 @@ def test_stage2_verifier_detailed_scores_preserve_raw_logits():
     assert details[1]["qbyt_logit"] == pytest.approx(-8.0)
     assert details[1]["completion_logit"] is None
     assert details[1]["completion_score"] is None
+    assert "eps_position_logits" not in details[0]
 
     legacy_scores = verifier.score_clip_feats(
         [torch.zeros(3, 80), torch.zeros(5, 80)],
@@ -279,3 +280,78 @@ def test_stage2_verifier_detailed_scores_preserve_raw_logits():
     assert legacy_scores == pytest.approx(
         [float(torch.sigmoid(torch.tensor(8.0))), float(torch.sigmoid(torch.tensor(-8.0)))]
     )
+
+
+def test_stage2_verifier_detailed_scores_export_trimmed_eps_positions():
+    class _ReadoutDetails:
+        position_logits = torch.tensor(
+            [
+                [1.0, 3.0, 0.0],
+                [-1.0, 0.0, 0.0],
+            ]
+        )
+        position_mask = torch.tensor(
+            [
+                [True, True, False],
+                [True, False, False],
+            ]
+        )
+
+    class _DetailedModel:
+        def forward_logits_with_readout_details(
+            self, feats, feat_lengths, anchors, anchor_lengths
+        ):
+            del feats, feat_lengths, anchors, anchor_lengths
+            return (
+                torch.tensor([2.0, -1.0]),
+                torch.tensor([1.5, -0.5]),
+                torch.tensor([True, True]),
+                _ReadoutDetails(),
+            )
+
+    verifier = Stage2Verifier.__new__(Stage2Verifier)
+    verifier._torch = torch
+    verifier._device = torch.device("cpu")
+    verifier._model = _DetailedModel()
+
+    details = verifier.score_clip_feats_detailed(
+        [torch.zeros(3, 80), torch.zeros(5, 80)],
+        [[1, 2], [3]],
+        include_eps_positions=True,
+    )
+
+    assert details[0]["eps_position_logits"] == pytest.approx([1.0, 3.0])
+    assert details[1]["eps_position_logits"] == pytest.approx([-1.0])
+    assert details[0]["qbyt_logit"] == pytest.approx(2.0)
+    assert details[1]["qbyt_logit"] == pytest.approx(-1.0)
+
+
+def test_stage2_verifier_eps_position_export_is_none_for_gru_readout():
+    class _ReadoutDetails:
+        position_logits = None
+        position_mask = torch.tensor([[True, True]])
+
+    class _DetailedModel:
+        def forward_logits_with_readout_details(
+            self, feats, feat_lengths, anchors, anchor_lengths
+        ):
+            del feats, feat_lengths, anchors, anchor_lengths
+            return (
+                torch.tensor([0.5]),
+                torch.tensor([0.25]),
+                torch.tensor([True]),
+                _ReadoutDetails(),
+            )
+
+    verifier = Stage2Verifier.__new__(Stage2Verifier)
+    verifier._torch = torch
+    verifier._device = torch.device("cpu")
+    verifier._model = _DetailedModel()
+
+    details = verifier.score_clip_feats_detailed(
+        [torch.zeros(3, 80)],
+        [[1, 2]],
+        include_eps_positions=True,
+    )
+
+    assert details[0]["eps_position_logits"] is None

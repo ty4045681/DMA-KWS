@@ -206,31 +206,54 @@ def test_eps_score_is_masked_mean_of_valid_position_logits():
     text_batch = torch.zeros(2, LONG_TEXT_LEN, dtype=torch.long)
     text_batch[0, :SHORT_TEXT_LEN] = short_text
     text_batch[1] = long_text
-    captured = {}
+    with torch.no_grad():
+        logits, _, details = model.forward_with_readout_details(
+            torch.stack([short_audio, long_audio]),
+            text_batch,
+            speech_lengths=torch.tensor([AUDIO_LEN, AUDIO_LEN]),
+            text_lengths=torch.tensor([SHORT_TEXT_LEN, LONG_TEXT_LEN]),
+        )
 
-    def capture_position_logits(_module, _inputs, output):
-        captured["position_logits"] = output.squeeze(-1).detach()
-
-    handle = model.final_pos_fc.register_forward_hook(capture_position_logits)
-    try:
-        with torch.no_grad():
-            logits, _ = model(
-                torch.stack([short_audio, long_audio]),
-                text_batch,
-                speech_lengths=torch.tensor([AUDIO_LEN, AUDIO_LEN]),
-                text_lengths=torch.tensor([SHORT_TEXT_LEN, LONG_TEXT_LEN]),
-            )
-    finally:
-        handle.remove()
-
-    position_logits = captured["position_logits"]
+    position_logits = details.position_logits
+    assert position_logits.shape == (2, LONG_TEXT_LEN)
+    assert details.position_mask.dtype == torch.bool
+    assert details.position_mask[0].sum() == SHORT_TEXT_LEN
+    assert details.position_mask[1].sum() == LONG_TEXT_LEN
+    torch.testing.assert_close(
+        position_logits[0, SHORT_TEXT_LEN:],
+        torch.zeros_like(position_logits[0, SHORT_TEXT_LEN:]),
+    )
     expected = torch.stack(
         [
-            position_logits[0, :SHORT_TEXT_LEN].mean(),
-            position_logits[1, :LONG_TEXT_LEN].mean(),
+            position_logits[0][details.position_mask[0]].mean(),
+            position_logits[1][details.position_mask[1]].mean(),
         ]
     )
     torch.testing.assert_close(logits, expected)
+
+
+def test_gru_readout_details_do_not_invent_eps_position_logits():
+    model = _model(readout_mode="gru_last")
+    text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
+
+    with torch.no_grad():
+        logits, seq_logits, details = model.forward_with_readout_details(
+            audio.unsqueeze(0),
+            text.unsqueeze(0),
+            speech_lengths=torch.tensor([AUDIO_LEN]),
+            text_lengths=torch.tensor([SHORT_TEXT_LEN]),
+        )
+        ordinary_logits, ordinary_seq_logits = model(
+            audio.unsqueeze(0),
+            text.unsqueeze(0),
+            speech_lengths=torch.tensor([AUDIO_LEN]),
+            text_lengths=torch.tensor([SHORT_TEXT_LEN]),
+        )
+
+    assert details.position_logits is None
+    assert details.position_mask.tolist() == [[True] * SHORT_TEXT_LEN]
+    torch.testing.assert_close(logits, ordinary_logits)
+    torch.testing.assert_close(seq_logits, ordinary_seq_logits)
 
 
 def test_eps_score_is_invariant_to_batch_companions():
@@ -288,13 +311,18 @@ def test_eps_final_position_scorer_receives_utterance_gradient():
 def test_eps_empty_anchor_has_finite_neutral_logit_without_device_sync():
     model = _model(readout_mode="eps_mean")
     with torch.no_grad():
-        logits, _ = model(
+        logits, _, details = model.forward_with_readout_details(
             torch.randn(1, AUDIO_LEN, ENCODER_DIM),
             torch.zeros(1, 1, dtype=torch.long),
             speech_lengths=torch.tensor([AUDIO_LEN]),
             text_lengths=torch.tensor([0]),
         )
     torch.testing.assert_close(logits, torch.zeros_like(logits))
+    assert not bool(details.position_mask.any())
+    torch.testing.assert_close(
+        details.position_logits,
+        torch.zeros_like(details.position_logits),
+    )
 
 
 def test_unknown_readout_mode_is_rejected():

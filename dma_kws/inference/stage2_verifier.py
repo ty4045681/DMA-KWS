@@ -115,7 +115,15 @@ class Stage2Verifier:
                     readout_mode=qbyt_readout_mode,
                 )
 
-            def _encode_and_score(self, feats, feat_lengths, anchors, anchor_lengths):
+            def _encode_and_score(
+                self,
+                feats,
+                feat_lengths,
+                anchors,
+                anchor_lengths,
+                *,
+                include_readout_details=False,
+            ):
                 # Inference always runs at the deployment operating point.
                 encoder_out, encoder_mask = run_encoder(
                     self.encoder,
@@ -132,7 +140,12 @@ class Stage2Verifier:
                     speech, _ = self.adapter(
                         encoder_out, encoder_mask, with_log_probs=False
                     )
-                return self.qbyt(
+                score_fn = (
+                    self.qbyt.forward_with_readout_details
+                    if include_readout_details
+                    else self.qbyt
+                )
+                return score_fn(
                     speech,
                     anchors,
                     speech_lengths=encoder_lens,
@@ -154,6 +167,25 @@ class Stage2Verifier:
                     anchor_lengths,
                 )
                 return logits, completion_logits, completion_valid
+
+            def forward_logits_with_readout_details(
+                self, feats, feat_lengths, anchors, anchor_lengths
+            ):
+                """Return scalar heads plus analysis-only QbyT readout tensors."""
+                from dma_kws.stage2.scoring import gather_completion_logits
+
+                logits, seq_logits, readout_details = self._encode_and_score(
+                    feats,
+                    feat_lengths,
+                    anchors,
+                    anchor_lengths,
+                    include_readout_details=True,
+                )
+                completion_logits, completion_valid = gather_completion_logits(
+                    seq_logits,
+                    anchor_lengths,
+                )
+                return logits, completion_logits, completion_valid, readout_details
 
             def forward(self, feats, feat_lengths, anchors, anchor_lengths):
                 logits, _ = self._encode_and_score(
@@ -274,12 +306,17 @@ class Stage2Verifier:
         self,
         feats: Sequence,
         keyword_ids_batch: Sequence[Sequence[int]],
-    ) -> list[dict[str, float | None]]:
+        *,
+        include_eps_positions: bool = False,
+    ) -> list[dict[str, Any]]:
         """Return raw and probability scores for both Stage II heads.
 
         This analysis-only API deliberately leaves :meth:`score_clip_feats`
         unchanged, so enabling diagnostics cannot alter deployed decisions.
         Empty anchors have no completion score and are represented by ``None``.
+        When ``include_eps_positions`` is true, ``eps_position_logits`` contains
+        one raw shared-scorer logit per valid anchor token. It is ``None`` for a
+        ``gru_last`` readout and an empty list for an empty EPS anchor.
         """
 
         torch = self._torch
@@ -301,12 +338,24 @@ class Stage2Verifier:
             [len(ids) for ids in keyword_ids_batch], dtype=torch.long
         )
         with torch.no_grad():
-            utt_logits, completion_logits, completion_valid = self._model.forward_logits(
+            model_args = (
                 padded_feats.to(self._device),
                 feat_lengths.to(self._device),
                 anchors.to(self._device),
                 anchor_lengths.to(self._device),
             )
+            if include_eps_positions:
+                (
+                    utt_logits,
+                    completion_logits,
+                    completion_valid,
+                    readout_details,
+                ) = self._model.forward_logits_with_readout_details(*model_args)
+            else:
+                utt_logits, completion_logits, completion_valid = (
+                    self._model.forward_logits(*model_args)
+                )
+                readout_details = None
             utt_scores = torch.sigmoid(utt_logits)
             completion_scores = torch.sigmoid(completion_logits)
 
@@ -315,8 +364,31 @@ class Stage2Verifier:
         completion_logits = completion_logits.reshape(-1).detach().cpu()
         completion_scores = completion_scores.reshape(-1).detach().cpu()
         completion_valid = completion_valid.reshape(-1).detach().cpu()
-        return [
-            {
+
+        position_logits = None
+        position_mask = None
+        if readout_details is not None:
+            position_mask = readout_details.position_mask.detach().cpu()
+            if readout_details.position_logits is not None:
+                position_logits = readout_details.position_logits.detach().cpu()
+
+        records = []
+        for index, (
+            utt_logit,
+            utt_score,
+            completion_logit,
+            completion_score,
+            is_valid,
+        ) in enumerate(
+            zip(
+                utt_logits,
+                utt_scores,
+                completion_logits,
+                completion_scores,
+                completion_valid,
+            )
+        ):
+            record = {
                 "qbyt_logit": float(utt_logit),
                 "qbyt_score": float(utt_score),
                 "completion_logit": (
@@ -326,14 +398,41 @@ class Stage2Verifier:
                     float(completion_score) if bool(is_valid) else None
                 ),
             }
-            for utt_logit, utt_score, completion_logit, completion_score, is_valid in zip(
-                utt_logits,
-                utt_scores,
-                completion_logits,
-                completion_scores,
-                completion_valid,
-            )
-        ]
+            if include_eps_positions:
+                if position_logits is None:
+                    record["eps_position_logits"] = None
+                else:
+                    sample_mask = position_mask[index]
+                    sample_logits = position_logits[index][sample_mask]
+                    expected_length = int(anchor_lengths[index])
+                    if sample_logits.numel() != expected_length:
+                        raise RuntimeError(
+                            "EPS position mask length does not match the anchor: "
+                            f"sample={index}, mask={sample_logits.numel()}, "
+                            f"anchor={expected_length}"
+                        )
+                    if not bool(torch.isfinite(sample_logits).all()):
+                        raise RuntimeError(
+                            f"EPS position logits contain non-finite values for sample {index}"
+                        )
+                    expected_logit = (
+                        sample_logits.mean()
+                        if sample_logits.numel()
+                        else torch.zeros_like(utt_logit)
+                    )
+                    if not bool(
+                        torch.isclose(expected_logit, utt_logit, rtol=1e-5, atol=1e-6)
+                    ):
+                        raise RuntimeError(
+                            "EPS position-logit mean disagrees with the utterance logit: "
+                            f"sample={index}, mean={float(expected_logit)}, "
+                            f"utterance={float(utt_logit)}"
+                        )
+                    record["eps_position_logits"] = [
+                        float(value) for value in sample_logits
+                    ]
+            records.append(record)
+        return records
 
     def decode_phoneme_feats(self, feats: Sequence) -> list[list[int]]:
         """Greedily decode phoneme ids from full-clip fbank features.

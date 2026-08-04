@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 import math
+from typing import NamedTuple
 
 # Keep this vendored model importable on its own (for example from ``qbyt/``).
 # These public mode spellings intentionally mirror ``dma_kws.stage2.readout``;
@@ -10,6 +11,13 @@ import math
 GRU_LAST_READOUT = "gru_last"
 EPS_MEAN_READOUT = "eps_mean"
 _QBYT_READOUT_MODES = frozenset({GRU_LAST_READOUT, EPS_MEAN_READOUT})
+
+
+class QbyTReadoutDetails(NamedTuple):
+    """Analysis-only tensors produced by the configured utterance readout."""
+
+    position_logits: torch.Tensor | None
+    position_mask: torch.Tensor
 
 
 def _normalize_qbyt_readout_mode(value):
@@ -114,6 +122,47 @@ class QbyT(nn.Module):
         ``text.ne(0)`` fallback for ``text_lengths`` assumes id 0 is only ever
         padding.
         """
+        logits, text_logits, _ = self._forward_impl(
+            speech,
+            text,
+            speech_lengths=speech_lengths,
+            text_lengths=text_lengths,
+            include_readout_details=False,
+        )
+        return logits, text_logits
+
+    def forward_with_readout_details(
+        self,
+        speech,
+        text,
+        speech_lengths=None,
+        text_lengths=None,
+    ):
+        """Score pairs and expose valid EPS position logits for diagnostics.
+
+        The ordinary :meth:`forward` contract remains a two-tuple so training
+        and deployment callers are unaffected. For ``eps_mean``, position
+        logits are zero outside ``position_mask``; for ``gru_last`` they are
+        ``None`` because that readout has no shared per-position scorer.
+        """
+        logits, text_logits, details = self._forward_impl(
+            speech,
+            text,
+            speech_lengths=speech_lengths,
+            text_lengths=text_lengths,
+            include_readout_details=True,
+        )
+        return logits, text_logits, details
+
+    def _forward_impl(
+        self,
+        speech,
+        text,
+        *,
+        speech_lengths=None,
+        text_lengths=None,
+        include_readout_details,
+    ):
         # 文本处理
         text_emb = self.text_projection(text)
         text_emb = self.pos_enc(text_emb)
@@ -185,6 +234,15 @@ class QbyT(nn.Module):
             )
             gru_out = gru_out.gather(1, last_valid_indices).squeeze(1)
             logits = self.fc(gru_out).squeeze(-1)
+            if include_readout_details:
+                text_positions = torch.arange(text_width, device=text.device).unsqueeze(0)
+                text_mask = text_positions < text_lengths.unsqueeze(1)
+                readout_details = QbyTReadoutDetails(
+                    position_logits=None,
+                    position_mask=text_mask,
+                )
+            else:
+                readout_details = None
         elif self.readout_mode == EPS_MEAN_READOUT:
             position_logits = self.final_pos_fc(text_states).squeeze(-1)
             text_positions = torch.arange(text_width, device=text.device).unsqueeze(0)
@@ -192,14 +250,23 @@ class QbyT(nn.Module):
             # For a short anchor, [text_length, text_width) contains re-packed
             # audio frames rather than text padding. Masking is part of the
             # readout definition, not only a numerical optimization.
-            logits = torch.where(
+            valid_position_logits = torch.where(
                 text_mask,
                 position_logits,
                 torch.zeros_like(position_logits),
-            ).sum(dim=1) / text_mask.sum(dim=1).clamp_min(1)
+            )
+            logits = valid_position_logits.sum(dim=1) / text_mask.sum(dim=1).clamp_min(1)
+            readout_details = (
+                QbyTReadoutDetails(
+                    position_logits=valid_position_logits,
+                    position_mask=text_mask,
+                )
+                if include_readout_details
+                else None
+            )
         else:  # normalize_qbyt_readout_mode makes this unreachable.
             raise RuntimeError(f"Unhandled QbyT readout mode: {self.readout_mode}")
-        return logits, text_logits
+        return logits, text_logits, readout_details
 
 
 if __name__ == "__main__":

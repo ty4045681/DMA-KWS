@@ -115,9 +115,23 @@ def _finite_float(value: object, *, field: str) -> float:
 
 
 def _result_record(manifest_row: dict, runner_result: dict) -> dict:
+    keyword_phonemes_raw = runner_result.get("keyword_phonemes")
+    if keyword_phonemes_raw is None:
+        keyword_phonemes = None
+    elif isinstance(keyword_phonemes_raw, (list, tuple)) and all(
+        isinstance(value, str) for value in keyword_phonemes_raw
+    ):
+        keyword_phonemes = list(keyword_phonemes_raw)
+    else:
+        raise ValueError(
+            "keyword_phonemes must be a sequence of strings or None, "
+            f"got {keyword_phonemes_raw!r}"
+        )
+
     record = {
         "audio_path": manifest_row["audio_path"],
         "keyword": manifest_row["keyword"],
+        "keyword_phonemes": keyword_phonemes,
         "qbyt_score": _finite_float(
             runner_result.get("qbyt_score", 0.0),
             field="qbyt_score",
@@ -134,6 +148,50 @@ def _result_record(manifest_row: dict, runner_result: dict) -> dict:
             record[name] = (
                 None if value is None else _finite_float(value, field=name)
             )
+
+    position_logits_raw = runner_result.get("eps_position_logits")
+    if position_logits_raw is None:
+        record["eps_position_logits"] = None
+    elif isinstance(position_logits_raw, (list, tuple)):
+        position_logits = [
+            _finite_float(value, field=f"eps_position_logits[{index}]")
+            for index, value in enumerate(position_logits_raw)
+        ]
+        if keyword_phonemes is None:
+            raise ValueError(
+                "keyword_phonemes is required when eps_position_logits is present"
+            )
+        if len(position_logits) != len(keyword_phonemes):
+            raise ValueError(
+                "eps_position_logits must contain one value per keyword phoneme: "
+                f"logits={len(position_logits)}, phonemes={len(keyword_phonemes)}"
+            )
+        qbyt_logit = record.get("qbyt_logit")
+        if qbyt_logit is None:
+            raise ValueError(
+                "qbyt_logit is required when eps_position_logits is present"
+            )
+        expected_logit = (
+            math.fsum(position_logits) / len(position_logits)
+            if position_logits
+            else 0.0
+        )
+        if not math.isclose(
+            expected_logit,
+            qbyt_logit,
+            rel_tol=1e-5,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                "mean(eps_position_logits) must equal qbyt_logit: "
+                f"mean={expected_logit}, qbyt_logit={qbyt_logit}"
+            )
+        record["eps_position_logits"] = position_logits
+    else:
+        raise ValueError(
+            "eps_position_logits must be a sequence of finite numbers or None, "
+            f"got {position_logits_raw!r}"
+        )
 
     manifest_meta = {
         key: value
@@ -249,6 +307,7 @@ def run_eval(cfg: DictConfig) -> dict:
         left_padding_ms=left_padding_ms,
         right_padding_ms=right_padding_ms,
         include_score_details=True,
+        include_eps_positions=True,
     )
     results = [
         _result_record(row, runner_result)

@@ -15,19 +15,24 @@ def test_qbyt_forward_accepts_lengths_and_masks_padded_frames():
     tree = ast.parse(source)
     qbyt_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "QbyT")
     forward = next(node for node in qbyt_class.body if isinstance(node, ast.FunctionDef) and node.name == "forward")
+    implementation = next(
+        node
+        for node in qbyt_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_forward_impl"
+    )
     arg_names = [arg.arg for arg in forward.args.args]
 
     assert "speech_lengths" in arg_names
     assert any(
         isinstance(node, ast.Call)
         and any(keyword.arg == "src_key_padding_mask" for keyword in node.keywords)
-        for node in ast.walk(forward)
+        for node in ast.walk(implementation)
     )
     assert any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "gather"
-        for node in ast.walk(forward)
+        for node in ast.walk(implementation)
     )
 
 

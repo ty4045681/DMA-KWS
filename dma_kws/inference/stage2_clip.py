@@ -193,6 +193,7 @@ class Stage2ClipRunner:
         left_padding_ms: int = 0,
         right_padding_ms: int = 0,
         include_score_details: bool = False,
+        include_eps_positions: bool = False,
     ) -> list[dict]:
         """Run Stage II verification on many clips with batched GPU scoring.
 
@@ -201,7 +202,8 @@ class Stage2ClipRunner:
         Optional zero-valued waveform padding is applied in memory before fbank
         extraction; source audio files are not modified. The padding counts
         toward the minimum encoder-input length and can make a short clip
-        scoreable.
+        scoreable. ``include_eps_positions`` requires score details and exposes
+        one EPS readout logit per enrollment phoneme when that readout is active.
         """
         try:
             from torch.utils.data import DataLoader
@@ -209,6 +211,11 @@ class Stage2ClipRunner:
             raise SystemExit(
                 "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
             ) from exc
+
+        if include_eps_positions and not include_score_details:
+            raise ValueError(
+                "include_eps_positions=true requires include_score_details=true"
+            )
 
         rows = list(rows)
         threshold = float(self._demo_cfg.get("qbyt_threshold", 0.5))
@@ -220,6 +227,12 @@ class Stage2ClipRunner:
                 keyword_ids = tokenize_phoneme_string(
                     self._tokenizer, " ".join(phonemes)
                 )
+                if len(keyword_ids) != len(phonemes):
+                    raise RuntimeError(
+                        "Enrollment phoneme/token length mismatch: "
+                        f"keyword={keyword!r}, phonemes={len(phonemes)}, "
+                        f"token_ids={len(keyword_ids)}"
+                    )
                 keyword_cache[keyword] = (phonemes, keyword_ids)
 
         dataset = ClipFeatureDataset(
@@ -261,6 +274,11 @@ class Stage2ClipRunner:
                                 "qbyt_logit": None,
                                 "completion_logit": None,
                                 "completion_score": None,
+                                **(
+                                    {"eps_position_logits": None}
+                                    if include_eps_positions
+                                    else {}
+                                ),
                             }
                             if include_score_details
                             else None
@@ -276,6 +294,11 @@ class Stage2ClipRunner:
                 detailed_scores = self._verifier.score_clip_feats_detailed(
                     feats,
                     keyword_ids_batch,
+                    **(
+                        {"include_eps_positions": True}
+                        if include_eps_positions
+                        else {}
+                    ),
                 )
             else:
                 detailed_scores = [
@@ -328,6 +351,8 @@ class Stage2ClipRunner:
                     "completion_score": score_details.get("completion_score"),
                 }
             )
+            if "eps_position_logits" in score_details:
+                result["eps_position_logits"] = score_details["eps_position_logits"]
         return result
 
     def run_file_windows(

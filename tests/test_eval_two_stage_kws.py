@@ -80,6 +80,9 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
             return [
                 {
                     "qbyt_score": 0.75,
+                    "qbyt_logit": 1.0986122886681098,
+                    "keyword_phonemes": ["HH"],
+                    "eps_position_logits": [1.0986122886681098],
                     "detected": True,
                     "threshold": 0.5,
                     "skipped": False,
@@ -100,7 +103,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
             "paths": {},
             "stage1": {},
             "stage2": {
-                "qbyt_readout": {"mode": "gru_last"},
+                "qbyt_readout": {"mode": "eps_mean"},
                 "sequence_loss": {
                     "target_mode": "ordered_contiguous_prefix",
                     "completion_weight": 0.5,
@@ -140,6 +143,8 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert captured["rows"] == rows
     assert captured["kwargs"]["left_padding_ms"] == 160
     assert captured["kwargs"]["right_padding_ms"] == 160
+    assert captured["kwargs"]["include_score_details"] is True
+    assert captured["kwargs"]["include_eps_positions"] is True
     assert summary["audio_padding_ms"] == {"left": 160, "right": 160}
     assert summary["provenance"]["checkpoint"]["path"] == str(
         checkpoint_path.resolve()
@@ -157,6 +162,13 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     }
     saved_summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert saved_summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    saved_result = json.loads(
+        (tmp_path / "results.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert saved_result["keyword_phonemes"] == ["HH"]
+    assert saved_result["eps_position_logits"] == pytest.approx(
+        [1.0986122886681098]
+    )
 
 
 def test_score_provenance_classifies_missing_checkpoint_config_as_legacy(tmp_path):
@@ -376,6 +388,8 @@ def test_stage2_clip_result_record_preserves_raw_head_logits():
         {
             "qbyt_score": 0.9,
             "qbyt_logit": 2.1972246,
+            "keyword_phonemes": ["HH", "AH0"],
+            "eps_position_logits": [1.1972246, 3.1972246],
             "completion_score": 0.25,
             "completion_logit": -1.0986123,
             "detected": True,
@@ -385,6 +399,10 @@ def test_stage2_clip_result_record_preserves_raw_head_logits():
     )
 
     assert record["qbyt_logit"] == pytest.approx(2.1972246)
+    assert record["keyword_phonemes"] == ["HH", "AH0"]
+    assert record["eps_position_logits"] == pytest.approx(
+        [1.1972246, 3.1972246]
+    )
     assert record["completion_score"] == pytest.approx(0.25)
     assert record["completion_logit"] == pytest.approx(-1.0986123)
 
@@ -403,3 +421,32 @@ def test_stage2_clip_result_record_rejects_non_finite_scores():
                 "skipped": False,
             },
         )
+
+
+def test_stage2_clip_result_record_rejects_invalid_eps_position_details():
+    base_result = {
+        "qbyt_score": 0.5,
+        "qbyt_logit": 0.0,
+        "keyword_phonemes": ["HH", "EY1"],
+        "eps_position_logits": [-1.0, 1.0],
+        "detected": True,
+        "threshold": 0.5,
+        "skipped": False,
+    }
+    manifest_row = {
+        "audio_path": "/tmp/audio.wav",
+        "keyword": "hey",
+        "label": 0,
+    }
+
+    bad_length = dict(base_result, eps_position_logits=[0.0])
+    with pytest.raises(ValueError, match="one value per keyword phoneme"):
+        stage2_clip_result_record(manifest_row, bad_length)
+
+    bad_mean = dict(base_result, eps_position_logits=[1.0, 1.0])
+    with pytest.raises(ValueError, match=r"mean\(eps_position_logits\)"):
+        stage2_clip_result_record(manifest_row, bad_mean)
+
+    bad_finite = dict(base_result, eps_position_logits=[float("nan"), 0.0])
+    with pytest.raises(ValueError, match=r"eps_position_logits\[0\] must be finite"):
+        stage2_clip_result_record(manifest_row, bad_finite)

@@ -284,17 +284,23 @@ class FakeBatchVerifier:
         self._scores = self._scores[len(feats):]
         return scores
 
-    def score_clip_feats_detailed(self, feats, keyword_ids_batch):
+    def score_clip_feats_detailed(
+        self, feats, keyword_ids_batch, *, include_eps_positions=False
+    ):
         scores = self.score_clip_feats(feats, keyword_ids_batch)
-        return [
-            {
+        records = []
+        for score, keyword_ids in zip(scores, keyword_ids_batch):
+            qbyt_logit = math.log(score / (1.0 - score))
+            record = {
                 "qbyt_score": score,
-                "qbyt_logit": math.log(score / (1.0 - score)),
+                "qbyt_logit": qbyt_logit,
                 "completion_score": 0.25,
                 "completion_logit": math.log(0.25 / 0.75),
             }
-            for score in scores
-        ]
+            if include_eps_positions:
+                record["eps_position_logits"] = [qbyt_logit] * len(keyword_ids)
+            records.append(record)
+        return records
 
 
 def test_clip_runner_run_batch(monkeypatch):
@@ -387,6 +393,7 @@ def test_clip_runner_run_batch_can_include_score_details(monkeypatch):
         batch_size=8,
         num_workers=0,
         include_score_details=True,
+        include_eps_positions=True,
     )
 
     assert results[0]["qbyt_logit"] == pytest.approx(math.log(9.0))
@@ -394,9 +401,23 @@ def test_clip_runner_run_batch_can_include_score_details(monkeypatch):
     assert results[0]["completion_logit"] == pytest.approx(
         math.log(1.0 / 3.0)
     )
+    assert results[0]["keyword_phonemes"] == ["HELLO"]
+    assert results[0]["eps_position_logits"] == pytest.approx([math.log(9.0)])
     assert results[1]["qbyt_logit"] is None
     assert results[1]["completion_score"] is None
     assert results[1]["completion_logit"] is None
+    assert results[1]["eps_position_logits"] is None
+
+
+def test_clip_runner_eps_positions_require_score_details(monkeypatch):
+    runner = _build_runner(
+        threshold=0.5,
+        verifier=FakeVerifier(scores=[0.7]),
+        monkeypatch=monkeypatch,
+    )
+
+    with pytest.raises(ValueError, match="requires include_score_details"):
+        runner.run_batch([], include_eps_positions=True)
 
 
 def test_clip_runner_result_record_shape(monkeypatch):
