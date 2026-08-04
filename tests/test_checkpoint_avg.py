@@ -54,6 +54,32 @@ def test_average_lightning_checkpoints_supports_legacy_model_state_dict(tmp_path
     assert torch.allclose(averaged["model_state_dict"]["bias"], torch.tensor([1.0]))
 
 
+def test_average_rejects_different_stage2_sequence_objectives(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy.ckpt"
+    current = tmp_path / "current.ckpt"
+    state = {"qbyt.weight": torch.tensor([1.0])}
+    torch.save({"state_dict": state, "config": {"stage2": {}}}, legacy)
+    torch.save(
+        {
+            "state_dict": state,
+            "config": {
+                "stage2": {
+                    "sequence_loss": {
+                        "target_mode": "ordered_contiguous_prefix",
+                        "progress_weight": 0.5,
+                        "completion_weight": 0.5,
+                        "normalization": "sample",
+                    }
+                }
+            },
+        },
+        current,
+    )
+
+    with pytest.raises(ValueError, match="different Stage II sequence objectives"):
+        average_lightning_checkpoints([legacy, current], tmp_path / "bad.ckpt")
+
+
 def test_average_lightning_checkpoints_requires_paths(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="At least one checkpoint"):
         average_lightning_checkpoints([], tmp_path / "avg.ckpt")

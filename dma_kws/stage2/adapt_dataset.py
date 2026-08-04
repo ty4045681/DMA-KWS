@@ -13,7 +13,13 @@ from torch.utils.data import Dataset
 
 from dma_kws.g2p import make_g2p, text_to_phonemes
 from dma_kws.stage2.adapt_paths import wav_to_fbank_mirror
-from dma_kws.tokenizer import build_seq_label, tokenize_phoneme_string
+from dma_kws.tokenizer import (
+    DEFAULT_SEQ_LABEL_MODE,
+    SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX,
+    build_seq_label,
+    normalize_seq_label_mode,
+    tokenize_phoneme_string,
+)
 
 
 def _resolve_adapt_fbank_path(fbank_root: Path, audio_path: str, *, manifest_root: Path | None = None) -> Path:
@@ -41,12 +47,14 @@ class KeywordAdaptationDataset(Dataset):
         tokenizer: Any,
         g2p: Any | None = None,
         manifest_root: str | Path | None = None,
+        seq_label_mode: str = DEFAULT_SEQ_LABEL_MODE,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.keyword = keyword
         self.fbank_root = Path(fbank_root)
         self.manifest_root = Path(manifest_root) if manifest_root else self.manifest_path.parent
         self.tokenizer = tokenizer
+        self.seq_label_mode = normalize_seq_label_mode(seq_label_mode)
         self.g2p = g2p if g2p is not None else make_g2p()
 
         df = pd.read_csv(self.manifest_path)
@@ -73,11 +81,24 @@ class KeywordAdaptationDataset(Dataset):
             audio_path,
             manifest_root=self.manifest_root,
         )
-        feats = torch.from_numpy(np.load(fbank_path))
 
         query_g2p = _text_to_g2p(self.g2p, text)
         query_seq = tokenize_phoneme_string(self.tokenizer, query_g2p)
-        seq_label = build_seq_label(self._anchor_seq, query_seq)
+        seq_label = build_seq_label(
+            self._anchor_seq,
+            query_seq,
+            mode=self.seq_label_mode,
+        )
+        if self.seq_label_mode == SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX:
+            completed = bool(seq_label[-1])
+            if completed != bool(label):
+                raise ValueError(
+                    f"{self.manifest_path}: row {int(index)} has label={label}, but its "
+                    f"text {text!r} implies keyword-completion target {int(completed)}. "
+                    "For keyword-occurrence training, phrases containing the full "
+                    "keyword must be labeled positive."
+                )
+        feats = torch.from_numpy(np.load(fbank_path))
 
         return {
             "anchor_seq": torch.tensor(self._anchor_seq, dtype=torch.long),

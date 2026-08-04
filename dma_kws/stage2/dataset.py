@@ -14,10 +14,18 @@ import torch.utils.data
 from torch.utils.data import Dataset
 
 from dma_kws.g2p import make_g2p, text_to_phonemes
-from dma_kws.tokenizer import build_seq_label, load_char_tokenizer, tokenize_phoneme_string
+from dma_kws.tokenizer import (
+    DEFAULT_SEQ_LABEL_MODE,
+    SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX,
+    build_seq_label,
+    load_char_tokenizer,
+    normalize_seq_label_mode,
+    tokenize_phoneme_string,
+)
 from dma_kws.training.ddp import process_rank
 
 _PARQUET_COLUMNS = ["ngram", "ngram_g2p", "clips_file", "distances_file"]
+_MAX_CONTAINING_NEGATIVE_DRAWS = 16
 
 _EVAL_COLUMNS = [
     "anchor_text",
@@ -111,12 +119,14 @@ class LibriPhraseTrainDataset(Dataset):
         df: pd.DataFrame | None = None,
         augment: bool = False,
         noise_list_path: str | Path | None = None,
+        seq_label_mode: str = DEFAULT_SEQ_LABEL_MODE,
     ) -> None:
         if tokenizer is None:
             if dict_path is None:
                 raise ValueError("Either tokenizer or dict_path must be provided")
             tokenizer = load_char_tokenizer(Path(dict_path))
         self.tokenizer = tokenizer
+        self.seq_label_mode = normalize_seq_label_mode(seq_label_mode)
 
         if df is not None:
             self.df = df.reset_index(drop=True)
@@ -187,39 +197,69 @@ class LibriPhraseTrainDataset(Dataset):
         feats = torch.from_numpy(np.load(fbank_path))
         return feats
 
+    def _draw_negative(self, index: int, anchor_inform) -> tuple[str, str]:
+        hard_neg = self.get_random_distances(anchor_inform["distances_file"])
+        negative_type = self._rng.choices(
+            [1, 2],
+            weights=[self.negative_ratio, self.hard_negative_ratio],
+            k=1,
+        )[0]
+        if negative_type == 1 or hard_neg is None:
+            negative_wav, negative_g2p, _negative = self.get_negative(index)
+        else:
+            negative_wav, negative_g2p, _negative = self.get_hard_negative(hard_neg)
+        return negative_wav["audio_path"], negative_g2p
+
     def __getitem__(self, index: int) -> dict:
         index = index % len(self.anchor_lists)
-        anchor = self.anchor_lists[index]
         anchor_inform = self.df.iloc[index]
         anchor_g2p = anchor_inform["ngram_g2p"]
+        anchor_seq = tokenize_phoneme_string(self.tokenizer, anchor_g2p)
         label = 1
 
         if self._rng.random() < 0.5:
-            label = 1
             anchor_clips = anchor_inform["clips_file"]
-            query_g2p = anchor_g2p
             query_wav = self.get_random_clips(anchor_clips)["audio_path"]
+            query_seq = list(anchor_seq)
+            seq_label = build_seq_label(
+                anchor_seq,
+                query_seq,
+                mode=self.seq_label_mode,
+            )
         else:
             label = 0
-            hard_neg = self.get_random_distances(anchor_inform["distances_file"])
-            negative_type = self._rng.choices(
-                [1, 2],
-                weights=[self.negative_ratio, self.hard_negative_ratio],
-                k=1,
-            )[0]
-            if negative_type == 1 or hard_neg is None:
-                negative_wav, negative_g2p, _negative = self.get_negative(index)
+            for _ in range(_MAX_CONTAINING_NEGATIVE_DRAWS):
+                query_wav, query_g2p = self._draw_negative(index, anchor_inform)
+                query_seq = tokenize_phoneme_string(self.tokenizer, query_g2p)
+                seq_label = build_seq_label(
+                    anchor_seq,
+                    query_seq,
+                    mode=self.seq_label_mode,
+                )
+                # Stage II is keyword-occurrence detection: an n-gram that
+                # contains the complete anchor is a positive, not a hard
+                # negative. Re-draw so the intended 50/50 sampling ratio is not
+                # distorted by nested LibriPhrase n-grams.
+                if (
+                    self.seq_label_mode != SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
+                    or not seq_label[-1]
+                ):
+                    break
             else:
-                negative_wav, negative_g2p, _negative = self.get_hard_negative(hard_neg)
-
-            query_wav = negative_wav["audio_path"]
-            query_g2p = negative_g2p
+                # A tiny/adversarial phrase pool may contain no valid negative.
+                # The selected audio still contains the keyword, so relabeling
+                # is the only supervision-consistent fallback.
+                label = 1
 
         feats = self._load_fbank(query_wav)
-
-        anchor_seq = tokenize_phoneme_string(self.tokenizer, anchor_g2p)
-        query_seq = tokenize_phoneme_string(self.tokenizer, query_g2p)
-        seq_label = build_seq_label(anchor_seq, query_seq)
+        if (
+            self.seq_label_mode == SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
+            and bool(seq_label[-1]) != bool(label)
+        ):
+            raise RuntimeError(
+                "Internal Stage II target mismatch: utterance and completion "
+                "labels must agree under keyword-occurrence semantics"
+            )
 
         return {
             "anchor_seq": torch.tensor(anchor_seq, dtype=torch.long),

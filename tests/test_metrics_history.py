@@ -110,6 +110,10 @@ def test_collect_hparams_stage2_section():
     assert hparams["batch_size_per_gpu"] == 64
     assert hparams["accumulate_grad_batches"] == 2
     assert hparams["seed"] == 7
+    assert hparams["seq_target_mode"] == "ordered_contiguous_prefix"
+    assert hparams["seq_progress_weight"] == 0.5
+    assert hparams["seq_completion_weight"] == 0.5
+    assert hparams["seq_normalization"] == "sample"
     assert "rank" not in hparams
 
 

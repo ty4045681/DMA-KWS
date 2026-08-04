@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from dma_kws.tokenizer import build_seq_label, load_char_tokenizer, tokenize_phoneme_string
+import pytest
+
+from dma_kws.tokenizer import (
+    SEQ_LABEL_MEMBERSHIP,
+    build_seq_label,
+    load_char_tokenizer,
+    tokenize_phoneme_string,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DICT_PATH = REPO_ROOT / "data" / "dict" / "lang_char.txt"
@@ -24,8 +31,53 @@ def test_stress_stripped_phonemes_are_out_of_vocabulary():
     assert tokenize_phoneme_string(tok, "HH AH L OW") == [35, unk_id, 44, unk_id]
 
 
-def test_build_seq_label_membership():
-    assert build_seq_label([10, 11, 12], [11, 99]) == [0, 1, 0]
+HEY_GOOGLE = [10, 11, 12, 13, 12, 14, 15]
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        (HEY_GOOGLE, [1, 1, 1, 1, 1, 1, 1]),
+        ([99, *HEY_GOOGLE], [1, 1, 1, 1, 1, 1, 1]),
+        ([*HEY_GOOGLE, 99], [1, 1, 1, 1, 1, 1, 1]),
+        # Play/A/OK Google share most of the suffix but never start the anchor.
+        ([20, 21, 11, 12, 13, 12, 14, 15], [0, 0, 0, 0, 0, 0, 0]),
+        ([14, 12, 13, 12, 14, 15], [0, 0, 0, 0, 0, 0, 0]),
+        ([22, 23, 11, 12, 13, 12, 14, 15], [0, 0, 0, 0, 0, 0, 0]),
+        (HEY_GOOGLE[:4], [1, 1, 1, 1, 0, 0, 0]),
+        ([10, 99, *HEY_GOOGLE[1:]], [1, 0, 0, 0, 0, 0, 0]),
+        ([], [0, 0, 0, 0, 0, 0, 0]),
+    ],
+)
+def test_build_seq_label_uses_ordered_contiguous_prefix_progress(query, expected):
+    assert build_seq_label(HEY_GOOGLE, query) == expected
+
+
+def test_build_seq_label_respects_repeated_phone_count_and_position():
+    assert build_seq_label([10, 10, 11], [10, 11]) == [1, 0, 0]
+    assert build_seq_label([10, 10, 11], [99, 10, 10, 11, 98]) == [1, 1, 1]
+
+
+def test_build_seq_label_uses_best_contiguous_query_start():
+    assert build_seq_label([10, 11, 12], [10, 99, 10, 11, 88]) == [1, 1, 0]
+
+
+def test_build_seq_label_retains_explicit_membership_ablation():
+    assert build_seq_label(
+        [10, 11, 12],
+        [11, 99],
+        mode=SEQ_LABEL_MEMBERSHIP,
+    ) == [0, 1, 0]
+
+
+def test_build_seq_label_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="Unsupported seq label mode"):
+        build_seq_label([10], [10], mode="edit_distance")
+
+
+def test_build_seq_label_rejects_empty_anchor():
+    with pytest.raises(ValueError, match="anchor_ids must contain"):
+        build_seq_label([], [10])
 
 
 def test_load_char_tokenizer_loads_lang_char_dict():

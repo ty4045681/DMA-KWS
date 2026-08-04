@@ -126,6 +126,42 @@ def test_dataset_positive_sample_has_matching_seq_label(mock_npy_loader):
     assert torch.all(sample["seq_label"] == 1)
 
 
+def test_dataset_rejects_unknown_seq_label_mode(mock_npy_loader):
+    with pytest.raises(ValueError, match="Unsupported seq label mode"):
+        LibriPhraseTrainDataset(
+            wav_dir="/data/segments",
+            tokenizer=_FakeTokenizer(),
+            df=_mock_dataframe(),
+            sample_lens=1,
+            seq_label_mode="levenshtein",
+        )
+
+
+def test_containing_ngram_is_never_returned_as_a_negative(mock_npy_loader):
+    df = pd.DataFrame(
+        {
+            "ngram": ["google", "hey google"],
+            "ngram_g2p": ["G UW1 G AH0 L", "HH EY1 G UW1 G AH0 L"],
+            "clips_file": ["clips-2-a.npy", "clips-2-b.npy"],
+            "distances_file": ["dist-0-a.npy", "dist-2-b.npy"],
+        }
+    )
+    dataset = LibriPhraseTrainDataset(
+        wav_dir="/data/segments",
+        tokenizer=_FakeTokenizer(),
+        df=df,
+        sample_lens=1,
+        seed=0,
+    )
+
+    sample = dataset[0]
+
+    # seed=0 takes the negative branch. The only candidate contains the full
+    # anchor, so after bounded re-draws it must be relabeled as an occurrence.
+    assert sample["label"].item() == 1
+    assert sample["seq_label"].tolist() == [1] * sample["anchor_seq"].numel()
+
+
 def test_dataset_collate_batch_shapes(mock_npy_loader):
     dataset = LibriPhraseTrainDataset(
         wav_dir="/data/segments",

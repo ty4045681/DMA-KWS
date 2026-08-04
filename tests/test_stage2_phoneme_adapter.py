@@ -62,7 +62,7 @@ def _mock_encoder_output(feat: torch.Tensor, feat_lengths: torch.Tensor):
 
 def _batch(batch_size: int = 2, frames: int = 12) -> dict:
     feat_lengths = torch.tensor([frames, frames - 4], dtype=torch.long)
-    seq_label = torch.tensor([[1, 0, 1], [0, 1, -1]], dtype=torch.long)
+    seq_label = torch.tensor([[1, 1, 1], [1, 0, -1]], dtype=torch.long)
     return {
         "feat": torch.randn(batch_size, frames, 80),
         "feat_lengths": feat_lengths,
@@ -219,7 +219,7 @@ def test_ctc_weight_zero_reproduces_the_pre_adapter_loss():
     logits = torch.randn(4)
     seq_logits = torch.randn(4, 3)
     labels = torch.tensor([1, 0, 1, 0])
-    seq_labels = torch.tensor([[1, 0, 1], [0, 1, -1], [1, 1, 1], [0, 0, -1]])
+    seq_labels = torch.tensor([[1, 1, 1], [1, 0, -1], [1, 1, 1], [0, 0, -1]])
     mask = (seq_labels != -1).float()
 
     baseline, _ = compute_stage2_losses(logits, seq_logits, labels, seq_labels, mask)

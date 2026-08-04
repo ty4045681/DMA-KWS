@@ -253,11 +253,27 @@ def test_keyword_adaptation_dataset_seq_label(tmp_path: Path, monkeypatch):
     pos_dir = fbank_root / "tts" / "positive"
     pos_dir.mkdir(parents=True)
     np.save(pos_dir / "pos.npy", np.zeros((4, 80), dtype=np.float32))
+    neg_dir = fbank_root / "tts" / "negative"
+    neg_dir.mkdir(parents=True)
+    np.save(neg_dir / "contains.npy", np.zeros((4, 80), dtype=np.float32))
 
     manifest = tmp_path / "train.csv"
     write_train_manifest(
         manifest,
-        [AdaptSample(audio_path="raw/tts/positive/pos.wav", text="hey eva", label=1, phase="tts")],
+        [
+            AdaptSample(
+                audio_path="raw/tts/positive/pos.wav",
+                text="hey eva",
+                label=1,
+                phase="tts",
+            ),
+            AdaptSample(
+                audio_path="raw/tts/negative/contains.wav",
+                text="please hey eva",
+                label=0,
+                phase="tts",
+            ),
+        ],
     )
 
     tokenizer = load_char_tokenizer(DICT_PATH)
@@ -275,6 +291,8 @@ def test_keyword_adaptation_dataset_seq_label(tmp_path: Path, monkeypatch):
     batch = train_collate_fn([pos, pos])
     assert batch["anchor"].shape[0] == 2
     assert batch["seq_label_mask"].shape == batch["seq_label"].shape
+    with pytest.raises(ValueError, match="phrases containing the full keyword"):
+        dataset[1]
 
 
 def test_mixed_adaptation_sampling_ratio():

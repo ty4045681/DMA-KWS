@@ -16,6 +16,7 @@ from dma_kws.config import resolve_stream_policy
 from dma_kws.nn import build_encoder, run_encoder
 from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage2.losses import compute_stage2_losses
+from dma_kws.stage2.objective import resolve_sequence_objective
 from dma_kws.training.checkpoint_io import (
     assert_qbyt_readout_version,
     assert_stream_policy_matches,
@@ -91,6 +92,18 @@ class Stage2LightningModule(pl.LightningModule):
         stage1 = config["stage1"]
         stage2 = config["stage2"]
         encoder_dim = int(stage2.get("encoder_output_dim", stage1.get("encoder_output_dim", 144)))
+
+        sequence_objective = resolve_sequence_objective(stage2)
+        self.seq_label_mode = sequence_objective.target_mode
+        self.seq_progress_weight = sequence_objective.progress_weight
+        self.seq_completion_weight = sequence_objective.completion_weight
+        self.seq_normalization = sequence_objective.normalization
+        # Minimal hand-written configs may omit this section. Stamp the resolved
+        # objective into all new checkpoints so two same-shape QbyT models do not
+        # become indistinguishable after being trained against different targets.
+        self._checkpoint_config.setdefault("stage2", {})[
+            "sequence_loss"
+        ] = sequence_objective.as_dict()
 
         self.stream_policy = resolve_stream_policy(stage1)
         self.encoder = build_encoder(stage1, output_dim=encoder_dim)
@@ -502,6 +515,9 @@ class Stage2LightningModule(pl.LightningModule):
             labels=batch["label"],
             seq_labels=batch["seq_label"],
             seq_label_mask=batch["seq_label_mask"],
+            seq_progress_weight=self.seq_progress_weight,
+            seq_completion_weight=self.seq_completion_weight,
+            seq_normalization=self.seq_normalization,
             ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
             ctc_weight=self.ctc_weight,
         )
@@ -511,6 +527,10 @@ class Stage2LightningModule(pl.LightningModule):
         self.log("train/loss", total_loss, on_step=True, prog_bar=True)
         self.log("train/utt_loss", losses["utt_loss"], on_step=True, prog_bar=True)
         self.log("train/seq_loss", losses["seq_loss"], on_step=True, prog_bar=True)
+        if self.seq_progress_weight:
+            self.log("train/seq_progress_loss", losses["seq_progress_loss"], on_step=True)
+        if self.seq_completion_weight:
+            self.log("train/seq_completion_loss", losses["seq_completion_loss"], on_step=True)
         if "ctc_loss" in losses:
             self.log("train/ctc_loss", losses["ctc_loss"], on_step=True, prog_bar=True)
 

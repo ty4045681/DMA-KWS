@@ -31,6 +31,12 @@ def _minimal_config() -> dict:
             "warmup_steps": 2,
             "total_scheduler_steps": 10,
             "max_steps": 10,
+            "sequence_loss": {
+                "target_mode": "ordered_contiguous_prefix",
+                "progress_weight": 0.5,
+                "completion_weight": 0.5,
+                "normalization": "sample",
+            },
         },
     }
 
@@ -54,7 +60,7 @@ def _random_batch(batch_size: int = 2) -> dict:
 
     feat = torch.randn(batch_size, max_feat, 80)
     anchor = torch.tensor([[10, 11, 12], [13, 14, 0]], dtype=torch.long)
-    seq_label = torch.tensor([[1, 0, 1], [0, 1, -1]], dtype=torch.long)
+    seq_label = torch.tensor([[1, 1, 1], [1, 0, -1]], dtype=torch.long)
     seq_label_mask = (seq_label != -1).float()
 
     return {

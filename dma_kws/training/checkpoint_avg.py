@@ -93,6 +93,21 @@ def average_lightning_checkpoints(paths: list[Path], output_path: Path) -> Path:
 
     checkpoints = [torch.load(path, map_location="cpu") for path in paths]
     state_dicts = [_extract_state_dict(checkpoint) for checkpoint in checkpoints]
+    if any(key.startswith("qbyt.") for key in state_dicts[0]):
+        from dma_kws.stage2.objective import checkpoint_sequence_objective
+
+        sequence_objectives = [
+            checkpoint_sequence_objective(checkpoint) for checkpoint in checkpoints
+        ]
+        if any(
+            objective != sequence_objectives[0]
+            for objective in sequence_objectives[1:]
+        ):
+            described = [objective.describe() for objective in sequence_objectives]
+            raise ValueError(
+                "Cannot average checkpoints trained with different Stage II sequence "
+                f"objectives: {described}"
+            )
     reference_keys = set(state_dicts[0])
     for path, state in zip(paths[1:], state_dicts[1:]):
         if set(state) != reference_keys:

@@ -133,6 +133,19 @@ def collect_hparams(
             "recipe": str((config.get("training") or {}).get("recipe", "")),
         }
     )
+    sequence_loss = stage2.get("sequence_loss", {}) or {}
+    hparams.update(
+        {
+            "seq_target_mode": str(
+                sequence_loss.get("target_mode", "ordered_contiguous_prefix")
+            ),
+            "seq_progress_weight": float(sequence_loss.get("progress_weight", 0.5)),
+            "seq_completion_weight": float(
+                sequence_loss.get("completion_weight", 0.5)
+            ),
+            "seq_normalization": str(sequence_loss.get("normalization", "sample")),
+        }
+    )
     if extra:
         hparams.update(extra)
     return hparams

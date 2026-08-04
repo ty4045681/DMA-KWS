@@ -168,11 +168,71 @@ def tokenize_phoneme_string(tokenizer, g2p_text: str) -> list[int]:
     return token_ids
 
 
-def build_seq_label(anchor_ids: list[int], query_ids: list[int]) -> list[int]:
-    """Build per-anchor-token membership labels against ``query_ids``.
+SEQ_LABEL_MEMBERSHIP = "membership"
+SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX = "ordered_contiguous_prefix"
+DEFAULT_SEQ_LABEL_MODE = SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
+SEQ_LABEL_MODES = frozenset(
+    {
+        SEQ_LABEL_MEMBERSHIP,
+        SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX,
+    }
+)
 
-    Ids are stress-marked, so ``AH0`` in the anchor does not match ``AH1`` in the
-    query. If the phoneme matcher's ``seq_loss`` ever needs the looser
-    stress-agnostic supervision, this is the single place to relax.
+
+def normalize_seq_label_mode(mode: str) -> str:
+    """Validate and normalize a Stage II sequence-target mode."""
+    normalized = str(mode).strip().lower()
+    if normalized not in SEQ_LABEL_MODES:
+        choices = ", ".join(sorted(SEQ_LABEL_MODES))
+        raise ValueError(
+            f"Unsupported seq label mode {mode!r}; expected one of: {choices}"
+        )
+    return normalized
+
+
+def _longest_contiguous_anchor_prefix(
+    anchor_ids: list[int],
+    query_ids: list[int],
+) -> int:
+    """Length of the longest anchor prefix occurring contiguously in the query."""
+    best = 0
+    for query_start in range(len(query_ids)):
+        matched = 0
+        while (
+            matched < len(anchor_ids)
+            and query_start + matched < len(query_ids)
+            and anchor_ids[matched] == query_ids[query_start + matched]
+        ):
+            matched += 1
+        best = max(best, matched)
+        if best == len(anchor_ids):
+            break
+    return best
+
+
+def build_seq_label(
+    anchor_ids: list[int],
+    query_ids: list[int],
+    *,
+    mode: str = DEFAULT_SEQ_LABEL_MODE,
+) -> list[int]:
+    """Build one binary sequence target per anchor phoneme.
+
+    The default target describes ordered, contiguous progress: if the longest
+    prefix of ``anchor_ids`` found anywhere in ``query_ids`` has length ``r``,
+    the result is ``r`` ones followed by zeros. Query-side leading/trailing
+    context is allowed, but insertions, reordering and reusing one occurrence of
+    a repeated phoneme cannot advance the target.
+
+    ``membership`` retains the released DMA/PhonMatchNet heuristic for explicit
+    legacy ablations. Ids remain stress-marked, so e.g. ``AH0`` and ``AH1`` are
+    distinct in both modes.
     """
-    return [1 if anchor_id in query_ids else 0 for anchor_id in anchor_ids]
+    mode = normalize_seq_label_mode(mode)
+    if not anchor_ids:
+        raise ValueError("anchor_ids must contain at least one phoneme")
+    if mode == SEQ_LABEL_MEMBERSHIP:
+        return [1 if anchor_id in query_ids else 0 for anchor_id in anchor_ids]
+
+    matched = _longest_contiguous_anchor_prefix(anchor_ids, query_ids)
+    return [1] * matched + [0] * (len(anchor_ids) - matched)

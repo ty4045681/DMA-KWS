@@ -25,6 +25,17 @@ freeze_encoder: false
 # way, and no score from such a checkpoint is comparable with its original run.
 allow_legacy_qbyt_readout: false
 
+# The released code used unordered phoneme set-membership labels. The corrected
+# target is cumulative ordered/contiguous progress (111...000), plus an explicit
+# full-keyword completion term. For a strict legacy ablation use:
+# target_mode=membership, progress_weight=1, completion_weight=0,
+# normalization=token.
+sequence_loss:
+  target_mode: ordered_contiguous_prefix
+  progress_weight: 0.5
+  completion_weight: 0.5
+  normalization: sample
+
 # Phoneme-CTC trunk between the frozen encoder and QbyT (see configs/phoneme_adapter).
 # Off by default so pre-adapter checkpoints keep loading and stay comparable.
 phoneme_adapter:

@@ -358,6 +358,21 @@ class Stage2PhonemeAdapterConfig:
 
 
 @dataclass
+class Stage2SequenceLossConfig:
+    """Ordered phoneme-progress supervision for the QbyT sequence head."""
+
+    #: ``membership`` is retained only for reproducing the released objective.
+    target_mode: str = "ordered_contiguous_prefix"
+    #: Per-anchor-position progress BCE contribution.
+    progress_weight: float = 0.5
+    #: Extra weight on the last valid position (full keyword completion).
+    completion_weight: float = 0.5
+    #: ``sample`` gives every pair equal weight; ``token`` reproduces the old
+    #: valid-token mean, under which long anchors count more.
+    normalization: str = "sample"
+
+
+@dataclass
 class Stage2Config:
     encoder_output_dim: int = 144
     qbyt_embed_dim: int = 128
@@ -402,6 +417,9 @@ class Stage2Config:
     checkpoint: Stage2CheckpointConfig = field(default_factory=Stage2CheckpointConfig)
     gradient_diagnostics: Stage2GradientDiagnosticsConfig = field(default_factory=Stage2GradientDiagnosticsConfig)
     prep: Stage2PrepConfig = field(default_factory=Stage2PrepConfig)
+    sequence_loss: Stage2SequenceLossConfig = field(
+        default_factory=Stage2SequenceLossConfig
+    )
     phoneme_adapter: Stage2PhonemeAdapterConfig = field(
         default_factory=Stage2PhonemeAdapterConfig
     )

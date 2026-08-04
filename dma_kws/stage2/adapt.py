@@ -24,6 +24,10 @@ from dma_kws.stage2.adapt_dataset import (
 )
 from dma_kws.stage2.adapt_paths import adapt_data_root, phase_manifest, slugify
 from dma_kws.stage2.module import Stage2LightningModule
+from dma_kws.stage2.objective import (
+    assert_sequence_objective_matches,
+    resolve_sequence_objective,
+)
 from dma_kws.stage2.train import _build_val_dataloader, _resolve_path
 from dma_kws.training.adapt_params import (
     load_adapt_params_file,
@@ -704,6 +708,13 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             args.resume_checkpoint,
         )
 
+    if resume_path is not None:
+        assert_sequence_objective_matches(
+            torch.load(resume_path, map_location="cpu"),
+            stage2,
+            source=resume_path,
+        )
+
     if is_primary_process:
         reporter.section(f"LoRA adaptation · {adapt_paths['keyword_str']} · phase={phase}")
         reporter.print_plan(
@@ -725,6 +736,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
 
     seed = int(training.get("seed", 2025))
     pl_mod.seed_everything(seed, workers=True)
+    seq_label_mode = resolve_sequence_objective(stage2).target_mode
     # MixedAdaptationDataset ignores the sampler's index and samples from its own
     # RNG. Give num_workers=0 runs distinct streams too; worker processes apply
     # the same rank offset again from their DataLoader-provided base seed.
@@ -736,6 +748,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         fbank_root=adapt_paths["fbank_root"],
         tokenizer=tokenizer,
         manifest_root=adapt_paths["data_root"],
+        seq_label_mode=seq_label_mode,
     )
 
     processed_root = Path(paths["processed_root"])
@@ -755,6 +768,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         hard_negative_ratio=int(stage2.get("hard_negative_ratio", 1)),
         sample_lens=int(adapt.get("sample_lens", stage2.get("sample_lens", 5000))),
         seed=sampling_seed,
+        seq_label_mode=seq_label_mode,
     )
 
     train_dataset = MixedAdaptationDataset(
@@ -1001,7 +1015,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 {
                     "checkpoint_kind": "stage2_lora_adapter",
                     "lora_state_dict": lora_state_dict(model.qbyt),
-                    "config": config,
+                    "config": model._checkpoint_config,
                     "step": global_step,
                     "keyword": adapt_paths["keyword_str"],
                     "slug": adapt_paths["slug_str"],
@@ -1020,7 +1034,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             stamp_qbyt_readout_version(
                 {
                     "model_state_dict": model.state_dict(),
-                    "config": config,
+                    "config": model._checkpoint_config,
                     "step": global_step,
                     "keyword": adapt_paths["keyword_str"],
                     "slug": adapt_paths["slug_str"],

@@ -59,6 +59,12 @@ def test_demo_config_loads_with_tokenizer_and_training_seed():
     assert stage2["negative_ratio"] == 1
     assert stage2["learning_rate"] == 0.0005
     assert stage2["warmup_steps"] == 2500
+    assert stage2["sequence_loss"] == {
+        "target_mode": "ordered_contiguous_prefix",
+        "progress_weight": 0.5,
+        "completion_weight": 0.5,
+        "normalization": "sample",
+    }
 
 
 @pytest.mark.parametrize(

@@ -102,6 +102,10 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     from dma_kws.stage2.collate import train_collate_fn
     from dma_kws.stage2.dataset import LibriPhraseTrainDataset, stage2_worker_init_fn
     from dma_kws.stage2.module import Stage2LightningModule
+    from dma_kws.stage2.objective import (
+        assert_sequence_objective_matches,
+        resolve_sequence_objective,
+    )
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training import resolve_resume_path
     from dma_kws.training.callbacks import build_stage2_callbacks, print_run_summary
@@ -141,6 +145,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
 
     seed = int(training.get("seed", 2025))
     pl.seed_everything(seed, workers=True)
+    sequence_objective = resolve_sequence_objective(stage2)
 
     train_dataset = LibriPhraseTrainDataset(
         parquet_file=parquet_file,
@@ -150,6 +155,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         hard_negative_ratio=int(stage2.get("hard_negative_ratio", 1)),
         sample_lens=int(stage2.get("sample_lens", 5000)),
         seed=seed,
+        seq_label_mode=sequence_objective.target_mode,
     )
 
     batch_size = int(stage2.get("batch_size_per_gpu", 64))
@@ -179,6 +185,14 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     resume_path = resolve_resume_path(args.resume_from, checkpoint_dir)
+
+    if resume_path is not None:
+        resume_payload = torch.load(resume_path, map_location="cpu")
+        assert_sequence_objective_matches(
+            resume_payload,
+            stage2,
+            source=resume_path,
+        )
 
     if resume_path is not None:
         if resume_checkpoint or init_checkpoint:
@@ -291,7 +305,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         stamp_qbyt_readout_version(
             {
                 "model_state_dict": model.state_dict(),
-                "config": config,
+                "config": model._checkpoint_config,
                 "step": global_step,
                 "tokenizer_dict_path": str(dict_path),
                 "vocab_size": vocab_size,
