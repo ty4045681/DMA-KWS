@@ -8,6 +8,10 @@ per-subset (music/noise/speech) FA/hour.
 Output schema matches ``scripts/eval_stage2_clips.py``:
   - ``results.jsonl`` has one JSON object per scored window.
   - ``summary.json`` contains aggregate metrics.
+
+Set ``prep.keyword_phonemes`` to a space-separated ARPAbet sequence (or a
+Hydra list) to override keyword G2P. A missing or blank value retains automatic
+G2P. These are the only two files written to ``prep.output_dir``.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from dma_kws.inference.musan_fa import (
     subset_summary,
 )
 from dma_kws.inference.stage2_clip import Stage2ClipRunner
+from dma_kws.inference.stage2_reporting import build_score_provenance
 from dma_kws.training.device import resolve_accelerator
 
 
@@ -79,67 +84,106 @@ def run_eval(cfg: DictConfig) -> dict:
     runner = Stage2ClipRunner.from_config(config, prep, device)
     threshold = float(runner._demo_cfg.get("qbyt_threshold", 0.5))
 
+    raw_keyword_phonemes = prep.get("keyword_phonemes")
+    use_keyword_phoneme_override = raw_keyword_phonemes is not None and not (
+        isinstance(raw_keyword_phonemes, str)
+        and not raw_keyword_phonemes.strip()
+    )
+    try:
+        keyword_phonemes = runner.resolve_keyword_phonemes(
+            keyword,
+            raw_keyword_phonemes if use_keyword_phoneme_override else None,
+            field_name="prep.keyword_phonemes",
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    keyword_phonemes_source = (
+        "prep.keyword_phonemes" if use_keyword_phoneme_override else "g2p"
+    )
+
+    stream_description = runner.stream_policy.describe()
+    provenance = build_score_provenance(
+        config,
+        checkpoint_path=stage2_ckpt,
+        stream=stream_description,
+        # Sliding windows are scored as-is; unlike clip evaluation, this path
+        # does not add zero-valued waveform context around each window.
+        left_padding_ms=0,
+        right_padding_ms=0,
+    )
+    sequence_objective = provenance["sequence_objective"]
+
     audio_files = iter_audio_files(musan_root_path)
     if not audio_files:
         raise SystemExit(f"No audio files found under {musan_root}")
 
-    # Keep a reproducible source manifest.
-    manifest_path = output_dir / "musan_manifest.jsonl"
-    with manifest_path.open("w", encoding="utf-8") as manifest_handle:
-        for audio_path in audio_files:
-            row = {
-                "audio_path": str(audio_path.resolve()),
-                "keyword": keyword,
-                "label": 0,
-                "subset": detect_subset(audio_path, musan_root_path),
-            }
-            manifest_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    # Re-load manifest so ordering and metadata are explicit.
-    with manifest_path.open("r", encoding="utf-8") as manifest_handle:
-        source_rows = [json.loads(line) for line in manifest_handle if line.strip()]
+    source_rows = [
+        {
+            "audio_path": str(audio_path.resolve()),
+            "subset": detect_subset(audio_path, musan_root_path),
+        }
+        for audio_path in audio_files
+    ]
 
     results_path = output_dir / "results.jsonl"
-    results_handle = results_path.open("w", encoding="utf-8")
-
     all_results: list[dict[str, Any]] = []
     subset_results: dict[str, list[dict[str, Any]]] = defaultdict(list)
     subset_hours: dict[str, float] = defaultdict(float)
     total_hours = 0.0
 
-    for source_row in source_rows:
-        audio_path = source_row["audio_path"]
-        subset = source_row["subset"]
-        duration = audio_duration_sec(audio_path)
-        total_hours += duration / 3600.0
-        subset_hours[subset] += duration / 3600.0
+    with results_path.open("w", encoding="utf-8") as results_handle:
+        for source_row in source_rows:
+            audio_path = source_row["audio_path"]
+            subset = source_row["subset"]
+            duration = audio_duration_sec(audio_path)
+            total_hours += duration / 3600.0
+            subset_hours[subset] += duration / 3600.0
 
-        window_results = runner.run_file_windows(
-            audio_path,
-            keyword,
-            window_sec=window_sec,
-            hop_sec=hop_sec,
-        )
-        for window_result in window_results:
-            record = musan_result_record(audio_path, keyword, subset, window_result)
-            all_results.append(record)
-            subset_results[subset].append(record)
-            results_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    results_handle.close()
+            window_results = runner.run_file_windows(
+                audio_path,
+                keyword,
+                window_sec=window_sec,
+                hop_sec=hop_sec,
+                keyword_phonemes=(
+                    keyword_phonemes if use_keyword_phoneme_override else None
+                ),
+                include_score_details=True,
+                include_eps_positions=True,
+                include_seq_positions=True,
+            )
+            for window_result in window_results:
+                record = musan_result_record(
+                    audio_path,
+                    keyword,
+                    subset,
+                    window_result,
+                    window_index=int(window_result["window_index"]),
+                    sequence_objective=sequence_objective,
+                    qbyt_readout=provenance["qbyt_readout"],
+                )
+                all_results.append(record)
+                subset_results[subset].append(record)
+                results_handle.write(
+                    json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+                )
 
     summary: dict[str, Any] = {
-        "manifest": str(manifest_path.resolve()),
         "num_samples": len(all_results),
+        "num_skipped": sum(
+            bool(record.get("skipped", False)) for record in all_results
+        ),
         "output_dir": str(output_dir.resolve()),
         "musan_root": str(musan_root_path.resolve()),
         "keyword": keyword,
+        "keyword_phonemes": keyword_phonemes,
+        "keyword_phonemes_source": keyword_phonemes_source,
         "stage2_ckpt": stage2_ckpt,
         "window_sec": window_sec,
         "hop_sec": hop_sec,
         "total_files": len(source_rows),
         "total_hours": total_hours,
-        "stream": runner.stream_policy.describe(),
+        "stream": stream_description,
+        "provenance": provenance,
     }
 
     overall_metrics = summarize_false_accept_rate(
@@ -162,9 +206,9 @@ def run_eval(cfg: DictConfig) -> dict:
 
     summary_path = output_dir / "summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, ensure_ascii=False, indent=2)
+        json.dump(summary, handle, ensure_ascii=False, indent=2, allow_nan=False)
 
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False))
     return summary
 
 

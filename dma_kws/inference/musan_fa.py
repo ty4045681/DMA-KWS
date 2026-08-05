@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from dma_kws.inference.metrics import summarize_false_accept_rate
+from dma_kws.inference.stage2_reporting import build_result_record
 
 
 def audio_duration_sec(path: str | Path) -> float:
@@ -37,22 +40,30 @@ def musan_result_record(
     keyword: str,
     subset: str,
     runner_result: dict,
+    *,
+    window_index: int | None = None,
+    sequence_objective: Mapping[str, object] | None = None,
+    qbyt_readout: Mapping[str, object] | None = None,
 ) -> dict:
-    """Build a results.jsonl row matching ``scripts/eval_stage2_clips.py`` output."""
-    return {
+    """Build a rich Stage-II result row for one MUSAN sliding window."""
+
+    span = runner_result["clip_span_sec"]
+    manifest_row = {
         "audio_path": source_path,
         "keyword": keyword,
-        "qbyt_score": float(runner_result.get("qbyt_score", 0.0)),
-        "detected": bool(runner_result["detected"]),
-        "threshold": float(runner_result["threshold"]),
-        "skipped": bool(runner_result.get("skipped", False)),
         "label": 0,
-        "manifest_meta": {
-            "subset": subset,
-            "start_sec": float(runner_result["clip_span_sec"]["start_sec"]),
-            "end_sec": float(runner_result["clip_span_sec"]["end_sec"]),
-        },
+        "subset": subset,
+        "start_sec": float(span["start_sec"]),
+        "end_sec": float(span["end_sec"]),
     }
+    if window_index is not None:
+        manifest_row["window_index"] = int(window_index)
+    return build_result_record(
+        manifest_row,
+        runner_result,
+        sequence_objective=sequence_objective,
+        qbyt_readout=qbyt_readout,
+    )
 
 
 def metrics_record(record: dict) -> dict:

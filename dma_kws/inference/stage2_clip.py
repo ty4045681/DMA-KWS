@@ -21,20 +21,25 @@ from dma_kws.tokenizer import (
 if TYPE_CHECKING:
     from dma_kws.inference.stage2_verifier import Stage2Verifier
 
-__all__ = ["ClipFeatureDataset", "Stage2ClipRunner", "collate_clip_feature_batch"]
+__all__ = [
+    "ClipFeatureDataset",
+    "Stage2ClipRunner",
+    "collate_clip_feature_batch",
+    "parse_phoneme_sequence",
+]
 
 
-def _parse_manifest_phonemes(
+def parse_phoneme_sequence(
     value: object,
     *,
     field_name: str,
 ) -> list[str]:
-    """Parse an explicitly supplied manifest phoneme override.
+    """Parse an explicitly supplied phoneme override.
 
-    CSV manifests normally use a space-separated ARPAbet string, while JSONL
-    manifests may use either that string or a JSON array of strings. Invalid or
-    empty values fail loudly instead of silently falling back to G2P or being
-    tokenized as ``<unk>``.
+    CLI/config values and CSV manifests normally use a space-separated ARPAbet
+    string, while JSONL manifests may use either that string or a JSON array of
+    strings. Invalid or empty values fail loudly instead of silently falling
+    back to G2P or being tokenized as ``<unk>``.
     """
     parsed: object = value
     if isinstance(value, str):
@@ -233,6 +238,22 @@ class Stage2ClipRunner:
             skipped=not stage2_scores,
         )
 
+    def resolve_keyword_phonemes(
+        self,
+        keyword: str,
+        keyword_phonemes: object | None = None,
+        *,
+        field_name: str = "keyword_phonemes",
+    ) -> list[str]:
+        """Return the effective enrollment sequence for one keyword.
+
+        ``None`` retains automatic G2P. Any explicit value uses the same strict
+        ARPAbet parser and vocabulary validation as manifest overrides.
+        """
+        if keyword_phonemes is None:
+            return text_to_phonemes(self._g2p, keyword)
+        return parse_phoneme_sequence(keyword_phonemes, field_name=field_name)
+
     def run_batch(
         self,
         rows: Sequence[Mapping[str, Any]],
@@ -273,7 +294,7 @@ class Stage2ClipRunner:
             include_eps_positions or include_seq_positions
         ):
             raise ValueError(
-                "Position-logit export requires include_score_details=true"
+                "Position-logit export requires include_score_details=True"
             )
 
         rows = list(rows)
@@ -294,7 +315,7 @@ class Stage2ClipRunner:
         for row_index, row in enumerate(rows, start=1):
             keyword = str(row["keyword"])
             override = (
-                _parse_manifest_phonemes(
+                parse_phoneme_sequence(
                     row["keyword_phonemes"],
                     field_name=f"Manifest row {row_index} keyword_phonemes",
                 )
@@ -329,7 +350,7 @@ class Stage2ClipRunner:
                 and not text_variant_override_raw.strip()
             )
             text_variant_override = (
-                _parse_manifest_phonemes(
+                parse_phoneme_sequence(
                     text_variant_override_raw,
                     field_name=f"Manifest row {row_index} text_variant_phonemes",
                 )
@@ -487,20 +508,43 @@ class Stage2ClipRunner:
         *,
         window_sec: float,
         hop_sec: float,
+        keyword_phonemes: object | None = None,
+        include_score_details: bool = False,
+        include_eps_positions: bool = False,
+        include_seq_positions: bool = False,
     ) -> list[dict]:
         """Run Stage-II verification on sliding windows of a long audio file.
 
         The file is divided into overlapping windows of length ``window_sec``
         advanced by ``hop_sec``. Each window is scored independently and a result
-        dict in the same format as :meth:`run` is returned.
+        dict in the same format as :meth:`run` is returned. ``keyword_phonemes``
+        overrides automatic G2P when supplied. Position-level exports require
+        ``include_score_details=True``.
         """
         from dma_kws.inference.audio_utils import has_min_fbank_frames
         from dma_kws.stage2.features import waveform_to_fbank
 
-        keyword_phonemes = text_to_phonemes(self._g2p, keyword)
+        if not include_score_details and (
+            include_eps_positions or include_seq_positions
+        ):
+            raise ValueError(
+                "Position-logit export requires include_score_details=True"
+            )
+
+        keyword_phonemes = self.resolve_keyword_phonemes(
+            keyword,
+            keyword_phonemes,
+            field_name="keyword_phonemes",
+        )
         keyword_ids = tokenize_phoneme_string(
             self._tokenizer, " ".join(keyword_phonemes)
         )
+        if len(keyword_ids) != len(keyword_phonemes):
+            raise RuntimeError(
+                "Enrollment phoneme/token length mismatch: "
+                f"keyword={keyword!r}, phonemes={len(keyword_phonemes)}, "
+                f"token_ids={len(keyword_ids)}"
+            )
         threshold = float(self._demo_cfg.get("qbyt_threshold", 0.5))
         min_stage2_fbank_frames = self._verifier.min_fbank_frames
 
@@ -517,8 +561,10 @@ class Stage2ClipRunner:
 
         fbank_kwargs = self._verifier.fbank_kwargs
         feats = []
-        spans: list[tuple[float, float]] = []
-        for start in range(0, total_samples - window_samples + 1, hop_samples):
+        spans: list[tuple[int, float, float]] = []
+        for window_index, start in enumerate(
+            range(0, total_samples - window_samples + 1, hop_samples)
+        ):
             end = start + window_samples
             if not has_min_fbank_frames(
                 end - start,
@@ -537,24 +583,52 @@ class Stage2ClipRunner:
                 **fbank_kwargs,
             )
             feats.append(feat)
-            spans.append((start / sample_rate, end / sample_rate))
+            spans.append((window_index, start / sample_rate, end / sample_rate))
 
         if not feats:
             return []
 
-        scores = self._verifier.score_clip_feats(feats, [keyword_ids] * len(feats))
-        results = []
-        for (start_sec, end_sec), score in zip(spans, scores):
-            results.append(
-                self._clip_result(
-                    audio_path,
-                    keyword,
-                    keyword_phonemes,
-                    end_sec=end_sec,
-                    qbyt_score=float(score),
-                    threshold=threshold,
-                    skipped=False,
-                    start_sec=start_sec,
-                )
+        if include_score_details:
+            position_kwargs = {}
+            if include_eps_positions:
+                position_kwargs["include_eps_positions"] = True
+            if include_seq_positions:
+                position_kwargs["include_seq_positions"] = True
+            score_details = self._verifier.score_clip_feats_detailed(
+                feats,
+                [keyword_ids] * len(feats),
+                **position_kwargs,
             )
+        else:
+            score_details = [
+                {"qbyt_score": score}
+                for score in self._verifier.score_clip_feats(
+                    feats,
+                    [keyword_ids] * len(feats),
+                )
+            ]
+        if len(score_details) != len(spans):
+            raise RuntimeError(
+                "Stage-II window scorer returned an unexpected result count: "
+                f"expected={len(spans)}, actual={len(score_details)}"
+            )
+        results = []
+        for (window_index, start_sec, end_sec), details in zip(
+            spans, score_details
+        ):
+            result = self._clip_result(
+                audio_path,
+                keyword,
+                keyword_phonemes,
+                end_sec=end_sec,
+                qbyt_score=float(details["qbyt_score"]),
+                threshold=threshold,
+                skipped=False,
+                start_sec=start_sec,
+                score_details=details if include_score_details else None,
+            )
+            # This is the original hop-grid index, not the compacted position
+            # among scoreable windows.
+            result["window_index"] = window_index
+            results.append(result)
         return results

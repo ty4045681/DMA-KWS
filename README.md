@@ -1617,16 +1617,18 @@ Checkpoints run sequentially on one GPU; to use multiple GPUs, split the checkpo
 To measure the false-accept (FA) rate of a Stage-II QbyT checkpoint on continuous
 background audio, use `scripts/eval_musan_fa.py` or the batch wrapper
 `scripts/batch_eval_musan_fa.sh`. These scripts slide a fixed-length window over
-every MUSAN file and score each window with Stage-II only. The output format
-matches `scripts/eval_stage2_clips.py` (`results.jsonl` + `summary.json`), and the
-summary reports both overall and per-subset (`music`/`noise`/`speech`) FA/hour.
+every MUSAN file and score each window with Stage-II only. Each run writes only
+`results.jsonl` and `summary.json`; the summary reports both overall and
+per-subset (`music`/`noise`/`speech`) FA/hour, while each result row records the
+effective keyword phonemes and position-level Stage-II diagnostics.
 
-Single keyword, single checkpoint:
+Single keyword, single checkpoint with an explicit pronunciation:
 
 ```bash
 python3 scripts/eval_musan_fa.py \
   +experiment=icefall_zipformer_stage2 \
   prep.keyword="hey eva" \
+  'prep.keyword_phonemes=HH EY1 IY1 V AH0' \
   prep.musan_root=/path/to/musan \
   prep.stage2_ckpt=/path/to/stage2_step020000.pt \
   prep.window_sec=3.0 \
@@ -1634,11 +1636,14 @@ python3 scripts/eval_musan_fa.py \
   prep.output_dir=/path/to/out
 ```
 
+Omit `prep.keyword_phonemes` (or leave it blank) to retain automatic G2P.
+
 Batch evaluation across multiple checkpoints and keywords:
 
 ```bash
 bash scripts/batch_eval_musan_fa.sh \
   --keyword "hey eva" \
+  --keyword-phonemes "HH EY1 IY1 V AH0" \
   --keyword "hey android" \
   --musan-root /path/to/musan \
   --pt /path/to/stage2_step020000.pt \
@@ -1647,13 +1652,15 @@ bash scripts/batch_eval_musan_fa.sh \
   --hop-sec 1.0
 ```
 
-For many keywords, put them in a file (`keywords.txt`):
+`--keyword-phonemes` applies to the immediately preceding `--keyword`. Keywords
+without that option use automatic G2P. For many keywords, use a one- or two-column
+TAB-separated file (`keywords.txt`):
 
 ```text
-# One keyword per line. Blank lines and lines starting with # are ignored.
-hey eva
+# keyword<TAB>optional ARPAbet phonemes; blank lines and # comments are ignored.
+hey eva	HH EY1 IY1 V AH0
 hey android
-hi galaxy
+hi galaxy	HH AY1 G AE1 L AH0 K S IY0
 ```
 
 then run:
@@ -1666,11 +1673,16 @@ bash scripts/batch_eval_musan_fa.sh \
   --base-out /path/to/musan_fa_outputs
 ```
 
-Each checkpoint × keyword combination produces a `summary.json` with
-`total_hours`, `fa_per_hour`, `fa_per_1000_hours`, and
-`subsets.{music,noise,speech}.metrics.fa_per_hour`. After all runs,
-`batch_eval_musan_fa.sh` writes a combined `musan_fa_summary.tsv` for easy
-comparison.
+Each checkpoint × keyword combination produces its own `results.jsonl` and
+`summary.json`. The batch wrapper does not create CSV or TSV output. If a
+consolidated TSV is needed for manual analysis, run the retained aggregation
+utility explicitly:
+
+```bash
+python3 scripts/aggregate_musan_fa.py \
+  /path/to/musan_fa_outputs \
+  /path/to/musan_fa_outputs/musan_fa_summary.tsv
+```
 
 ### Remove wake-word audio from MUSAN with WeNet ASR
 

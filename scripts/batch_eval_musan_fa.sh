@@ -6,7 +6,9 @@
 #
 # Options:
 #   --keyword KEYWORD       Keyword to evaluate (repeatable)
-#   --keywords-file FILE    Text file with one keyword per line (# comments and blank lines ignored)
+#   --keyword-phonemes PHONES
+#                           ARPAbet override for the preceding --keyword
+#   --keywords-file FILE    One keyword, or keyword<TAB>phonemes, per line
 #   --musan-root DIR        Root of the MUSAN corpus (must contain music/noise/speech dirs)
 #   --pt PT:OUT             Explicit .pt checkpoint and its required output directory (repeatable)
 #   --pts-file FILE         Text file with one PT:OUT_DIR per non-comment line
@@ -17,12 +19,15 @@
 #   -h, --help              Show this help
 #
 # --keywords-file format:
-#   One keyword per line. Lines starting with '#' and blank lines are ignored.
+#   keyword
+#   keyword<TAB>HH EY1 IY1 V AH0
+#   Lines starting with '#' and blank lines are ignored. One-column rows use G2P.
 #
 # Examples:
 #   # Single keyword, explicit checkpoints:
 #   bash scripts/batch_eval_musan_fa.sh \
 #     --keyword "hey eva" \
+#     --keyword-phonemes "HH EY1 IY1 V AH0" \
 #     --musan-root /path/to/musan \
 #     --pt /path/to/stage2_step010000.pt:/path/to/out/step10000 \
 #     --pt /path/to/stage2_step020000.pt:/path/to/out/step20000 \
@@ -40,12 +45,13 @@
 #   With --pt PT:OUT and one keyword, output lands in OUT.
 #   With --pt PT:OUT and multiple keywords, output lands in OUT/<keyword_slug>.
 #   With --base-out and --pt, output lands in BASE_OUT/<ckpt_name>/<keyword_slug>.
-#   After all runs, a combined TSV is written to BASE_OUT/musan_fa_summary.tsv
-#   (or the first explicit OUT's parent if --base-out is omitted).
+#   Each run writes only results.jsonl and summary.json.
 
 set -euo pipefail
 
 KEYWORDS=()
+KEYWORD_PHONEMES=()
+KEYWORD_PHONEMES_SET=()
 KEYWORDS_FILE=""
 MUSAN_ROOT=""
 EXPLICIT_PTS=()
@@ -56,13 +62,36 @@ HOP_SEC="1.0"
 EXPERIMENT="icefall_zipformer_stage2"
 
 usage() {
-  sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,48p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --keyword)       KEYWORDS+=("$2"); shift 2 ;;
+    --keyword)
+      KEYWORDS+=("$2")
+      KEYWORD_PHONEMES+=("")
+      KEYWORD_PHONEMES_SET+=("0")
+      shift 2
+      ;;
+    --keyword-phonemes)
+      if [[ ${#KEYWORDS[@]} -eq 0 ]]; then
+        echo "ERROR: --keyword-phonemes must follow --keyword." >&2
+        exit 1
+      fi
+      keyword_index=$((${#KEYWORDS[@]} - 1))
+      if [[ "${KEYWORD_PHONEMES_SET[${keyword_index}]}" == "1" ]]; then
+        echo "ERROR: duplicate --keyword-phonemes for ${KEYWORDS[${keyword_index}]}" >&2
+        exit 1
+      fi
+      if [[ -z "${2//[[:space:]]/}" ]]; then
+        echo "ERROR: --keyword-phonemes must not be empty." >&2
+        exit 1
+      fi
+      KEYWORD_PHONEMES[${keyword_index}]="$2"
+      KEYWORD_PHONEMES_SET[${keyword_index}]="1"
+      shift 2
+      ;;
     --keywords-file) KEYWORDS_FILE="$2"; shift 2 ;;
     --musan-root)    MUSAN_ROOT="$2";   shift 2 ;;
     --pt)            EXPLICIT_PTS+=("$2"); shift 2 ;;
@@ -85,7 +114,26 @@ if [[ -n "${KEYWORDS_FILE}" ]]; then
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "${line}" || "${line}" == \#* ]] && continue
-    KEYWORDS+=("${line}")
+    keyword="${line%%$'\t'*}"
+    phonemes=""
+    if [[ "${line}" == *$'\t'* ]]; then
+      phonemes="${line#*$'\t'}"
+      if [[ "${phonemes}" == *$'\t'* ]]; then
+        echo "ERROR: --keywords-file accepts at most two tab-separated columns: ${line}" >&2
+        exit 1
+      fi
+    fi
+    keyword="${keyword#"${keyword%%[![:space:]]*}"}"
+    keyword="${keyword%"${keyword##*[![:space:]]}"}"
+    phonemes="${phonemes#"${phonemes%%[![:space:]]*}"}"
+    phonemes="${phonemes%"${phonemes##*[![:space:]]}"}"
+    if [[ -z "${keyword}" ]]; then
+      echo "ERROR: Empty keyword in --keywords-file row: ${line}" >&2
+      exit 1
+    fi
+    KEYWORDS+=("${keyword}")
+    KEYWORD_PHONEMES+=("${phonemes}")
+    [[ -n "${phonemes}" ]] && KEYWORD_PHONEMES_SET+=("1") || KEYWORD_PHONEMES_SET+=("0")
   done < "${KEYWORDS_FILE}"
 fi
 
@@ -133,31 +181,28 @@ run_checkpoint_keyword() {
   local ckpt="$1"
   local out_dir="$2"
   local keyword="$3"
-  local display_label="$4"
+  local keyword_phonemes="$4"
+  local display_label="$5"
+  local -a eval_command=(
+    python3 scripts/eval_musan_fa.py
+    "+experiment=${EXPERIMENT}"
+    "prep.keyword=${keyword}"
+    "prep.musan_root=${MUSAN_ROOT}"
+    "prep.stage2_ckpt=${ckpt}"
+    "prep.window_sec=${WINDOW_SEC}"
+    "prep.hop_sec=${HOP_SEC}"
+    "prep.output_dir=${out_dir}"
+  )
+  if [[ -n "${keyword_phonemes}" ]]; then
+    eval_command+=("prep.keyword_phonemes=${keyword_phonemes}")
+  fi
 
   echo "--- [${display_label}] ---"
-  python3 scripts/eval_musan_fa.py \
-    +experiment="${EXPERIMENT}" \
-    prep.keyword="${keyword}" \
-    prep.musan_root="${MUSAN_ROOT}" \
-    prep.stage2_ckpt="${ckpt}" \
-    prep.window_sec="${WINDOW_SEC}" \
-    prep.hop_sec="${HOP_SEC}" \
-    prep.output_dir="${out_dir}"
+  "${eval_command[@]}"
   echo "Done -> ${out_dir}"
   echo ""
   (( total_runs++ )) || true
 }
-
-# Determine where to write the combined TSV.
-combined_tsv_dir="${BASE_OUT}"
-if [[ -z "${combined_tsv_dir}" && ${#EXPLICIT_PTS[@]} -gt 0 ]]; then
-  first_entry="${EXPLICIT_PTS[0]}"
-  first_out="${first_entry#*:}"
-  if [[ -n "${first_out}" && "${first_out}" != "${first_entry}" ]]; then
-    combined_tsv_dir="${first_out}"
-  fi
-fi
 
 if [[ -n "${BASE_OUT}" ]]; then
   mkdir -p "${BASE_OUT}"
@@ -189,9 +234,13 @@ for entry in "${EXPLICIT_PTS[@]}"; do
 
   if [[ ${#KEYWORDS[@]} -eq 1 && -n "${per_out}" ]]; then
     # Single keyword + explicit output -> use output as-is
-    run_checkpoint_keyword "${ckpt}" "${per_out}" "${KEYWORDS[0]}" "${ckpt_name}/${KEYWORDS[0]}"
+    run_checkpoint_keyword \
+      "${ckpt}" "${per_out}" "${KEYWORDS[0]}" "${KEYWORD_PHONEMES[0]}" \
+      "${ckpt_name}/${KEYWORDS[0]}"
   else
-    for keyword in "${KEYWORDS[@]}"; do
+    for keyword_index in "${!KEYWORDS[@]}"; do
+      keyword="${KEYWORDS[${keyword_index}]}"
+      keyword_phonemes="${KEYWORD_PHONEMES[${keyword_index}]}"
       kw_slug="$(keyword_slug "${keyword}")"
       if [[ -n "${per_out}" ]]; then
         out_dir="${per_out}/${kw_slug}"
@@ -201,15 +250,11 @@ for entry in "${EXPLICIT_PTS[@]}"; do
         echo "ERROR: No output directory for ${ckpt} / ${keyword}. Use --base-out or PT:OUT_DIR." >&2
         exit 1
       fi
-      run_checkpoint_keyword "${ckpt}" "${out_dir}" "${keyword}" "${ckpt_name}/${keyword}"
+      run_checkpoint_keyword \
+        "${ckpt}" "${out_dir}" "${keyword}" "${keyword_phonemes}" \
+        "${ckpt_name}/${keyword}"
     done
   fi
 done
-
-# Aggregate summary.json files into a TSV.
-if [[ -n "${combined_tsv_dir}" ]]; then
-  mkdir -p "${combined_tsv_dir}"
-  python3 scripts/aggregate_musan_fa.py "${combined_tsv_dir}" "${combined_tsv_dir}/musan_fa_summary.tsv"
-fi
 
 echo "All done. Evaluated ${total_runs} checkpoint×keyword combination(s) total."
