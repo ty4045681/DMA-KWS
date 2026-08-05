@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from pathlib import Path
 from typing import Any, Mapping
@@ -21,8 +22,11 @@ from dma_kws.training.checkpoint_avg import average_lightning_checkpoints
 #: state had then consumed no audio at all. Version 2 re-packs each sample as
 #: ``[valid text][valid audio][padding]`` and reads the final valid audio state
 #: with GRU+FC. Version 3 makes the readout mode checkpoint-configured and adds
-#: EPS mean pooling over a shared scorer at valid anchor positions.
-QBYT_READOUT_VERSION = 3
+#: EPS mean pooling over a shared scorer at valid anchor positions. Version 4
+#: adds temperature-configured EPS soft-min pooling. Mean and soft-min share the
+#: same trainable head, so the resolved temperature is part of the checkpoint
+#: score semantics even though it does not appear in the state dict.
+QBYT_READOUT_VERSION = 4
 
 QBYT_READOUT_VERSION_KEY = "qbyt_readout_version"
 
@@ -164,24 +168,81 @@ def stamp_qbyt_readout_version(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _checkpoint_qbyt_readout_mode(checkpoint: Mapping[str, Any], saved: Any) -> str:
-    """Infer the score semantics carried by a versioned QbyT checkpoint."""
+def qbyt_readout_specs_equal(left: Any, right: Any) -> bool:
+    """Whether two resolved readouts produce the same deployed score."""
+
+    if left.mode != right.mode:
+        return False
+    return math.isclose(
+        float(left.temperature),
+        float(right.temperature),
+        rel_tol=1e-12,
+        abs_tol=0.0,
+    )
+
+
+def _describe_readout_spec(spec: Any) -> str:
+    if spec is None:
+        return "unknown"
+    return f"{spec.mode}(temperature={float(spec.temperature):g})"
+
+
+def checkpoint_qbyt_readout_spec(
+    checkpoint: Mapping[str, Any],
+    *,
+    saved_version: Any | None = None,
+) -> Any:
+    """Resolve the score semantics carried by a supported QbyT checkpoint.
+
+    Version 2 is unambiguously GRU-last. Version 3 supports GRU-last and EPS
+    mean, and its mode may be inferred from the mutually exclusive head keys for
+    historical fixtures without an embedded config. Version 4 requires an
+    explicit temperature whenever it selects EPS soft-min: mean and soft-min
+    use identical ``final_pos_fc`` tensors, so guessing from weights would
+    silently change scores.
+    """
 
     from dma_kws.stage2.readout import (
         EPS_MEAN_READOUT,
+        EPS_SOFTMIN_READOUT,
         GRU_LAST_READOUT,
-        resolve_qbyt_readout_mode,
+        resolve_qbyt_readout,
     )
+
+    saved = (
+        checkpoint.get(QBYT_READOUT_VERSION_KEY)
+        if saved_version is None
+        else saved_version
+    )
+    if saved not in (2, 3, QBYT_READOUT_VERSION):
+        raise ValueError(f"unsupported QbyT readout version {saved!r}")
 
     # Version 2 predates configurable readouts and is unambiguously GRU-last.
     if saved == 2:
-        return GRU_LAST_READOUT
+        return resolve_qbyt_readout(
+            {"qbyt_readout": {"mode": GRU_LAST_READOUT}}
+        )
 
     config = checkpoint.get("config")
     if isinstance(config, Mapping):
         stage2 = config.get("stage2")
         if isinstance(stage2, Mapping):
-            return resolve_qbyt_readout_mode(stage2)
+            spec = resolve_qbyt_readout(stage2)
+            if saved == 3 and spec.mode not in (
+                GRU_LAST_READOUT,
+                EPS_MEAN_READOUT,
+            ):
+                raise ValueError(
+                    f"QbyT readout version 3 cannot carry mode {spec.mode!r}"
+                )
+            if spec.mode == EPS_SOFTMIN_READOUT:
+                raw = stage2.get("qbyt_readout")
+                if not isinstance(raw, Mapping) or "temperature" not in raw:
+                    raise ValueError(
+                        "EPS soft-min checkpoints must explicitly record "
+                        "stage2.qbyt_readout.temperature"
+                    )
+            return spec
 
     state = extract_state_dict(dict(checkpoint))
     if isinstance(state, Mapping):
@@ -189,16 +250,25 @@ def _checkpoint_qbyt_readout_mode(checkpoint: Mapping[str, Any], saved: Any) -> 
             isinstance(key, str) and key.startswith("qbyt.final_pos_fc.")
             for key in state
         ):
-            return EPS_MEAN_READOUT
+            if saved == 3:
+                return resolve_qbyt_readout(
+                    {"qbyt_readout": {"mode": EPS_MEAN_READOUT}}
+                )
+            raise ValueError(
+                "QbyT readout version 4 uses a final_pos_fc head but does not "
+                "explicitly identify EPS mean versus soft-min in its config"
+            )
         if any(
             isinstance(key, str) and key.startswith(("qbyt.gru.", "qbyt.fc."))
             for key in state
         ):
-            return GRU_LAST_READOUT
+            return resolve_qbyt_readout(
+                {"qbyt_readout": {"mode": GRU_LAST_READOUT}}
+            )
 
     # Hand-built fixtures and adapter-only payloads may not expose a full base.
     # GRU-last is the backward-compatible default used by their configs.
-    return GRU_LAST_READOUT
+    return resolve_qbyt_readout({"qbyt_readout": {"mode": GRU_LAST_READOUT}})
 
 
 def _carries_qbyt_weights(checkpoint: Any) -> bool:
@@ -224,6 +294,7 @@ def assert_qbyt_readout_version(
     source: Any,
     allow_legacy: bool = False,
     expected_mode: str | None = None,
+    expected_temperature: float | None = None,
 ) -> None:
     """Fail when checkpoint and configured QbyT score semantics disagree."""
     import warnings
@@ -231,37 +302,52 @@ def assert_qbyt_readout_version(
     if not _carries_qbyt_weights(checkpoint):
         return
 
-    from dma_kws.stage2.readout import GRU_LAST_READOUT, normalize_qbyt_readout_mode
+    from dma_kws.stage2.readout import GRU_LAST_READOUT, resolve_qbyt_readout
 
     saved = checkpoint.get(QBYT_READOUT_VERSION_KEY)
-    expected = (
-        normalize_qbyt_readout_mode(expected_mode)
-        if expected_mode is not None
-        else None
-    )
-    saved_mode = (
-        _checkpoint_qbyt_readout_mode(checkpoint, saved)
-        if saved in (2, QBYT_READOUT_VERSION)
-        else None
-    )
+    if expected_mode is None:
+        expected = None
+    else:
+        raw_expected: dict[str, Any] = {"mode": expected_mode}
+        if expected_temperature is not None:
+            raw_expected["temperature"] = expected_temperature
+        expected = resolve_qbyt_readout({"qbyt_readout": raw_expected})
 
-    compatible = saved == QBYT_READOUT_VERSION and (
-        expected is None or saved_mode == expected
+    saved_spec = None
+    saved_error = None
+    try:
+        saved_spec = checkpoint_qbyt_readout_spec(
+            checkpoint,
+            saved_version=saved,
+        )
+    except ValueError as exc:
+        saved_error = str(exc)
+
+    compatible = saved == QBYT_READOUT_VERSION and saved_spec is not None and (
+        expected is None or qbyt_readout_specs_equal(saved_spec, expected)
     )
-    # A v2 GRU checkpoint remains score-compatible when the current model
-    # explicitly selects gru_last. This lets A inspect existing checkpoints
-    # after EPS support is added without ever scoring them as EPS.
+    # Versions 2 and 3 remain accepted only when this build reproduces their
+    # exact historical score semantics.
     compatible = compatible or (
-        saved == 2
-        and saved_mode == GRU_LAST_READOUT
-        and (expected is None or expected == GRU_LAST_READOUT)
+        saved in (2, 3)
+        and saved_spec is not None
+        and (expected is None or qbyt_readout_specs_equal(saved_spec, expected))
+        and (saved != 2 or saved_spec.mode == GRU_LAST_READOUT)
     )
     if compatible:
         return
 
     described = "unversioned (pre-fix)" if saved is None else f"version {saved!r}"
-    mode_detail = f" ({saved_mode})" if saved_mode is not None else ""
-    expected_detail = f"; current config expects {expected}" if expected else ""
+    mode_detail = (
+        f" ({_describe_readout_spec(saved_spec)})"
+        if saved_spec is not None
+        else (f" ({saved_error})" if saved_error else "")
+    )
+    expected_detail = (
+        f"; current config expects {_describe_readout_spec(expected)}"
+        if expected
+        else ""
+    )
     if allow_legacy:
         warnings.warn(
             f"{source} carries QbyT weights at readout {described}{mode_detail}, but this "

@@ -17,7 +17,7 @@ from dma_kws.nn import build_encoder, run_encoder
 from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage2.losses import compute_stage2_losses
 from dma_kws.stage2.objective import resolve_sequence_objective
-from dma_kws.stage2.readout import resolve_qbyt_readout_mode
+from dma_kws.stage2.readout import resolve_qbyt_readout
 from dma_kws.stage2.scoring import gather_completion_logits
 from dma_kws.training.checkpoint_io import (
     assert_qbyt_readout_version,
@@ -99,7 +99,9 @@ class Stage2LightningModule(pl.LightningModule):
         encoder_dim = int(stage2.get("encoder_output_dim", stage1.get("encoder_output_dim", 144)))
 
         sequence_objective = resolve_sequence_objective(stage2)
-        self.qbyt_readout_mode = resolve_qbyt_readout_mode(stage2)
+        qbyt_readout = resolve_qbyt_readout(stage2)
+        self.qbyt_readout_mode = qbyt_readout.mode
+        self.qbyt_readout_temperature = qbyt_readout.temperature
         self.seq_label_mode = sequence_objective.target_mode
         self.seq_progress_weight = sequence_objective.progress_weight
         self.seq_completion_weight = sequence_objective.completion_weight
@@ -110,6 +112,9 @@ class Stage2LightningModule(pl.LightningModule):
         self._checkpoint_config.setdefault("stage2", {})[
             "sequence_loss"
         ] = sequence_objective.as_dict()
+        self._checkpoint_config["stage2"][
+            "qbyt_readout"
+        ] = qbyt_readout.as_dict()
 
         self.stream_policy = resolve_stream_policy(stage1)
         self.encoder = build_encoder(stage1, output_dim=encoder_dim)
@@ -153,6 +158,7 @@ class Stage2LightningModule(pl.LightningModule):
             embed_dim=int(stage2.get("qbyt_embed_dim", 128)),
             post_num_layers=int(stage2.get("qbyt_layers", 2)),
             readout_mode=self.qbyt_readout_mode,
+            readout_temperature=self.qbyt_readout_temperature,
         )
 
         self._stage2_cfg = stage2
@@ -257,6 +263,7 @@ class Stage2LightningModule(pl.LightningModule):
             checkpoint,
             source=checkpoint_path,
             expected_mode=self.qbyt_readout_mode,
+            expected_temperature=self.qbyt_readout_temperature,
             # A legacy readout is only useful as a warm start when QbyT will be
             # retrained. LoRA freezes QbyT, so its strict base path must reject it.
             allow_legacy=self._allow_legacy_qbyt_readout and not require_full_qbyt,
@@ -423,6 +430,7 @@ class Stage2LightningModule(pl.LightningModule):
             checkpoint,
             source="the Stage II checkpoint being restored",
             expected_mode=self.qbyt_readout_mode,
+            expected_temperature=self.qbyt_readout_temperature,
             # Full Lightning restore also restores optimizer/scheduler state.
             # The legacy escape hatch is weights-only and belongs exclusively
             # to _load_init_checkpoint; a v2 gru_last checkpoint is accepted by

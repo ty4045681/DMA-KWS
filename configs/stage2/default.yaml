@@ -1,10 +1,12 @@
 encoder_output_dim: 144
 qbyt_embed_dim: 128
 qbyt_layers: 2
-# Final deployed QbyT score. Keep gru_last for existing v2 checkpoints; use the
-# dedicated EPS experiment config for a shared position scorer baseline.
+# Final deployed QbyT score. Keep gru_last for existing v2 checkpoints; use
+# eps_mean or eps_softmin for a shared position scorer. Temperature affects
+# eps_softmin only: smaller values put more weight on the weakest position.
 qbyt_readout:
   mode: gru_last
+  temperature: 1.0
 negative_ratio: 1
 learning_rate: 0.0005
 warmup_steps: 2500

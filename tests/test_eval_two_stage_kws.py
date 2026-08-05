@@ -167,6 +167,10 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert summary["provenance"]["sequence_objective"]["target_mode"] == (
         "ordered_contiguous_prefix"
     )
+    assert summary["provenance"]["qbyt_readout"] == {
+        "mode": "eps_mean",
+        "temperature": 1.0,
+    }
     assert summary["score_diagnostic_config"] == {
         "utterance_threshold": 0.5,
         "completion_threshold": 0.4,
@@ -183,6 +187,8 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert saved_result["eps_position_logits"] == pytest.approx(
         [1.0986122886681098]
     )
+    assert saved_result["qbyt_readout_mode"] == "eps_mean"
+    assert saved_result["qbyt_readout_temperature"] == 1.0
     assert saved_result["seq_position_logits"] == pytest.approx([0.0])
     assert saved_result["seq_position_scores"] == pytest.approx([0.5])
     assert saved_result["expected_prefix_length"] == pytest.approx(0.5)
@@ -439,6 +445,31 @@ def test_stage2_clip_result_record_preserves_raw_head_logits():
     assert record["completion_logit"] == pytest.approx(-1.0986123)
 
 
+def test_stage2_clip_result_record_validates_softmin_readout():
+    temperature = 0.5
+    position_logits = [1.0, 3.0]
+    expected_logit = 1.0 - temperature * np.log(
+        (1.0 + np.exp(-2.0 / temperature)) / 2.0
+    )
+    record = stage2_clip_result_record(
+        {"audio_path": "/tmp/audio.wav", "keyword": "hello", "label": 0},
+        {
+            "qbyt_score": 0.8,
+            "qbyt_logit": expected_logit,
+            "keyword_phonemes": ["HH", "AH0"],
+            "eps_position_logits": position_logits,
+            "detected": True,
+            "threshold": 0.5,
+            "skipped": False,
+        },
+        qbyt_readout={"mode": "eps_softmin", "temperature": temperature},
+    )
+
+    assert record["qbyt_readout_mode"] == "eps_softmin"
+    assert record["qbyt_readout_temperature"] == temperature
+    assert record["qbyt_logit"] == pytest.approx(expected_logit)
+
+
 def test_stage2_clip_result_record_derives_ordered_sequence_diagnostics():
     logits = [2.0, 2.0, -1.0, -2.0, -3.0]
     completion_score = 1.0 / (1.0 + np.exp(3.0))
@@ -580,7 +611,7 @@ def test_stage2_clip_result_record_rejects_invalid_eps_position_details():
         stage2_clip_result_record(manifest_row, bad_length)
 
     bad_mean = dict(base_result, eps_position_logits=[1.0, 1.0])
-    with pytest.raises(ValueError, match=r"mean\(eps_position_logits\)"):
+    with pytest.raises(ValueError, match="EPS position-logit aggregation"):
         stage2_clip_result_record(manifest_row, bad_mean)
 
     bad_finite = dict(base_result, eps_position_logits=[float("nan"), 0.0])

@@ -387,8 +387,12 @@ class Stage2QbyTReadoutConfig:
     """Final utterance-score readout applied after the QbyT matcher."""
 
     #: ``gru_last`` reproduces readout v2. ``eps_mean`` applies one shared
-    #: position scorer to valid anchor states and averages its raw logits.
+    #: position scorer to valid anchor states and averages its raw logits;
+    #: ``eps_softmin`` emphasizes the weakest valid position.
     mode: str = "gru_last"
+    #: Positive soft-min temperature. Smaller values approach a hard minimum;
+    #: larger values approach mean pooling.
+    temperature: float = 1.0
 
 
 @dataclass

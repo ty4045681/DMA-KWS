@@ -326,6 +326,47 @@ def test_stage2_verifier_detailed_scores_export_trimmed_eps_positions():
     assert details[1]["qbyt_logit"] == pytest.approx(-1.0)
 
 
+def test_stage2_verifier_validates_softmin_eps_positions():
+    temperature = 0.5
+    raw_position_logits = torch.tensor([[1.0, 3.0]])
+    expected_logit = -temperature * (
+        torch.logsumexp(-raw_position_logits[0] / temperature, dim=0)
+        - torch.log(torch.tensor(2.0))
+    )
+
+    class _ReadoutDetails:
+        position_logits = raw_position_logits
+        position_mask = torch.tensor([[True, True]])
+
+    class _DetailedModel:
+        def forward_logits_with_readout_details(
+            self, feats, feat_lengths, anchors, anchor_lengths
+        ):
+            del feats, feat_lengths, anchors, anchor_lengths
+            return (
+                expected_logit.unsqueeze(0),
+                torch.tensor([0.0]),
+                torch.tensor([True]),
+                _ReadoutDetails(),
+            )
+
+    verifier = Stage2Verifier.__new__(Stage2Verifier)
+    verifier._torch = torch
+    verifier._device = torch.device("cpu")
+    verifier._model = _DetailedModel()
+    verifier.qbyt_readout_mode = "eps_softmin"
+    verifier.qbyt_readout_temperature = temperature
+
+    details = verifier.score_clip_feats_detailed(
+        [torch.zeros(3, 80)],
+        [[1, 2]],
+        include_eps_positions=True,
+    )
+
+    assert details[0]["qbyt_logit"] == pytest.approx(float(expected_logit))
+    assert details[0]["eps_position_logits"] == pytest.approx([1.0, 3.0])
+
+
 def test_stage2_verifier_eps_position_export_is_none_for_gru_readout():
     class _ReadoutDetails:
         position_logits = None

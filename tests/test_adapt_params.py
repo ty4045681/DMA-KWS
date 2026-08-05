@@ -183,6 +183,8 @@ def test_stage2_summary_rows_unchanged():
     assert rows["warmup_steps"] == "2500"
     assert rows["max_steps"] == "50000"
     assert rows["batch_size_per_gpu"] == "64"
+    assert rows["qbyt_readout_mode"] == "gru_last"
+    assert rows["qbyt_readout_temperature"] == "1.0"
     assert rows["qbyt_deployment_threshold"] == "0.5"
     assert rows["score_ece_num_bins"] == "15"
     assert rows["seq_diagnostic_threshold"] == "0.5"

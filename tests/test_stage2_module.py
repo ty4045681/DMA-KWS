@@ -46,6 +46,7 @@ class _FakeQbyT(nn.Module):
         super().__init__()
         self.dummy = nn.Parameter(torch.zeros(1))
         self.readout_mode = kwargs.get("readout_mode", "gru_last")
+        self.readout_temperature = kwargs.get("readout_temperature", 1.0)
 
     def forward(self, speech, text, speech_lengths=None, text_lengths=None):
         batch_size = speech.size(0)
@@ -120,6 +121,30 @@ def test_stage2_module_passes_eps_readout_to_qbyt(monkeypatch):
 
     assert module.qbyt_readout_mode == "eps_mean"
     assert module.qbyt.readout_mode == "eps_mean"
+
+
+def test_stage2_module_passes_and_stamps_softmin_temperature(monkeypatch):
+    config = _minimal_config()
+    config["stage2"]["qbyt_readout"] = {
+        "mode": "eps_softmin",
+        "temperature": 0.5,
+    }
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_encoder",
+        lambda *_args, **_kwargs: MagicMock(side_effect=_mock_encoder_output),
+    )
+    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _FakeQbyT)
+
+    module = Stage2LightningModule(config, vocab_size=71)
+
+    assert module.qbyt_readout_mode == "eps_softmin"
+    assert module.qbyt_readout_temperature == 0.5
+    assert module.qbyt.readout_mode == "eps_softmin"
+    assert module.qbyt.readout_temperature == 0.5
+    assert module._checkpoint_config["stage2"]["qbyt_readout"] == {
+        "mode": "eps_softmin",
+        "temperature": 0.5,
+    }
 
 
 def test_train_end_flushes_partial_window_once(patched_module):
@@ -554,7 +579,11 @@ def test_saved_checkpoints_carry_the_readout_version(monkeypatch):
 
     assert checkpoint[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION
     assert checkpoint["checkpoint_kind"] == "stage2"
-    assert checkpoint["config"] == _minimal_config()
+    assert checkpoint["config"] == module._checkpoint_config
+    assert checkpoint["config"]["stage2"]["qbyt_readout"] == {
+        "mode": "gru_last",
+        "temperature": 1.0,
+    }
     assert checkpoint["vocab_size"] == 71
     module.on_load_checkpoint(checkpoint)
 

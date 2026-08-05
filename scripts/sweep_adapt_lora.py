@@ -85,6 +85,7 @@ def _eval_lph_auc(
         source=checkpoint,
         allow_legacy=False,
         expected_mode=model.qbyt_readout_mode,
+        expected_temperature=model.qbyt_readout_temperature,
     )
     state = extract_state_dict(ckpt)
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -120,7 +121,7 @@ def _eval_target_auc(
     from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
     from dma_kws.stage2.readout import (
         assert_qbyt_readout_state_loaded,
-        resolve_qbyt_readout_mode,
+        resolve_qbyt_readout,
     )
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training.checkpoint_io import (
@@ -154,12 +155,13 @@ def _eval_target_auc(
     )
 
     ckpt = torch.load(checkpoint, map_location="cpu")
-    expected_readout_mode = resolve_qbyt_readout_mode(config.get("stage2", {}))
+    expected_readout = resolve_qbyt_readout(config.get("stage2", {}))
     assert_qbyt_readout_version(
         ckpt,
         source=checkpoint,
         allow_legacy=False,
-        expected_mode=expected_readout_mode,
+        expected_mode=expected_readout.mode,
+        expected_temperature=expected_readout.temperature,
     )
     state = extract_state_dict(ckpt)
 

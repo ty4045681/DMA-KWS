@@ -50,6 +50,8 @@ def _config(
     rank: int = 2,
     alpha: float | None = 4.0,
     targets: list[str] | None = None,
+    readout_mode: str | None = None,
+    readout_temperature: float | None = None,
 ) -> dict:
     adapt = {
         "keyword": "hey eva",
@@ -60,6 +62,12 @@ def _config(
     }
     if alpha is not None:
         adapt["alpha"] = alpha
+    stage2 = {"qbyt_embed_dim": 4, "qbyt_layers": 1}
+    if readout_mode is not None:
+        readout = {"mode": readout_mode}
+        if readout_temperature is not None:
+            readout["temperature"] = readout_temperature
+        stage2["qbyt_readout"] = readout
     return {
         "tokenizer": {
             "dict_path": str(DICT_PATH),
@@ -69,18 +77,24 @@ def _config(
             "encoder_type": "conformer",
             "encoder_output_dim": 3,
         },
-        "stage2": {"qbyt_embed_dim": 4, "qbyt_layers": 1},
+        "stage2": stage2,
         "adapt": adapt,
     }
 
 
-def _stage2_state() -> dict[str, torch.Tensor]:
+def _stage2_state(
+    *,
+    readout_mode: str = "gru_last",
+    readout_temperature: float = 1.0,
+) -> dict[str, torch.Tensor]:
     QbyT = load_qbyt_class()
     qbyt = QbyT(
         encoder_output_size=3,
         num_embeds=VOCAB_SIZE,
         embed_dim=4,
         post_num_layers=1,
+        readout_mode=readout_mode,
+        readout_temperature=readout_temperature,
     )
     state = {
         "encoder.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
@@ -254,6 +268,109 @@ def test_convert_v2_checkpoint_rejects_eps_mode(tmp_path: Path) -> None:
 
     with pytest.raises(CheckpointConversionError, match="version 2 only with mode"):
         convert_checkpoint(source, tmp_path / "v2_eps.pt")
+
+
+def test_convert_v3_eps_mean_checkpoint_preserves_v3_provenance(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "v3_mean.ckpt"
+    output = tmp_path / "v3_mean.pt"
+    config = _config(readout_mode="eps_mean")
+    torch.save(
+        _checkpoint(
+            _stage2_state(readout_mode="eps_mean"),
+            config=config,
+            readout_version=3,
+        ),
+        source,
+    )
+
+    convert_checkpoint(source, output)
+
+    payload = torch.load(output, map_location="cpu")
+    assert payload[QBYT_READOUT_VERSION_KEY] == 3
+    assert_qbyt_readout_version(
+        payload,
+        source=output,
+        expected_mode="eps_mean",
+    )
+
+
+def test_convert_v3_checkpoint_rejects_softmin_mode(tmp_path: Path) -> None:
+    source = tmp_path / "v3_softmin.ckpt"
+    config = _config(
+        readout_mode="eps_softmin",
+        readout_temperature=0.5,
+    )
+    torch.save(
+        _checkpoint(
+            _stage2_state(
+                readout_mode="eps_softmin",
+                readout_temperature=0.5,
+            ),
+            config=config,
+            readout_version=3,
+        ),
+        source,
+    )
+
+    with pytest.raises(
+        CheckpointConversionError,
+        match="version 3 only with modes",
+    ):
+        convert_checkpoint(source, tmp_path / "v3_softmin.pt")
+
+
+def test_convert_v4_softmin_roundtrip_preserves_temperature(tmp_path: Path) -> None:
+    source = tmp_path / "v4_softmin.ckpt"
+    output = tmp_path / "v4_softmin.pt"
+    config = _config(
+        readout_mode="eps_softmin",
+        readout_temperature=0.5,
+    )
+    torch.save(
+        _checkpoint(
+            _stage2_state(
+                readout_mode="eps_softmin",
+                readout_temperature=0.5,
+            ),
+            config=config,
+        ),
+        source,
+    )
+
+    convert_checkpoint(source, output)
+
+    payload = torch.load(output, map_location="cpu")
+    assert payload[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION
+    assert payload["config"]["stage2"]["qbyt_readout"] == {
+        "mode": "eps_softmin",
+        "temperature": 0.5,
+    }
+    assert_qbyt_readout_version(
+        payload,
+        source=output,
+        expected_mode="eps_softmin",
+        expected_temperature=0.5,
+    )
+
+
+def test_convert_v4_softmin_requires_explicit_temperature(tmp_path: Path) -> None:
+    source = tmp_path / "v4_implicit_temperature.ckpt"
+    config = _config(readout_mode="eps_softmin")
+    torch.save(
+        _checkpoint(
+            _stage2_state(readout_mode="eps_softmin"),
+            config=config,
+        ),
+        source,
+    )
+
+    with pytest.raises(
+        CheckpointConversionError,
+        match="explicitly record.*temperature",
+    ):
+        convert_checkpoint(source, tmp_path / "ambiguous.pt")
 
 
 def test_historical_checkpoint_uses_explicit_fallback_config(tmp_path: Path) -> None:

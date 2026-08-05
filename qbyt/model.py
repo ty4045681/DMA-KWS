@@ -10,7 +10,10 @@ from typing import NamedTuple
 # this local guard prevents the vendored model from depending back on dma_kws.
 GRU_LAST_READOUT = "gru_last"
 EPS_MEAN_READOUT = "eps_mean"
-_QBYT_READOUT_MODES = frozenset({GRU_LAST_READOUT, EPS_MEAN_READOUT})
+EPS_SOFTMIN_READOUT = "eps_softmin"
+_QBYT_READOUT_MODES = frozenset(
+    {GRU_LAST_READOUT, EPS_MEAN_READOUT, EPS_SOFTMIN_READOUT}
+)
 
 
 class QbyTReadoutDetails(NamedTuple):
@@ -28,6 +31,63 @@ def _normalize_qbyt_readout_mode(value):
             f"Unsupported QbyT readout mode {value!r}; expected one of: {choices}"
         )
     return mode
+
+
+def _normalize_readout_temperature(value):
+    if isinstance(value, bool):
+        raise ValueError(
+            f"QbyT readout_temperature must be a finite positive number, got {value!r}"
+        )
+    try:
+        temperature = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"QbyT readout_temperature must be a finite positive number, got {value!r}"
+        ) from exc
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(
+            f"QbyT readout_temperature must be a finite positive number, got {value!r}"
+        )
+    return temperature
+
+
+def _masked_normalized_softmin(position_logits, position_mask, temperature):
+    """Pool valid raw logits with a stable, length-normalized soft minimum.
+
+    The minimum shift avoids forming ``-position_logits / temperature``
+    directly, which can overflow for a small temperature even though the
+    mathematical result is finite. The reduction deliberately runs in float32
+    under mixed precision. Normalizing by the valid-position count makes equal
+    position logits pool back to that same logit rather than adding a keyword-
+    length-dependent offset.
+    """
+
+    logits = position_logits.float()
+    mask = position_mask.to(device=logits.device, dtype=torch.bool)
+    batch_size, width = logits.shape
+    if width == 0:
+        return logits.new_zeros((batch_size,))
+
+    counts = mask.sum(dim=1)
+    empty = counts.eq(0)
+    first_position = torch.arange(width, device=logits.device).eq(0).unsqueeze(0)
+    empty_sentinel = empty.unsqueeze(1) & first_position
+    safe_mask = mask | empty_sentinel
+
+    # An empty anchor receives one synthetic zero solely inside the reduction.
+    # It therefore has the same finite neutral logit as the existing mean
+    # readout, without evaluating logsumexp over an all--inf row.
+    safe_logits = torch.where(mask, logits, torch.zeros_like(logits))
+    minimum = safe_logits.masked_fill(~safe_mask, torch.inf).min(dim=1).values
+    shifted = torch.where(
+        mask,
+        -(logits - minimum.unsqueeze(1)) / temperature,
+        torch.full_like(logits, -torch.inf),
+    )
+    shifted = torch.where(empty_sentinel, torch.zeros_like(shifted), shifted)
+    log_mean_exp = torch.logsumexp(shifted, dim=1) - counts.clamp_min(1).log()
+    pooled = minimum - temperature * log_mean_exp
+    return torch.where(empty, torch.zeros_like(pooled), pooled)
 
 
 class PositionalEncoding(nn.Module):
@@ -84,6 +144,7 @@ class QbyT(nn.Module):
         embed_dim=128,
         post_num_layers=2,
         readout_mode=GRU_LAST_READOUT,
+        readout_temperature=1.0,
     ):
         super().__init__()
         self.audio_projection = nn.Linear(encoder_output_size, embed_dim)
@@ -102,6 +163,9 @@ class QbyT(nn.Module):
             num_layers=post_num_layers
         )
         self.readout_mode = _normalize_qbyt_readout_mode(readout_mode)
+        self.readout_temperature = _normalize_readout_temperature(
+            readout_temperature
+        )
         if self.readout_mode == GRU_LAST_READOUT:
             self.gru = nn.GRU(embed_dim, embed_dim, batch_first=True)
             self.fc = nn.Linear(embed_dim, 1)
@@ -141,7 +205,7 @@ class QbyT(nn.Module):
         """Score pairs and expose valid EPS position logits for diagnostics.
 
         The ordinary :meth:`forward` contract remains a two-tuple so training
-        and deployment callers are unaffected. For ``eps_mean``, position
+        and deployment callers are unaffected. For either EPS readout, position
         logits are zero outside ``position_mask``; for ``gru_last`` they are
         ``None`` because that readout has no shared per-position scorer.
         """
@@ -243,7 +307,7 @@ class QbyT(nn.Module):
                 )
             else:
                 readout_details = None
-        elif self.readout_mode == EPS_MEAN_READOUT:
+        elif self.readout_mode in (EPS_MEAN_READOUT, EPS_SOFTMIN_READOUT):
             position_logits = self.final_pos_fc(text_states).squeeze(-1)
             text_positions = torch.arange(text_width, device=text.device).unsqueeze(0)
             text_mask = text_positions < text_lengths.unsqueeze(1)
@@ -255,7 +319,16 @@ class QbyT(nn.Module):
                 position_logits,
                 torch.zeros_like(position_logits),
             )
-            logits = valid_position_logits.sum(dim=1) / text_mask.sum(dim=1).clamp_min(1)
+            if self.readout_mode == EPS_MEAN_READOUT:
+                logits = valid_position_logits.sum(dim=1) / text_mask.sum(
+                    dim=1
+                ).clamp_min(1)
+            else:
+                logits = _masked_normalized_softmin(
+                    position_logits,
+                    text_mask,
+                    self.readout_temperature,
+                )
             readout_details = (
                 QbyTReadoutDetails(
                     position_logits=valid_position_logits,

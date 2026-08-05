@@ -25,7 +25,12 @@ AUDIO_LEN = 20
 assert SHORT_TEXT_LEN + AUDIO_LEN - 1 < LONG_TEXT_LEN
 
 
-def _model(seed: int = 0, *, readout_mode: str = "gru_last"):
+def _model(
+    seed: int = 0,
+    *,
+    readout_mode: str = "gru_last",
+    readout_temperature: float = 1.0,
+):
     QbyT = load_qbyt_class()
     torch.manual_seed(seed)
     model = QbyT(
@@ -34,8 +39,22 @@ def _model(seed: int = 0, *, readout_mode: str = "gru_last"):
         embed_dim=EMBED_DIM,
         post_num_layers=2,
         readout_mode=readout_mode,
+        readout_temperature=readout_temperature,
     )
     return model.eval()
+
+
+class _FixedPositionScorer(torch.nn.Module):
+    """Ignore matcher states and emit deterministic per-position logits."""
+
+    def __init__(self, values, *, dtype=torch.float32):
+        super().__init__()
+        self.register_buffer("values", torch.tensor(values, dtype=dtype))
+
+    def forward(self, states):
+        if states.size(1) != self.values.numel():
+            raise AssertionError("fixed scorer width does not match the text tensor")
+        return self.values.view(1, -1, 1).expand(states.size(0), -1, -1)
 
 
 def _sample(text_len: int, audio_len: int, seed: int):
@@ -232,6 +251,72 @@ def test_eps_score_is_masked_mean_of_valid_position_logits():
     torch.testing.assert_close(logits, expected)
 
 
+def test_eps_softmin_is_stable_normalized_log_mean_exp_of_valid_logits():
+    model = _model(readout_mode="eps_softmin", readout_temperature=1.0)
+    # The final value occupies text padding and is intentionally much smaller
+    # than both valid values. A masking error would make it dominate soft-min.
+    model.final_pos_fc = _FixedPositionScorer(
+        [1.0, 3.0, -1000.0],
+        dtype=torch.float16,
+    )
+    with torch.no_grad():
+        logits, _, details = model.forward_with_readout_details(
+            torch.randn(1, AUDIO_LEN, ENCODER_DIM),
+            torch.tensor([[3, 4, 0]]),
+            speech_lengths=torch.tensor([AUDIO_LEN]),
+            text_lengths=torch.tensor([2]),
+        )
+
+    # -log((exp(-1) + exp(-3)) / 2)
+    assert logits.dtype == torch.float32
+    assert logits.item() == pytest.approx(1.5662191695169727, abs=1e-6)
+    assert details.position_mask.tolist() == [[True, True, False]]
+    torch.testing.assert_close(
+        details.position_logits,
+        torch.tensor([[1.0, 3.0, 0.0]], dtype=torch.float16),
+    )
+
+
+def test_eps_softmin_temperature_controls_mean_to_min_interpolation():
+    text = torch.tensor([[3, 4]])
+    audio = torch.randn(1, AUDIO_LEN, ENCODER_DIM)
+    pooled = []
+    for temperature in (100.0, 1.0, 0.5):
+        model = _model(
+            readout_mode="eps_softmin",
+            readout_temperature=temperature,
+        )
+        model.final_pos_fc = _FixedPositionScorer([1.0, 3.0])
+        with torch.no_grad():
+            logits, _ = model(
+                audio,
+                text,
+                speech_lengths=torch.tensor([AUDIO_LEN]),
+                text_lengths=torch.tensor([2]),
+            )
+        pooled.append(logits.item())
+
+    assert pooled[0] == pytest.approx(1.995000083331111, abs=1e-5)
+    assert pooled[1] == pytest.approx(1.5662191695169727, abs=1e-6)
+    assert pooled[2] == pytest.approx(1.3374986263210678, abs=1e-6)
+    assert pooled[0] > pooled[1] > pooled[2] > 1.0
+
+
+def test_eps_softmin_preserves_equal_and_single_valid_logits():
+    model = _model(readout_mode="eps_softmin", readout_temperature=0.3)
+    model.final_pos_fc = _FixedPositionScorer([5.0, 5.0])
+    audio = torch.randn(2, AUDIO_LEN, ENCODER_DIM)
+    with torch.no_grad():
+        logits, _ = model(
+            audio,
+            torch.tensor([[3, 4], [3, 0]]),
+            speech_lengths=torch.tensor([AUDIO_LEN, AUDIO_LEN]),
+            text_lengths=torch.tensor([2, 1]),
+        )
+
+    torch.testing.assert_close(logits, torch.tensor([5.0, 5.0]))
+
+
 def test_gru_readout_details_do_not_invent_eps_position_logits():
     model = _model(readout_mode="gru_last")
     text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
@@ -256,8 +341,9 @@ def test_gru_readout_details_do_not_invent_eps_position_logits():
     torch.testing.assert_close(seq_logits, ordinary_seq_logits)
 
 
-def test_eps_score_is_invariant_to_batch_companions():
-    model = _model(readout_mode="eps_mean")
+@pytest.mark.parametrize("readout_mode", ["eps_mean", "eps_softmin"])
+def test_eps_score_is_invariant_to_batch_companions(readout_mode):
+    model = _model(readout_mode=readout_mode)
     text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
     short_companion, short_audio = _sample(SHORT_TEXT_LEN + 1, AUDIO_LEN, seed=2)
     long_companion, long_audio = _sample(LONG_TEXT_LEN, AUDIO_LEN, seed=3)
@@ -280,8 +366,9 @@ def test_eps_score_is_invariant_to_batch_companions():
     torch.testing.assert_close(with_short, with_long, atol=1e-5, rtol=1e-4)
 
 
-def test_eps_readout_registers_only_its_active_final_head():
-    model = _model(readout_mode="eps_mean")
+@pytest.mark.parametrize("readout_mode", ["eps_mean", "eps_softmin"])
+def test_eps_readout_registers_only_its_active_final_head(readout_mode):
+    model = _model(readout_mode=readout_mode)
     state_keys = set(model.state_dict())
 
     assert "final_pos_fc.weight" in state_keys
@@ -292,8 +379,9 @@ def test_eps_readout_registers_only_its_active_final_head():
     assert model.fc is None
 
 
-def test_eps_final_position_scorer_receives_utterance_gradient():
-    model = _model(readout_mode="eps_mean").train()
+@pytest.mark.parametrize("readout_mode", ["eps_mean", "eps_softmin"])
+def test_eps_final_position_scorer_receives_utterance_gradient(readout_mode):
+    model = _model(readout_mode=readout_mode).train()
     text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
 
     logits, _ = model(
@@ -308,8 +396,9 @@ def test_eps_final_position_scorer_receives_utterance_gradient():
     assert torch.isfinite(model.final_pos_fc.weight.grad).all()
 
 
-def test_eps_empty_anchor_has_finite_neutral_logit_without_device_sync():
-    model = _model(readout_mode="eps_mean")
+@pytest.mark.parametrize("readout_mode", ["eps_mean", "eps_softmin"])
+def test_eps_empty_anchor_has_finite_neutral_logit_without_device_sync(readout_mode):
+    model = _model(readout_mode=readout_mode)
     with torch.no_grad():
         logits, _, details = model.forward_with_readout_details(
             torch.randn(1, AUDIO_LEN, ENCODER_DIM),
@@ -328,3 +417,12 @@ def test_eps_empty_anchor_has_finite_neutral_logit_without_device_sync():
 def test_unknown_readout_mode_is_rejected():
     with pytest.raises(ValueError, match="Unsupported QbyT readout mode"):
         _model(readout_mode="unknown")
+
+
+@pytest.mark.parametrize(
+    "temperature",
+    [0.0, -1.0, float("nan"), float("inf"), True, "not-a-number"],
+)
+def test_invalid_readout_temperature_is_rejected(temperature):
+    with pytest.raises(ValueError, match="readout_temperature"):
+        _model(readout_mode="eps_softmin", readout_temperature=temperature)

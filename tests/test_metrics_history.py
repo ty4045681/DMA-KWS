@@ -248,10 +248,25 @@ def test_collect_hparams_stage2_section():
     assert hparams["seq_progress_weight"] == 0.5
     assert hparams["seq_completion_weight"] == 0.5
     assert hparams["seq_normalization"] == "sample"
+    assert hparams["qbyt_readout_mode"] == "gru_last"
+    assert hparams["qbyt_readout_temperature"] == 1.0
     assert hparams["qbyt_deployment_threshold"] == 0.5
     assert hparams["score_ece_num_bins"] == 15
     assert hparams["seq_diagnostic_threshold"] == 0.5
     assert "rank" not in hparams
+
+
+def test_collect_hparams_records_softmin_readout():
+    config = dict(CONFIG)
+    config["stage2"] = dict(
+        CONFIG["stage2"],
+        qbyt_readout={"mode": "eps_softmin", "temperature": 0.5},
+    )
+
+    hparams = collect_hparams(config)
+
+    assert hparams["qbyt_readout_mode"] == "eps_softmin"
+    assert hparams["qbyt_readout_temperature"] == 0.5
 
 
 def test_collect_hparams_adapt_section():

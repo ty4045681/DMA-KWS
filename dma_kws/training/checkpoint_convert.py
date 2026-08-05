@@ -205,12 +205,18 @@ def _require_compatible_readout(
 ) -> int:
     """Return the saved version when this build can reproduce its readout.
 
-    Version 2 GRU-last is still implemented byte-for-byte so historical models
-    can be evaluated and converted safely.  Preserve version 2 in the output;
-    relabeling those weights as version 3 would falsify their provenance.
+    Version 2 GRU-last and version 3 GRU-last/EPS-mean remain reproducible, so
+    historical models can be evaluated and converted safely. Preserve their
+    original version in the output; relabeling old weights as version 4 would
+    falsify their provenance.
     """
 
-    from dma_kws.stage2.readout import GRU_LAST_READOUT, resolve_qbyt_readout_mode
+    from dma_kws.stage2.readout import (
+        EPS_MEAN_READOUT,
+        EPS_SOFTMIN_READOUT,
+        GRU_LAST_READOUT,
+        resolve_qbyt_readout,
+    )
 
     raw_saved = checkpoint.get(QBYT_READOUT_VERSION_KEY)
     if raw_saved is None:
@@ -226,17 +232,27 @@ def _require_compatible_readout(
     stage2 = config.get("stage2")
     if not isinstance(stage2, Mapping):
         raise CheckpointConversionError("Resolved config has no stage2 mapping")
-    mode = resolve_qbyt_readout_mode(stage2)
+    readout = resolve_qbyt_readout(stage2)
     if saved == QBYT_READOUT_VERSION:
+        if readout.mode == EPS_SOFTMIN_READOUT:
+            raw = stage2.get("qbyt_readout")
+            if not isinstance(raw, Mapping) or "temperature" not in raw:
+                raise CheckpointConversionError(
+                    "EPS soft-min checkpoints must explicitly record "
+                    "stage2.qbyt_readout.temperature"
+                )
         return saved
-    if saved == 2 and mode == GRU_LAST_READOUT:
+    if saved == 3 and readout.mode in (GRU_LAST_READOUT, EPS_MEAN_READOUT):
+        return saved
+    if saved == 2 and readout.mode == GRU_LAST_READOUT:
         return saved
     if saved != QBYT_READOUT_VERSION:
         raise CheckpointConversionError(
             f"Checkpoint QbyT readout version is {saved!r}, while its resolved mode is "
-            f"{mode!r}; this build supports version {QBYT_READOUT_VERSION}, plus version "
-            "2 only with mode 'gru_last'. Refusing to stamp incompatible metadata onto "
-            "weights trained against a different or unknown readout."
+            f"{readout.mode!r}; this build supports version {QBYT_READOUT_VERSION}, "
+            "version 3 only with modes 'gru_last'/'eps_mean', plus version 2 only "
+            "with mode 'gru_last'. Refusing to stamp incompatible metadata onto weights "
+            "trained against a different or unknown readout."
         )
     return saved
 
@@ -442,15 +458,17 @@ def _validate_deployable_model_state(
 
     try:
         from dma_kws.pathing import load_qbyt_class
-        from dma_kws.stage2.readout import resolve_qbyt_readout_mode
+        from dma_kws.stage2.readout import resolve_qbyt_readout
 
         QbyT = load_qbyt_class()
+        readout = resolve_qbyt_readout(stage2)
         qbyt = QbyT(
             encoder_output_size=qbyt_input_dim,
             num_embeds=vocab_size,
             embed_dim=int(stage2.get("qbyt_embed_dim", 128)),
             post_num_layers=int(stage2.get("qbyt_layers", 2)),
-            readout_mode=resolve_qbyt_readout_mode(stage2),
+            readout_mode=readout.mode,
+            readout_temperature=readout.temperature,
         )
         qbyt.load_state_dict(_submodule_state(state, "qbyt"), strict=True)
     except (ImportError, RuntimeError, SystemExit, TypeError, ValueError) as exc:

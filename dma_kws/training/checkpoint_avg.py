@@ -95,6 +95,10 @@ def average_lightning_checkpoints(paths: list[Path], output_path: Path) -> Path:
     state_dicts = [_extract_state_dict(checkpoint) for checkpoint in checkpoints]
     if any(key.startswith("qbyt.") for key in state_dicts[0]):
         from dma_kws.stage2.objective import checkpoint_sequence_objective
+        from dma_kws.training.checkpoint_io import (
+            checkpoint_qbyt_readout_spec,
+            qbyt_readout_specs_equal,
+        )
 
         sequence_objectives = [
             checkpoint_sequence_objective(checkpoint) for checkpoint in checkpoints
@@ -107,6 +111,24 @@ def average_lightning_checkpoints(paths: list[Path], output_path: Path) -> Path:
             raise ValueError(
                 "Cannot average checkpoints trained with different Stage II sequence "
                 f"objectives: {described}"
+            )
+        try:
+            readout_specs = [
+                checkpoint_qbyt_readout_spec(checkpoint)
+                for checkpoint in checkpoints
+            ]
+        except ValueError as exc:
+            raise ValueError(
+                f"Cannot verify the QbyT readout of every checkpoint: {exc}"
+            ) from exc
+        if any(
+            not qbyt_readout_specs_equal(spec, readout_specs[0])
+            for spec in readout_specs[1:]
+        ):
+            described = [spec.as_dict() for spec in readout_specs]
+            raise ValueError(
+                "Cannot average checkpoints with different QbyT readouts: "
+                f"{described}"
             )
     reference_keys = set(state_dicts[0])
     for path, state in zip(paths[1:], state_dicts[1:]):
@@ -124,8 +146,6 @@ def average_lightning_checkpoints(paths: list[Path], output_path: Path) -> Path:
             raise ValueError("LoRA checkpoint contains no adapter A/B tensors")
 
         from dma_kws.training.checkpoint_io import (
-            QBYT_READOUT_VERSION,
-            QBYT_READOUT_VERSION_KEY,
             STAGE2_BASE_FINGERPRINT_KEY,
             fingerprint_stage2_base,
         )
@@ -155,15 +175,6 @@ def average_lightning_checkpoints(paths: list[Path], output_path: Path) -> Path:
             ):
                 raise ValueError(f"Cannot average checkpoints with different LoRA {key}")
 
-        readout_versions = [
-            checkpoint.get(QBYT_READOUT_VERSION_KEY)
-            for checkpoint in checkpoints
-        ]
-        if any(version != QBYT_READOUT_VERSION for version in readout_versions):
-            raise ValueError(
-                "All LoRA checkpoints must carry the current QbyT readout version "
-                f"{QBYT_READOUT_VERSION}; got {readout_versions}"
-            )
         try:
             stream_policies = [
                 resolve_stream_policy(checkpoint["config"])

@@ -252,10 +252,15 @@ def collect_hparams(
     if effective_max_steps is not None:
         hparams["max_steps"] = int(effective_max_steps)
     if section in {"stage2", "adapt"}:
+        from dma_kws.stage2.readout import resolve_qbyt_readout
+
         sequence_loss = stage2.get("sequence_loss", {}) or {}
         validation = stage2.get("validation", {}) or {}
+        readout = resolve_qbyt_readout(stage2)
         hparams.update(
             {
+                "qbyt_readout_mode": readout.mode,
+                "qbyt_readout_temperature": readout.temperature,
                 "qbyt_deployment_threshold": float(
                     ((config.get("demo") or {}).get("qbyt_threshold", 0.5))
                 ),

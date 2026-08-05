@@ -6,6 +6,7 @@ the QbyT query-by-text model, returning per-candidate detection scores.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping, Sequence
 
 from dma_kws.config import (
@@ -31,6 +32,7 @@ def _load_model_state(
     stream_policy=None,
     allow_legacy_qbyt_readout: bool = False,
     expected_qbyt_readout_mode: str | None = None,
+    expected_qbyt_readout_temperature: float | None = None,
 ):
     ckpt = load_fn(ckpt_path, map_location="cpu")
     if stream_policy is not None:
@@ -44,6 +46,7 @@ def _load_model_state(
         source=ckpt_path,
         allow_legacy=allow_legacy_qbyt_readout,
         expected_mode=expected_qbyt_readout_mode,
+        expected_temperature=expected_qbyt_readout_temperature,
     )
     state = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state, strict=True)
@@ -83,9 +86,13 @@ class Stage2Verifier:
         self._stream_policy = stream_policy
         adapter_cfg = stage2_cfg.get("phoneme_adapter", {}) or {}
         adapter_enabled = bool(adapter_cfg.get("enabled", False))
-        from dma_kws.stage2.readout import resolve_qbyt_readout_mode
+        from dma_kws.stage2.readout import resolve_qbyt_readout
 
-        qbyt_readout_mode = resolve_qbyt_readout_mode(stage2_cfg)
+        qbyt_readout = resolve_qbyt_readout(stage2_cfg)
+        qbyt_readout_mode = qbyt_readout.mode
+        qbyt_readout_temperature = qbyt_readout.temperature
+        self.qbyt_readout_mode = qbyt_readout_mode
+        self.qbyt_readout_temperature = qbyt_readout_temperature
 
         class Stage2Model(torch.nn.Module):
             def __init__(self):
@@ -113,6 +120,7 @@ class Stage2Verifier:
                     embed_dim=int(stage2_cfg.get("qbyt_embed_dim", 128)),
                     post_num_layers=int(stage2_cfg.get("qbyt_layers", 2)),
                     readout_mode=qbyt_readout_mode,
+                    readout_temperature=qbyt_readout_temperature,
                 )
 
             def _encode_and_score(
@@ -231,6 +239,7 @@ class Stage2Verifier:
                 # readout. The legacy flag is reserved for training warm starts.
                 allow_legacy_qbyt_readout=False,
                 expected_qbyt_readout_mode=qbyt_readout_mode,
+                expected_qbyt_readout_temperature=qbyt_readout_temperature,
             )
         except RuntimeError as exc:
             raise SystemExit(
@@ -350,6 +359,10 @@ class Stage2Verifier:
         """
 
         torch = self._torch
+        qbyt_readout_mode = getattr(self, "qbyt_readout_mode", "eps_mean")
+        qbyt_readout_temperature = float(
+            getattr(self, "qbyt_readout_temperature", 1.0)
+        )
         if not feats:
             return []
         if len(feats) != len(keyword_ids_batch):
@@ -492,17 +505,31 @@ class Stage2Verifier:
                         raise RuntimeError(
                             f"EPS position logits contain non-finite values for sample {index}"
                         )
-                    expected_logit = (
-                        sample_logits.mean()
-                        if sample_logits.numel()
-                        else torch.zeros_like(utt_logit)
-                    )
+                    if not sample_logits.numel():
+                        expected_logit = torch.zeros_like(utt_logit)
+                    elif qbyt_readout_mode == "eps_mean":
+                        expected_logit = sample_logits.mean()
+                    elif qbyt_readout_mode == "eps_softmin":
+                        values = sample_logits.float()
+                        expected_logit = -qbyt_readout_temperature * (
+                            torch.logsumexp(
+                                -values / qbyt_readout_temperature,
+                                dim=0,
+                            )
+                            - math.log(values.numel())
+                        )
+                    else:
+                        raise RuntimeError(
+                            "EPS position logits were exported for a non-EPS "
+                            f"readout: {qbyt_readout_mode!r}"
+                        )
                     if not bool(
                         torch.isclose(expected_logit, utt_logit, rtol=1e-5, atol=1e-6)
                     ):
                         raise RuntimeError(
-                            "EPS position-logit mean disagrees with the utterance logit: "
-                            f"sample={index}, mean={float(expected_logit)}, "
+                            "EPS position-logit aggregation disagrees with the utterance "
+                            f"logit: sample={index}, mode={qbyt_readout_mode}, "
+                            f"expected={float(expected_logit)}, "
                             f"utterance={float(utt_logit)}"
                         )
                     record["eps_position_logits"] = [

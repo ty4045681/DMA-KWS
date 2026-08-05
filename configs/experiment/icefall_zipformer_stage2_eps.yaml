@@ -15,6 +15,8 @@ training:
 stage2:
   qbyt_readout:
     mode: eps_mean
+    # Set mode=eps_softmin to enable weakest-position-aware pooling.
+    temperature: 1.0
   # This ablation changes only the final readout; keep the phoneme adapter out.
   phoneme_adapter:
     enabled: false

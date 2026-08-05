@@ -39,7 +39,7 @@ from dma_kws.inference.metrics import summarize_labeled_results
 from dma_kws.inference.stage2_clip import Stage2ClipRunner
 from dma_kws.pathing import resolve_dict_path
 from dma_kws.stage2.objective import checkpoint_sequence_objective
-from dma_kws.stage2.readout import resolve_qbyt_readout_mode
+from dma_kws.stage2.readout import resolve_qbyt_readout
 from dma_kws.tokenizer import (
     SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX,
     build_seq_label,
@@ -99,11 +99,16 @@ def _score_provenance(
             f"Failed to read Stage II checkpoint objective metadata: {exc}"
         ) from exc
     sequence_objective = checkpoint_sequence_objective(checkpoint)
+    qbyt_readout = resolve_qbyt_readout(stage2)
 
     return {
         "schema_version": _PROVENANCE_SCHEMA_VERSION,
         "checkpoint": _file_identity(checkpoint_path, kind="Stage II checkpoint"),
-        "qbyt_readout_mode": resolve_qbyt_readout_mode(stage2),
+        # Keep the scalar mode for older consumers and record the complete
+        # score semantics so two soft-min temperatures cannot be compared as
+        # though they produced interchangeable logits.
+        "qbyt_readout_mode": qbyt_readout.mode,
+        "qbyt_readout": qbyt_readout.as_dict(),
         "stream": stream,
         "audio_padding_ms": {
             "left": int(left_padding_ms),
@@ -126,6 +131,30 @@ def _finite_float(value: object, *, field: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f"{field} must be finite, got {number!r}")
     return number
+
+
+def _eps_readout_logit(
+    position_logits: list[float],
+    *,
+    mode: str,
+    temperature: float,
+) -> float:
+    """Reproduce QbyT's length-normalized EPS aggregation in Python."""
+
+    if not position_logits:
+        return 0.0
+    if mode == "eps_mean":
+        return math.fsum(position_logits) / len(position_logits)
+    if mode != "eps_softmin":
+        raise ValueError(
+            f"EPS position logits are incompatible with readout mode {mode!r}"
+        )
+    minimum = min(position_logits)
+    mean_exp = math.fsum(
+        math.exp(-(value - minimum) / temperature)
+        for value in position_logits
+    ) / len(position_logits)
+    return minimum - temperature * math.log(mean_exp)
 
 
 def _optional_phoneme_sequence(value: object, *, field: str) -> list[str] | None:
@@ -300,6 +329,7 @@ def _result_record(
     runner_result: dict,
     *,
     sequence_objective: Mapping[str, object] | None = None,
+    qbyt_readout: Mapping[str, object] | None = None,
 ) -> dict:
     keyword_phonemes = _optional_phoneme_sequence(
         runner_result.get("keyword_phonemes"),
@@ -318,6 +348,19 @@ def _result_record(
         "threshold": _finite_float(runner_result["threshold"], field="threshold"),
         "skipped": bool(runner_result.get("skipped", False)),
     }
+    if qbyt_readout is None:
+        # Backward-compatible default for direct helper callers and historical
+        # EPS JSONL fixtures. Real evaluation always supplies provenance.
+        readout_mode = "eps_mean"
+        readout_temperature = 1.0
+    else:
+        resolved_readout = resolve_qbyt_readout(
+            {"qbyt_readout": dict(qbyt_readout)}
+        )
+        readout_mode = resolved_readout.mode
+        readout_temperature = resolved_readout.temperature
+        record["qbyt_readout_mode"] = readout_mode
+        record["qbyt_readout_temperature"] = readout_temperature
     text_variant_phonemes = None
     if "text_variant_phonemes" in runner_result:
         text_variant_phonemes = _optional_phoneme_sequence(
@@ -356,10 +399,10 @@ def _result_record(
             raise ValueError(
                 "qbyt_logit is required when eps_position_logits is present"
             )
-        expected_logit = (
-            math.fsum(position_logits) / len(position_logits)
-            if position_logits
-            else 0.0
+        expected_logit = _eps_readout_logit(
+            position_logits,
+            mode=readout_mode,
+            temperature=readout_temperature,
         )
         if not math.isclose(
             expected_logit,
@@ -368,8 +411,9 @@ def _result_record(
             abs_tol=1e-6,
         ):
             raise ValueError(
-                "mean(eps_position_logits) must equal qbyt_logit: "
-                f"mean={expected_logit}, qbyt_logit={qbyt_logit}"
+                "EPS position-logit aggregation must equal qbyt_logit: "
+                f"mode={readout_mode}, expected={expected_logit}, "
+                f"qbyt_logit={qbyt_logit}"
             )
         record["eps_position_logits"] = position_logits
     else:
@@ -526,6 +570,7 @@ def run_eval(cfg: DictConfig) -> dict:
             row,
             runner_result,
             sequence_objective=sequence_objective,
+            qbyt_readout=provenance["qbyt_readout"],
         )
         for row, runner_result in zip(rows, runner_results)
     ]

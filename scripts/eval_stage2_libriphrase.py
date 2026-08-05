@@ -30,6 +30,7 @@ def _load_model(config: dict, checkpoint_path: Path, vocab_size: int) -> Stage2L
         source=checkpoint_path,
         allow_legacy=False,
         expected_mode=model.qbyt_readout_mode,
+        expected_temperature=model.qbyt_readout_temperature,
     )
 
     if checkpoint_path.suffix == ".pt":

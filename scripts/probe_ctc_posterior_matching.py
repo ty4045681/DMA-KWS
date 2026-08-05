@@ -99,6 +99,7 @@ def main(cfg: DictConfig) -> None:
         source=checkpoint_path,
         allow_legacy=False,
         expected_mode=model.qbyt_readout_mode,
+        expected_temperature=model.qbyt_readout_temperature,
     )
     state = (
         extract_state_dict(checkpoint)

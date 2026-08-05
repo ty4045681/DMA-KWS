@@ -423,11 +423,16 @@ def build_run_summary_rows(
         ]
     )
     if section in {"stage2", "adapt"}:
+        from dma_kws.stage2.readout import resolve_qbyt_readout
+
         sequence_cfg = stage2.get("sequence_loss", {}) or {}
         adapter_cfg = stage2.get("phoneme_adapter", {}) or {}
         validation_diagnostics_cfg = stage2.get("validation", {}) or {}
+        readout = resolve_qbyt_readout(stage2)
         rows.extend(
             [
+                ("qbyt_readout_mode", readout.mode),
+                ("qbyt_readout_temperature", str(readout.temperature)),
                 (
                     "qbyt_deployment_threshold",
                     str(

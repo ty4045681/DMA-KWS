@@ -80,6 +80,96 @@ def test_average_rejects_different_stage2_sequence_objectives(tmp_path: Path) ->
         average_lightning_checkpoints([legacy, current], tmp_path / "bad.ckpt")
 
 
+def _write_qbyt_readout_ckpt(
+    path: Path,
+    *,
+    mode: str,
+    temperature: float = 1.0,
+    version: int = QBYT_READOUT_VERSION,
+    weight: float = 1.0,
+) -> None:
+    torch.save(
+        {
+            "state_dict": {"qbyt.weight": torch.tensor([weight])},
+            "config": {
+                "stage2": {
+                    "qbyt_readout": {
+                        "mode": mode,
+                        "temperature": temperature,
+                    }
+                }
+            },
+            QBYT_READOUT_VERSION_KEY: version,
+        },
+        path,
+    )
+
+
+def test_average_rejects_different_qbyt_readout_modes_or_temperatures(
+    tmp_path: Path,
+) -> None:
+    mean = tmp_path / "mean.ckpt"
+    mean_other_temperature = tmp_path / "mean_other_temperature.ckpt"
+    softmin_a = tmp_path / "softmin_a.ckpt"
+    softmin_b = tmp_path / "softmin_b.ckpt"
+    _write_qbyt_readout_ckpt(mean, mode="eps_mean")
+    _write_qbyt_readout_ckpt(
+        mean_other_temperature,
+        mode="eps_mean",
+        temperature=0.5,
+    )
+    _write_qbyt_readout_ckpt(
+        softmin_a,
+        mode="eps_softmin",
+        temperature=0.5,
+    )
+    _write_qbyt_readout_ckpt(
+        softmin_b,
+        mode="eps_softmin",
+        temperature=0.75,
+    )
+
+    with pytest.raises(ValueError, match="different QbyT readouts"):
+        average_lightning_checkpoints(
+            [mean, softmin_a],
+            tmp_path / "bad_mode.ckpt",
+        )
+    with pytest.raises(ValueError, match="different QbyT readouts"):
+        average_lightning_checkpoints(
+            [softmin_a, softmin_b],
+            tmp_path / "bad_temperature.ckpt",
+        )
+    with pytest.raises(ValueError, match="different QbyT readouts"):
+        average_lightning_checkpoints(
+            [mean, mean_other_temperature],
+            tmp_path / "bad_mean_temperature.ckpt",
+        )
+
+
+def test_average_accepts_same_readout_across_compatible_versions(
+    tmp_path: Path,
+) -> None:
+    v3 = tmp_path / "v3_mean.ckpt"
+    v4 = tmp_path / "v4_mean.ckpt"
+    output = tmp_path / "mean.ckpt"
+    _write_qbyt_readout_ckpt(
+        v3,
+        mode="eps_mean",
+        version=3,
+        weight=1.0,
+    )
+    _write_qbyt_readout_ckpt(v4, mode="eps_mean", weight=3.0)
+
+    average_lightning_checkpoints([v3, v4], output)
+
+    averaged = torch.load(output, map_location="cpu")
+    assert averaged[QBYT_READOUT_VERSION_KEY] == 3
+    torch.testing.assert_close(
+        averaged["state_dict"]["qbyt.weight"],
+        torch.tensor([2.0]),
+    )
+
+
 def test_average_lightning_checkpoints_requires_paths(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="At least one checkpoint"):
         average_lightning_checkpoints([], tmp_path / "avg.ckpt")
@@ -93,6 +183,8 @@ def _write_lora_ckpt(
     alpha: float = 4.0,
     keyword: str = "hey eva",
     lora_targets: list[str] | tuple[str, ...] | str = ("in_proj_weight",),
+    readout_mode: str = "gru_last",
+    readout_temperature: float = 1.0,
 ) -> None:
     state = {
         key: value.clone()
@@ -121,6 +213,12 @@ def _write_lora_ckpt(
                 "stage1": {
                     "encoder_type": "conformer",
                     "use_dynamic_chunk": False,
+                },
+                "stage2": {
+                    "qbyt_readout": {
+                        "mode": readout_mode,
+                        "temperature": readout_temperature,
+                    }
                 },
                 "adapt": {
                     "keyword": keyword,
@@ -193,6 +291,35 @@ def test_lora_average_rejects_different_bases_or_scaling(tmp_path: Path):
         average_lightning_checkpoints(
             [first, different_alpha],
             tmp_path / "bad_alpha.ckpt",
+        )
+
+
+def test_lora_average_rejects_different_softmin_temperatures(tmp_path: Path):
+    base = {
+        "encoder.weight": torch.randn(4, 3),
+        "qbyt.layer.parametrizations.weight.original": torch.randn(3, 3),
+    }
+    first = tmp_path / "softmin_a.ckpt"
+    second = tmp_path / "softmin_b.ckpt"
+    _write_lora_ckpt(
+        first,
+        base=base,
+        adapter_value=1.0,
+        readout_mode="eps_softmin",
+        readout_temperature=0.5,
+    )
+    _write_lora_ckpt(
+        second,
+        base=base,
+        adapter_value=3.0,
+        readout_mode="eps_softmin",
+        readout_temperature=0.75,
+    )
+
+    with pytest.raises(ValueError, match="different QbyT readouts"):
+        average_lightning_checkpoints(
+            [first, second],
+            tmp_path / "bad_readout.ckpt",
         )
 
 

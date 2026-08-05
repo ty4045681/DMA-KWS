@@ -397,6 +397,7 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
                 state,
                 source=adapter_checkpoint,
                 expected_mode=self.qbyt_readout_mode,
+                expected_temperature=self.qbyt_readout_temperature,
                 # The base QbyT is frozen; unlike a full warm start, a legacy
                 # adapter cannot relearn the corrected pooled readout.
                 allow_legacy=False,
@@ -452,6 +453,7 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             checkpoint,
             source="the LoRA checkpoint being restored",
             expected_mode=self.qbyt_readout_mode,
+            expected_temperature=self.qbyt_readout_temperature,
             allow_legacy=False,
         )
         super().on_load_checkpoint(checkpoint)
