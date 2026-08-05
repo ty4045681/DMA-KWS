@@ -289,7 +289,12 @@ class FakeBatchVerifier:
         return scores
 
     def score_clip_feats_detailed(
-        self, feats, keyword_ids_batch, *, include_eps_positions=False
+        self,
+        feats,
+        keyword_ids_batch,
+        *,
+        include_eps_positions=False,
+        include_seq_positions=False,
     ):
         scores = self.score_clip_feats(feats, keyword_ids_batch)
         records = []
@@ -303,6 +308,12 @@ class FakeBatchVerifier:
             }
             if include_eps_positions:
                 record["eps_position_logits"] = [qbyt_logit] * len(keyword_ids)
+            if include_seq_positions:
+                record["seq_position_logits"] = (
+                    [0.5] * (len(keyword_ids) - 1) + [record["completion_logit"]]
+                    if keyword_ids
+                    else []
+                )
             records.append(record)
         return records
 
@@ -391,6 +402,7 @@ def test_clip_runner_run_batch_uses_per_row_keyword_phoneme_overrides(monkeypatc
     g2p_calls: list[str] = []
     ee_vah = ["HH", "EY1", "IY1", "V", "AH0"]
     ay_vah = ["HH", "EY1", "EY1", "V", "AH0"]
+    hey_eve = ["HH", "EY1", "IY1", "V"]
 
     def fake_text_to_phonemes(_g2p, text):
         g2p_calls.append(text)
@@ -415,6 +427,7 @@ def test_clip_runner_run_batch_uses_per_row_keyword_phoneme_overrides(monkeypatc
             "keyword": "hey eva",
             "keyword_phonemes": "HH EY1 IY1 V AH0",
             "text_variant": "hey eva",
+            "text_variant_phonemes": "HH EY1 IY1 V",
         },
         {
             "audio_path": "/tmp/ay-vah.wav",
@@ -431,7 +444,7 @@ def test_clip_runner_run_batch_uses_per_row_keyword_phoneme_overrides(monkeypatc
         ay_vah,
         ay_vah,
     ]
-    assert results[0]["text_variant_phonemes"] == ay_vah
+    assert results[0]["text_variant_phonemes"] == hey_eve
     assert "text_variant_phonemes" not in results[1]
     assert "text_variant_phonemes" not in results[2]
     assert g2p_calls == ["hey eva"]
@@ -500,6 +513,7 @@ def test_clip_runner_run_batch_can_include_score_details(monkeypatch):
         num_workers=0,
         include_score_details=True,
         include_eps_positions=True,
+        include_seq_positions=True,
     )
 
     assert results[0]["qbyt_logit"] == pytest.approx(math.log(9.0))
@@ -509,10 +523,14 @@ def test_clip_runner_run_batch_can_include_score_details(monkeypatch):
     )
     assert results[0]["keyword_phonemes"] == ["HELLO"]
     assert results[0]["eps_position_logits"] == pytest.approx([math.log(9.0)])
+    assert results[0]["seq_position_logits"] == pytest.approx(
+        [math.log(1.0 / 3.0)]
+    )
     assert results[1]["qbyt_logit"] is None
     assert results[1]["completion_score"] is None
     assert results[1]["completion_logit"] is None
     assert results[1]["eps_position_logits"] is None
+    assert results[1]["seq_position_logits"] is None
 
 
 def test_clip_runner_eps_positions_require_score_details(monkeypatch):
@@ -524,6 +542,8 @@ def test_clip_runner_eps_positions_require_score_details(monkeypatch):
 
     with pytest.raises(ValueError, match="requires include_score_details"):
         runner.run_batch([], include_eps_positions=True)
+    with pytest.raises(ValueError, match="requires include_score_details"):
+        runner.run_batch([], include_seq_positions=True)
 
 
 def test_clip_runner_result_record_shape(monkeypatch):

@@ -355,3 +355,66 @@ def test_stage2_verifier_eps_position_export_is_none_for_gru_readout():
     )
 
     assert details[0]["eps_position_logits"] is None
+
+
+def test_stage2_verifier_exports_trimmed_sequence_positions():
+    class _ReadoutDetails:
+        position_logits = torch.tensor(
+            [
+                [0.25, 0.5, 0.75],
+                [-0.25, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+        position_mask = torch.tensor(
+            [
+                [True, True, True],
+                [True, False, False],
+                [False, False, False],
+            ]
+        )
+
+    class _DetailedModel:
+        def forward_logits_with_position_details(
+            self, feats, feat_lengths, anchors, anchor_lengths
+        ):
+            del feats, feat_lengths, anchors, anchor_lengths
+            return (
+                torch.tensor([0.5, -0.25, 0.0]),
+                torch.tensor([-1.0, -2.0, 0.0]),
+                torch.tensor([True, True, False]),
+                torch.tensor(
+                    [
+                        [2.0, 0.0, -1.0],
+                        [-2.0, float("nan"), float("nan")],
+                        [float("nan"), float("nan"), float("nan")],
+                    ]
+                ),
+                _ReadoutDetails(),
+            )
+
+    verifier = Stage2Verifier.__new__(Stage2Verifier)
+    verifier._torch = torch
+    verifier._device = torch.device("cpu")
+    verifier._model = _DetailedModel()
+
+    details = verifier.score_clip_feats_detailed(
+        [torch.zeros(3, 80), torch.zeros(4, 80), torch.zeros(5, 80)],
+        [[1, 2, 3], [4], []],
+        include_eps_positions=True,
+        include_seq_positions=True,
+    )
+
+    assert details[0]["seq_position_logits"] == pytest.approx([2.0, 0.0, -1.0])
+    assert details[1]["seq_position_logits"] == pytest.approx([-2.0])
+    assert details[2]["seq_position_logits"] == []
+    assert details[0]["completion_logit"] == pytest.approx(
+        details[0]["seq_position_logits"][-1]
+    )
+    assert details[1]["completion_logit"] == pytest.approx(
+        details[1]["seq_position_logits"][-1]
+    )
+    assert details[2]["completion_logit"] is None
+    assert details[0]["eps_position_logits"] == pytest.approx([0.25, 0.5, 0.75])
+    assert details[1]["eps_position_logits"] == pytest.approx([-0.25])
+    assert details[2]["eps_position_logits"] == []

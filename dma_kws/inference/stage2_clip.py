@@ -243,14 +243,15 @@ class Stage2ClipRunner:
         right_padding_ms: int = 0,
         include_score_details: bool = False,
         include_eps_positions: bool = False,
+        include_seq_positions: bool = False,
     ) -> list[dict]:
         """Run Stage II verification on many clips with batched GPU scoring.
 
         ``rows`` are mappings with ``audio_path`` and ``keyword`` keys. An
         optional ``keyword_phonemes`` value overrides G2P for that row; it may
-        be a space-separated ARPAbet string or a sequence of strings. When a
-        non-empty ``text_variant`` is present, its default-G2P phonemes are
-        included in the result as ``text_variant_phonemes`` for diagnostics.
+        be a space-separated ARPAbet string or a sequence of strings. A
+        ``text_variant_phonemes`` value similarly overrides diagnostic query
+        G2P; otherwise a non-empty ``text_variant`` is converted automatically.
         Results are returned in the same order as ``rows`` and use the ``run``
         schema.
         Optional zero-valued waveform padding is applied in memory before fbank
@@ -258,6 +259,8 @@ class Stage2ClipRunner:
         toward the minimum encoder-input length and can make a short clip
         scoreable. ``include_eps_positions`` requires score details and exposes
         one EPS readout logit per enrollment phoneme when that readout is active.
+        ``include_seq_positions`` has the same requirement and exposes the
+        progress/completion head logit at every enrollment position.
         """
         try:
             from torch.utils.data import DataLoader
@@ -266,9 +269,11 @@ class Stage2ClipRunner:
                 "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
             ) from exc
 
-        if include_eps_positions and not include_score_details:
+        if not include_score_details and (
+            include_eps_positions or include_seq_positions
+        ):
             raise ValueError(
-                "include_eps_positions=true requires include_score_details=true"
+                "Position-logit export requires include_score_details=true"
             )
 
         rows = list(rows)
@@ -318,12 +323,27 @@ class Stage2ClipRunner:
                     )
                 keyword_cache[keyword_key] = (phonemes, keyword_ids)
 
+            text_variant_override_raw = row.get("text_variant_phonemes")
+            has_text_variant_override = text_variant_override_raw is not None and not (
+                isinstance(text_variant_override_raw, str)
+                and not text_variant_override_raw.strip()
+            )
+            text_variant_override = (
+                _parse_manifest_phonemes(
+                    text_variant_override_raw,
+                    field_name=f"Manifest row {row_index} text_variant_phonemes",
+                )
+                if has_text_variant_override
+                else None
+            )
             text_variant_raw = row.get("text_variant")
             text_variant = (
                 "" if text_variant_raw is None else str(text_variant_raw).strip()
             )
             row_text_variant_phonemes.append(
-                list(auto_phonemes(text_variant)) if text_variant else None
+                list(text_variant_override)
+                if text_variant_override is not None
+                else (list(auto_phonemes(text_variant)) if text_variant else None)
             )
 
         dataset = ClipFeatureDataset(
@@ -372,6 +392,11 @@ class Stage2ClipRunner:
                                     if include_eps_positions
                                     else {}
                                 ),
+                                **(
+                                    {"seq_position_logits": None}
+                                    if include_seq_positions
+                                    else {}
+                                ),
                             }
                             if include_score_details
                             else None
@@ -384,14 +409,15 @@ class Stage2ClipRunner:
             if not feats:
                 continue
             if include_score_details:
+                position_kwargs = {}
+                if include_eps_positions:
+                    position_kwargs["include_eps_positions"] = True
+                if include_seq_positions:
+                    position_kwargs["include_seq_positions"] = True
                 detailed_scores = self._verifier.score_clip_feats_detailed(
                     feats,
                     keyword_ids_batch,
-                    **(
-                        {"include_eps_positions": True}
-                        if include_eps_positions
-                        else {}
-                    ),
+                    **position_kwargs,
                 )
             else:
                 detailed_scores = [
@@ -450,6 +476,8 @@ class Stage2ClipRunner:
             )
             if "eps_position_logits" in score_details:
                 result["eps_position_logits"] = score_details["eps_position_logits"]
+            if "seq_position_logits" in score_details:
+                result["seq_position_logits"] = score_details["seq_position_logits"]
         return result
 
     def run_file_windows(

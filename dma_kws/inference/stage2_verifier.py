@@ -172,6 +172,24 @@ class Stage2Verifier:
                 self, feats, feat_lengths, anchors, anchor_lengths
             ):
                 """Return scalar heads plus analysis-only QbyT readout tensors."""
+                (
+                    logits,
+                    completion_logits,
+                    completion_valid,
+                    _seq_logits,
+                    readout_details,
+                ) = self.forward_logits_with_position_details(
+                    feats,
+                    feat_lengths,
+                    anchors,
+                    anchor_lengths,
+                )
+                return logits, completion_logits, completion_valid, readout_details
+
+            def forward_logits_with_position_details(
+                self, feats, feat_lengths, anchors, anchor_lengths
+            ):
+                """Return scalar heads plus both analysis-only position tensors."""
                 from dma_kws.stage2.scoring import gather_completion_logits
 
                 logits, seq_logits, readout_details = self._encode_and_score(
@@ -185,7 +203,13 @@ class Stage2Verifier:
                     seq_logits,
                     anchor_lengths,
                 )
-                return logits, completion_logits, completion_valid, readout_details
+                return (
+                    logits,
+                    completion_logits,
+                    completion_valid,
+                    seq_logits,
+                    readout_details,
+                )
 
             def forward(self, feats, feat_lengths, anchors, anchor_lengths):
                 logits, _ = self._encode_and_score(
@@ -308,6 +332,7 @@ class Stage2Verifier:
         keyword_ids_batch: Sequence[Sequence[int]],
         *,
         include_eps_positions: bool = False,
+        include_seq_positions: bool = False,
     ) -> list[dict[str, Any]]:
         """Return raw and probability scores for both Stage II heads.
 
@@ -317,6 +342,11 @@ class Stage2Verifier:
         When ``include_eps_positions`` is true, ``eps_position_logits`` contains
         one raw shared-scorer logit per valid anchor token. It is ``None`` for a
         ``gru_last`` readout and an empty list for an empty EPS anchor.
+        When ``include_seq_positions`` is true, ``seq_position_logits`` contains
+        the progress/completion head output for every valid anchor token. The
+        final value is required to agree with the separately exported completion
+        scalar. Probability- and target-based diagnostics are derived by the
+        evaluation script rather than mixed into this inference API.
         """
 
         torch = self._torch
@@ -344,17 +374,27 @@ class Stage2Verifier:
                 anchors.to(self._device),
                 anchor_lengths.to(self._device),
             )
-            if include_eps_positions:
+            if include_seq_positions:
+                (
+                    utt_logits,
+                    completion_logits,
+                    completion_valid,
+                    seq_logits,
+                    readout_details,
+                ) = self._model.forward_logits_with_position_details(*model_args)
+            elif include_eps_positions:
                 (
                     utt_logits,
                     completion_logits,
                     completion_valid,
                     readout_details,
                 ) = self._model.forward_logits_with_readout_details(*model_args)
+                seq_logits = None
             else:
                 utt_logits, completion_logits, completion_valid = (
                     self._model.forward_logits(*model_args)
                 )
+                seq_logits = None
                 readout_details = None
             utt_scores = torch.sigmoid(utt_logits)
             completion_scores = torch.sigmoid(completion_logits)
@@ -364,6 +404,8 @@ class Stage2Verifier:
         completion_logits = completion_logits.reshape(-1).detach().cpu()
         completion_scores = completion_scores.reshape(-1).detach().cpu()
         completion_valid = completion_valid.reshape(-1).detach().cpu()
+        if seq_logits is not None:
+            seq_logits = seq_logits.detach().cpu()
 
         position_logits = None
         position_mask = None
@@ -398,6 +440,41 @@ class Stage2Verifier:
                     float(completion_score) if bool(is_valid) else None
                 ),
             }
+            if include_seq_positions:
+                expected_length = int(anchor_lengths[index])
+                sample_seq_logits = seq_logits[index, :expected_length]
+                if sample_seq_logits.numel() != expected_length:
+                    raise RuntimeError(
+                        "Sequence-position width does not match the anchor: "
+                        f"sample={index}, logits={sample_seq_logits.numel()}, "
+                        f"anchor={expected_length}"
+                    )
+                if not bool(torch.isfinite(sample_seq_logits).all()):
+                    raise RuntimeError(
+                        f"Sequence position logits contain non-finite values for sample {index}"
+                    )
+                if bool(is_valid) != bool(expected_length):
+                    raise RuntimeError(
+                        "Completion validity disagrees with the anchor length: "
+                        f"sample={index}, valid={bool(is_valid)}, "
+                        f"anchor={expected_length}"
+                    )
+                if bool(is_valid) and not bool(
+                    torch.isclose(
+                        sample_seq_logits[-1],
+                        completion_logit,
+                        rtol=1e-5,
+                        atol=1e-6,
+                    )
+                ):
+                    raise RuntimeError(
+                        "Final sequence-position logit disagrees with completion: "
+                        f"sample={index}, final={float(sample_seq_logits[-1])}, "
+                        f"completion={float(completion_logit)}"
+                    )
+                record["seq_position_logits"] = [
+                    float(value) for value in sample_seq_logits
+                ]
             if include_eps_positions:
                 if position_logits is None:
                     record["eps_position_logits"] = None
