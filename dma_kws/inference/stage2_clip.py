@@ -6,17 +6,66 @@ the Stage II QbyT verifier, bypassing Stage I locator models entirely.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from dma_kws.audio import load_audio
 from dma_kws.g2p import make_g2p, text_to_phonemes
 from dma_kws.stage1.candidates import KeywordCandidate
-from dma_kws.tokenizer import load_char_tokenizer, tokenize_phoneme_string
+from dma_kws.tokenizer import (
+    load_char_tokenizer,
+    tokenize_phoneme_string,
+    unsupported_phones,
+)
 
 if TYPE_CHECKING:
     from dma_kws.inference.stage2_verifier import Stage2Verifier
 
 __all__ = ["ClipFeatureDataset", "Stage2ClipRunner", "collate_clip_feature_batch"]
+
+
+def _parse_manifest_phonemes(
+    value: object,
+    *,
+    field_name: str,
+) -> list[str]:
+    """Parse an explicitly supplied manifest phoneme override.
+
+    CSV manifests normally use a space-separated ARPAbet string, while JSONL
+    manifests may use either that string or a JSON array of strings. Invalid or
+    empty values fail loudly instead of silently falling back to G2P or being
+    tokenized as ``<unk>``.
+    """
+    parsed: object = value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError(f"{field_name} must not be empty")
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{field_name} must be a space-separated ARPAbet string or "
+                    "a JSON array of strings"
+                ) from exc
+        else:
+            parsed = stripped.split()
+
+    if not isinstance(parsed, (list, tuple)) or not parsed:
+        raise ValueError(
+            f"{field_name} must be a non-empty ARPAbet string or sequence of strings"
+        )
+    if not all(isinstance(phone, str) and phone.strip() for phone in parsed):
+        raise ValueError(f"{field_name} must contain only non-empty strings")
+
+    phonemes = [phone.strip() for phone in parsed]
+    unsupported = unsupported_phones(phonemes)
+    if unsupported:
+        raise ValueError(
+            f"{field_name} contains unsupported phonemes: {', '.join(unsupported)}"
+        )
+    return phonemes
 
 
 class ClipFeatureDataset:
@@ -197,8 +246,13 @@ class Stage2ClipRunner:
     ) -> list[dict]:
         """Run Stage II verification on many clips with batched GPU scoring.
 
-        ``rows`` are mappings with ``audio_path`` and ``keyword`` keys. Results
-        are returned in the same order as ``rows`` and use the ``run`` schema.
+        ``rows`` are mappings with ``audio_path`` and ``keyword`` keys. An
+        optional ``keyword_phonemes`` value overrides G2P for that row; it may
+        be a space-separated ARPAbet string or a sequence of strings. When a
+        non-empty ``text_variant`` is present, its default-G2P phonemes are
+        included in the result as ``text_variant_phonemes`` for diagnostics.
+        Results are returned in the same order as ``rows`` and use the ``run``
+        schema.
         Optional zero-valued waveform padding is applied in memory before fbank
         extraction; source audio files are not modified. The padding counts
         toward the minimum encoder-input length and can make a short clip
@@ -219,11 +273,40 @@ class Stage2ClipRunner:
 
         rows = list(rows)
         threshold = float(self._demo_cfg.get("qbyt_threshold", 0.5))
-        keyword_cache: dict[str, tuple[list[str], list[int]]] = {}
-        for row in rows:
-            keyword = row["keyword"]
-            if keyword not in keyword_cache:
-                phonemes = text_to_phonemes(self._g2p, keyword)
+        auto_phoneme_cache: dict[str, list[str]] = {}
+
+        def auto_phonemes(text: str) -> list[str]:
+            if text not in auto_phoneme_cache:
+                auto_phoneme_cache[text] = text_to_phonemes(self._g2p, text)
+            return auto_phoneme_cache[text]
+
+        keyword_cache: dict[
+            tuple[str, tuple[str, ...] | None],
+            tuple[list[str], list[int]],
+        ] = {}
+        row_keyword_keys: list[tuple[str, tuple[str, ...] | None]] = []
+        row_text_variant_phonemes: list[list[str] | None] = []
+        for row_index, row in enumerate(rows, start=1):
+            keyword = str(row["keyword"])
+            override = (
+                _parse_manifest_phonemes(
+                    row["keyword_phonemes"],
+                    field_name=f"Manifest row {row_index} keyword_phonemes",
+                )
+                if "keyword_phonemes" in row
+                else None
+            )
+            keyword_key = (
+                keyword,
+                tuple(override) if override is not None else None,
+            )
+            row_keyword_keys.append(keyword_key)
+            if keyword_key not in keyword_cache:
+                phonemes = (
+                    list(override)
+                    if override is not None
+                    else auto_phonemes(keyword)
+                )
                 keyword_ids = tokenize_phoneme_string(
                     self._tokenizer, " ".join(phonemes)
                 )
@@ -233,7 +316,15 @@ class Stage2ClipRunner:
                         f"keyword={keyword!r}, phonemes={len(phonemes)}, "
                         f"token_ids={len(keyword_ids)}"
                     )
-                keyword_cache[keyword] = (phonemes, keyword_ids)
+                keyword_cache[keyword_key] = (phonemes, keyword_ids)
+
+            text_variant_raw = row.get("text_variant")
+            text_variant = (
+                "" if text_variant_raw is None else str(text_variant_raw).strip()
+            )
+            row_text_variant_phonemes.append(
+                list(auto_phonemes(text_variant)) if text_variant else None
+            )
 
         dataset = ClipFeatureDataset(
             audio_paths=[row["audio_path"] for row in rows],
@@ -259,7 +350,8 @@ class Stage2ClipRunner:
             pending: list[tuple[int, float]] = []
             for index, feat, end_sec in batch:
                 keyword = rows[index]["keyword"]
-                phonemes, keyword_ids = keyword_cache[keyword]
+                phonemes, keyword_ids = keyword_cache[row_keyword_keys[index]]
+                text_variant_phonemes = row_text_variant_phonemes[index]
                 if feat is None:
                     results[index] = self._clip_result(
                         rows[index]["audio_path"],
@@ -269,6 +361,7 @@ class Stage2ClipRunner:
                         0.0,
                         threshold,
                         skipped=True,
+                        text_variant_phonemes=text_variant_phonemes,
                         score_details=(
                             {
                                 "qbyt_logit": None,
@@ -307,7 +400,7 @@ class Stage2ClipRunner:
                 ]
             for (index, end_sec), score_details in zip(pending, detailed_scores):
                 keyword = rows[index]["keyword"]
-                phonemes, _ = keyword_cache[keyword]
+                phonemes, _ = keyword_cache[row_keyword_keys[index]]
                 results[index] = self._clip_result(
                     rows[index]["audio_path"],
                     keyword,
@@ -316,6 +409,7 @@ class Stage2ClipRunner:
                     float(score_details["qbyt_score"]),
                     threshold,
                     skipped=False,
+                    text_variant_phonemes=row_text_variant_phonemes[index],
                     score_details=score_details if include_score_details else None,
                 )
         return results
@@ -331,6 +425,7 @@ class Stage2ClipRunner:
         *,
         skipped: bool,
         start_sec: float = 0.0,
+        text_variant_phonemes: Sequence[str] | None = None,
         score_details: Mapping[str, Any] | None = None,
     ) -> dict:
         result = {
@@ -343,6 +438,8 @@ class Stage2ClipRunner:
             "detected": qbyt_score >= threshold,
             "skipped": skipped,
         }
+        if text_variant_phonemes is not None:
+            result["text_variant_phonemes"] = list(text_variant_phonemes)
         if score_details is not None:
             result.update(
                 {

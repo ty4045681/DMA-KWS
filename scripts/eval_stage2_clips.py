@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Evaluate Stage II-only DMA-KWS inference on a manifest of keyword clips.
 
+Manifest rows may provide ``keyword_phonemes`` as a space-separated ARPAbet
+string (or a string array in JSONL) to override keyword G2P for that row. Rows
+without the field retain automatic G2P. When ``text_variant`` is present, its
+automatic-G2P sequence is recorded as ``text_variant_phonemes`` in results.
+
 Each clip receives 160 ms of zero-valued waveform context on both sides by
 default. Override with ``+prep.left_padding_ms=...`` and
 ``+prep.right_padding_ms=...``; use zero to disable either side.
@@ -114,19 +119,23 @@ def _finite_float(value: object, *, field: str) -> float:
     return number
 
 
-def _result_record(manifest_row: dict, runner_result: dict) -> dict:
-    keyword_phonemes_raw = runner_result.get("keyword_phonemes")
-    if keyword_phonemes_raw is None:
-        keyword_phonemes = None
-    elif isinstance(keyword_phonemes_raw, (list, tuple)) and all(
-        isinstance(value, str) for value in keyword_phonemes_raw
+def _optional_phoneme_sequence(value: object, *, field: str) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(phone, str) for phone in value
     ):
-        keyword_phonemes = list(keyword_phonemes_raw)
-    else:
-        raise ValueError(
-            "keyword_phonemes must be a sequence of strings or None, "
-            f"got {keyword_phonemes_raw!r}"
-        )
+        return list(value)
+    raise ValueError(
+        f"{field} must be a sequence of strings or None, got {value!r}"
+    )
+
+
+def _result_record(manifest_row: dict, runner_result: dict) -> dict:
+    keyword_phonemes = _optional_phoneme_sequence(
+        runner_result.get("keyword_phonemes"),
+        field="keyword_phonemes",
+    )
 
     record = {
         "audio_path": manifest_row["audio_path"],
@@ -140,6 +149,11 @@ def _result_record(manifest_row: dict, runner_result: dict) -> dict:
         "threshold": _finite_float(runner_result["threshold"], field="threshold"),
         "skipped": bool(runner_result.get("skipped", False)),
     }
+    if "text_variant_phonemes" in runner_result:
+        record["text_variant_phonemes"] = _optional_phoneme_sequence(
+            runner_result["text_variant_phonemes"],
+            field="text_variant_phonemes",
+        )
     if "label" in manifest_row:
         record["label"] = int(manifest_row["label"])
     for name in ("qbyt_logit", "completion_logit", "completion_score"):
@@ -196,7 +210,7 @@ def _result_record(manifest_row: dict, runner_result: dict) -> dict:
     manifest_meta = {
         key: value
         for key, value in manifest_row.items()
-        if key not in {"audio_path", "keyword", "label"}
+        if key not in {"audio_path", "keyword", "keyword_phonemes", "label"}
     }
     if manifest_meta:
         record["manifest_meta"] = manifest_meta

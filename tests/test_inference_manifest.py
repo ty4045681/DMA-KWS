@@ -134,6 +134,33 @@ def test_load_manifest_jsonl_invalid_label_reports_file_row(tmp_path):
         load_manifest(manifest_path)
 
 
+def test_load_manifest_preserves_csv_keyword_phonemes_and_text_variant(tmp_path):
+    manifest_path = tmp_path / "manifest.csv"
+    manifest_path.write_text(
+        "audio_path,keyword,keyword_phonemes,text_variant,label\n"
+        "a.wav,hey eva,HH EY1 IY1 V AH0,hey eever,1\n",
+        encoding="utf-8",
+    )
+
+    row = load_manifest(manifest_path)[0]
+
+    assert row["keyword_phonemes"] == "HH EY1 IY1 V AH0"
+    assert row["text_variant"] == "hey eever"
+
+
+def test_load_manifest_preserves_jsonl_keyword_phoneme_array(tmp_path):
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        '{"audio_path":"a.wav","keyword":"hey eva",'
+        '"keyword_phonemes":["HH","EY1","IY1","V","AH0"]}\n',
+        encoding="utf-8",
+    )
+
+    row = load_manifest(manifest_path)[0]
+
+    assert row["keyword_phonemes"] == ["HH", "EY1", "IY1", "V", "AH0"]
+
+
 def test_write_manifest_empty_rows(tmp_path):
     with pytest.raises(ValueError, match="empty manifest"):
         write_manifest(tmp_path / "manifest.csv", [])

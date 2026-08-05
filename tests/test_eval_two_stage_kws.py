@@ -62,7 +62,14 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     )
     tokenizer_path = tmp_path / "lang_char.txt"
     tokenizer_path.write_text("<blank> 0\nHH 1\n", encoding="utf-8")
-    rows = [{"audio_path": "clip.wav", "keyword": "hello"}]
+    rows = [
+        {
+            "audio_path": "clip.wav",
+            "keyword": "hello",
+            "keyword_phonemes": "HH",
+            "text_variant": "hullo",
+        }
+    ]
     captured = {}
 
     class FakeStreamPolicy:
@@ -82,6 +89,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
                     "qbyt_score": 0.75,
                     "qbyt_logit": 1.0986122886681098,
                     "keyword_phonemes": ["HH"],
+                    "text_variant_phonemes": ["HH", "AH0", "L", "OW1"],
                     "eps_position_logits": [1.0986122886681098],
                     "detected": True,
                     "threshold": 0.5,
@@ -166,6 +174,8 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
         (tmp_path / "results.jsonl").read_text(encoding="utf-8").strip()
     )
     assert saved_result["keyword_phonemes"] == ["HH"]
+    assert saved_result["text_variant_phonemes"] == ["HH", "AH0", "L", "OW1"]
+    assert saved_result["manifest_meta"] == {"text_variant": "hullo"}
     assert saved_result["eps_position_logits"] == pytest.approx(
         [1.0986122886681098]
     )
@@ -361,6 +371,8 @@ def test_stage2_clip_result_record_includes_manifest_meta_for_extra_columns():
         "audio_path": "/tmp/audio.wav",
         "keyword": "hello",
         "label": "0",
+        "keyword_phonemes": "HH AH0 L OW1",
+        "text_variant": "hullo",
         "speaker_id": "spk-002",
         "utterance_id": "utt-77",
     }
@@ -369,6 +381,8 @@ def test_stage2_clip_result_record_includes_manifest_meta_for_extra_columns():
         "detected": False,
         "threshold": 0.5,
         "skipped": False,
+        "keyword_phonemes": ["HH", "AH0", "L", "OW1"],
+        "text_variant_phonemes": ["HH", "AH0", "L", "OW1"],
     }
 
     record = stage2_clip_result_record(manifest_row, runner_result)
@@ -376,7 +390,10 @@ def test_stage2_clip_result_record_includes_manifest_meta_for_extra_columns():
     assert record["audio_path"] == "/tmp/audio.wav"
     assert record["keyword"] == "hello"
     assert record["label"] == 0
+    assert record["keyword_phonemes"] == ["HH", "AH0", "L", "OW1"]
+    assert record["text_variant_phonemes"] == ["HH", "AH0", "L", "OW1"]
     assert record["manifest_meta"] == {
+        "text_variant": "hullo",
         "speaker_id": "spk-002",
         "utterance_id": "utt-77",
     }

@@ -262,6 +262,7 @@ class FakeBatchVerifier:
 
         self._scores = list(scores)
         self.batches: list[int] = []
+        self.keyword_ids_batches: list[list[list[int]]] = []
         self.min_fbank_frames = 7
         self.fbank_extractor = FbankExtractor(dither=0.0)
         self.fbank_kwargs = {
@@ -280,6 +281,9 @@ class FakeBatchVerifier:
     def score_clip_feats(self, feats, keyword_ids_batch):
         assert len(feats) == len(keyword_ids_batch)
         self.batches.append(len(feats))
+        self.keyword_ids_batches.append(
+            [list(keyword_ids) for keyword_ids in keyword_ids_batch]
+        )
         scores = self._scores[: len(feats)]
         self._scores = self._scores[len(feats):]
         return scores
@@ -335,7 +339,11 @@ def test_clip_runner_run_batch(monkeypatch):
 
     rows = [
         {"audio_path": "/tmp/a.wav", "keyword": "hello"},
-        {"audio_path": "/tmp/short.wav", "keyword": "hello"},
+        {
+            "audio_path": "/tmp/short.wav",
+            "keyword": "hello",
+            "text_variant": "hey eva",
+        },
         {"audio_path": "/tmp/b.wav", "keyword": "hello"},
     ]
     results = runner.run_batch(rows, batch_size=8, num_workers=0)
@@ -345,9 +353,16 @@ def test_clip_runner_run_batch(monkeypatch):
     assert results[0]["detected"] is True
     assert results[1]["qbyt_score"] == 0.0
     assert results[1]["detected"] is False
+    assert results[1]["text_variant_phonemes"] == [
+        "HH",
+        "EY1",
+        "IY1",
+        "V",
+        "AH0",
+    ]
     assert results[2]["qbyt_score"] == 0.2
     assert results[2]["detected"] is False
-    assert g2p_calls == ["hello"]
+    assert g2p_calls == ["hello", "hey eva"]
     assert verifier.batches == [2]
     assert set(results[0]) == {
         "audio",
@@ -359,6 +374,97 @@ def test_clip_runner_run_batch(monkeypatch):
         "detected",
         "skipped",
     }
+
+
+def test_clip_runner_run_batch_uses_per_row_keyword_phoneme_overrides(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchaudio")
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.load_audio",
+        lambda _path, *, sample_rate: (
+            torch.zeros(1, sample_rate * 2),
+            sample_rate,
+        ),
+    )
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.make_g2p", _fake_g2p)
+    g2p_calls: list[str] = []
+    ee_vah = ["HH", "EY1", "IY1", "V", "AH0"]
+    ay_vah = ["HH", "EY1", "EY1", "V", "AH0"]
+
+    def fake_text_to_phonemes(_g2p, text):
+        g2p_calls.append(text)
+        assert text == "hey eva"
+        return ay_vah
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.text_to_phonemes", fake_text_to_phonemes
+    )
+
+    verifier = FakeBatchVerifier(scores=[0.9, 0.2, 0.8])
+    tokenizer = load_char_tokenizer("data/dict/lang_char.txt", split_with_space=" ")
+    runner = Stage2ClipRunner(
+        verifier=verifier,
+        tokenizer=tokenizer,
+        demo_cfg={"qbyt_threshold": 0.5},
+        sample_rate=16000,
+    )
+    rows = [
+        {
+            "audio_path": "/tmp/ee-vah.wav",
+            "keyword": "hey eva",
+            "keyword_phonemes": "HH EY1 IY1 V AH0",
+            "text_variant": "hey eva",
+        },
+        {
+            "audio_path": "/tmp/ay-vah.wav",
+            "keyword": "hey eva",
+            "keyword_phonemes": ay_vah,
+        },
+        {"audio_path": "/tmp/default.wav", "keyword": "hey eva"},
+    ]
+
+    results = runner.run_batch(rows, batch_size=8, num_workers=0)
+
+    assert [result["keyword_phonemes"] for result in results] == [
+        ee_vah,
+        ay_vah,
+        ay_vah,
+    ]
+    assert results[0]["text_variant_phonemes"] == ay_vah
+    assert "text_variant_phonemes" not in results[1]
+    assert "text_variant_phonemes" not in results[2]
+    assert g2p_calls == ["hey eva"]
+    assert verifier.keyword_ids_batches == [
+        [
+            [tokenizer.symbol_table[phone] for phone in ee_vah],
+            [tokenizer.symbol_table[phone] for phone in ay_vah],
+            [tokenizer.symbol_table[phone] for phone in ay_vah],
+        ]
+    ]
+
+
+@pytest.mark.parametrize(
+    "override",
+    ["", None, [], "HH NOT_A_PHONE"],
+)
+def test_clip_runner_rejects_invalid_keyword_phoneme_override(monkeypatch, override):
+    runner = _build_runner(
+        threshold=0.5,
+        verifier=FakeVerifier(scores=[0.7]),
+        monkeypatch=monkeypatch,
+    )
+
+    with pytest.raises(ValueError, match="Manifest row 1 keyword_phonemes"):
+        runner.run_batch(
+            [
+                {
+                    "audio_path": "/tmp/clip.wav",
+                    "keyword": "hey eva",
+                    "keyword_phonemes": override,
+                }
+            ]
+        )
 
 
 def test_clip_runner_run_batch_can_include_score_details(monkeypatch):
