@@ -125,6 +125,175 @@ def test_phoneme_per_runner_applies_waveform_padding(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("reference_column", "override_column"),
+    [
+        ("keyword", "keyword_phonemes"),
+        ("text_variant", "text_variant_phonemes"),
+    ],
+)
+def test_phoneme_per_runner_uses_per_row_reference_phoneme_overrides(
+    monkeypatch,
+    reference_column,
+    override_column,
+):
+    torch = pytest.importorskip("torch")
+    from dma_kws.inference import stage2_clip
+
+    phone_ids = {
+        "HH": 2,
+        "EY1": 3,
+        "IY1": 4,
+        "V": 5,
+        "AH0": 6,
+        "EH1": 7,
+    }
+    ee_vah = ["HH", "EY1", "IY1", "V", "AH0"]
+    ay_vah = ["HH", "EY1", "EY1", "V", "AH0"]
+    default = ["HH", "EY1", "EH1", "V", "AH0"]
+    expected_references = [ee_vah, ay_vah, default]
+    expected_ids = [
+        [phone_ids[phone] for phone in phonemes]
+        for phonemes in expected_references
+    ]
+    g2p_calls = []
+
+    class FakeDataset:
+        def __init__(self, *, audio_paths, **_kwargs):
+            self.audio_paths = list(audio_paths)
+
+        def __len__(self):
+            return len(self.audio_paths)
+
+        def __getitem__(self, index):
+            return index, torch.ones(2, 80), 1.0
+
+    class FakeVerifier:
+        fbank_extractor = object()
+        fbank_kwargs = {}
+        min_fbank_frames = 1
+
+        @staticmethod
+        def decode_phoneme_feats(feats):
+            assert len(feats) == len(expected_ids)
+            return expected_ids
+
+    class FakeTokenizer:
+        @staticmethod
+        def tokenize(text):
+            phonemes = text.split()
+            return phonemes, [phone_ids[phone] for phone in phonemes]
+
+        @staticmethod
+        def ids2tokens(ids):
+            id_phones = {value: key for key, value in phone_ids.items()}
+            return [id_phones[token_id] for token_id in ids]
+
+    def fake_text_to_phonemes(_g2p, text):
+        g2p_calls.append(text)
+        assert text == "hey eva"
+        return default
+
+    monkeypatch.setattr(stage2_clip, "ClipFeatureDataset", FakeDataset)
+    monkeypatch.setattr(stage2_clip, "collate_clip_feature_batch", lambda batch: batch)
+    monkeypatch.setattr(
+        "dma_kws.inference.phoneme_per.text_to_phonemes",
+        fake_text_to_phonemes,
+    )
+    runner = PhonemePerRunner(
+        verifier=FakeVerifier(),
+        tokenizer=FakeTokenizer(),
+        sample_rate=16000,
+        g2p=object(),
+    )
+    rows = [
+        {
+            "audio_path": "/audio/ee-vah.wav",
+            "keyword": "hey eva",
+            "label": 1,
+            "text_variant": "hey eva",
+            override_column: "HH EY1 IY1 V AH0",
+        },
+        {
+            "audio_path": "/audio/ay-vah.wav",
+            "keyword": "hey eva",
+            "label": 1,
+            "text_variant": "hey eva",
+            override_column: ay_vah,
+        },
+        {
+            "audio_path": "/audio/default.wav",
+            "keyword": "hey eva",
+            "label": 1,
+            "text_variant": "hey eva",
+            **({override_column: ""} if reference_column == "text_variant" else {}),
+        },
+    ]
+
+    results = runner.run_batch(
+        rows,
+        reference_column=reference_column,
+        batch_size=8,
+        num_workers=0,
+    )
+
+    assert [result["reference_phonemes"] for result in results] == expected_references
+    assert [result["per"] for result in results] == [0.0, 0.0, 0.0]
+    assert g2p_calls == ["hey eva"]
+
+
+@pytest.mark.parametrize(
+    ("reference_column", "override_column"),
+    [
+        ("keyword", "keyword_phonemes"),
+        ("text_variant", "text_variant_phonemes"),
+    ],
+)
+def test_phoneme_per_runner_rejects_invalid_reference_phoneme_override(
+    monkeypatch,
+    reference_column,
+    override_column,
+):
+    pytest.importorskip("torch")
+    from dma_kws.inference import stage2_clip
+
+    class FakeVerifier:
+        fbank_extractor = object()
+        fbank_kwargs = {}
+        min_fbank_frames = 1
+
+    class FakeTokenizer:
+        @staticmethod
+        def tokenize(_text):
+            return ["HH"], [2]
+
+    class UnexpectedDataset:
+        def __init__(self, **_kwargs):
+            raise AssertionError("audio loading must not start before override validation")
+
+    monkeypatch.setattr(stage2_clip, "ClipFeatureDataset", UnexpectedDataset)
+    monkeypatch.setattr(
+        "dma_kws.inference.phoneme_per.text_to_phonemes",
+        lambda _g2p, _text: ["HH"],
+    )
+    runner = PhonemePerRunner(
+        verifier=FakeVerifier(),
+        tokenizer=FakeTokenizer(),
+        sample_rate=16000,
+        g2p=object(),
+    )
+    row = {
+        "audio_path": "/audio/invalid.wav",
+        "keyword": "hey eva",
+        "label": 1,
+        "text_variant": "hey eva",
+        override_column: "HH NOT_A_PHONE",
+    }
+
+    with pytest.raises(ValueError, match=f"Manifest row 1 {override_column}"):
+        runner.run_batch([row], reference_column=reference_column, num_workers=0)
+
+
+@pytest.mark.parametrize(
     "padding_overrides,expected_padding",
     [
         ({}, (160, 160)),

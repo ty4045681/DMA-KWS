@@ -201,6 +201,8 @@ class PhonemePerRunner:
     ) -> list[dict[str, Any]]:
         """Compute full-clip greedy CTC hypotheses and PER records.
 
+        A per-row ``<reference_column>_phonemes`` value overrides reference G2P
+        using the same ARPAbet formats accepted by Stage II clip evaluation.
         Optional zero-valued waveform padding is applied in memory before fbank
         extraction. It counts toward the minimum encoder-input length and can
         make a short clip decodable; source audio files are not modified.
@@ -215,19 +217,48 @@ class PhonemePerRunner:
         from dma_kws.inference.stage2_clip import (
             ClipFeatureDataset,
             collate_clip_feature_batch,
+            parse_phoneme_sequence,
         )
 
         rows = list(rows)
-        reference_cache: dict[str, tuple[list[str], list[int]]] = {}
-        for row in rows:
+        reference_phoneme_column = f"{reference_column}_phonemes"
+        reference_cache: dict[
+            tuple[str, tuple[str, ...] | None],
+            tuple[list[str], list[int]],
+        ] = {}
+        row_reference_keys: list[tuple[str, tuple[str, ...] | None]] = []
+        for row_index, row in enumerate(rows, start=1):
             reference_text = str(row[reference_column]).strip()
-            if reference_text not in reference_cache:
-                phonemes = text_to_phonemes(self._g2p, reference_text)
+            override_raw = row.get(reference_phoneme_column)
+            has_override = reference_phoneme_column in row
+            if reference_phoneme_column == "text_variant_phonemes":
+                has_override = override_raw is not None and not (
+                    isinstance(override_raw, str) and not override_raw.strip()
+                )
+            override = (
+                parse_phoneme_sequence(
+                    override_raw,
+                    field_name=f"Manifest row {row_index} {reference_phoneme_column}",
+                )
+                if has_override
+                else None
+            )
+            reference_key = (
+                reference_text,
+                tuple(override) if override is not None else None,
+            )
+            row_reference_keys.append(reference_key)
+            if reference_key not in reference_cache:
+                phonemes = (
+                    list(override)
+                    if override is not None
+                    else text_to_phonemes(self._g2p, reference_text)
+                )
                 token_ids = tokenize_phoneme_string(
                     self._tokenizer,
                     " ".join(phonemes),
                 )
-                reference_cache[reference_text] = (phonemes, token_ids)
+                reference_cache[reference_key] = (phonemes, token_ids)
 
         dataset = ClipFeatureDataset(
             audio_paths=[str(row["audio_path"]) for row in rows],
@@ -250,8 +281,9 @@ class PhonemePerRunner:
 
         def store(index: int, hypothesis_ids: Sequence[int], *, skipped: bool) -> None:
             row = rows[index]
-            reference_text = str(row[reference_column]).strip()
-            reference_phonemes, reference_ids = reference_cache[reference_text]
+            reference_phonemes, reference_ids = reference_cache[
+                row_reference_keys[index]
+            ]
             hypothesis_ids = list(hypothesis_ids)
             results[index] = build_per_record(
                 row,

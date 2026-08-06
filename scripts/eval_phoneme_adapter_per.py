@@ -2,8 +2,11 @@
 """Evaluate phoneme-adapter PER on an ``eval_stage2_clips.py`` manifest.
 
 By default, the true transcript is read from the manifest's ``text_variant``
-column. Evaluation can also be restricted to positive rows before using
-``keyword`` as the reference for legacy manifests.
+column. A per-row ``text_variant_phonemes`` value overrides its automatic G2P.
+Evaluation can also be restricted to positive rows before using ``keyword`` as
+the reference for legacy manifests, with ``keyword_phonemes`` as its optional
+per-row override. CSV overrides are space-separated ARPAbet strings; JSONL also
+accepts arrays of strings.
 
 Each clip receives 160 ms of zero-valued waveform context on both sides by
 default. Override with ``+prep.left_padding_ms=...`` and
@@ -125,7 +128,7 @@ def run_eval(cfg: DictConfig) -> dict:
             left_padding_ms=left_padding_ms,
             right_padding_ms=right_padding_ms,
         )
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
     output_dir = Path(
