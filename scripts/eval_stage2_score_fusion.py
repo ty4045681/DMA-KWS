@@ -27,6 +27,10 @@ from dma_kws.inference.score_calibration import (
     fit_affine_logit_calibrator,
     sigmoid,
 )
+from dma_kws.inference.score_provenance import (
+    semantic_score_provenance,
+    validate_score_provenance,
+)
 from dma_kws.training.score_diagnostics import binary_score_diagnostics
 
 
@@ -92,51 +96,17 @@ def _read_score_provenance(results_path: Path) -> tuple[Path, dict[str, Any]]:
         raise ValueError(
             f"{summary_path} has no score provenance; re-run eval_stage2_clips.py"
         )
-    provenance = summary["provenance"]
-    required = {
-        "schema_version",
-        "checkpoint",
-        "qbyt_readout_mode",
-        "stream",
-        "audio_padding_ms",
-        "fbank",
-        "tokenizer",
-        "sequence_objective",
-    }
-    missing = sorted(required - set(provenance))
-    if missing:
-        raise ValueError(f"{summary_path} provenance is missing fields: {missing}")
-    if int(provenance["schema_version"]) != 1:
-        raise ValueError(
-            f"unsupported score provenance version {provenance['schema_version']!r} "
-            f"in {summary_path}"
-        )
-    for section, section_fields in {
-        "checkpoint": ("path", "size_bytes", "sha256"),
-        "tokenizer": ("path", "size_bytes", "sha256", "split_with_space"),
-    }.items():
-        value = provenance.get(section)
-        if not isinstance(value, dict):
-            raise ValueError(f"{summary_path} provenance {section!r} must be a mapping")
-        missing_section = sorted(set(section_fields) - set(value))
-        if missing_section:
-            raise ValueError(
-                f"{summary_path} provenance {section!r} is missing: {missing_section}"
-            )
+    provenance = validate_score_provenance(
+        summary["provenance"],
+        source=summary_path,
+    )
     return summary_path.resolve(), provenance
 
 
 def _semantic_provenance(provenance: dict[str, Any]) -> dict[str, Any]:
     """Drop location-only paths while retaining content identities."""
 
-    value = json.loads(json.dumps(provenance, allow_nan=False))
-    checkpoint = value.get("checkpoint")
-    if isinstance(checkpoint, dict):
-        checkpoint.pop("path", None)
-    tokenizer = value.get("tokenizer")
-    if isinstance(tokenizer, dict):
-        tokenizer.pop("path", None)
-    return value
+    return semantic_score_provenance(provenance)
 
 
 def _assert_same_provenance(

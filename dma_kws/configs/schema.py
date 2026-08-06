@@ -316,6 +316,10 @@ class PhonemeAdapterConfig:
     expose_posterior: bool = False
     #: Icefall (or Stage I) checkpoint the frozen encoder is initialized from.
     init_checkpoint: str = ""
+    #: Step A adapter export used for weights-only continual training. This is
+    #: intentionally independent of the frozen encoder checkpoint and does not
+    #: restore optimizer/scheduler/global-step state.
+    adapter_init_checkpoint: str = ""
     train_manifest: str = ""
     dev_manifest: str = ""
     batch_size_per_gpu: int = 32
@@ -532,6 +536,7 @@ class AdaptConfig:
     keyword: str = "hey eva"
     slug: str = ""
     phase: str = "tts"
+    train_phases: list[str] = field(default_factory=lambda: ["tts", "real"])
     stage: str = "all"
     data_root: str = ""
     exp_root: str = ""

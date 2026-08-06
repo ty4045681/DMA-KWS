@@ -19,6 +19,7 @@ from dma_kws.tokenizer import (
     build_seq_label,
     normalize_seq_label_mode,
     tokenize_phoneme_string,
+    unsupported_phones,
 )
 
 
@@ -33,6 +34,35 @@ def _resolve_adapt_fbank_path(fbank_root: Path, audio_path: str, *, manifest_roo
 def _text_to_g2p(g2p: Any, text: str) -> str:
     phones = text_to_phonemes(g2p, text)
     return " ".join(phones)
+
+
+def _phoneme_override(value: Any, *, field: str) -> str | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    tokens = str(value).strip().split()
+    if not tokens:
+        return None
+    invalid = unsupported_phones(tokens)
+    if invalid:
+        raise ValueError(f"{field} contains unsupported phonemes: {', '.join(invalid)}")
+    return " ".join(tokens)
+
+
+def _anchor_g2p_from_manifest(df: pd.DataFrame, *, keyword: str, g2p: Any) -> str:
+    values: set[str] = set()
+    if "keyword_phonemes" in df.columns:
+        for row_index, value in enumerate(df["keyword_phonemes"]):
+            override = _phoneme_override(
+                value,
+                field=f"keyword_phonemes at row {row_index}",
+            )
+            if override:
+                values.add(override)
+    if len(values) > 1:
+        raise ValueError(
+            f"Manifest has inconsistent keyword_phonemes overrides: {sorted(values)}"
+        )
+    return next(iter(values)) if values else _text_to_g2p(g2p, keyword)
 
 
 class KeywordAdaptationDataset(Dataset):
@@ -64,7 +94,11 @@ class KeywordAdaptationDataset(Dataset):
             raise ValueError(f"{self.manifest_path} missing columns: {sorted(missing)}")
         self.df = df.reset_index(drop=True)
 
-        self.anchor_g2p = _text_to_g2p(self.g2p, keyword)
+        self.anchor_g2p = _anchor_g2p_from_manifest(
+            self.df,
+            keyword=keyword,
+            g2p=self.g2p,
+        )
         self._anchor_seq = tokenize_phoneme_string(self.tokenizer, self.anchor_g2p)
 
     def __len__(self) -> int:
@@ -82,7 +116,10 @@ class KeywordAdaptationDataset(Dataset):
             manifest_root=self.manifest_root,
         )
 
-        query_g2p = _text_to_g2p(self.g2p, text)
+        query_g2p = _phoneme_override(
+            row.get("text_variant_phonemes"),
+            field=f"{self.manifest_path}: row {int(index)} text_variant_phonemes",
+        ) or _text_to_g2p(self.g2p, text)
         query_seq = tokenize_phoneme_string(self.tokenizer, query_g2p)
         seq_label = build_seq_label(
             self._anchor_seq,
@@ -137,7 +174,11 @@ class TargetKeywordValDataset(Dataset):
             raise ValueError(f"{self.manifest_path} must contain audio_path and label")
         self.df = df.reset_index(drop=True)
 
-        self.anchor_g2p = _text_to_g2p(self.g2p, keyword)
+        self.anchor_g2p = _anchor_g2p_from_manifest(
+            self.df,
+            keyword=keyword,
+            g2p=self.g2p,
+        )
         self._anchor_seq = tokenize_phoneme_string(self.tokenizer, self.anchor_g2p)
 
     def __len__(self) -> int:
@@ -219,7 +260,11 @@ def clips_eval_manifest_from_adapt(eval_manifest: Path, keyword: str, output_pat
     df = pd.read_csv(eval_manifest)
     if "keyword" not in df.columns:
         df["keyword"] = keyword
-    cols = [col for col in ("audio_path", "keyword", "label") if col in df.columns]
+    # Keep speaker/split/text/source metadata in the evaluation result's
+    # manifest_meta.  Hard-negative mining needs these fields to enforce
+    # speaker caps and reject blind/eval leakage.
+    leading = [col for col in ("audio_path", "keyword", "label") if col in df.columns]
+    cols = leading + [col for col in df.columns if col not in leading]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df[cols].to_csv(output_path, index=False)
     return output_path

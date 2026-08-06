@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -23,6 +23,10 @@ class AdaptSample:
     label: int
     phase: str
     split: str | None = None
+    # Preserve source-manifest attributes such as speaker_id, device and session.
+    # They are not model inputs, but they are required to audit domain balance and
+    # prove that an explicitly supplied train/eval split is speaker-disjoint.
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 def _import_torchaudio():
@@ -172,18 +176,101 @@ def load_manifest_csv(path: Path) -> list[AdaptSample]:
         if not required.issubset(reader.fieldnames or []):
             raise ValueError(f"Manifest {path} must contain columns: {sorted(required)}")
         phase = "custom"
-        if "phase" in (reader.fieldnames or []):
-            pass
+        reserved = {"audio_path", "text", "keyword", "label", "phase", "split"}
         for row in reader:
+            row_phase = str(row.get("phase", "")).strip() or phase
+            row_split = str(row.get("split", "")).strip().casefold() or None
             rows.append(
                 AdaptSample(
                     audio_path=str(row["audio_path"]),
                     text=str(row["text"]),
                     label=int(row["label"]),
-                    phase=str(row.get("phase", phase)),
+                    phase=row_phase,
+                    split=row_split,
+                    metadata={
+                        str(key): str(value)
+                        for key, value in row.items()
+                        if key is not None
+                        and key not in reserved
+                        and value is not None
+                        and str(value).strip()
+                    },
                 )
             )
     return rows
+
+
+def split_explicit_manifest(
+    samples: list[AdaptSample],
+    *,
+    phase: str,
+) -> tuple[list[AdaptSample], list[AdaptSample]] | None:
+    """Return a declared train/eval split and reject speaker leakage.
+
+    A manifest remains backward compatible when no row has ``split``: the caller
+    can use the historical seeded random split.  Once one row declares a split,
+    every row in that phase must do so; silently randomizing the remainder would
+    defeat the purpose of a speaker-controlled manifest.
+    """
+
+    declared = [sample for sample in samples if sample.split is not None]
+    if not declared:
+        return None
+    if len(declared) != len(samples):
+        raise ValueError(
+            f"Manifest phase {phase!r} mixes explicit and missing split values; "
+            "set every row to 'train' or 'eval', or omit split from every row."
+        )
+
+    invalid = sorted({str(sample.split) for sample in samples} - {"train", "eval"})
+    if invalid:
+        raise ValueError(
+            f"Manifest phase {phase!r} has invalid split values: {invalid}; "
+            "expected 'train' or 'eval'."
+        )
+
+    train = [sample for sample in samples if sample.split == "train"]
+    eval_set = [sample for sample in samples if sample.split == "eval"]
+    if not train or not eval_set:
+        raise ValueError(
+            f"Manifest phase {phase!r} requires at least one train and one eval row "
+            "when explicit splits are used."
+        )
+
+    train_speakers = {
+        sample.metadata["speaker_id"].strip().casefold()
+        for sample in train
+        if sample.metadata.get("speaker_id", "").strip()
+    }
+    eval_speakers = {
+        sample.metadata["speaker_id"].strip().casefold()
+        for sample in eval_set
+        if sample.metadata.get("speaker_id", "").strip()
+    }
+    overlap = sorted(train_speakers & eval_speakers)
+    if overlap:
+        raise ValueError(
+            f"Manifest phase {phase!r} leaks speaker_id across train/eval: {overlap}"
+        )
+    return train, eval_set
+
+
+def validate_manifest_speaker_splits(samples: Iterable[AdaptSample]) -> None:
+    """Reject a speaker assigned to train anywhere and eval anywhere."""
+
+    train_speakers = {
+        sample.metadata["speaker_id"].strip().casefold()
+        for sample in samples
+        if sample.split == "train" and sample.metadata.get("speaker_id", "").strip()
+    }
+    eval_speakers = {
+        sample.metadata["speaker_id"].strip().casefold()
+        for sample in samples
+        if sample.split == "eval" and sample.metadata.get("speaker_id", "").strip()
+    }
+    overlap = sorted(train_speakers & eval_speakers)
+    if overlap:
+        raise ValueError(f"Manifest leaks speaker_id across train/eval: {overlap}")
 
 
 def split_train_eval(
@@ -219,10 +306,23 @@ def compute_and_save_fbank(
     return True
 
 
+def _materialize_rows(rows: Iterable[AdaptSample]) -> list[AdaptSample]:
+    return list(rows)
+
+
+def _metadata_fields(rows: Iterable[AdaptSample]) -> list[str]:
+    return sorted({key for row in rows for key in row.metadata})
+
+
 def write_train_manifest(path: Path, rows: Iterable[AdaptSample]) -> None:
+    rows = _materialize_rows(rows)
+    metadata_fields = _metadata_fields(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["audio_path", "text", "label"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["audio_path", "text", "label", *metadata_fields],
+        )
         writer.writeheader()
         for row in rows:
             writer.writerow(
@@ -230,14 +330,20 @@ def write_train_manifest(path: Path, rows: Iterable[AdaptSample]) -> None:
                     "audio_path": row.audio_path,
                     "text": row.text,
                     "label": row.label,
+                    **{key: row.metadata.get(key, "") for key in metadata_fields},
                 }
             )
 
 
 def write_eval_manifest(path: Path, rows: Iterable[AdaptSample], keyword: str) -> None:
+    rows = _materialize_rows(rows)
+    metadata_fields = _metadata_fields(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["audio_path", "text", "keyword", "label"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["audio_path", "text", "keyword", "label", *metadata_fields],
+        )
         writer.writeheader()
         for row in rows:
             writer.writerow(
@@ -246,6 +352,7 @@ def write_eval_manifest(path: Path, rows: Iterable[AdaptSample], keyword: str) -
                     "text": row.text,
                     "keyword": keyword,
                     "label": row.label,
+                    **{key: row.metadata.get(key, "") for key in metadata_fields},
                 }
             )
 
@@ -282,6 +389,7 @@ def prepare_keyword_adaptation(
     )
     if uses_manifest:
         all_samples = load_manifest_csv(manifest_csv)
+        validate_manifest_speaker_splits(all_samples)
     elif uses_external_sources:
         all_samples = scan_external_sources(keyword, source_config)
     else:
@@ -294,7 +402,14 @@ def prepare_keyword_adaptation(
 
     phase_splits: dict[str, tuple[list[AdaptSample], list[AdaptSample]]] = {}
     for phase, phase_samples in sorted(by_phase.items()):
-        if uses_manifest or uses_external_sources:
+        explicit_split = (
+            split_explicit_manifest(phase_samples, phase=phase)
+            if uses_manifest
+            else None
+        )
+        if explicit_split is not None:
+            train_rows, eval_rows = explicit_split
+        elif uses_manifest or uses_external_sources:
             train_rows, eval_rows = split_train_eval(
                 phase_samples,
                 eval_fraction=eval_fraction,

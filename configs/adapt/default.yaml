@@ -3,6 +3,11 @@ adapt:
   keyword: hey eva
   slug: ""
   phase: tts
+  # Ordered phases used by the one-command trainer and sweep.  Keeping the
+  # historical default preserves TTS -> real continual adaptation, while a
+  # real-only dataset can set [real] explicitly instead of failing on a
+  # missing tts_train.csv.
+  train_phases: [tts, real]
   stage: all
   data_root: ""
   exp_root: ""

@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Any, Callable
 import yaml
 
 from dma_kws.pathing import PROJECT_ROOT
-from dma_kws.stage2.adapt_paths import adapt_exp_root, slugify
+from dma_kws.stage2.adapt_paths import (
+    adapt_exp_root,
+    resolve_adapt_train_phases,
+    slugify,
+)
 from dma_kws.training.adapt_params import merge_adapt_params, normalize_adapt_params
 
 if TYPE_CHECKING:
@@ -92,7 +96,7 @@ def run_adaptation_trial(
     eval_target_fn: Callable[[str, str], float] | None = None,
     on_event: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
-    """Run one TTS→real adaptation trial and return metrics for Optuna.
+    """Run one configured multi-phase adaptation trial and return metrics.
 
     ``on_event(stage, detail)`` reports progress (``train``/``eval`` stages) so
     callers can render console output without this module knowing about rich.
@@ -219,22 +223,27 @@ def run_adaptation_training_trial(
             ),
         )
 
-    tts_artifacts = train_phase(
-        "tts",
-        adapter_checkpoint=base_args.resume_checkpoint,
-    )
-    real_artifacts = (
-        None
-        if single_phase
-        else train_phase("real", adapter_checkpoint=str(tts_artifacts["adapter"]))
-    )
+    phases = resolve_adapt_train_phases(adapt)
+    if single_phase:
+        phases = phases[:1]
+    phase_artifacts: dict[str, dict[str, Path]] = {}
+    adapter_checkpoint = base_args.resume_checkpoint
+    for index, phase in enumerate(phases):
+        artifacts = train_phase(phase, adapter_checkpoint=adapter_checkpoint)
+        phase_artifacts[phase] = artifacts
+        if index + 1 < len(phases):
+            if "adapter" not in artifacts:
+                raise RuntimeError(
+                    f"Adaptation phase {phase!r} produced no adapter for the next phase"
+                )
+            adapter_checkpoint = str(artifacts["adapter"])
 
     return {
         "config": trial_config,
         "keyword": keyword,
         "params": effective_params,
-        "tts": tts_artifacts,
-        "real": real_artifacts,
+        "tts": phase_artifacts.get("tts"),
+        "real": phase_artifacts.get("real"),
         "merged_checkpoint": trial_root / "stage2_adapted.pt",
     }
 

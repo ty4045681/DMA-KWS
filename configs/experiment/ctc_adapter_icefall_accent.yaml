@@ -1,0 +1,35 @@
+# @package _global_
+# Continue the Icefall phoneme adapter on the Chinese-accent mixture while
+# replaying LibriSpeech. Both manifests contain Linux absolute wav_path values
+# rooted below /home/q00931063/DMA-KWS/data/dma-kws.
+#
+# Usage:
+#   export ICEFALL_ROOT=/path/to/icefall
+#   export ICEFALL_CHECKPOINT=/path/to/the/original/icefall_checkpoint.pt
+#   export PHONEME_ADAPTER_CHECKPOINT=/path/to/adapter_best_stepXXXXXX.pt
+#   python scripts/train_ctc_adapter.py +experiment=ctc_adapter_icefall_accent
+
+defaults:
+  - ctc_adapter_icefall
+  - _self_
+
+training:
+  recipe: phoneme-adapter-ctc-chinese-accent
+
+phoneme_adapter:
+  # Frozen encoder initialization retains the original Step A meaning.
+  init_checkpoint: ${oc.env:ICEFALL_CHECKPOINT}
+  # Adapter-only warm-start; optimizer/scheduler/global step start from zero.
+  adapter_init_checkpoint: ${oc.env:PHONEME_ADAPTER_CHECKPOINT}
+
+  train_manifest: /home/q00931063/DMA-KWS/data/dma-kws/chinese_accent_english_datasets/manifests/adapter/train_mix.jsonl
+  dev_manifest: /home/q00931063/DMA-KWS/data/dma-kws/chinese_accent_english_datasets/manifests/adapter/dev_select.jsonl
+
+  max_steps: 20000
+  learning_rate: 0.0002
+  warmup_steps: 500
+  total_scheduler_steps: 20000
+
+  checkpoint_dir: ${paths.exp_root}/phoneme_adapter/checkpoints/conv-accent
+  log_dir: ${paths.exp_root}/phoneme_adapter/logs/conv-accent
+  run_name: phoneme-adapter-conv-accent

@@ -1,0 +1,38 @@
+# @package _global_
+# Hey Eva LoRA adaptation on the retrained Stage II base that includes the
+# phoneme adapter.  The complete Stage II checkpoint is the single weight source;
+# do not point phoneme_adapter.init_checkpoint at a separate Step-A export here.
+
+defaults:
+  - adapt_hey_eva_icefall
+  - _self_
+
+prep:
+  # Keep prepare-only usable before Stage II finishes; train/all still rejects
+  # an empty base checkpoint in run_keyword_adaptation.py.
+  stage2_ckpt: ${oc.env:STAGE2_ADAPTER_V2_CHECKPOINT,""}
+  # Default to the speaker-disjoint real-data source built by
+  # prepare_chinese_accent_english.py.  Point HEY_EVA_ADAPT_MANIFEST at a
+  # combined TTS + real + mined-negative CSV when those sources are available.
+  manifest_csv: ${oc.env:HEY_EVA_ADAPT_MANIFEST,"/home/q00931063/DMA-KWS/data/dma-kws/chinese_accent_english_datasets/views/hey_eva_adapt/manifests/real_source.csv"}
+
+adapt:
+  data_root: /home/q00931063/DMA-KWS/data/dma-kws/chinese_accent_english_datasets/views/hey_eva_adapt
+  exp_root: ${paths.exp_root}/lora/hey-eva-adapter-v2
+  # No TTS files were present in the supplied local dataset.  This keeps the
+  # approved real-data pipeline runnable now; override to [tts, real] after
+  # supplying a combined manifest with both phases.
+  train_phases: [real]
+
+stage2:
+  phoneme_adapter:
+    enabled: true
+    init_checkpoint: ""
+    freeze: true
+    ctc_weight: 0.0
+    trunk:
+      type: conv
+      output_dim: 192
+      num_layers: 2
+      kernel_size: 7
+      dropout: 0.1

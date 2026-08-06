@@ -115,7 +115,10 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         print_run_summary,
         print_training_result_summary,
     )
-    from dma_kws.training.checkpoint_io import stamp_qbyt_readout_version
+    from dma_kws.training.checkpoint_io import (
+        restore_best_checkpoint_weights,
+        stamp_qbyt_readout_version,
+    )
     from dma_kws.training.ddp import apply_step_based_validation, build_trainer_kwargs
     from dma_kws.training.ddp import rank_zero_print
     from dma_kws.training.metrics_history import (
@@ -364,8 +367,13 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     # concurrent CSV appends and torch.save calls can otherwise duplicate rows
     # or corrupt a checkpoint while ranks overwrite the same path.
     runs_csv = Path(paths["exp_root"]) / "stage2_qbyt" / "runs.csv"
-    ckpt_path = checkpoint_dir / f"stage2_step{global_step:06d}.pt"
     if trainer.is_global_zero:
+        artifact_step, artifact_source = restore_best_checkpoint_weights(
+            model,
+            checkpoint_callback,
+            final_step=global_step,
+        )
+        ckpt_path = checkpoint_dir / f"stage2_step{artifact_step:06d}.pt"
         final_metrics = numeric_callback_metrics(dict(trainer.callback_metrics))
         append_wide_row(
             runs_csv,
@@ -381,8 +389,8 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
                 identity=run_context.identity(),
                 provenance={
                     "metrics_source": "last_trainer_state",
-                    "primary_artifact_source": f"final_weights@step={global_step}",
-                    "primary_artifact_step": global_step,
+                    "primary_artifact_source": artifact_source,
+                    "primary_artifact_step": artifact_step,
                     "primary_artifact_path": str(ckpt_path),
                 },
             ),
@@ -393,7 +401,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
                     {
                         "model_state_dict": model.state_dict(),
                         "config": model._checkpoint_config,
-                        "step": global_step,
+                        "step": artifact_step,
                         "tokenizer_dict_path": str(dict_path),
                         "vocab_size": vocab_size,
                     }
@@ -420,7 +428,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
                 "runs_csv": runs_csv,
             },
             artifact_sources={
-                "final_checkpoint": f"final_weights@step={global_step}"
+                "final_checkpoint": artifact_source
             },
             title="Stage II QbyT Training Result",
             rich=bool((stage2.get("console", {}) or {}).get("rich", True)),

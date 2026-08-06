@@ -257,3 +257,106 @@ def test_training_ctc_counts_are_global_per_step(module, monkeypatch):
     assert values["train/microbatch/ctc_skipped"] == 4
     assert values["train/microbatch/ctc_skip_rate"] == pytest.approx(4 / 6)
     assert values["train/epoch/ctc_skip_rate"] == pytest.approx(4 / 6)
+
+
+def _adapter_export(module, *, config=None, blank_id=0) -> dict:
+    return {
+        "checkpoint_kind": "phoneme_adapter",
+        "model_state_dict": module.adapter.state_dict(),
+        "config": config or _config(),
+        "blank_id": blank_id,
+        "vocab_size": VOCAB_SIZE,
+    }
+
+
+def test_adapter_weights_only_warm_start_is_independent_from_encoder_init(
+    monkeypatch, tmp_path
+):
+    source_encoder = _FakeEncoder()
+    monkeypatch.setattr(
+        "dma_kws.phoneme_adapter.lightning.build_encoder",
+        lambda *_a, **_k: source_encoder,
+    )
+    source = PhonemeAdapterCtcModule(_config(), vocab_size=VOCAB_SIZE)
+    with torch.no_grad():
+        for parameter in source.adapter.parameters():
+            parameter.fill_(0.125)
+
+    adapter_checkpoint = tmp_path / "adapter_best_step000100.pt"
+    torch.save(_adapter_export(source), adapter_checkpoint)
+
+    encoder_loader = MagicMock()
+    monkeypatch.setattr(
+        "dma_kws.phoneme_adapter.lightning.load_encoder_weights", encoder_loader
+    )
+    reloaded = PhonemeAdapterCtcModule(
+        _config(),
+        vocab_size=VOCAB_SIZE,
+        init_checkpoint=tmp_path / "encoder.pt",
+        adapter_init_checkpoint=adapter_checkpoint,
+    )
+
+    encoder_loader.assert_called_once()
+    for actual, expected in zip(reloaded.adapter.parameters(), source.adapter.parameters()):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_adapter_warm_start_rejects_blank_mismatch(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "dma_kws.phoneme_adapter.lightning.build_encoder",
+        lambda *_a, **_k: _FakeEncoder(),
+    )
+    source = PhonemeAdapterCtcModule(_config(), vocab_size=VOCAB_SIZE)
+    checkpoint = tmp_path / "wrong_blank.pt"
+    torch.save(_adapter_export(source, blank_id=3), checkpoint)
+
+    with pytest.raises(SystemExit, match="blank_id"):
+        PhonemeAdapterCtcModule(
+            _config(),
+            vocab_size=VOCAB_SIZE,
+            adapter_init_checkpoint=checkpoint,
+        )
+
+
+def test_adapter_warm_start_rejects_stream_policy_mismatch(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "dma_kws.phoneme_adapter.lightning.build_encoder",
+        lambda *_a, **_k: _FakeEncoder(),
+    )
+    source = PhonemeAdapterCtcModule(_config(), vocab_size=VOCAB_SIZE)
+    saved_config = _config()
+    saved_config["stage1"].update(
+        {
+            "encoder_type": "icefall_zipformer",
+            "causal": True,
+            "stream": {"chunk_size": 16, "left_context_frames": 64},
+        }
+    )
+    checkpoint = tmp_path / "wrong_stream.pt"
+    torch.save(_adapter_export(source, config=saved_config), checkpoint)
+
+    with pytest.raises(ValueError, match="Streaming operating point mismatch"):
+        PhonemeAdapterCtcModule(
+            _config(),
+            vocab_size=VOCAB_SIZE,
+            adapter_init_checkpoint=checkpoint,
+        )
+
+
+def test_adapter_warm_start_rejects_shape_mismatch(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "dma_kws.phoneme_adapter.lightning.build_encoder",
+        lambda *_a, **_k: _FakeEncoder(),
+    )
+    source = PhonemeAdapterCtcModule(_config(), vocab_size=VOCAB_SIZE)
+    checkpoint = tmp_path / "wrong_shape.pt"
+    torch.save(_adapter_export(source), checkpoint)
+
+    changed = _config()
+    changed["phoneme_adapter"]["trunk"]["output_dim"] = TRUNK_DIM * 2
+    with pytest.raises(RuntimeError):
+        PhonemeAdapterCtcModule(
+            changed,
+            vocab_size=VOCAB_SIZE,
+            adapter_init_checkpoint=checkpoint,
+        )

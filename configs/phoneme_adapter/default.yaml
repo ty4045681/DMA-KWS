@@ -25,8 +25,12 @@ ctc_dropout: 0.0
 expose_posterior: false
 
 # Icefall (or Stage I) checkpoint the frozen encoder is initialized from.
-# Resuming a run uses run.resume_from, not a separate weights-only key.
 init_checkpoint: ""
+
+# Step A adapter_best_step*.pt / adapter_final_step*.pt used for weights-only
+# continual training. The optimizer, scheduler, and global step start fresh;
+# use run.resume_from instead only when recovering the exact same run.
+adapter_init_checkpoint: ""
 
 # Empty means ${paths.processed_root}/stage1_phoneme_ctc/{train,dev}.jsonl,
 # i.e. the manifests scripts/prepare_stage1_librispeech.py already writes.

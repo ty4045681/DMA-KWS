@@ -272,3 +272,37 @@ def test_sweep_objective_stub(monkeypatch):
     )
     assert metrics["target_auc"] == 0.92
     assert score == pytest.approx(0.89)
+
+
+def test_sweep_single_phase_honors_real_only_configuration(monkeypatch):
+    from dma_kws.stage2 import sweep_adapt
+    from dma_kws.stage2.adapt import Stage2AdaptArgs
+
+    phases: list[str] = []
+
+    def fake_run(config, args):
+        del args
+        phase = config["adapt"]["phase"]
+        phases.append(phase)
+        return {
+            "adapter": f"/tmp/{phase}/adapter.pt",
+            "merged": f"/tmp/{phase}/stage2_adapted.pt",
+        }
+
+    monkeypatch.setattr("dma_kws.stage2.adapt.run_stage2_adaptation", fake_run)
+    result = sweep_adapt.run_adaptation_training_trial(
+        {
+            "adapt": {
+                "keyword": "hey eva",
+                "max_steps": 10,
+                "train_phases": ["real"],
+            }
+        },
+        params={"rank": 8, "alpha": 16, "learning_rate": 1e-4, "max_steps": 10},
+        base_args=Stage2AdaptArgs(init_checkpoint="/tmp/base.pt"),
+        single_phase=True,
+    )
+
+    assert phases == ["real"]
+    assert result["tts"] is None
+    assert result["real"] is not None

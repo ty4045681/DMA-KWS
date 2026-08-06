@@ -99,7 +99,10 @@ def run_phoneme_adapter_training(config: dict[str, Any], args: PhonemeAdapterTra
     from dma_kws.stage1.dataset import Stage1Dataset, stage1_collate_fn
     from dma_kws.stage2.fbank import FbankExtractor
     from dma_kws.tokenizer import load_char_tokenizer
-    from dma_kws.training.checkpoint_io import export_model_pt
+    from dma_kws.training.checkpoint_io import (
+        export_model_pt,
+        restore_best_checkpoint_weights,
+    )
     from dma_kws.training.callbacks import (
         build_console_callbacks,
         print_run_summary,
@@ -202,20 +205,11 @@ def run_phoneme_adapter_training(config: dict[str, Any], args: PhonemeAdapterTra
             "phonemes at all), so it is required rather than optional."
         )
 
-    init_checkpoint = args.init_checkpoint or str(adapter_cfg.get("init_checkpoint", ""))
-    model = PhonemeAdapterCtcModule(
-        config,
-        vocab_size=vocab_size,
-        blank_id=blank_id,
-        init_checkpoint=init_checkpoint or None,
-    )
-
-    accelerator, devices = resolve_accelerator_and_devices(args.device, args.devices)
-    if accelerator == "gpu":
-        torch.set_float32_matmul_precision("high")
-
     checkpoint_root = Path(
-        adapter_cfg.get("checkpoint_dir", Path(paths["exp_root"]) / "phoneme_adapter" / "checkpoints")
+        adapter_cfg.get(
+            "checkpoint_dir",
+            Path(paths["exp_root"]) / "phoneme_adapter" / "checkpoints",
+        )
     )
     log_dir = adapter_cfg.get(
         "log_dir", Path(paths["exp_root"]) / "phoneme_adapter" / "logs"
@@ -226,6 +220,29 @@ def run_phoneme_adapter_training(config: dict[str, Any], args: PhonemeAdapterTra
         checkpoint_root,
         run_name,
     )
+
+    init_checkpoint = args.init_checkpoint or str(adapter_cfg.get("init_checkpoint", ""))
+    adapter_init_checkpoint = str(
+        adapter_cfg.get("adapter_init_checkpoint", "")
+    ).strip()
+    if resume_path is not None and adapter_init_checkpoint:
+        raise SystemExit(
+            "phoneme_adapter.adapter_init_checkpoint is a weights-only new-domain "
+            "start and cannot be combined with run.resume_from, which restores the "
+            "full model/optimizer/scheduler state. Clear one of them."
+        )
+    model = PhonemeAdapterCtcModule(
+        config,
+        vocab_size=vocab_size,
+        blank_id=blank_id,
+        init_checkpoint=init_checkpoint or None,
+        adapter_init_checkpoint=adapter_init_checkpoint or None,
+    )
+
+    accelerator, devices = resolve_accelerator_and_devices(args.device, args.devices)
+    if accelerator == "gpu":
+        torch.set_float32_matmul_precision("high")
+
     resume_payload = (
         torch.load(resume_path, map_location="cpu")
         if resume_path is not None
@@ -315,6 +332,11 @@ def run_phoneme_adapter_training(config: dict[str, Any], args: PhonemeAdapterTra
                 else {}
             ),
             **(
+                {"adapter_init_checkpoint": adapter_init_checkpoint}
+                if adapter_init_checkpoint
+                else {}
+            ),
+            **(
                 {"parent_run_id": run_context.parent_run_id}
                 if run_context.parent_run_id
                 else {}
@@ -334,23 +356,21 @@ def run_phoneme_adapter_training(config: dict[str, Any], args: PhonemeAdapterTra
 
     global_step = int(trainer.global_step)
     if trainer.is_global_zero:
-        artifact_step = global_step
-        artifact_source = f"final_weights@step={global_step}"
         best_path_value = (
             checkpoint_callback.best_model_path
             if checkpoint_callback is not None
             else ""
         )
-        best_path = Path(best_path_value) if best_path_value else None
-        if best_path is not None and best_path.is_file():
-            best_state = torch.load(best_path, map_location="cpu")
-            model.load_state_dict(best_state["state_dict"])
-            artifact_step = int(best_state.get("global_step", global_step))
-            artifact_source = f"best_checkpoint@step={artifact_step}:{best_path}"
-            print(f"Loaded best adapter weights from {best_path}")
-        elif best_path is not None:
+        artifact_step, artifact_source = restore_best_checkpoint_weights(
+            model,
+            checkpoint_callback,
+            final_step=global_step,
+        )
+        if artifact_source.startswith("best_checkpoint"):
+            print(f"Loaded best adapter weights from {best_path_value}")
+        elif best_path_value:
             print(
-                f"Best adapter checkpoint is unavailable at {best_path}; "
+                f"Best adapter checkpoint is unavailable at {best_path_value}; "
                 "exporting the final in-memory weights instead."
             )
 
@@ -371,7 +391,10 @@ def run_phoneme_adapter_training(config: dict[str, Any], args: PhonemeAdapterTra
             vocab_size=vocab_size,
             step=artifact_step,
             blank_id=blank_id,
-            extra={RUN_CONTEXT_KEY: run_context.as_dict()},
+            extra={
+                "checkpoint_kind": "phoneme_adapter",
+                RUN_CONTEXT_KEY: run_context.as_dict(),
+            },
         )
         runs_csv = Path(paths["exp_root"]) / "phoneme_adapter" / "runs.csv"
         final_metrics = numeric_callback_metrics(dict(trainer.callback_metrics))

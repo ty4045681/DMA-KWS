@@ -8,20 +8,53 @@ and run_two_stage_demo.py.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 
 from dma_kws.phonemes import normalize_english_text
 
 _STRESS_DIGIT_RE = re.compile(r"[0-2]")
 _LETTER_RE = re.compile(r"[A-Za-z]")
 
+# g2p_en's CMU entry for Eva contains both AY-va and EE-va and selects the
+# first one.  This project targets the common wake-name pronunciation EE-va;
+# making that choice at converter construction keeps adapter CTC, QbyT, LoRA
+# and online inference on exactly the same enrollment sequence.
+EVA_PRONUNCIATION = ("IY1", "V", "AH0")
+HEY_EVA_PHONEMES = ("HH", "EY1", *EVA_PRONUNCIATION)
+PROJECT_PRONUNCIATION_OVERRIDES: Mapping[str, Sequence[str]] = {
+    "eva": EVA_PRONUNCIATION,
+}
 
-def make_g2p():
-    """Construct a g2p_en.G2p converter, with a friendly error if missing."""
+
+def make_g2p(
+    pronunciation_overrides: Mapping[str, Sequence[str]] | None = None,
+):
+    """Construct the project G2P converter with deterministic name pronunciations."""
     try:
         from g2p_en import G2p
     except ImportError as exc:
         raise SystemExit("Missing dependency g2p_en. Install it with: pip install g2p_en") from exc
-    return G2p()
+    converter = G2p()
+    overrides = (
+        PROJECT_PRONUNCIATION_OVERRIDES
+        if pronunciation_overrides is None
+        else pronunciation_overrides
+    )
+    cmu = getattr(converter, "cmu", None)
+    if not isinstance(cmu, dict):
+        raise RuntimeError("g2p_en.G2p has no mutable CMU pronunciation dictionary")
+    # Some NLTK/g2p_en versions may share this mapping between converter
+    # instances. Keep project overrides local to this converter so direct
+    # G2p() callers in the same process retain the upstream dictionary.
+    cmu = dict(cmu)
+    converter.cmu = cmu
+    for word, phones in overrides.items():
+        normalized_word = normalize_english_text(str(word))
+        phone_list = [str(phone).strip() for phone in phones if str(phone).strip()]
+        if not normalized_word or " " in normalized_word or not phone_list:
+            raise ValueError(f"Invalid pronunciation override for {word!r}: {phones!r}")
+        cmu[normalized_word] = [phone_list]
+    return converter
 
 
 def text_to_phonemes(g2p, text: str) -> list[str]:

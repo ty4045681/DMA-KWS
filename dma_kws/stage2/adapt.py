@@ -40,6 +40,7 @@ from dma_kws.training.checkpoint_io import (
     assert_qbyt_readout_version,
     assert_stream_policy_matches,
     fingerprint_stage2_base,
+    restore_best_checkpoint_weights,
     stamp_qbyt_readout_version,
 )
 from dma_kws.training.distributed_metrics import sum_across_processes
@@ -1133,6 +1134,11 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     }
 
     if trainer.is_global_zero:
+        artifact_step, artifact_source = restore_best_checkpoint_weights(
+            model,
+            checkpoint_callback,
+            final_step=global_step,
+        )
         base_model_sha256 = fingerprint_stage2_base(model.state_dict())
         if base_model_sha256 != model._base_model_sha256:
             raise RuntimeError(
@@ -1145,7 +1151,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     "checkpoint_kind": "stage2_lora_adapter",
                     "lora_state_dict": lora_state_dict(model.qbyt),
                     "config": model._checkpoint_config,
-                    "step": global_step,
+                    "step": artifact_step,
                     "keyword": adapt_paths["keyword_str"],
                     "slug": adapt_paths["slug_str"],
                     "phase": phase,
@@ -1165,7 +1171,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 {
                     "model_state_dict": model.state_dict(),
                     "config": model._checkpoint_config,
-                    "step": global_step,
+                    "step": artifact_step,
                     "keyword": adapt_paths["keyword_str"],
                     "slug": adapt_paths["slug_str"],
                     "phase": phase,
@@ -1201,8 +1207,8 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 identity=run_context.identity(),
                 provenance={
                     "metrics_source": "last_trainer_state",
-                    "primary_artifact_source": f"final_weights@step={global_step}",
-                    "primary_artifact_step": global_step,
+                    "primary_artifact_source": artifact_source,
+                    "primary_artifact_step": artifact_step,
                     "primary_artifact_path": str(merged_out),
                     "compatibility_alias": json.dumps(
                         {
@@ -1244,9 +1250,9 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 },
             },
             artifact_sources={
-                "adapter": f"final_lora_weights@step={global_step}",
-                "merged": f"final_merged_weights@step={global_step}",
-                "final_adapter": f"final_lora_weights@step={global_step}",
+                "adapter": artifact_source,
+                "merged": artifact_source,
+                "final_adapter": artifact_source,
                 **{
                     f"compatibility_alias/{name}": "compatibility_alias (atomic last-writer pointer)"
                     for name in compatibility_aliases

@@ -87,7 +87,7 @@ def _assert_post_fit_artifacts_are_rank_zero(
         (
             "dma_kws/phoneme_adapter/runner.py",
             "run_phoneme_adapter_training",
-            {"load", "export_model_pt"},
+            {"restore_best_checkpoint_weights", "export_model_pt"},
             "phoneme_adapter_artifacts_saved",
         ),
         (

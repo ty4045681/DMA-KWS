@@ -47,6 +47,7 @@ class PhonemeAdapterCtcModule(pl.LightningModule):
         vocab_size: int,
         blank_id: int = BLANK_ID,
         init_checkpoint: str | Path | None = None,
+        adapter_init_checkpoint: str | Path | None = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(
@@ -54,6 +55,9 @@ class PhonemeAdapterCtcModule(pl.LightningModule):
                 "vocab_size": vocab_size,
                 "blank_id": blank_id,
                 "init_checkpoint": str(init_checkpoint) if init_checkpoint else None,
+                "adapter_init_checkpoint": (
+                    str(adapter_init_checkpoint) if adapter_init_checkpoint else None
+                ),
             }
         )
 
@@ -83,6 +87,13 @@ class PhonemeAdapterCtcModule(pl.LightningModule):
 
         if init_checkpoint:
             load_encoder_weights(self.encoder, Path(init_checkpoint), self.stream_policy)
+        if adapter_init_checkpoint:
+            load_adapter_weights(
+                self.adapter,
+                Path(adapter_init_checkpoint),
+                self.stream_policy,
+                blank_id=blank_id,
+            )
 
         for param in self.encoder.parameters():
             param.requires_grad = False
@@ -522,3 +533,73 @@ def load_encoder_weights(encoder, checkpoint_path: Path, stream_policy) -> None:
         f"Loaded encoder weights from {checkpoint_path}: "
         f"missing={len(missing)} unexpected={len(unexpected)}"
     )
+
+
+def load_adapter_weights(
+    adapter,
+    checkpoint_path: Path,
+    stream_policy,
+    *,
+    blank_id: int,
+) -> None:
+    """Strictly initialize Step A from a previously exported adapter.
+
+    Unlike Lightning resume, this path restores only adapter parameters and
+    intentionally starts a fresh optimizer, scheduler, and global step for the
+    new domain.  The encoder remains controlled independently by
+    ``init_checkpoint``.
+    """
+    if not checkpoint_path.is_file():
+        raise SystemExit(f"Phoneme adapter init checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise SystemExit(
+            f"{checkpoint_path} is not a phoneme adapter export: expected a mapping payload"
+        )
+
+    checkpoint_kind = checkpoint.get("checkpoint_kind")
+    if checkpoint_kind not in (None, "phoneme_adapter"):
+        raise SystemExit(
+            f"{checkpoint_path} has checkpoint_kind={checkpoint_kind!r}; expected "
+            "a Step A phoneme_adapter export."
+        )
+
+    saved_config = checkpoint.get("config")
+    if not isinstance(saved_config, dict) or "stage1" not in saved_config:
+        raise SystemExit(
+            f"{checkpoint_path} has no embedded stage1 config, so its streaming "
+            "operating point cannot be verified. Use adapter_best_step*.pt or "
+            "adapter_final_step*.pt exported by the Step A trainer."
+        )
+    assert_stream_policy_matches(checkpoint, stream_policy, source=checkpoint_path)
+
+    saved_blank_id = checkpoint.get("blank_id")
+    if saved_blank_id is None:
+        raise SystemExit(
+            f"{checkpoint_path} has no blank_id metadata, so it cannot be safely "
+            "used for phoneme adapter warm-start."
+        )
+    if int(saved_blank_id) != int(blank_id):
+        raise SystemExit(
+            f"{checkpoint_path} was trained with blank_id={int(saved_blank_id)} but "
+            f"the current tokenizer uses blank_id={int(blank_id)}."
+        )
+
+    saved_vocab_size = checkpoint.get("vocab_size")
+    if saved_vocab_size is not None and int(saved_vocab_size) != int(adapter.vocab_size):
+        raise SystemExit(
+            f"{checkpoint_path} was trained with vocab_size={int(saved_vocab_size)} but "
+            f"the current adapter uses vocab_size={int(adapter.vocab_size)}."
+        )
+
+    state = extract_state_dict(checkpoint)
+    if not isinstance(state, dict) or not state:
+        raise SystemExit(f"{checkpoint_path} carries no adapter model_state_dict")
+
+    # Step A exports ``model.adapter`` directly, so accepting prefixed Stage II
+    # or full Lightning states here would make it too easy to initialize from
+    # the wrong artifact. strict=True also rejects missing tensors and every
+    # trunk/CTC shape mismatch.
+    adapter.load_state_dict(state, strict=True)
+    rank_zero_print(f"Loaded phoneme adapter warm-start weights from {checkpoint_path}")

@@ -21,6 +21,7 @@ from dma_kws.stage2.adapt_paths import (
     adapt_exp_root,
     clips_eval_manifest_from_adapt,
     phase_manifest,
+    resolve_adapt_train_phases,
     slugify,
 )
 from dma_kws.stage2.prep_console import Stage2PrepReporter
@@ -123,6 +124,7 @@ def _build_eval_report(
             [
                 sys.executable,
                 str(PROJECT_ROOT / "scripts" / "eval_stage2_libriphrase.py"),
+                *_forward_overrides(),
                 f"prep.checkpoint={ckpt}",
                 "prep.split=hard",
                 "run.device=cpu",
@@ -172,6 +174,7 @@ def main(cfg: DictConfig) -> None:
     data_root = Path(adapt["data_root"]) if adapt.get("data_root") else adapt_data_root(config, keyword)
     exp_root = adapt_exp_root(config, keyword)
     sweep_cfg = adapt.get("sweep", {}) or {}
+    train_phases = resolve_adapt_train_phases(adapt)
     common = [f"adapt.keyword={keyword!r}"]
 
     reporter = adapt_console.adapt_reporter(config, prep)
@@ -185,6 +188,7 @@ def main(cfg: DictConfig) -> None:
             ("data_root", str(data_root)),
             ("exp_root", str(exp_root)),
             ("device", f"{run.device} x{run.devices}"),
+            ("train_phases", " -> ".join(train_phases)),
             ("sweep", "enabled" if sweep_cfg.get("enabled", False) else "disabled"),
         ],
         title="Adaptation Run",
@@ -212,7 +216,7 @@ def main(cfg: DictConfig) -> None:
         if params_file:
             train_overrides.append(f"adapt.params_file={params_file}")
             reporter.info(f"Using swept hyperparameters from {params_file}")
-        for phase in ("tts", "real"):
+        for phase in train_phases:
             reporter.section(f"LoRA training · phase={phase}")
             _run_script(
                 "adapt_stage2_keyword.py",

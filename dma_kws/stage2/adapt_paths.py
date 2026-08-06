@@ -7,6 +7,31 @@ from pathlib import Path
 from typing import Any
 
 
+DEFAULT_ADAPT_TRAIN_PHASES = ("tts", "real")
+
+
+def resolve_adapt_train_phases(adapt: dict[str, Any]) -> tuple[str, ...]:
+    """Return the validated ordered phases for orchestration and sweeps."""
+
+    raw = adapt.get("train_phases", DEFAULT_ADAPT_TRAIN_PHASES)
+    if isinstance(raw, str):
+        phases = [part.strip().casefold() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple)):
+        phases = [str(part).strip().casefold() for part in raw if str(part).strip()]
+    else:
+        raise ValueError("adapt.train_phases must be a list or comma-separated string")
+    if not phases:
+        raise ValueError("adapt.train_phases must contain at least one phase")
+    invalid = sorted(set(phases) - {"tts", "real"})
+    if invalid:
+        raise ValueError(
+            f"adapt.train_phases contains unsupported phases {invalid}; expected tts and/or real"
+        )
+    if len(phases) != len(set(phases)):
+        raise ValueError(f"adapt.train_phases contains duplicates: {phases}")
+    return tuple(phases)
+
+
 def slugify(keyword: str) -> str:
     """Convert keyword text to a filesystem slug, e.g. 'hey eva' -> 'hey_eva'."""
     text = keyword.strip().lower()

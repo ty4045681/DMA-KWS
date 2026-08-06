@@ -1,0 +1,24 @@
+# @package _global_
+# Stage II QbyT retraining against the domain-adapted phoneme trunk.
+# The trunk remains fixed (B1); only QbyT learns the updated feature space.
+
+defaults:
+  - icefall_zipformer_stage2_adapter
+  - _self_
+
+training:
+  recipe: icefall-zipformer-frozen-adapter-v2
+
+stage2:
+  # Both weight sources are mandatory in this specialized experiment.  Empty
+  # fallbacks would silently train QbyT against a random frozen encoder/trunk.
+  init_checkpoint: ${oc.env:ICEFALL_CHECKPOINT}
+  phoneme_adapter:
+    # Deliberately distinct from Step 1's warm-start input variable.
+    init_checkpoint: ${oc.env:PHONEME_ADAPTER_V2_CHECKPOINT}
+    freeze: true
+    ctc_weight: 0.0
+
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-adapter-v2
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-adapter-v2
+  run_name: icefall-zipformer-frozen-adapter-v2

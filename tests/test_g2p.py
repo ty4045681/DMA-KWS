@@ -1,4 +1,13 @@
-from dma_kws.g2p import clean_phoneme_tokens, has_stress_markers, text_to_phonemes
+import sys
+from types import SimpleNamespace
+
+from dma_kws.g2p import (
+    EVA_PRONUNCIATION,
+    clean_phoneme_tokens,
+    has_stress_markers,
+    make_g2p,
+    text_to_phonemes,
+)
 from dma_kws.tokenizer import unsupported_phones
 
 
@@ -43,3 +52,32 @@ def test_text_to_phonemes_survives_possessive_apostrophes():
 
     assert "'" not in phonemes
     assert unsupported_phones(phonemes) == []
+
+
+def test_make_g2p_prefers_project_eva_pronunciation(monkeypatch):
+    class FakeG2P:
+        def __init__(self):
+            self.cmu = {"eva": [["EY1", "V", "AH0"], ["IY1", "V", "AH0"]]}
+
+    monkeypatch.setitem(sys.modules, "g2p_en", SimpleNamespace(G2p=FakeG2P))
+    converter = make_g2p()
+
+    assert converter.cmu["eva"] == [list(EVA_PRONUNCIATION)]
+
+
+def test_make_g2p_does_not_mutate_shared_source_dictionary(monkeypatch):
+    original = [["EY1", "V", "AH0"], ["IY1", "V", "AH0"]]
+    shared_cmu = {"eva": original}
+
+    class FakeG2P:
+        def __init__(self):
+            self.cmu = shared_cmu
+
+    monkeypatch.setitem(sys.modules, "g2p_en", SimpleNamespace(G2p=FakeG2P))
+
+    converter = make_g2p()
+
+    assert converter.cmu is not shared_cmu
+    assert converter.cmu["eva"] == [list(EVA_PRONUNCIATION)]
+    assert shared_cmu["eva"] == original
+    assert FakeG2P().cmu["eva"] == original

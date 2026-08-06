@@ -13,6 +13,7 @@ from dma_kws.config import (
     get_tokenizer_config,
 )
 from dma_kws.pathing import resolve_dict_path
+from dma_kws.inference.score_provenance import PROVENANCE_SCHEMA_VERSION
 from dma_kws.stage2.objective import checkpoint_sequence_objective
 from dma_kws.stage2.readout import resolve_qbyt_readout
 from dma_kws.tokenizer import (
@@ -20,10 +21,6 @@ from dma_kws.tokenizer import (
     build_seq_label,
     normalize_seq_label_mode,
 )
-
-
-PROVENANCE_SCHEMA_VERSION = 1
-
 
 def _file_identity(path: str | Path, *, kind: str) -> dict[str, str | int]:
     resolved = Path(path).expanduser().resolve()

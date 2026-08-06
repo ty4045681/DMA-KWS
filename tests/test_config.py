@@ -80,6 +80,43 @@ def test_checkpoint_monitor_and_mode_accept_structured_overrides():
     assert config["stage2"]["checkpoint"]["mode"] == "min"
 
 
+def test_adapter_v2_stage2_config_freezes_the_domain_adapted_trunk(monkeypatch):
+    monkeypatch.setenv("ICEFALL_CHECKPOINT", "/checkpoints/icefall.pt")
+    monkeypatch.setenv("PHONEME_ADAPTER_V2_CHECKPOINT", "/checkpoints/adapter-v2.pt")
+    config = config_to_dict(compose_config("icefall_zipformer_stage2_adapter_v2"))
+
+    adapter = config["stage2"]["phoneme_adapter"]
+    assert config["stage2"]["init_checkpoint"] == "/checkpoints/icefall.pt"
+    assert adapter["enabled"] is True
+    assert adapter["init_checkpoint"] == "/checkpoints/adapter-v2.pt"
+    assert adapter["freeze"] is True
+    assert adapter["ctc_weight"] == 0.0
+    assert adapter["trunk"]["output_dim"] == 192
+    assert config["stage2"]["run_name"].endswith("adapter-v2")
+
+
+def test_hey_eva_adapter_v2_config_uses_the_complete_stage2_base(monkeypatch):
+    monkeypatch.setenv("STAGE2_ADAPTER_V2_CHECKPOINT", "/checkpoints/stage2-v2.pt")
+    config = config_to_dict(compose_config("adapt_hey_eva_icefall_adapter_v2"))
+
+    adapter = config["stage2"]["phoneme_adapter"]
+    assert config["prep"]["stage2_ckpt"] == "/checkpoints/stage2-v2.pt"
+    assert adapter["enabled"] is True
+    assert adapter["init_checkpoint"] == ""
+    assert adapter["freeze"] is True
+    assert adapter["ctc_weight"] == 0.0
+    assert adapter["trunk"]["output_dim"] == 192
+    assert config["adapt"]["data_root"] == (
+        "/home/q00931063/DMA-KWS/data/dma-kws/"
+        "chinese_accent_english_datasets/views/hey_eva_adapt"
+    )
+    assert config["prep"]["manifest_csv"].endswith(
+        "views/hey_eva_adapt/manifests/real_source.csv"
+    )
+    assert config["adapt"]["train_phases"] == ["real"]
+    assert config["adapt"]["exp_root"].endswith("lora/hey-eva-adapter-v2")
+
+
 @pytest.mark.parametrize(
     "experiment",
     ["paper_ls460", "paper_ls_gs1460"],

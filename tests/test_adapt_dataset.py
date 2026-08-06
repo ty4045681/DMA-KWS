@@ -8,12 +8,14 @@ import torch
 from dma_kws.stage2.adapt_dataset import (
     KeywordAdaptationDataset,
     MixedAdaptationDataset,
+    clips_eval_manifest_from_adapt,
     load_adapt_manifest,
 )
 from dma_kws.stage2.adapt_paths import directory_name_to_text, neg_slug_to_text, slugify, wav_to_fbank_mirror
 from dma_kws.stage2.collate import train_collate_fn
 from dma_kws.stage2.prepare_adapt import (
     AdaptSample,
+    load_manifest_csv,
     prepare_keyword_adaptation,
     scan_external_source,
     scan_raw_tree,
@@ -235,6 +237,40 @@ def test_load_adapt_manifest(tmp_path: Path):
     assert rows[0]["label"] == 1
 
 
+def test_clips_eval_manifest_preserves_mining_metadata(tmp_path: Path):
+    source = tmp_path / "real_eval.csv"
+    with source.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["audio_path", "text", "label", "speaker_id", "split", "source"],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "audio_path": "/audio/a.wav",
+                "text": "hey ava",
+                "label": 0,
+                "speaker_id": "speaker-1",
+                "split": "train",
+                "source": "speechocean762",
+            }
+        )
+
+    output = clips_eval_manifest_from_adapt(source, "hey eva", tmp_path / "clips.csv")
+    rows = list(csv.DictReader(output.open(encoding="utf-8")))
+    assert rows == [
+        {
+            "audio_path": "/audio/a.wav",
+            "keyword": "hey eva",
+            "label": "0",
+            "text": "hey ava",
+            "speaker_id": "speaker-1",
+            "split": "train",
+            "source": "speechocean762",
+        }
+    ]
+
+
 def test_keyword_adaptation_dataset_seq_label(tmp_path: Path, monkeypatch):
     if not DICT_PATH.is_file():
         pytest.skip("dict not available")
@@ -295,6 +331,61 @@ def test_keyword_adaptation_dataset_seq_label(tmp_path: Path, monkeypatch):
         dataset[1]
 
 
+def test_keyword_adaptation_dataset_uses_explicit_eva_pronunciation(tmp_path: Path):
+    if not DICT_PATH.is_file():
+        pytest.skip("dict not available")
+
+    fbank_root = tmp_path / "fbank"
+    for relative in ("real/positive/eva.npy", "real/near_negative/ava.npy"):
+        path = fbank_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, np.zeros((4, 80), dtype=np.float32))
+
+    manifest = tmp_path / "real_train.csv"
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "audio_path",
+                "text",
+                "label",
+                "keyword_phonemes",
+                "text_variant_phonemes",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(
+            [
+                {
+                    "audio_path": "raw/real/positive/eva.wav",
+                    "text": "hey eva",
+                    "label": 1,
+                    "keyword_phonemes": "HH EY1 IY1 V AH0",
+                    "text_variant_phonemes": "HH EY1 IY1 V AH0",
+                },
+                {
+                    "audio_path": "raw/real/near_negative/ava.wav",
+                    "text": "hey ava",
+                    "label": 0,
+                    "keyword_phonemes": "HH EY1 IY1 V AH0",
+                    "text_variant_phonemes": "HH EY1 EY1 V AH0",
+                },
+            ]
+        )
+
+    dataset = KeywordAdaptationDataset(
+        manifest_path=manifest,
+        keyword="hey eva",
+        fbank_root=fbank_root,
+        tokenizer=load_char_tokenizer(DICT_PATH),
+        manifest_root=tmp_path,
+        g2p=lambda _text: [],
+    )
+
+    assert dataset[0]["seq_label"][-1].item() == 1
+    assert dataset[1]["seq_label"][-1].item() == 0
+
+
 def test_mixed_adaptation_sampling_ratio():
     if not DICT_PATH.is_file():
         pytest.skip("dict not available")
@@ -346,3 +437,124 @@ def test_split_train_eval_and_eval_manifest(tmp_path: Path):
     write_eval_manifest(eval_path, eval_set, "hey eva")
     rows = list(csv.DictReader(eval_path.open(encoding="utf-8")))
     assert rows[0]["keyword"] == "hey eva"
+
+
+def test_manifest_explicit_split_preserves_metadata(tmp_path: Path, monkeypatch):
+    audio_paths = [tmp_path / "train.wav", tmp_path / "eval.wav"]
+    for audio_path in audio_paths:
+        audio_path.touch()
+
+    source = tmp_path / "source.csv"
+    with source.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "audio_path",
+                "text",
+                "label",
+                "phase",
+                "split",
+                "speaker_id",
+                "device",
+                "session",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "audio_path": audio_paths[0],
+                "text": "hey eva",
+                "label": 1,
+                "phase": "real",
+                "split": "train",
+                "speaker_id": "speaker_train",
+                "device": "phone",
+                "session": "s1",
+            }
+        )
+        writer.writerow(
+            {
+                "audio_path": audio_paths[1],
+                "text": "hey ava",
+                "label": 0,
+                "phase": "real",
+                "split": "eval",
+                "speaker_id": "speaker_eval",
+                "device": "pc",
+                "session": "s2",
+            }
+        )
+
+    loaded = load_manifest_csv(source)
+    assert loaded[0].split == "train"
+    assert loaded[0].metadata == {
+        "speaker_id": "speaker_train",
+        "device": "phone",
+        "session": "s1",
+    }
+
+    monkeypatch.setattr("dma_kws.stage2.prepare_adapt.make_g2p", lambda: object())
+    monkeypatch.setattr("dma_kws.stage2.prepare_adapt.validate_g2p", lambda *_args: None)
+    monkeypatch.setattr(
+        "dma_kws.stage2.prepare_adapt.compute_and_save_fbank",
+        lambda *_args, **_kwargs: True,
+    )
+    output_root = tmp_path / "prepared"
+    stats = prepare_keyword_adaptation(
+        keyword="hey eva",
+        data_root=output_root,
+        fbank_params={},
+        manifest_csv=source,
+        # Explicit splits must win over this deliberately extreme fallback.
+        eval_fraction=1.0,
+    )
+
+    assert stats["phases"]["real"]["train"] == 1
+    assert stats["phases"]["real"]["eval"] == 1
+    train_rows = list(
+        csv.DictReader((output_root / "manifests" / "real_train.csv").open())
+    )
+    eval_rows = list(
+        csv.DictReader((output_root / "manifests" / "real_eval.csv").open())
+    )
+    assert train_rows[0]["speaker_id"] == "speaker_train"
+    assert train_rows[0]["device"] == "phone"
+    assert train_rows[0]["session"] == "s1"
+    assert eval_rows[0]["speaker_id"] == "speaker_eval"
+    assert eval_rows[0]["device"] == "pc"
+
+
+def test_manifest_explicit_split_rejects_speaker_leakage(tmp_path: Path):
+    source = tmp_path / "source.csv"
+    with source.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "audio_path",
+                "text",
+                "label",
+                "phase",
+                "split",
+                "speaker_id",
+            ],
+        )
+        writer.writeheader()
+        for split in ("train", "eval"):
+            writer.writerow(
+                {
+                    "audio_path": tmp_path / f"{split}.wav",
+                    "text": "hey eva",
+                    "label": 1,
+                    "phase": "real",
+                    "split": split,
+                    "speaker_id": "same_speaker",
+                }
+            )
+
+    with pytest.raises(ValueError, match="leaks speaker_id"):
+        prepare_keyword_adaptation(
+            keyword="hey eva",
+            data_root=tmp_path / "prepared",
+            fbank_params={},
+            manifest_csv=source,
+        )

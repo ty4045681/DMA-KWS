@@ -38,6 +38,39 @@ _PARAMETRIZED_ORIGINAL_RE = re.compile(
 )
 
 
+def restore_best_checkpoint_weights(
+    model: torch.nn.Module,
+    checkpoint_callback: Any,
+    *,
+    final_step: int,
+) -> tuple[int, str]:
+    """Restore the callback-selected Lightning weights before a ``.pt`` export.
+
+    Training still completes at ``final_step`` and its final metrics remain useful,
+    but the deployable artifact should match the checkpoint selected by the
+    configured validation monitor.  Runs without a selected/available checkpoint
+    retain the historical final-weight behavior.
+    """
+
+    best_path_value = str(getattr(checkpoint_callback, "best_model_path", "") or "")
+    if not best_path_value:
+        return int(final_step), f"final_weights@step={int(final_step)}"
+
+    best_path = Path(best_path_value)
+    if not best_path.is_file():
+        return int(final_step), f"final_weights@step={int(final_step)}"
+
+    checkpoint = torch.load(best_path, map_location="cpu")
+    state = checkpoint.get("state_dict") if isinstance(checkpoint, Mapping) else None
+    if not isinstance(state, Mapping) or not state:
+        raise ValueError(
+            f"Best checkpoint {best_path} has no non-empty Lightning state_dict"
+        )
+    model.load_state_dict(dict(state), strict=True)
+    selected_step = int(checkpoint.get("global_step", final_step))
+    return selected_step, f"best_checkpoint@step={selected_step}:{best_path}"
+
+
 def canonical_stage2_base_state(
     state: Mapping[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
