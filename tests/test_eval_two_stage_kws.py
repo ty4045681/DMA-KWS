@@ -10,9 +10,11 @@ from dma_kws.inference.manifest import load_manifest
 from dma_kws.inference.metrics import binary_eer, summarize_labeled_results
 import scripts.eval_stage2_clips as eval_stage2_clips
 from scripts.eval_stage2_clips import (
+    _binary_roc_points,
     _result_record as stage2_clip_result_record,
     _resolve_audio_padding_ms,
     _score_provenance,
+    _write_detection_plots,
 )
 from scripts.eval_two_stage_kws import _result_record as two_stage_result_record
 
@@ -42,6 +44,82 @@ def test_stage2_clip_audio_padding_rejects_negative_values(prep):
         _resolve_audio_padding_ms(prep)
 
 
+def test_binary_roc_points_keep_tied_scores_at_one_operating_point():
+    records = [
+        {"label": 1, "qbyt_score": 0.9},
+        {"label": 0, "qbyt_score": 0.8},
+        {"label": 1, "qbyt_score": 0.8},
+        {"label": 0, "qbyt_score": 0.1},
+        {"label": 0, "qbyt_score": 1.0, "skipped": True},
+    ]
+
+    curve = _binary_roc_points(records, score_field="qbyt_score")
+
+    assert curve is not None
+    assert curve["num_samples"] == 4
+    assert curve["num_positive"] == 2
+    assert curve["num_negative"] == 2
+    assert curve["thresholds"] == pytest.approx([np.inf, 0.9, 0.8, 0.1])
+    assert curve["fpr"] == pytest.approx([0.0, 0.0, 0.5, 1.0])
+    assert curve["tpr"] == pytest.approx([0.0, 0.5, 1.0, 1.0])
+
+
+def test_detection_plots_skip_single_class_without_creating_files(tmp_path):
+    plot_summary = _write_detection_plots(
+        [
+            {"label": 0, "qbyt_score": 0.2},
+            {"label": 0, "qbyt_score": 0.1},
+        ],
+        output_dir=tmp_path,
+        threshold=0.5,
+        metrics={"auc": 0.0, "eer": 0.0, "eer_threshold": 0.0},
+    )
+
+    assert plot_summary["status"] == "skipped"
+    assert "positive and negative" in plot_summary["reason"]
+    assert not (tmp_path / "roc_curve.png").exists()
+    assert not (tmp_path / "det_curve.png").exists()
+
+
+def test_detection_plots_write_roc_and_det_pngs(tmp_path):
+    pytest.importorskip("matplotlib")
+    records = [
+        {"label": 1, "qbyt_score": 0.95},
+        {"label": 0, "qbyt_score": 0.75},
+        {"label": 1, "qbyt_score": 0.65},
+        {"label": 0, "qbyt_score": 0.10},
+    ]
+    metrics = summarize_labeled_results(
+        [
+            {"label": record["label"], "best_qbyt_score": record["qbyt_score"]}
+            for record in records
+        ],
+        threshold=0.5,
+    )
+
+    plot_summary = _write_detection_plots(
+        records,
+        output_dir=tmp_path,
+        threshold=0.5,
+        metrics=metrics,
+        dpi=72,
+    )
+
+    roc_path = tmp_path / "roc_curve.png"
+    det_path = tmp_path / "det_curve.png"
+    assert plot_summary == {
+        "status": "generated",
+        "score_field": "qbyt_score",
+        "num_samples": 4,
+        "num_positive": 2,
+        "num_negative": 2,
+        "roc": str(roc_path.resolve()),
+        "det": str(det_path.resolve()),
+    }
+    assert roc_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert det_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
 def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypatch):
     torch = pytest.importorskip("torch")
     checkpoint_path = tmp_path / "stage2.pt"
@@ -66,6 +144,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
         {
             "audio_path": "clip.wav",
             "keyword": "hello",
+            "label": 1,
             "keyword_phonemes": "HH",
             "text_variant": "hullo",
         }
@@ -176,8 +255,11 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
         "completion_threshold": 0.4,
         "ece_num_bins": 9,
     }
+    assert summary["plots"]["status"] == "skipped"
+    assert "positive and negative" in summary["plots"]["reason"]
     saved_summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert saved_summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    assert saved_summary["plots"] == summary["plots"]
     saved_result = json.loads(
         (tmp_path / "results.jsonl").read_text(encoding="utf-8").strip()
     )
