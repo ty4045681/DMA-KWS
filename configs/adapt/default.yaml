@@ -78,5 +78,9 @@ adapt:
     lph_subset: 2000
     search_mix: false
     single_phase: false
+    # Final target-eval artifacts are written below the last phase's versioned
+    # training log directory as target_eval/{summary.json,predictions.jsonl,*.png}.
+    plot_curves: true
+    plot_dpi: 160
     storage: ""
     study_name: ""

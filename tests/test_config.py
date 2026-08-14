@@ -9,6 +9,7 @@ from dma_kws.config import (
     load_config,
     require_sections,
 )
+from dma_kws.configs.schema import AdaptSweepConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -110,6 +111,14 @@ def test_musan_mix_music_defaults_to_disabled_at_20_db():
         "enabled": False,
         "snr_db": 20.0,
     }
+
+
+def test_adapt_sweep_plot_defaults_match_structured_config():
+    config = config_to_dict(compose_config())
+    structured = AdaptSweepConfig()
+
+    assert config["adapt"]["sweep"]["plot_curves"] is structured.plot_curves
+    assert config["adapt"]["sweep"]["plot_dpi"] == structured.plot_dpi
 
 
 def test_adapter_v2_stage2_config_freezes_the_domain_adapted_trunk(monkeypatch):

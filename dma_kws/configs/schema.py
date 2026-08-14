@@ -521,6 +521,8 @@ class AdaptSweepConfig:
     lph_subset: int = 2000
     search_mix: bool = False
     single_phase: bool = False
+    plot_curves: bool = True
+    plot_dpi: int = 160
     storage: str = ""
     study_name: str = ""
 

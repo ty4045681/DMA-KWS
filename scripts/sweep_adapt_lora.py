@@ -123,6 +123,10 @@ def _eval_target_auc(
         assert_qbyt_readout_state_loaded,
         resolve_qbyt_readout,
     )
+    from dma_kws.stage2.sweep_eval import (
+        resolve_target_eval_output_dir,
+        write_target_eval_report,
+    )
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training.checkpoint_io import (
         assert_qbyt_readout_version,
@@ -169,12 +173,26 @@ def _eval_target_auc(
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.target_auc_metric = __import__("torchmetrics").AUROC(task="binary")
+            self.target_eval_records: list[dict] = []
 
         def validation_step(self, batch, batch_idx):
+            del batch_idx
             logits, _ = self(batch["feat"], batch["feat_lengths"], batch["anchor"])
-            preds = torch.sigmoid(logits)
-            labels = batch["label"].int()
-            self.target_auc_metric.update(preds, labels)
+            probabilities = torch.sigmoid(logits)
+            self.target_auc_metric.update(probabilities, batch["label"].int())
+            scores = probabilities.detach().cpu().reshape(-1).tolist()
+            labels = batch["label"].detach().cpu().reshape(-1).tolist()
+            sample_ids = batch["sample_id"].detach().cpu().reshape(-1).tolist()
+            self.target_eval_records.extend(
+                {
+                    "sample_id": int(sample_id),
+                    "audio_path": str(dataset.df.iloc[int(sample_id)]["audio_path"]),
+                    "keyword": keyword,
+                    "label": int(label),
+                    "qbyt_score": float(score),
+                }
+                for sample_id, label, score in zip(sample_ids, labels, scores)
+            )
 
         def on_validation_epoch_end(self):
             auc = self.target_auc_metric.compute()
@@ -194,9 +212,44 @@ def _eval_target_auc(
     trainer = pl.Trainer(
         accelerator=accelerator, devices=1, logger=False, enable_checkpointing=False
     )
-    results = trainer.validate(model, dataloaders=val_loader, verbose=False)
-    metrics = results[0] if results else {}
-    return float(metrics.get("val/target_auc", 0.0))
+    validation_results = trainer.validate(model, dataloaders=val_loader, verbose=False)
+    validation_metrics = validation_results[0] if validation_results else {}
+    records = sorted(model.target_eval_records, key=lambda record: record["sample_id"])
+    if len(records) != len(dataset):
+        raise RuntimeError(
+            "Target sweep evaluation did not score every manifest row: "
+            f"expected {len(dataset)}, got {len(records)}"
+        )
+
+    sweep_cfg = adapt.get("sweep", {}) or {}
+    deployment_threshold = float(
+        (config.get("demo", {}) or {}).get("qbyt_threshold", 0.5)
+    )
+    output_dir = resolve_target_eval_output_dir(checkpoint, ckpt)
+    report = write_target_eval_report(
+        records,
+        output_dir=output_dir,
+        manifest_path=eval_manifest,
+        checkpoint_path=checkpoint,
+        threshold=deployment_threshold,
+        plot_curves=bool(sweep_cfg.get("plot_curves", True)),
+        plot_dpi=int(sweep_cfg.get("plot_dpi", 160)),
+    )
+    print(
+        json.dumps(
+            {
+                "target_eval_summary": report["summary"],
+                "target_eval_plots": report["plots"],
+            },
+            ensure_ascii=False,
+        )
+    )
+    return float(
+        validation_metrics.get(
+            "val/target_auc",
+            report["metrics"].get("auc", 0.0),
+        )
+    )
 
 
 def _release_cuda_cache(torch_module) -> None:
