@@ -15,6 +15,8 @@ default. Override with ``+prep.left_padding_ms=...`` and
 Padding is part of the scored model input and counts toward its minimum length.
 When valid positive and negative labels are present, the output directory also
 receives ``roc_curve.png`` and ``det_curve.png`` for the utterance QbyT score.
+Optional ``prep.musan_mix`` settings add deterministic MUSAN noise, music and/or
+overlapping speech in memory before the existing zero-valued padding.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from dma_kws.config import require_sections
 from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.inference.manifest import load_manifest
 from dma_kws.inference.metrics import summarize_labeled_results
+from dma_kws.inference.musan_mix import MusanWaveformMixer
 from dma_kws.inference.stage2_clip import Stage2ClipRunner
 from dma_kws.inference.stage2_reporting import (
     build_result_record as _result_record,
@@ -388,6 +391,13 @@ def run_eval(cfg: DictConfig) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rows = load_manifest(manifest_path)
+    try:
+        musan_mixer = MusanWaveformMixer.from_prep(
+            prep,
+            audio_paths=[str(row["audio_path"]) for row in rows],
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise SystemExit(f"Invalid prep.musan_mix configuration: {exc}") from exc
     accelerator, _ = resolve_accelerator(str(run_cfg.device))
     device = torch.device(accelerator if accelerator == "cpu" else "cuda")
     runner = Stage2ClipRunner.from_config(config, prep, device)
@@ -415,19 +425,22 @@ def run_eval(cfg: DictConfig) -> dict:
         num_workers=num_workers,
         left_padding_ms=left_padding_ms,
         right_padding_ms=right_padding_ms,
+        waveform_transform=musan_mixer if musan_mixer.enabled else None,
         include_score_details=True,
         include_eps_positions=True,
         include_seq_positions=True,
     )
-    results = [
-        _result_record(
+    results = []
+    for index, (row, runner_result) in enumerate(zip(rows, runner_results)):
+        record = _result_record(
             row,
             runner_result,
             sequence_objective=sequence_objective,
             qbyt_readout=provenance["qbyt_readout"],
         )
-        for row, runner_result in zip(rows, runner_results)
-    ]
+        if musan_mixer.enabled:
+            record["musan_mix"] = musan_mixer.recipe_metadata(index)
+        results.append(record)
 
     results_path = output_dir / "results.jsonl"
     with results_path.open("w", encoding="utf-8") as handle:
@@ -444,6 +457,7 @@ def run_eval(cfg: DictConfig) -> dict:
             "left": left_padding_ms,
             "right": right_padding_ms,
         },
+        "musan_mix": musan_mixer.summary(),
         "stream": stream_description,
         "num_skipped": sum(bool(record.get("skipped", False)) for record in results),
         "provenance": provenance,

@@ -1575,6 +1575,73 @@ python3 scripts/eval_stage2_clips.py \
   prep.batch_size=128 \
   prep.num_workers=8
 ```
+### MUSAN noise, music, and overlapping-speech robustness
+
+`scripts/eval_stage2_clips.py` can mix each cropped clip with MUSAN noise, music, overlapping speech, or any combination before inference. All three sources are disabled by default, so existing clean evaluation is unchanged and does not require `prep.musan_root`. When enabled, each component is read only from its matching `<musan_root>/noise/**`, `<musan_root>/music/**`, or `<musan_root>/speech/**` subset.
+
+Noise-only evaluation at 10 dB SNR:
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.musan_root=/path/to/musan \
+  prep.musan_mix.noise.enabled=true \
+  prep.musan_mix.noise.snr_db=10
+```
+
+Set `prep.musan_mix.noise.snr_db=20` for a 20 dB condition. The value is `20*log10(RMS(clean)/RMS(noise))`, so a larger SNR means quieter noise. Music uses the same definition through `prep.musan_mix.music.snr_db`.
+
+Noise and music together:
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.musan_root=/path/to/musan \
+  prep.musan_mix.seed=2025 \
+  prep.musan_mix.noise.enabled=true \
+  prep.musan_mix.noise.snr_db=10 \
+  prep.musan_mix.music.enabled=true \
+  prep.musan_mix.music.snr_db=10
+```
+
+Noise and music SNR values are applied independently against the original clean RMS. The mixer does not force their combined interference to a separate total SNR.
+
+Speech-only evaluation:
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.musan_root=/path/to/musan \
+  prep.musan_mix.speech.enabled=true \
+  prep.musan_mix.speech.relative_db=-6
+```
+
+`prep.musan_mix.speech.relative_db` controls speech RMS relative to the clean clip: a negative value is quieter, `0` is equal, and a positive value is louder. For example, `-6`, `0`, and `+6` dB are approximately `0.5x`, `1x`, and `2x` the clean RMS.
+
+Enable noise and overlapping speech together when needed:
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.musan_root=/path/to/musan \
+  prep.musan_mix.seed=2025 \
+  prep.musan_mix.noise.enabled=true \
+  prep.musan_mix.noise.snr_db=20 \
+  prep.musan_mix.speech.enabled=true \
+  prep.musan_mix.speech.relative_db=0
+```
+
+Noise, music, and speech are each scaled against the original clean RMS, then summed once without clipping, which preserves the requested ratios. Long MUSAN sources are cropped and short sources are repeated to the clip length. Source selection and crop position are derived from `prep.musan_mix.seed`, the manifest row, and the component type, so they are stable across batch sizes and DataLoader worker counts. Mixing happens in memory after sample-rate preparation and before the existing zero padding; source files are never modified and the padding remains zero-valued. A zero-RMS clean clip or selected MUSAN segment fails explicitly because its requested dB ratio is undefined.
+
+`summary.json` records the resolved mixing configuration and source-pool sizes. Each augmented `results.jsonl` row also contains a `musan_mix` recipe with the selected source, requested dB value, and deterministic crop information. For negative-set experiments, avoid overlapping speech that contains the enrolled wake word; [the MUSAN WeNet filter](scripts/filter_musan_by_wenet_asr.py) can build a filtered corpus tree.
 
 To evaluate exported `.pt` checkpoints against a manifest, use `scripts/batch_eval_stage2_clips.sh`. Directory inputs scan immediate `*.pt` children; an optional `:OUT_DIR` sets that directory source's output root, otherwise the script writes to `<base-out>/<checkpoint-directory-name>/<checkpoint-stem>/`:
 

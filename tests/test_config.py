@@ -80,6 +80,38 @@ def test_checkpoint_monitor_and_mode_accept_structured_overrides():
     assert config["stage2"]["checkpoint"]["mode"] == "min"
 
 
+def test_musan_mix_config_accepts_regular_hydra_overrides():
+    config = config_to_dict(
+        compose_config(
+            overrides=[
+                "prep.musan_mix.seed=7",
+                "prep.musan_mix.noise.enabled=true",
+                "prep.musan_mix.noise.snr_db=10",
+                "prep.musan_mix.music.enabled=true",
+                "prep.musan_mix.music.snr_db=12",
+                "prep.musan_mix.speech.enabled=true",
+                "prep.musan_mix.speech.relative_db=6",
+            ]
+        )
+    )
+
+    assert config["prep"]["musan_mix"] == {
+        "seed": 7,
+        "noise": {"enabled": True, "snr_db": 10.0},
+        "music": {"enabled": True, "snr_db": 12.0},
+        "speech": {"enabled": True, "relative_db": 6.0},
+    }
+
+
+def test_musan_mix_music_defaults_to_disabled_at_20_db():
+    config = config_to_dict(compose_config())
+
+    assert config["prep"]["musan_mix"]["music"] == {
+        "enabled": False,
+        "snr_db": 20.0,
+    }
+
+
 def test_adapter_v2_stage2_config_freezes_the_domain_adapted_trunk(monkeypatch):
     monkeypatch.setenv("ICEFALL_CHECKPOINT", "/checkpoints/icefall.pt")
     monkeypatch.setenv("PHONEME_ADAPTER_V2_CHECKPOINT", "/checkpoints/adapter-v2.pt")

@@ -86,6 +86,70 @@ def test_clip_feature_dataset_padding_precedes_min_frame_guard(monkeypatch):
     assert torch.equal(source, torch.tensor([[0.25, -0.5, 0.75]]))
 
 
+def test_clip_feature_dataset_transforms_prepared_audio_before_padding(monkeypatch):
+    torch = pytest.importorskip("torch")
+    source = torch.tensor([[1.0, 2.0]])
+    captured = {}
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.load_audio",
+        lambda _path, *, sample_rate: (source, sample_rate),
+    )
+    monkeypatch.setattr(
+        "dma_kws.inference.audio_utils.has_min_fbank_frames",
+        lambda *_args, **_kwargs: True,
+    )
+
+    def fake_waveform_to_fbank(waveform, *, sample_rate, **_kwargs):
+        captured["fbank_waveform"] = waveform.clone()
+        captured["fbank_sample_rate"] = sample_rate
+        return torch.ones(1, 80)
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.waveform_to_fbank",
+        fake_waveform_to_fbank,
+    )
+
+    class PreparingExtractor:
+        @staticmethod
+        def prepare_waveform(waveform, sample_rate):
+            return waveform + 1.0, sample_rate * 2
+
+    def transform(index, waveform, sample_rate):
+        captured["transform"] = (index, waveform.clone(), sample_rate)
+        return waveform * 10.0
+
+    dataset = ClipFeatureDataset(
+        audio_paths=["clip.wav"],
+        sample_rate=1000,
+        fbank_extractor=PreparingExtractor(),
+        fbank_kwargs={
+            "frame_length": 25,
+            "frame_shift": 10,
+            "snip_edges": True,
+        },
+        min_fbank_frames=1,
+        left_padding_ms=1,
+        right_padding_ms=1,
+        waveform_transform=transform,
+    )
+
+    index, feat, end_sec = dataset[0]
+
+    assert index == 0
+    assert feat.shape == (1, 80)
+    assert end_sec == pytest.approx(0.002)
+    transform_index, transform_waveform, transform_sample_rate = captured["transform"]
+    assert transform_index == 0
+    assert transform_sample_rate == 2000
+    assert torch.equal(transform_waveform, torch.tensor([[2.0, 3.0]]))
+    assert captured["fbank_sample_rate"] == 2000
+    assert torch.equal(
+        captured["fbank_waveform"],
+        torch.tensor([[0.0, 0.0, 20.0, 30.0, 0.0, 0.0]]),
+    )
+
+
 def test_clip_feature_dataset_padding_can_satisfy_encoder_length_guard(monkeypatch):
     torch = pytest.importorskip("torch")
     source = torch.ones(1, 10)

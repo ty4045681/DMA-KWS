@@ -7,7 +7,7 @@ the Stage II QbyT verifier, bypassing Stage I locator models entirely.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from dma_kws.audio import load_audio
 from dma_kws.g2p import make_g2p, text_to_phonemes
@@ -91,6 +91,7 @@ class ClipFeatureDataset:
         min_fbank_frames: int,
         left_padding_ms: int = 0,
         right_padding_ms: int = 0,
+        waveform_transform: Callable[[int, Any, int], Any] | None = None,
     ) -> None:
         left_padding_ms = int(left_padding_ms)
         right_padding_ms = int(right_padding_ms)
@@ -103,6 +104,7 @@ class ClipFeatureDataset:
         self._min_fbank_frames = int(min_fbank_frames)
         self._left_padding_ms = left_padding_ms
         self._right_padding_ms = right_padding_ms
+        self._waveform_transform = waveform_transform
 
     def __len__(self) -> int:
         return len(self._audio_paths)
@@ -118,6 +120,17 @@ class ClipFeatureDataset:
         # context used only by the model input.
         end_sec = waveform.size(1) / sample_rate
         waveform, sample_rate = self._extractor.prepare_waveform(waveform, sample_rate)
+        if self._waveform_transform is not None:
+            original_shape = tuple(waveform.shape)
+            waveform = self._waveform_transform(index, waveform, sample_rate)
+            if waveform is None or tuple(waveform.shape) != original_shape:
+                transformed_shape = (
+                    None if waveform is None else tuple(waveform.shape)
+                )
+                raise ValueError(
+                    "waveform_transform must preserve waveform shape: "
+                    f"before={original_shape}, after={transformed_shape}"
+                )
         left_samples = round(sample_rate * self._left_padding_ms / 1000)
         right_samples = round(sample_rate * self._right_padding_ms / 1000)
         if left_samples or right_samples:
@@ -262,6 +275,7 @@ class Stage2ClipRunner:
         num_workers: int = 0,
         left_padding_ms: int = 0,
         right_padding_ms: int = 0,
+        waveform_transform: Callable[[int, Any, int], Any] | None = None,
         include_score_details: bool = False,
         include_eps_positions: bool = False,
         include_seq_positions: bool = False,
@@ -275,8 +289,10 @@ class Stage2ClipRunner:
         G2P; otherwise a non-empty ``text_variant`` is converted automatically.
         Results are returned in the same order as ``rows`` and use the ``run``
         schema.
-        Optional zero-valued waveform padding is applied in memory before fbank
-        extraction; source audio files are not modified. The padding counts
+        ``waveform_transform``, when supplied, receives ``(row_index, waveform,
+        sample_rate)`` after fbank sample-rate preparation and must preserve the
+        waveform shape. It runs before optional zero-valued padding. Source audio
+        files are not modified. The padding counts
         toward the minimum encoder-input length and can make a short clip
         scoreable. ``include_eps_positions`` requires score details and exposes
         one EPS readout logit per enrollment phoneme when that readout is active.
@@ -375,6 +391,7 @@ class Stage2ClipRunner:
             min_fbank_frames=self._verifier.min_fbank_frames,
             left_padding_ms=left_padding_ms,
             right_padding_ms=right_padding_ms,
+            waveform_transform=waveform_transform,
         )
         loader = DataLoader(
             dataset,

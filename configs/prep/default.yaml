@@ -45,6 +45,20 @@ output: ""
 stage1_ckpt: ""
 stage2_ckpt: ""
 musan_root: ""
+# Optional in-memory interference for eval_stage2_clips.py. Noise/music SNR is
+# the clean/interference RMS ratio. Speech relative_db is speech RMS relative
+# to clean: negative is quieter, zero is equal, and positive is louder.
+musan_mix:
+  seed: 2025
+  noise:
+    enabled: false
+    snr_db: 20.0
+  music:
+    enabled: false
+    snr_db: 20.0
+  speech:
+    enabled: false
+    relative_db: 0.0
 window_sec: 3.0
 hop_sec: 1.0
 audio: ""

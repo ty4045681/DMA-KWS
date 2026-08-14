@@ -233,10 +233,12 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert captured["rows"] == rows
     assert captured["kwargs"]["left_padding_ms"] == 160
     assert captured["kwargs"]["right_padding_ms"] == 160
+    assert captured["kwargs"]["waveform_transform"] is None
     assert captured["kwargs"]["include_score_details"] is True
     assert captured["kwargs"]["include_eps_positions"] is True
     assert captured["kwargs"]["include_seq_positions"] is True
     assert summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    assert summary["musan_mix"]["enabled"] is False
     assert summary["provenance"]["checkpoint"]["path"] == str(
         checkpoint_path.resolve()
     )
@@ -259,6 +261,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert "positive and negative" in summary["plots"]["reason"]
     saved_summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert saved_summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    assert saved_summary["musan_mix"]["enabled"] is False
     assert saved_summary["plots"] == summary["plots"]
     saved_result = json.loads(
         (tmp_path / "results.jsonl").read_text(encoding="utf-8").strip()
@@ -282,6 +285,128 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert saved_result["seq_completion_loss_sample"] == pytest.approx(
         np.log(2.0)
     )
+
+
+def test_stage2_clip_eval_records_enabled_musan_mix(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    captured = {}
+    rows = [{"audio_path": "clip.wav", "keyword": "hello"}]
+
+    class FakeMixer:
+        enabled = True
+
+        @classmethod
+        def from_prep(cls, prep, *, audio_paths):
+            captured["mixer_prep"] = prep
+            captured["mixer_audio_paths"] = audio_paths
+            return cls()
+
+        def __call__(self, index, waveform, sample_rate):
+            del index, sample_rate
+            return waveform
+
+        @staticmethod
+        def summary():
+            return {"enabled": True, "seed": 7}
+
+        @staticmethod
+        def recipe_metadata(index):
+            return {
+                "row_index": index,
+                "noise": {"source": "noise/sample.wav", "snr_db": 10.0},
+                "music": {"source": "music/sample.wav", "snr_db": 12.0},
+            }
+
+    class FakeStreamPolicy:
+        @staticmethod
+        def describe():
+            return {"mode": "test"}
+
+    class FakeRunner:
+        _demo_cfg = {"qbyt_threshold": 0.5}
+        stream_policy = FakeStreamPolicy()
+
+        def run_batch(self, batch_rows, **kwargs):
+            captured["rows"] = batch_rows
+            captured["run_kwargs"] = kwargs
+            return [
+                {
+                    "qbyt_score": 0.25,
+                    "keyword_phonemes": ["HH"],
+                    "detected": False,
+                    "threshold": 0.5,
+                    "skipped": False,
+                }
+            ]
+
+    class FakeRunnerFactory:
+        @staticmethod
+        def from_config(_config, _prep, _device):
+            return FakeRunner()
+
+    monkeypatch.setattr(
+        eval_stage2_clips,
+        "resolved_config",
+        lambda _cfg: {
+            "paths": {},
+            "stage1": {},
+            "stage2": {"validation": {}},
+            "demo": {},
+            "tokenizer": {},
+        },
+    )
+    monkeypatch.setattr(eval_stage2_clips, "load_manifest", lambda _path: rows)
+    monkeypatch.setattr(eval_stage2_clips, "MusanWaveformMixer", FakeMixer)
+    monkeypatch.setattr(eval_stage2_clips, "Stage2ClipRunner", FakeRunnerFactory)
+    monkeypatch.setattr(
+        eval_stage2_clips, "resolve_accelerator", lambda _device: ("cpu", 1)
+    )
+    monkeypatch.setattr(
+        eval_stage2_clips,
+        "_score_provenance",
+        lambda *_args, **_kwargs: {
+            "qbyt_readout": {"mode": "gru_last", "temperature": 1.0},
+            "sequence_objective": {
+                "target_mode": "ordered_contiguous_prefix",
+                "progress_weight": 0.5,
+                "completion_weight": 0.5,
+                "normalization": "sample",
+            },
+        },
+    )
+
+    cfg = OmegaConf.create(
+        {
+            "prep": {
+                "manifest": "manifest.csv",
+                "stage2_ckpt": "stage2.pt",
+                "output_dir": str(tmp_path),
+                "musan_root": "/musan",
+                "musan_mix": {
+                    "seed": 7,
+                    "noise": {"enabled": True, "snr_db": 10.0},
+                    "music": {"enabled": True, "snr_db": 12.0},
+                    "speech": {"enabled": False, "relative_db": 0.0},
+                },
+            },
+            "run": {"device": "cpu"},
+        }
+    )
+
+    summary = eval_stage2_clips.run_eval(cfg)
+
+    assert captured["mixer_audio_paths"] == ["clip.wav"]
+    assert captured["rows"] == rows
+    assert isinstance(captured["run_kwargs"]["waveform_transform"], FakeMixer)
+    assert summary["musan_mix"] == {"enabled": True, "seed": 7}
+    saved_result = json.loads(
+        (tmp_path / "results.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert saved_result["musan_mix"] == {
+        "row_index": 0,
+        "noise": {"source": "noise/sample.wav", "snr_db": 10.0},
+        "music": {"source": "music/sample.wav", "snr_db": 12.0},
+    }
 
 
 def test_score_provenance_classifies_missing_checkpoint_config_as_legacy(tmp_path):
