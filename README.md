@@ -1575,9 +1575,9 @@ python3 scripts/eval_stage2_clips.py \
   prep.batch_size=128 \
   prep.num_workers=8
 ```
-### MUSAN noise, music, and overlapping-speech robustness
+### Configurable waveform robustness with MUSAN and synthetic noise
 
-`scripts/eval_stage2_clips.py` can mix each cropped clip with MUSAN noise, music, overlapping speech, or any combination before inference. All three sources are disabled by default, so existing clean evaluation is unchanged and does not require `prep.musan_root`. When enabled, each component is read only from its matching `<musan_root>/noise/**`, `<musan_root>/music/**`, or `<musan_root>/speech/**` subset.
+`scripts/eval_stage2_clips.py` can independently enable continuous MUSAN noise, music, overlapping speech, synthetic stationary noise, MUSAN burst noise, and clean-signal volume variation. Every effect is disabled by default, so existing clean evaluation is unchanged. Continuous noise/music/speech and burst noise read only their matching `<musan_root>/noise/**`, `<musan_root>/music/**`, or `<musan_root>/speech/**` subset. Synthetic stationary noise and volume variation are source-free and do not require `prep.musan_root`.
 
 Noise-only evaluation at 10 dB SNR:
 
@@ -1608,7 +1608,7 @@ python3 scripts/eval_stage2_clips.py \
   prep.musan_mix.music.snr_db=10
 ```
 
-Noise and music SNR values are applied independently against the original clean RMS. The mixer does not force their combined interference to a separate total SNR.
+Noise and music SNR values are applied independently against the same clean RMS after optional volume variation. The mixer does not force their combined interference to a separate total SNR.
 
 Speech-only evaluation:
 
@@ -1639,9 +1639,167 @@ python3 scripts/eval_stage2_clips.py \
   prep.musan_mix.speech.relative_db=0
 ```
 
-Noise, music, and speech are each scaled against the original clean RMS, then summed once without clipping, which preserves the requested ratios. Long MUSAN sources are cropped and short sources are repeated to the clip length. Source selection and crop position are derived from `prep.musan_mix.seed`, the manifest row, and the component type, so they are stable across batch sizes and DataLoader worker counts. Mixing happens in memory after sample-rate preparation and before the existing zero padding; source files are never modified and the padding remains zero-valued. A zero-RMS clean clip or selected MUSAN segment fails explicitly because its requested dB ratio is undefined.
+Continuous MUSAN noise, music, and speech are each scaled against the same clean RMS after optional volume variation, then summed without clipping. Long MUSAN sources are cropped and short sources are repeated to the clip length. For negative-set experiments, avoid overlapping speech that contains the enrolled wake word; [the MUSAN WeNet filter](scripts/filter_musan_by_wenet_asr.py) can build a filtered corpus tree.
 
-`summary.json` records the resolved mixing configuration and source-pool sizes. Each augmented `results.jsonl` row also contains a `musan_mix` recipe with the selected source, requested dB value, and deterministic crop information. For negative-set experiments, avoid overlapping speech that contains the enrolled wake word; [the MUSAN WeNet filter](scripts/filter_musan_by_wenet_asr.py) can build a filtered corpus tree.
+#### Synthetic stationary noise
+
+Enable deterministic white Gaussian noise at 10 dB SNR without a MUSAN corpus:
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.musan_mix.stationary_noise.enabled=true \
+  prep.musan_mix.stationary_noise.snr_db=10
+```
+
+Use `prep.musan_mix.stationary_noise.snr_db=20` for the corresponding 20 dB run. The first implementation intentionally supports only `kind=white_gaussian`. Each row gets a deterministic zero-mean realization, scaled to the exact configured RMS ratio. Stationary-noise-only evaluation does not require `prep.musan_root`.
+
+#### MUSAN burst noise
+
+A single 100–400 ms burst at 10 dB uses the declared defaults:
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.musan_root=/path/to/musan \
+  prep.musan_mix.burst_noise.enabled=true \
+  prep.musan_mix.burst_noise.snr_db=10
+```
+
+For two to four non-overlapping events with an explicit gap and duration range:
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.musan_root=/path/to/musan \
+  prep.musan_mix.burst_noise.enabled=true \
+  prep.musan_mix.burst_noise.event_count_min=2 \
+  prep.musan_mix.burst_noise.event_count_max=4 \
+  prep.musan_mix.burst_noise.duration_ms_min=80 \
+  prep.musan_mix.burst_noise.duration_ms_max=250 \
+  prep.musan_mix.burst_noise.fade_ms=10 \
+  prep.musan_mix.burst_noise.allow_overlap=false \
+  prep.musan_mix.burst_noise.min_gap_ms=50
+```
+
+`snr_scope=active_event` scales every faded event so its event-interval RMS has the configured ratio to the whole post-volume clean RMS. Event duration therefore does not change its instantaneous level. `snr_scope=whole_clip` first combines all events and intervening silence, then scales that full burst bed to the exact whole-clip SNR; sparse events will consequently be louder. With `allow_overlap=false`, `min_gap_ms` is enforced and an impossible placement fails explicitly instead of silently changing the recipe.
+
+#### Alternating clean-signal volume
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.musan_mix.volume_variation.enabled=true \
+  prep.musan_mix.volume_variation.low_gain_db=-12 \
+  prep.musan_mix.volume_variation.high_gain_db=6 \
+  prep.musan_mix.volume_variation.segment_ms_min=250 \
+  prep.musan_mix.volume_variation.segment_ms_max=750 \
+  prep.musan_mix.volume_variation.transition_ms=50
+```
+
+The clean signal alternates between the low and high dB gains in deterministic variable-length segments. Segment boundaries use a raised-cosine transition in the dB domain; `transition_ms` must not exceed `segment_ms_min`, which keeps every transition complete and continuous. The sample count does not change, and this effect also works without `prep.musan_root`.
+
+#### Combining the new effects
+
+All three new effects, and the existing continuous MUSAN components, can be enabled independently or together. For example:
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.musan_root=/path/to/musan \
+  prep.musan_mix.seed=2025 \
+  prep.musan_mix.volume_variation.enabled=true \
+  prep.musan_mix.stationary_noise.enabled=true \
+  prep.musan_mix.stationary_noise.snr_db=20 \
+  prep.musan_mix.burst_noise.enabled=true \
+  prep.musan_mix.burst_noise.snr_db=10 \
+  prep.musan_mix.burst_noise.event_count_min=2 \
+  prep.musan_mix.burst_noise.event_count_max=3
+```
+
+The fixed MUSAN-mixer order is:
+
+```text
+prepared mono clean -> volume_variation
+                    -> independently scale continuous noise/music/speech,
+                       stationary noise, and burst noise against that same clean
+                    -> sum once -> existing zero-valued context padding
+```
+
+Every additive component independently satisfies its configured ratio, so two 10 dB components do not imply a 10 dB total-interference SNR. The mixer intentionally applies no hard clipping or limiter because either would change those ratios; temporary floating-point values outside `[-1, 1]` are retained.
+
+All recipe seeds derive from `prep.musan_mix.seed`, manifest row, audio path, component, and burst-event index. Enabling one component therefore does not change another component's source or placement, and results are stable across batch sizes and DataLoader worker counts. Mixing happens in memory after mono conversion and resampling, before the existing zero padding; source files are never modified. When an SNR-controlled additive component is active, a zero-RMS clean reference or selected MUSAN segment fails explicitly because its requested dB ratio is undefined.
+
+`summary.json` records the resolved configuration, SNR scope, processing order, and MUSAN source-pool sizes. Each augmented `results.jsonl` row contains a top-level `musan_mix` recipe. Burst recipes include source, start fraction, duration, source-offset fraction, and event seed; volume variation records its gain/segment range and envelope seed.
+
+### audio_aug-compatible waveform transformations
+
+`eval_stage2_clips.py` also provides the nine waveform transformations from [`audio_aug` commit `58410f27`](https://github.com/ty4045681/audio_aug/tree/58410f27c5beecdb9fa438e98833daccb69db895), configured by the [audio augmentation configuration](configs/prep/default.yaml) and implemented by the [in-memory evaluator adapter](dma_kws/inference/audio_aug.py). Each method has its own `enabled` switch under `prep.audio_aug.transforms`; all nine default to `false`, so clean and MUSAN-only evaluations keep their previous waveform path.
+
+| Method | Pipeline phase | Main parameters |
+| --- | --- | --- |
+| `speed_change` | pre-mix | `speed_factor` |
+| `volume_gain` | pre-mix | `gain_db` |
+| `noise_mix` | additive | `snr_db` |
+| `amp_distortion` | post-mix | `distortion_type`, `rate`, subtype parameters |
+| `subband_eq` | post-mix | `low_min_gain_db`, `high_min_gain_db` |
+| `band_limit` | post-mix | `mode`, `cutoff_hz`, `filter_order`, `target_sample_rate` |
+| `narrowband` | post-mix | `target_sample_rate` |
+| `spectral_mask` | post-mix | mask counts and gain range |
+| `signal_mimic` | post-mix | five child-stage probabilities |
+
+Stationary Gaussian noise at an exact in-memory 10 dB RMS ratio:
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.audio_aug.pcm_policy=float_unclipped \
+  prep.audio_aug.transforms.noise_mix.enabled=true \
+  prep.audio_aug.transforms.noise_mix.snr_db=10
+```
+
+The default `prep.audio_aug.transforms.noise_mix.snr_mode=exact_rms` scales the generated noise delta to the requested empirical RMS ratio before the PCM policy is applied. Set `snr_mode=upstream_std` to reproduce the source method's Gaussian standard-deviation semantics instead. The default `prep.audio_aug.pcm_policy=clip_round_each_stage` rounds and clips after every enabled stage to model the upstream PCM16 script workflow; clipping can change the final measured ratio. Use `float_unclipped` for controlled SNR sweeps without quantization or clipping.
+
+Speed and whole-clip gain can be combined independently:
+
+```bash
+python3 scripts/eval_stage2_clips.py \
+  +experiment=wenet_asr_stage2 \
+  prep.manifest=/path/stage2_clip_manifest.csv \
+  prep.stage2_ckpt=/path/stage2.pt \
+  prep.audio_aug.transforms.speed_change.enabled=true \
+  prep.audio_aug.transforms.speed_change.speed_factor=1.10 \
+  prep.audio_aug.transforms.volume_gain.enabled=true \
+  prep.audio_aug.transforms.volume_gain.gain_db=-3
+```
+
+The default `prep.audio_aug.speed_length_policy=variable` preserves the real speed-adjusted sample count. `results.jsonl` then records both the original `clip_span_sec` and padding-free `augmented_duration_sec`. Set `center_crop_or_zero_pad` when a fixed input duration is required; it center-crops slower/longer output and symmetrically zero-pads faster/shorter output instead of resampling away the speed and pitch change.
+
+The fixed multi-effect order is:
+
+```text
+speed_change -> audio_aug volume_gain -> musan_mix volume_variation
+             -> parallel audio_aug noise_mix and MUSAN continuous/stationary/burst deltas
+             -> amp_distortion -> subband_eq -> band_limit -> narrowband
+             -> spectral_mask -> signal_mimic
+             -> existing zero-valued context padding
+```
+
+Every additive branch uses the same clean waveform after all enabled pre-mix volume transforms as its level reference. `signal_mimic` may internally invoke subband EQ, band limiting, narrowband conversion, or spectral masking, so enabling it together with those explicit methods is rejected by default. Set `prep.audio_aug.allow_signal_mimic_overlap=true` only when repeated degradation is intentional.
+
+`prep.audio_aug.seed` is combined with the manifest row, audio path, and method name, making each method reproducible without coupling its recipe to other enabled methods. `summary.json` records the compatibility revision, NumPy/SciPy versions, resolved parameters, and execution order. Each augmented result records its method-local seed and resolved recipe under `audio_aug`.
 
 To evaluate exported `.pt` checkpoints against a manifest, use `scripts/batch_eval_stage2_clips.sh`. Directory inputs scan immediate `*.pt` children; an optional `:OUT_DIR` sets that directory source's output root, otherwise the script writes to `<base-out>/<checkpoint-directory-name>/<checkpoint-stem>/`:
 

@@ -92,6 +92,25 @@ def test_musan_mix_config_accepts_regular_hydra_overrides():
                 "prep.musan_mix.music.snr_db=12",
                 "prep.musan_mix.speech.enabled=true",
                 "prep.musan_mix.speech.relative_db=6",
+                "prep.musan_mix.stationary_noise.enabled=true",
+                "prep.musan_mix.stationary_noise.kind=white_gaussian",
+                "prep.musan_mix.stationary_noise.snr_db=18",
+                "prep.musan_mix.burst_noise.enabled=true",
+                "prep.musan_mix.burst_noise.snr_db=8",
+                "prep.musan_mix.burst_noise.snr_scope=whole_clip",
+                "prep.musan_mix.burst_noise.event_count_min=2",
+                "prep.musan_mix.burst_noise.event_count_max=4",
+                "prep.musan_mix.burst_noise.duration_ms_min=80",
+                "prep.musan_mix.burst_noise.duration_ms_max=240",
+                "prep.musan_mix.burst_noise.fade_ms=12",
+                "prep.musan_mix.burst_noise.allow_overlap=true",
+                "prep.musan_mix.burst_noise.min_gap_ms=25",
+                "prep.musan_mix.volume_variation.enabled=true",
+                "prep.musan_mix.volume_variation.low_gain_db=-9",
+                "prep.musan_mix.volume_variation.high_gain_db=3",
+                "prep.musan_mix.volume_variation.segment_ms_min=200",
+                "prep.musan_mix.volume_variation.segment_ms_max=600",
+                "prep.musan_mix.volume_variation.transition_ms=40",
             ]
         )
     )
@@ -101,6 +120,31 @@ def test_musan_mix_config_accepts_regular_hydra_overrides():
         "noise": {"enabled": True, "snr_db": 10.0},
         "music": {"enabled": True, "snr_db": 12.0},
         "speech": {"enabled": True, "relative_db": 6.0},
+        "stationary_noise": {
+            "enabled": True,
+            "kind": "white_gaussian",
+            "snr_db": 18.0,
+        },
+        "burst_noise": {
+            "enabled": True,
+            "snr_db": 8.0,
+            "snr_scope": "whole_clip",
+            "event_count_min": 2,
+            "event_count_max": 4,
+            "duration_ms_min": 80.0,
+            "duration_ms_max": 240.0,
+            "fade_ms": 12.0,
+            "allow_overlap": True,
+            "min_gap_ms": 25.0,
+        },
+        "volume_variation": {
+            "enabled": True,
+            "low_gain_db": -9.0,
+            "high_gain_db": 3.0,
+            "segment_ms_min": 200.0,
+            "segment_ms_max": 600.0,
+            "transition_ms": 40.0,
+        },
     }
 
 
@@ -110,6 +154,180 @@ def test_musan_mix_music_defaults_to_disabled_at_20_db():
     assert config["prep"]["musan_mix"]["music"] == {
         "enabled": False,
         "snr_db": 20.0,
+    }
+
+
+def test_musan_mix_synthetic_and_volume_defaults_are_disabled():
+    config = config_to_dict(compose_config())
+
+    assert config["prep"]["musan_mix"]["stationary_noise"] == {
+        "enabled": False,
+        "kind": "white_gaussian",
+        "snr_db": 20.0,
+    }
+    assert config["prep"]["musan_mix"]["burst_noise"] == {
+        "enabled": False,
+        "snr_db": 10.0,
+        "snr_scope": "active_event",
+        "event_count_min": 1,
+        "event_count_max": 1,
+        "duration_ms_min": 100.0,
+        "duration_ms_max": 400.0,
+        "fade_ms": 10.0,
+        "allow_overlap": False,
+        "min_gap_ms": 50.0,
+    }
+    assert config["prep"]["musan_mix"]["volume_variation"] == {
+        "enabled": False,
+        "low_gain_db": -12.0,
+        "high_gain_db": 6.0,
+        "segment_ms_min": 250.0,
+        "segment_ms_max": 750.0,
+        "transition_ms": 50.0,
+    }
+
+
+def test_audio_aug_config_accepts_regular_hydra_overrides():
+    config = config_to_dict(
+        compose_config(
+            overrides=[
+                "prep.audio_aug.seed=7",
+                "prep.audio_aug.speed_length_policy=center_crop_or_zero_pad",
+                "prep.audio_aug.pcm_policy=float_unclipped",
+                "prep.audio_aug.allow_signal_mimic_overlap=true",
+                "prep.audio_aug.transforms.volume_gain.enabled=true",
+                "prep.audio_aug.transforms.volume_gain.gain_db=-3",
+                "prep.audio_aug.transforms.speed_change.enabled=true",
+                "prep.audio_aug.transforms.speed_change.speed_factor=0.95",
+                "prep.audio_aug.transforms.noise_mix.enabled=true",
+                "prep.audio_aug.transforms.noise_mix.snr_db=10",
+                "prep.audio_aug.transforms.noise_mix.snr_mode=upstream_std",
+                "prep.audio_aug.transforms.subband_eq.enabled=true",
+                "prep.audio_aug.transforms.subband_eq.low_min_gain_db=-4",
+                "prep.audio_aug.transforms.subband_eq.high_min_gain_db=-6",
+                "prep.audio_aug.transforms.band_limit.enabled=true",
+                "prep.audio_aug.transforms.band_limit.mode=resample",
+                "prep.audio_aug.transforms.band_limit.cutoff_hz=3000",
+                "prep.audio_aug.transforms.band_limit.filter_order=6",
+                "prep.audio_aug.transforms.band_limit.target_sample_rate=8000",
+                "prep.audio_aug.transforms.narrowband.enabled=true",
+                "prep.audio_aug.transforms.narrowband.target_sample_rate=10000",
+                "prep.audio_aug.transforms.spectral_mask.enabled=true",
+                "prep.audio_aug.transforms.spectral_mask.frequency_masks=2",
+                "prep.audio_aug.transforms.spectral_mask.time_masks=1",
+                "prep.audio_aug.transforms.spectral_mask.min_gain=0.2",
+                "prep.audio_aug.transforms.spectral_mask.max_gain=0.8",
+                "prep.audio_aug.transforms.amp_distortion.enabled=true",
+                "prep.audio_aug.transforms.amp_distortion.distortion_type=poly_distortion",
+                "prep.audio_aug.transforms.amp_distortion.rate=0.5",
+                "prep.audio_aug.transforms.amp_distortion.gain_db=6",
+                "prep.audio_aug.transforms.amp_distortion.max_db=-0.1",
+                "prep.audio_aug.transforms.amp_distortion.mask_number=5",
+                "prep.audio_aug.transforms.amp_distortion.a=0.5",
+                "prep.audio_aug.transforms.amp_distortion.m=2",
+                "prep.audio_aug.transforms.amp_distortion.n=3",
+                "prep.audio_aug.transforms.signal_mimic.enabled=true",
+                "prep.audio_aug.transforms.signal_mimic.subband_probability=0.1",
+                "prep.audio_aug.transforms.signal_mimic.mute_probability=0.2",
+                "prep.audio_aug.transforms.signal_mimic.band_limit_probability=0.3",
+                "prep.audio_aug.transforms.signal_mimic.spectral_mask_probability=0.4",
+                "prep.audio_aug.transforms.signal_mimic.narrowband_probability=0.5",
+            ]
+        )
+    )
+
+    assert config["prep"]["audio_aug"] == {
+        "seed": 7,
+        "speed_length_policy": "center_crop_or_zero_pad",
+        "pcm_policy": "float_unclipped",
+        "allow_signal_mimic_overlap": True,
+        "transforms": {
+            "volume_gain": {"enabled": True, "gain_db": -3.0},
+            "speed_change": {"enabled": True, "speed_factor": 0.95},
+            "noise_mix": {
+                "enabled": True,
+                "snr_db": 10.0,
+                "snr_mode": "upstream_std",
+            },
+            "subband_eq": {
+                "enabled": True,
+                "low_min_gain_db": -4.0,
+                "high_min_gain_db": -6.0,
+            },
+            "band_limit": {
+                "enabled": True,
+                "mode": "resample",
+                "cutoff_hz": 3000.0,
+                "filter_order": 6,
+                "target_sample_rate": 8000,
+            },
+            "narrowband": {
+                "enabled": True,
+                "target_sample_rate": 10000,
+            },
+            "spectral_mask": {
+                "enabled": True,
+                "frequency_masks": 2,
+                "time_masks": 1,
+                "min_gain": 0.2,
+                "max_gain": 0.8,
+            },
+            "amp_distortion": {
+                "enabled": True,
+                "distortion_type": "poly_distortion",
+                "rate": 0.5,
+                "gain_db": 6.0,
+                "max_db": -0.1,
+                "mask_number": 5,
+                "a": 0.5,
+                "m": 2,
+                "n": 3,
+            },
+            "signal_mimic": {
+                "enabled": True,
+                "subband_probability": 0.1,
+                "mute_probability": 0.2,
+                "band_limit_probability": 0.3,
+                "spectral_mask_probability": 0.4,
+                "narrowband_probability": 0.5,
+            },
+        },
+    }
+
+
+def test_audio_aug_defaults_match_fixed_upstream_recipe():
+    config = config_to_dict(compose_config())
+    audio_aug = config["prep"]["audio_aug"]
+
+    assert audio_aug["seed"] == 2025
+    assert audio_aug["speed_length_policy"] == "variable"
+    assert audio_aug["pcm_policy"] == "clip_round_each_stage"
+    assert audio_aug["allow_signal_mimic_overlap"] is False
+    assert set(audio_aug["transforms"]) == {
+        "volume_gain",
+        "speed_change",
+        "noise_mix",
+        "subband_eq",
+        "band_limit",
+        "narrowband",
+        "spectral_mask",
+        "amp_distortion",
+        "signal_mimic",
+    }
+    assert all(
+        transform["enabled"] is False
+        for transform in audio_aug["transforms"].values()
+    )
+    assert audio_aug["transforms"]["noise_mix"]["snr_db"] == 30.0
+    assert audio_aug["transforms"]["noise_mix"]["snr_mode"] == "exact_rms"
+    assert audio_aug["transforms"]["speed_change"]["speed_factor"] == 1.05
+    assert audio_aug["transforms"]["signal_mimic"] == {
+        "enabled": False,
+        "subband_probability": 0.6,
+        "mute_probability": 0.0,
+        "band_limit_probability": 0.0,
+        "spectral_mask_probability": 0.0,
+        "narrowband_probability": 0.0,
     }
 
 

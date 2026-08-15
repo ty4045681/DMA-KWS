@@ -7,10 +7,11 @@ the Stage II QbyT verifier, bypassing Stage I locator models entirely.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from dma_kws.audio import load_audio
 from dma_kws.g2p import make_g2p, text_to_phonemes
+from dma_kws.inference.waveform_augmentation import WaveformTransform
 from dma_kws.stage1.candidates import KeywordCandidate
 from dma_kws.tokenizer import (
     load_char_tokenizer,
@@ -91,7 +92,8 @@ class ClipFeatureDataset:
         min_fbank_frames: int,
         left_padding_ms: int = 0,
         right_padding_ms: int = 0,
-        waveform_transform: Callable[[int, Any, int], Any] | None = None,
+        waveform_transform: WaveformTransform | None = None,
+        include_augmented_duration: bool = False,
     ) -> None:
         left_padding_ms = int(left_padding_ms)
         right_padding_ms = int(right_padding_ms)
@@ -105,6 +107,7 @@ class ClipFeatureDataset:
         self._left_padding_ms = left_padding_ms
         self._right_padding_ms = right_padding_ms
         self._waveform_transform = waveform_transform
+        self._include_augmented_duration = bool(include_augmented_duration)
 
     def __len__(self) -> int:
         return len(self._audio_paths)
@@ -121,16 +124,19 @@ class ClipFeatureDataset:
         end_sec = waveform.size(1) / sample_rate
         waveform, sample_rate = self._extractor.prepare_waveform(waveform, sample_rate)
         if self._waveform_transform is not None:
-            original_shape = tuple(waveform.shape)
             waveform = self._waveform_transform(index, waveform, sample_rate)
-            if waveform is None or tuple(waveform.shape) != original_shape:
-                transformed_shape = (
-                    None if waveform is None else tuple(waveform.shape)
-                )
+            transformed_shape = None if waveform is None else tuple(waveform.shape)
+            if (
+                waveform is None
+                or len(transformed_shape) != 2
+                or transformed_shape[0] != 1
+                or transformed_shape[1] <= 0
+            ):
                 raise ValueError(
-                    "waveform_transform must preserve waveform shape: "
-                    f"before={original_shape}, after={transformed_shape}"
+                    "waveform_transform must return a non-empty mono 2-D waveform "
+                    f"with shape (1, samples), got {transformed_shape}"
                 )
+        augmented_duration_sec = waveform.size(1) / sample_rate
         left_samples = round(sample_rate * self._left_padding_ms / 1000)
         right_samples = round(sample_rate * self._right_padding_ms / 1000)
         if left_samples or right_samples:
@@ -147,14 +153,20 @@ class ClipFeatureDataset:
             frame_shift_ms=float(self._fbank_kwargs["frame_shift"]),
             snip_edges=bool(self._fbank_kwargs["snip_edges"]),
         ):
-            return index, None, end_sec
+            result = (index, None, end_sec)
+            if self._include_augmented_duration:
+                return (*result, augmented_duration_sec)
+            return result
         feat = waveform_to_fbank(
             waveform,
             sample_rate=sample_rate,
             extractor=self._extractor,
             **self._fbank_kwargs,
         )
-        return index, feat, end_sec
+        result = (index, feat, end_sec)
+        if self._include_augmented_duration:
+            return (*result, augmented_duration_sec)
+        return result
 
 
 def collate_clip_feature_batch(batch):
@@ -275,7 +287,7 @@ class Stage2ClipRunner:
         num_workers: int = 0,
         left_padding_ms: int = 0,
         right_padding_ms: int = 0,
-        waveform_transform: Callable[[int, Any, int], Any] | None = None,
+        waveform_transform: WaveformTransform | None = None,
         include_score_details: bool = False,
         include_eps_positions: bool = False,
         include_seq_positions: bool = False,
@@ -289,10 +301,13 @@ class Stage2ClipRunner:
         G2P; otherwise a non-empty ``text_variant`` is converted automatically.
         Results are returned in the same order as ``rows`` and use the ``run``
         schema.
-        ``waveform_transform``, when supplied, receives ``(row_index, waveform,
-        sample_rate)`` after fbank sample-rate preparation and must preserve the
-        waveform shape. It runs before optional zero-valued padding. Source audio
-        files are not modified. The padding counts
+        ``waveform_transform``, when supplied, is a pickle-friendly callable that
+        receives ``(row_index, waveform, sample_rate)`` after fbank sample-rate
+        preparation and must preserve a mono two-dimensional waveform; its
+        sample count may change. A phased
+        ``WaveformAugmentationPipeline`` satisfies the same callable contract. It
+        runs before optional zero-valued padding. Source audio files are not
+        modified. The padding counts
         toward the minimum encoder-input length and can make a short clip
         scoreable. ``include_eps_positions`` requires score details and exposes
         one EPS readout logit per enrollment phoneme when that readout is active.
@@ -383,6 +398,12 @@ class Stage2ClipRunner:
                 else (list(auto_phonemes(text_variant)) if text_variant else None)
             )
 
+        transform_enabled = waveform_transform is not None and bool(
+            getattr(waveform_transform, "enabled", True)
+        )
+        reports_augmented_duration = transform_enabled and bool(
+            getattr(waveform_transform, "changes_duration", True)
+        )
         dataset = ClipFeatureDataset(
             audio_paths=[row["audio_path"] for row in rows],
             sample_rate=self._sample_rate,
@@ -392,6 +413,7 @@ class Stage2ClipRunner:
             left_padding_ms=left_padding_ms,
             right_padding_ms=right_padding_ms,
             waveform_transform=waveform_transform,
+            include_augmented_duration=True,
         )
         loader = DataLoader(
             dataset,
@@ -405,8 +427,8 @@ class Stage2ClipRunner:
         for batch in loader:
             feats = []
             keyword_ids_batch = []
-            pending: list[tuple[int, float]] = []
-            for index, feat, end_sec in batch:
+            pending: list[tuple[int, float, float]] = []
+            for index, feat, end_sec, augmented_duration_sec in batch:
                 keyword = rows[index]["keyword"]
                 phonemes, keyword_ids = keyword_cache[row_keyword_keys[index]]
                 text_variant_phonemes = row_text_variant_phonemes[index]
@@ -439,11 +461,16 @@ class Stage2ClipRunner:
                             if include_score_details
                             else None
                         ),
+                        augmented_duration_sec=(
+                            augmented_duration_sec
+                            if reports_augmented_duration
+                            else None
+                        ),
                     )
                     continue
                 feats.append(feat)
                 keyword_ids_batch.append(keyword_ids)
-                pending.append((index, end_sec))
+                pending.append((index, end_sec, augmented_duration_sec))
             if not feats:
                 continue
             if include_score_details:
@@ -462,7 +489,11 @@ class Stage2ClipRunner:
                     {"qbyt_score": score}
                     for score in self._verifier.score_clip_feats(feats, keyword_ids_batch)
                 ]
-            for (index, end_sec), score_details in zip(pending, detailed_scores):
+            for (
+                index,
+                end_sec,
+                augmented_duration_sec,
+            ), score_details in zip(pending, detailed_scores):
                 keyword = rows[index]["keyword"]
                 phonemes, _ = keyword_cache[row_keyword_keys[index]]
                 results[index] = self._clip_result(
@@ -475,6 +506,11 @@ class Stage2ClipRunner:
                     skipped=False,
                     text_variant_phonemes=row_text_variant_phonemes[index],
                     score_details=score_details if include_score_details else None,
+                    augmented_duration_sec=(
+                        augmented_duration_sec
+                        if reports_augmented_duration
+                        else None
+                    ),
                 )
         return results
 
@@ -491,6 +527,7 @@ class Stage2ClipRunner:
         start_sec: float = 0.0,
         text_variant_phonemes: Sequence[str] | None = None,
         score_details: Mapping[str, Any] | None = None,
+        augmented_duration_sec: float | None = None,
     ) -> dict:
         result = {
             "audio": audio_path,
@@ -504,6 +541,8 @@ class Stage2ClipRunner:
         }
         if text_variant_phonemes is not None:
             result["text_variant_phonemes"] = list(text_variant_phonemes)
+        if augmented_duration_sec is not None:
+            result["augmented_duration_sec"] = float(augmented_duration_sec)
         if score_details is not None:
             result.update(
                 {

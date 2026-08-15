@@ -48,6 +48,8 @@ musan_root: ""
 # Optional in-memory interference for eval_stage2_clips.py. Noise/music SNR is
 # the clean/interference RMS ratio. Speech relative_db is speech RMS relative
 # to clean: negative is quieter, zero is equal, and positive is louder.
+# Stationary noise is synthetic and volume variation is source-free; bursts use
+# files from MUSAN/noise and therefore require prep.musan_root when enabled.
 musan_mix:
   seed: 2025
   noise:
@@ -59,6 +61,82 @@ musan_mix:
   speech:
     enabled: false
     relative_db: 0.0
+  stationary_noise:
+    enabled: false
+    kind: white_gaussian
+    snr_db: 20.0
+  burst_noise:
+    enabled: false
+    snr_db: 10.0
+    snr_scope: active_event
+    event_count_min: 1
+    event_count_max: 1
+    duration_ms_min: 100.0
+    duration_ms_max: 400.0
+    fade_ms: 10.0
+    allow_overlap: false
+    min_gap_ms: 50.0
+  volume_variation:
+    enabled: false
+    low_gain_db: -12.0
+    high_gain_db: 6.0
+    segment_ms_min: 250.0
+    segment_ms_max: 750.0
+    transition_ms: 50.0
+# Deterministic in-memory waveform augmentations compatible with the methods in
+# audio_aug commit 58410f27. Enabling any transform activates the pipeline.
+audio_aug:
+  seed: 2025
+  speed_length_policy: variable
+  pcm_policy: clip_round_each_stage
+  allow_signal_mimic_overlap: false
+  transforms:
+    volume_gain:
+      enabled: false
+      gain_db: 3.0
+    speed_change:
+      enabled: false
+      speed_factor: 1.05
+    noise_mix:
+      enabled: false
+      snr_db: 30.0
+      snr_mode: exact_rms
+    subband_eq:
+      enabled: false
+      low_min_gain_db: -3.0
+      high_min_gain_db: -5.0
+    band_limit:
+      enabled: false
+      mode: iir
+      cutoff_hz: 6500.0
+      filter_order: 4
+      target_sample_rate: 8000
+    narrowband:
+      enabled: false
+      target_sample_rate: 12000
+    spectral_mask:
+      enabled: false
+      frequency_masks: 1
+      time_masks: 0
+      min_gain: 0.6
+      max_gain: 0.9
+    amp_distortion:
+      enabled: false
+      distortion_type: gain_db
+      rate: 0.25
+      gain_db: 3.0
+      max_db: -0.03
+      mask_number: 4
+      a: 1.0
+      m: 1
+      n: 1
+    signal_mimic:
+      enabled: false
+      subband_probability: 0.6
+      mute_probability: 0.0
+      band_limit_probability: 0.0
+      spectral_mask_probability: 0.0
+      narrowband_probability: 0.0
 window_sec: 3.0
 hop_sec: 1.0
 audio: ""

@@ -6,6 +6,7 @@ hydra-core>=1.3
 pytest>=8.0
 g2p_en>=2.1.0
 numpy
+scipy>=1.15
 pandas
 pyarrow
 soundfile

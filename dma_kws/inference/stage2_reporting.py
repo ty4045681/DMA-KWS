@@ -341,10 +341,35 @@ def build_result_record(
         record["text_variant_phonemes"] = text_variant_phonemes
     if "label" in manifest_row:
         record["label"] = int(manifest_row["label"])
+    if "clip_span_sec" in runner_result:
+        span = runner_result["clip_span_sec"]
+        if not isinstance(span, Mapping):
+            raise TypeError("clip_span_sec must be a mapping")
+        start_sec = _finite_float(
+            span.get("start_sec"),
+            field="clip_span_sec.start_sec",
+        )
+        end_sec = _finite_float(span.get("end_sec"), field="clip_span_sec.end_sec")
+        if start_sec < 0.0:
+            raise ValueError("clip_span_sec.start_sec must be >= 0")
+        if end_sec < start_sec:
+            raise ValueError("clip_span_sec.end_sec must be >= start_sec")
+        record["clip_span_sec"] = {
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+        }
     for name in ("qbyt_logit", "completion_logit", "completion_score"):
         if name in runner_result:
             value = runner_result[name]
             record[name] = None if value is None else _finite_float(value, field=name)
+    if "augmented_duration_sec" in runner_result:
+        augmented_duration_sec = _finite_float(
+            runner_result["augmented_duration_sec"],
+            field="augmented_duration_sec",
+        )
+        if augmented_duration_sec <= 0.0:
+            raise ValueError("augmented_duration_sec must be > 0")
+        record["augmented_duration_sec"] = augmented_duration_sec
 
     position_logits_raw = runner_result.get("eps_position_logits")
     if position_logits_raw is None:

@@ -176,6 +176,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
                     "detected": True,
                     "threshold": 0.5,
                     "skipped": False,
+                    "augmented_duration_sec": 1.25,
                 }
             ]
 
@@ -238,6 +239,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert captured["kwargs"]["include_eps_positions"] is True
     assert captured["kwargs"]["include_seq_positions"] is True
     assert summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    assert summary["audio_aug"]["enabled"] is False
     assert summary["musan_mix"]["enabled"] is False
     assert summary["provenance"]["checkpoint"]["path"] == str(
         checkpoint_path.resolve()
@@ -261,6 +263,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert "positive and negative" in summary["plots"]["reason"]
     saved_summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
     assert saved_summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    assert saved_summary["audio_aug"]["enabled"] is False
     assert saved_summary["musan_mix"]["enabled"] is False
     assert saved_summary["plots"] == summary["plots"]
     saved_result = json.loads(
@@ -274,6 +277,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     )
     assert saved_result["qbyt_readout_mode"] == "eps_mean"
     assert saved_result["qbyt_readout_temperature"] == 1.0
+    assert saved_result["augmented_duration_sec"] == pytest.approx(1.25)
     assert saved_result["seq_position_logits"] == pytest.approx([0.0])
     assert saved_result["seq_position_scores"] == pytest.approx([0.5])
     assert saved_result["expected_prefix_length"] == pytest.approx(0.5)
@@ -287,8 +291,10 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     )
 
 
-def test_stage2_clip_eval_records_enabled_musan_mix(tmp_path, monkeypatch):
-    torch = pytest.importorskip("torch")
+def test_stage2_clip_eval_records_enabled_waveform_augmentations(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("torch")
     captured = {}
     rows = [{"audio_path": "clip.wav", "keyword": "hello"}]
 
@@ -307,7 +313,40 @@ def test_stage2_clip_eval_records_enabled_musan_mix(tmp_path, monkeypatch):
 
         @staticmethod
         def summary():
-            return {"enabled": True, "seed": 7}
+            return {
+                "enabled": True,
+                "seed": 7,
+                "stationary_noise": {
+                    "enabled": True,
+                    "kind": "white_gaussian",
+                    "snr_db": 18.0,
+                },
+                "burst_noise": {
+                    "enabled": True,
+                    "snr_db": 8.0,
+                    "snr_scope": "active_event",
+                    "event_count_min": 1,
+                    "event_count_max": 1,
+                    "duration_ms_min": 100.0,
+                    "duration_ms_max": 200.0,
+                    "fade_ms": 10.0,
+                    "allow_overlap": False,
+                    "min_gap_ms": 50.0,
+                    "num_files": 3,
+                },
+                "volume_variation": {
+                    "enabled": True,
+                    "low_gain_db": -9.0,
+                    "high_gain_db": 3.0,
+                    "segment_ms_min": 200.0,
+                    "segment_ms_max": 600.0,
+                    "transition_ms": 40.0,
+                },
+                "processing_order": (
+                    "volume_variation_then_scale_all_additive_components_against_"
+                    "the_same_varied_clean_then_sum_without_clipping"
+                ),
+            }
 
         @staticmethod
         def recipe_metadata(index):
@@ -315,6 +354,80 @@ def test_stage2_clip_eval_records_enabled_musan_mix(tmp_path, monkeypatch):
                 "row_index": index,
                 "noise": {"source": "noise/sample.wav", "snr_db": 10.0},
                 "music": {"source": "music/sample.wav", "snr_db": 12.0},
+                "stationary_noise": {
+                    "kind": "white_gaussian",
+                    "snr_db": 18.0,
+                    "recipe_seed": 101,
+                },
+                "burst_noise": {
+                    "snr_db": 8.0,
+                    "snr_scope": "active_event",
+                    "recipe_seed": 102,
+                    "event_count": 1,
+                    "events": [
+                        {
+                            "event_index": 0,
+                            "source": "noise/burst.wav",
+                            "duration_ms": 120.0,
+                            "start_fraction": 0.25,
+                            "source_offset_fraction": 0.5,
+                            "recipe_seed": 104,
+                        }
+                    ],
+                },
+                "volume_variation": {
+                    "low_gain_db": -9.0,
+                    "high_gain_db": 3.0,
+                    "segment_ms_min": 200.0,
+                    "segment_ms_max": 600.0,
+                    "transition_ms": 40.0,
+                    "recipe_seed": 103,
+                },
+            }
+
+    class FakeAudioAug:
+        enabled = True
+
+        @classmethod
+        def from_prep(cls, prep, *, audio_paths):
+            captured["audio_aug_prep"] = prep
+            captured["audio_aug_audio_paths"] = audio_paths
+            return cls()
+
+        @staticmethod
+        def summary():
+            return {"enabled": True, "seed": 11}
+
+        @staticmethod
+        def recipe_metadata(index):
+            return {
+                "row_index": index,
+                "applied_order": ["volume_gain"],
+                "transforms": {"volume_gain": {"gain_db": 3.0}},
+            }
+
+    class FakePipeline:
+        def __init__(self, audio_aug, musan_mixer):
+            captured["pipeline_audio_aug"] = audio_aug
+            captured["pipeline_musan_mixer"] = musan_mixer
+            self.audio_aug = audio_aug
+            self.musan_mixer = musan_mixer
+            self.enabled = audio_aug.enabled or musan_mixer.enabled
+
+        def __call__(self, index, waveform, sample_rate):
+            del index, sample_rate
+            return waveform
+
+        def summary(self):
+            return {
+                "audio_aug": self.audio_aug.summary(),
+                "musan_mix": self.musan_mixer.summary(),
+            }
+
+        def recipe_metadata(self, index):
+            return {
+                "audio_aug": self.audio_aug.recipe_metadata(index),
+                "musan_mix": self.musan_mixer.recipe_metadata(index),
             }
 
     class FakeStreamPolicy:
@@ -356,7 +469,13 @@ def test_stage2_clip_eval_records_enabled_musan_mix(tmp_path, monkeypatch):
         },
     )
     monkeypatch.setattr(eval_stage2_clips, "load_manifest", lambda _path: rows)
+    monkeypatch.setattr(
+        eval_stage2_clips, "AudioAugWaveformTransform", FakeAudioAug
+    )
     monkeypatch.setattr(eval_stage2_clips, "MusanWaveformMixer", FakeMixer)
+    monkeypatch.setattr(
+        eval_stage2_clips, "WaveformAugmentationPipeline", FakePipeline
+    )
     monkeypatch.setattr(eval_stage2_clips, "Stage2ClipRunner", FakeRunnerFactory)
     monkeypatch.setattr(
         eval_stage2_clips, "resolve_accelerator", lambda _device: ("cpu", 1)
@@ -387,6 +506,37 @@ def test_stage2_clip_eval_records_enabled_musan_mix(tmp_path, monkeypatch):
                     "noise": {"enabled": True, "snr_db": 10.0},
                     "music": {"enabled": True, "snr_db": 12.0},
                     "speech": {"enabled": False, "relative_db": 0.0},
+                    "stationary_noise": {
+                        "enabled": True,
+                        "kind": "white_gaussian",
+                        "snr_db": 18.0,
+                    },
+                    "burst_noise": {
+                        "enabled": True,
+                        "snr_db": 8.0,
+                        "snr_scope": "active_event",
+                        "event_count_min": 1,
+                        "event_count_max": 1,
+                        "duration_ms_min": 100.0,
+                        "duration_ms_max": 200.0,
+                        "fade_ms": 10.0,
+                        "allow_overlap": False,
+                        "min_gap_ms": 50.0,
+                    },
+                    "volume_variation": {
+                        "enabled": True,
+                        "low_gain_db": -9.0,
+                        "high_gain_db": 3.0,
+                        "segment_ms_min": 200.0,
+                        "segment_ms_max": 600.0,
+                        "transition_ms": 40.0,
+                    },
+                },
+                "audio_aug": {
+                    "seed": 11,
+                    "transforms": {
+                        "volume_gain": {"enabled": True, "gain_db": 3.0}
+                    },
                 },
             },
             "run": {"device": "cpu"},
@@ -395,10 +545,25 @@ def test_stage2_clip_eval_records_enabled_musan_mix(tmp_path, monkeypatch):
 
     summary = eval_stage2_clips.run_eval(cfg)
 
+    assert captured["audio_aug_audio_paths"] == ["clip.wav"]
     assert captured["mixer_audio_paths"] == ["clip.wav"]
+    assert captured["mixer_prep"]["musan_mix"]["stationary_noise"] == {
+        "enabled": True,
+        "kind": "white_gaussian",
+        "snr_db": 18.0,
+    }
+    assert captured["mixer_prep"]["musan_mix"]["volume_variation"] == {
+        "enabled": True,
+        "low_gain_db": -9.0,
+        "high_gain_db": 3.0,
+        "segment_ms_min": 200.0,
+        "segment_ms_max": 600.0,
+        "transition_ms": 40.0,
+    }
     assert captured["rows"] == rows
-    assert isinstance(captured["run_kwargs"]["waveform_transform"], FakeMixer)
-    assert summary["musan_mix"] == {"enabled": True, "seed": 7}
+    assert isinstance(captured["run_kwargs"]["waveform_transform"], FakePipeline)
+    assert summary["audio_aug"] == {"enabled": True, "seed": 11}
+    assert summary["musan_mix"] == FakeMixer.summary()
     saved_result = json.loads(
         (tmp_path / "results.jsonl").read_text(encoding="utf-8").strip()
     )
@@ -406,7 +571,232 @@ def test_stage2_clip_eval_records_enabled_musan_mix(tmp_path, monkeypatch):
         "row_index": 0,
         "noise": {"source": "noise/sample.wav", "snr_db": 10.0},
         "music": {"source": "music/sample.wav", "snr_db": 12.0},
+        "stationary_noise": {
+            "kind": "white_gaussian",
+            "snr_db": 18.0,
+            "recipe_seed": 101,
+        },
+        "burst_noise": {
+            "snr_db": 8.0,
+            "snr_scope": "active_event",
+            "recipe_seed": 102,
+            "event_count": 1,
+            "events": [
+                {
+                    "event_index": 0,
+                    "source": "noise/burst.wav",
+                    "duration_ms": 120.0,
+                    "start_fraction": 0.25,
+                    "source_offset_fraction": 0.5,
+                    "recipe_seed": 104,
+                }
+            ],
+        },
+        "volume_variation": {
+            "low_gain_db": -9.0,
+            "high_gain_db": 3.0,
+            "segment_ms_min": 200.0,
+            "segment_ms_max": 600.0,
+            "transition_ms": 40.0,
+            "recipe_seed": 103,
+        },
     }
+    assert saved_result["audio_aug"] == {
+        "row_index": 0,
+        "applied_order": ["volume_gain"],
+        "transforms": {"volume_gain": {"gain_db": 3.0}},
+    }
+
+
+def test_legacy_musan_mix_schema_remains_valid_without_new_sections(tmp_path):
+    noise_dir = tmp_path / "noise"
+    noise_dir.mkdir()
+    (noise_dir / "legacy.wav").write_bytes(b"legacy source placeholder")
+    mixer = eval_stage2_clips.MusanWaveformMixer.from_prep(
+        {
+            "musan_root": str(tmp_path),
+            "musan_mix": {
+                "seed": 7,
+                "noise": {"enabled": True, "snr_db": 10.0},
+                "music": {"enabled": False, "snr_db": 12.0},
+                "speech": {"enabled": False, "relative_db": 3.0},
+            }
+        },
+        audio_paths=["clip.wav"],
+    )
+
+    summary = mixer.summary()
+    assert mixer.enabled is True
+    assert summary["musan_root"] == str(tmp_path.resolve())
+    assert summary["noise"]["num_files"] == 1
+    assert summary["stationary_noise"]["enabled"] is False
+    assert summary["burst_noise"]["enabled"] is False
+    assert summary["volume_variation"]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("section", "settings"),
+    [
+        (
+            "stationary_noise",
+            {
+                "enabled": True,
+                "kind": "white_gaussian",
+                "snr_db": 18.0,
+            },
+        ),
+        (
+            "volume_variation",
+            {
+                "enabled": True,
+                "low_gain_db": -9.0,
+                "high_gain_db": 3.0,
+                "segment_ms_min": 200.0,
+                "segment_ms_max": 600.0,
+                "transition_ms": 40.0,
+            },
+        ),
+    ],
+)
+def test_synthetic_or_volume_only_musan_pipeline_does_not_require_root(
+    section,
+    settings,
+):
+    torch = pytest.importorskip("torch")
+    mixer = eval_stage2_clips.MusanWaveformMixer.from_prep(
+        {"musan_mix": {"seed": 19, section: settings}},
+        audio_paths=["clip.wav"],
+    )
+    pipeline = eval_stage2_clips.WaveformAugmentationPipeline(
+        musan_mixer=mixer,
+    )
+    waveform = torch.linspace(-0.4, 0.4, 16000).unsqueeze(0)
+
+    output = pipeline(0, waveform, 16000)
+    summary = pipeline.summary()["musan_mix"]
+    metadata = pipeline.recipe_metadata(0)["musan_mix"]
+
+    assert pipeline.enabled is True
+    assert summary["musan_root"] is None
+    assert summary[section]["enabled"] is True
+    assert section in metadata
+    assert output.shape == waveform.shape
+    assert torch.isfinite(output).all()
+    assert not torch.equal(output, waveform)
+
+
+def test_stage2_clip_eval_reports_invalid_audio_aug_config(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+
+    class InvalidAudioAug:
+        @classmethod
+        def from_prep(cls, _prep, *, audio_paths):
+            assert audio_paths == ["clip.wav"]
+            raise ValueError(
+                "signal_mimic overlaps enabled atomic transforms; "
+                "set allow_signal_mimic_overlap=true to allow it"
+            )
+
+    monkeypatch.setattr(
+        eval_stage2_clips,
+        "resolved_config",
+        lambda _cfg: {
+            "paths": {},
+            "stage1": {},
+            "stage2": {},
+            "demo": {},
+            "tokenizer": {},
+        },
+    )
+    monkeypatch.setattr(
+        eval_stage2_clips,
+        "load_manifest",
+        lambda _path: [{"audio_path": "clip.wav", "keyword": "hello"}],
+    )
+    monkeypatch.setattr(
+        eval_stage2_clips, "AudioAugWaveformTransform", InvalidAudioAug
+    )
+    cfg = OmegaConf.create(
+        {
+            "prep": {
+                "manifest": "manifest.csv",
+                "stage2_ckpt": "stage2.pt",
+                "output_dir": str(tmp_path),
+                "audio_aug": {
+                    "allow_signal_mimic_overlap": False,
+                    "transforms": {
+                        "subband_eq": {"enabled": True},
+                        "signal_mimic": {"enabled": True},
+                    },
+                },
+            },
+            "run": {"device": "cpu"},
+        }
+    )
+
+    with pytest.raises(
+        SystemExit,
+        match="Invalid prep.audio_aug configuration: signal_mimic overlaps",
+    ):
+        eval_stage2_clips.run_eval(cfg)
+
+
+def test_stage2_clip_eval_reports_invalid_musan_mix_context(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+
+    class InvalidMusanMixer:
+        @classmethod
+        def from_prep(cls, prep, *, audio_paths):
+            assert audio_paths == ["clip.wav"]
+            assert prep["musan_mix"]["stationary_noise"]["enabled"] is True
+            raise ValueError(
+                "prep.musan_mix.stationary_noise.kind must be white_gaussian"
+            )
+
+    monkeypatch.setattr(
+        eval_stage2_clips,
+        "resolved_config",
+        lambda _cfg: {
+            "paths": {},
+            "stage1": {},
+            "stage2": {},
+            "demo": {},
+            "tokenizer": {},
+        },
+    )
+    monkeypatch.setattr(
+        eval_stage2_clips,
+        "load_manifest",
+        lambda _path: [{"audio_path": "clip.wav", "keyword": "hello"}],
+    )
+    monkeypatch.setattr(
+        eval_stage2_clips,
+        "MusanWaveformMixer",
+        InvalidMusanMixer,
+    )
+    cfg = OmegaConf.create(
+        {
+            "prep": {
+                "manifest": "manifest.csv",
+                "stage2_ckpt": "stage2.pt",
+                "output_dir": str(tmp_path),
+                "musan_mix": {
+                    "stationary_noise": {
+                        "enabled": True,
+                        "kind": "pink_gaussian",
+                        "snr_db": 20.0,
+                    }
+                },
+            },
+            "run": {"device": "cpu"},
+        }
+    )
+
+    with pytest.raises(
+        SystemExit,
+        match="Invalid prep.musan_mix configuration:",
+    ):
+        eval_stage2_clips.run_eval(cfg)
 
 
 def test_score_provenance_classifies_missing_checkpoint_config_as_legacy(tmp_path):

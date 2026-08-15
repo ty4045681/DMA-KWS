@@ -15,8 +15,11 @@ default. Override with ``+prep.left_padding_ms=...`` and
 Padding is part of the scored model input and counts toward its minimum length.
 When valid positive and negative labels are present, the output directory also
 receives ``roc_curve.png`` and ``det_curve.png`` for the utterance QbyT score.
-Optional ``prep.musan_mix`` settings add deterministic MUSAN noise, music and/or
-overlapping speech in memory before the existing zero-valued padding.
+Optional ``prep.audio_aug`` and ``prep.musan_mix`` settings apply deterministic
+waveform augmentation in memory before the existing zero-valued padding. MUSAN
+mixing also supports stationary synthetic noise, MUSAN noise bursts and
+time-varying volume without modifying source files. Stationary noise and volume
+variation need no ``prep.musan_root``; burst noise uses its ``noise/**`` pool.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from dma_kws.config import require_sections
 from dma_kws.hydra_app import CONFIG_DIR, resolved_config
+from dma_kws.inference.audio_aug import AudioAugWaveformTransform
 from dma_kws.inference.detection_plots import (
     DEFAULT_PLOT_DPI,
     binary_roc_points as _binary_roc_points,
@@ -44,8 +48,9 @@ from dma_kws.inference.stage2_reporting import (
     build_result_record as _result_record,
     build_score_provenance as _score_provenance,
 )
-from dma_kws.training.score_diagnostics import binary_score_diagnostics
+from dma_kws.inference.waveform_augmentation import WaveformAugmentationPipeline
 from dma_kws.training.device import resolve_accelerator
+from dma_kws.training.score_diagnostics import binary_score_diagnostics
 
 
 DEFAULT_PADDING_MS = 160
@@ -137,13 +142,25 @@ def run_eval(cfg: DictConfig) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rows = load_manifest(manifest_path)
+    audio_paths = [str(row["audio_path"]) for row in rows]
+    try:
+        audio_aug = AudioAugWaveformTransform.from_prep(
+            prep,
+            audio_paths=audio_paths,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise SystemExit(f"Invalid prep.audio_aug configuration: {exc}") from exc
     try:
         musan_mixer = MusanWaveformMixer.from_prep(
             prep,
-            audio_paths=[str(row["audio_path"]) for row in rows],
+            audio_paths=audio_paths,
         )
     except (OSError, TypeError, ValueError) as exc:
         raise SystemExit(f"Invalid prep.musan_mix configuration: {exc}") from exc
+    waveform_augmentation = WaveformAugmentationPipeline(
+        audio_aug=audio_aug,
+        musan_mixer=musan_mixer,
+    )
     accelerator, _ = resolve_accelerator(str(run_cfg.device))
     device = torch.device(accelerator if accelerator == "cpu" else "cuda")
     runner = Stage2ClipRunner.from_config(config, prep, device)
@@ -171,7 +188,9 @@ def run_eval(cfg: DictConfig) -> dict:
         num_workers=num_workers,
         left_padding_ms=left_padding_ms,
         right_padding_ms=right_padding_ms,
-        waveform_transform=musan_mixer if musan_mixer.enabled else None,
+        waveform_transform=(
+            waveform_augmentation if waveform_augmentation.enabled else None
+        ),
         include_score_details=True,
         include_eps_positions=True,
         include_seq_positions=True,
@@ -184,8 +203,8 @@ def run_eval(cfg: DictConfig) -> dict:
             sequence_objective=sequence_objective,
             qbyt_readout=provenance["qbyt_readout"],
         )
-        if musan_mixer.enabled:
-            record["musan_mix"] = musan_mixer.recipe_metadata(index)
+        if waveform_augmentation.enabled:
+            record.update(waveform_augmentation.recipe_metadata(index))
         results.append(record)
 
     results_path = output_dir / "results.jsonl"
@@ -203,11 +222,11 @@ def run_eval(cfg: DictConfig) -> dict:
             "left": left_padding_ms,
             "right": right_padding_ms,
         },
-        "musan_mix": musan_mixer.summary(),
         "stream": stream_description,
         "num_skipped": sum(bool(record.get("skipped", False)) for record in results),
         "provenance": provenance,
     }
+    summary.update(waveform_augmentation.summary())
     scored_results = [record for record in results if not record.get("skipped", False)]
     deployment_threshold = float(runner._demo_cfg.get("qbyt_threshold", 0.5))
     validation_cfg = (config.get("stage2", {}) or {}).get("validation", {}) or {}
