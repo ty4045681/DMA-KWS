@@ -82,5 +82,8 @@ adapt:
     # training log directory as target_eval/{summary.json,predictions.jsonl,*.png}.
     plot_curves: true
     plot_dpi: 160
+    # Optional ROC/DET guide: rates use [0, 1]; configure at most one bound.
+    plot_min_recall: null
+    plot_max_fpr: null
     storage: ""
     study_name: ""

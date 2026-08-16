@@ -523,6 +523,8 @@ class AdaptSweepConfig:
     single_phase: bool = False
     plot_curves: bool = True
     plot_dpi: int = 160
+    plot_min_recall: float | None = None
+    plot_max_fpr: float | None = None
     storage: str = ""
     study_name: str = ""
 

@@ -234,6 +234,8 @@ def _eval_target_auc(
         threshold=deployment_threshold,
         plot_curves=bool(sweep_cfg.get("plot_curves", True)),
         plot_dpi=int(sweep_cfg.get("plot_dpi", 160)),
+        plot_min_recall=sweep_cfg.get("plot_min_recall"),
+        plot_max_fpr=sweep_cfg.get("plot_max_fpr"),
     )
     print(
         json.dumps(

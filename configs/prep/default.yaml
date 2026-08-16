@@ -4,6 +4,9 @@ stage2_clip_output_dir: outputs/eval_stage2_clips
 # Generate ROC/DET PNGs when the manifest contains both positive and negative labels.
 plot_curves: true
 plot_dpi: 160
+# Optional ROC/DET guide: rates use [0, 1]; configure at most one bound.
+plot_min_recall: null
+plot_max_fpr: null
 per_output_dir: outputs/eval_phoneme_adapter_per
 # PER reads the text actually spoken in each clip from this manifest column.
 # For legacy KWS-only manifests, keyword is allowed only with per_label_filter=1.

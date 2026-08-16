@@ -266,6 +266,8 @@ def run_eval(cfg: DictConfig) -> dict:
                 threshold=deployment_threshold,
                 metrics=labeled_summary,
                 dpi=int(prep.get("plot_dpi", DEFAULT_PLOT_DPI)),
+                min_recall=prep.get("plot_min_recall"),
+                max_fpr=prep.get("plot_max_fpr"),
             )
 
     summary_path = output_dir / "summary.json"

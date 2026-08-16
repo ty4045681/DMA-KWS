@@ -38,6 +38,8 @@ def write_target_eval_report(
     threshold: float,
     plot_curves: bool = True,
     plot_dpi: int = DEFAULT_PLOT_DPI,
+    plot_min_recall: float | None = None,
+    plot_max_fpr: float | None = None,
 ) -> dict[str, Any]:
     """Write predictions, metrics, and optional ROC/DET plots for a sweep trial."""
 
@@ -65,6 +67,8 @@ def write_target_eval_report(
             threshold=threshold,
             metrics=metrics,
             dpi=plot_dpi,
+            min_recall=plot_min_recall,
+            max_fpr=plot_max_fpr,
         )
     else:
         plots = {

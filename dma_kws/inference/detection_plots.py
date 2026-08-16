@@ -10,6 +10,7 @@ import numpy as np
 
 
 DEFAULT_PLOT_DPI = 160
+_CONSTRAINT_COLOR = "red"
 
 
 def binary_roc_points(
@@ -87,6 +88,184 @@ def _threshold_point(
     return fpr, tpr
 
 
+def _constraint_rate(name: str, value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number in [0, 1]")
+    try:
+        rate = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number in [0, 1]") from exc
+    if not np.isfinite(rate) or not 0.0 <= rate <= 1.0:
+        raise ValueError(f"{name} must be a finite number in [0, 1]")
+    return rate
+
+
+def _best_threshold_index(
+    candidates: np.ndarray,
+    thresholds: np.ndarray,
+) -> int:
+    return int(candidates[int(np.argmax(thresholds[candidates]))])
+
+
+def select_roc_constraint_point(
+    curve: dict[str, Any],
+    *,
+    min_recall: float | None = None,
+    max_fpr: float | None = None,
+) -> dict[str, Any] | None:
+    """Select one real ROC operating point under an optional plot constraint.
+
+    Empirical ROC points are discrete.  The returned ``actual_*`` values are a
+    conservative threshold that can really be deployed.  ``guide_*`` keeps the
+    requested axis value and projects it onto the empirical staircase so the
+    plot can show an unavailable bound explicitly without inventing a threshold.
+    """
+
+    requested_recall = _constraint_rate("plot_min_recall", min_recall)
+    requested_fpr = _constraint_rate("plot_max_fpr", max_fpr)
+    if requested_recall is not None and requested_fpr is not None:
+        raise ValueError(
+            "plot_min_recall and plot_max_fpr are mutually exclusive; configure only one"
+        )
+    if requested_recall is None and requested_fpr is None:
+        return None
+
+    fpr = np.asarray(curve["fpr"], dtype=np.float64)
+    recall = np.asarray(curve["tpr"], dtype=np.float64)
+    thresholds = np.asarray(curve["thresholds"], dtype=np.float64)
+    if not (fpr.shape == recall.shape == thresholds.shape) or fpr.ndim != 1:
+        raise ValueError("ROC curve fpr, tpr, and thresholds must be aligned 1-D arrays")
+
+    if requested_recall is not None:
+        candidates = np.flatnonzero(recall >= requested_recall)
+        best_fpr = np.min(fpr[candidates])
+        candidates = candidates[fpr[candidates] == best_fpr]
+        best_recall = np.max(recall[candidates])
+        candidates = candidates[recall[candidates] == best_recall]
+        index = _best_threshold_index(candidates, thresholds)
+        kind = "min_recall"
+        metric = "recall"
+        requested = requested_recall
+    else:
+        assert requested_fpr is not None
+        candidates = np.flatnonzero(fpr <= requested_fpr)
+        best_recall = np.max(recall[candidates])
+        candidates = candidates[recall[candidates] == best_recall]
+        best_fpr = np.min(fpr[candidates])
+        candidates = candidates[fpr[candidates] == best_fpr]
+        index = _best_threshold_index(candidates, thresholds)
+        kind = "max_fpr"
+        metric = "fpr"
+        requested = requested_fpr
+
+    threshold = float(thresholds[index])
+    guide_recall = (
+        float(requested) if kind == "min_recall" else float(recall[index])
+    )
+    guide_fpr = float(fpr[index]) if kind == "min_recall" else float(requested)
+    exact = bool(
+        np.any(
+            np.isclose(fpr, guide_fpr, rtol=0.0, atol=1.0e-12)
+            & np.isclose(recall, guide_recall, rtol=0.0, atol=1.0e-12)
+        )
+    )
+    return {
+        "kind": kind,
+        "metric": metric,
+        "requested": float(requested),
+        "exact": exact,
+        "actual_recall": float(recall[index]),
+        "actual_fpr": float(fpr[index]),
+        "guide_recall": guide_recall,
+        "guide_fpr": guide_fpr,
+        "threshold": threshold if np.isfinite(threshold) else None,
+    }
+
+
+def _constraint_legend_label(constraint: dict[str, Any]) -> str:
+    if constraint["kind"] == "min_recall":
+        label = f"Min Recall={constraint['requested']:.4g}"
+    else:
+        label = f"Max FPR={constraint['requested']:.4g}"
+    if not constraint["exact"]:
+        label += " (interpolated)"
+    return label
+
+
+def _draw_constraint_guides(
+    axis: Any,
+    *,
+    x: float,
+    y: float,
+    x_origin: float,
+    y_origin: float,
+    x_label: str,
+    y_label: str,
+    legend_label: str,
+) -> None:
+    line_style = (0, (5, 3))
+    axis.plot(
+        [x_origin, x],
+        [y, y],
+        color=_CONSTRAINT_COLOR,
+        linestyle=line_style,
+        linewidth=1.4,
+        zorder=3,
+    )
+    axis.plot(
+        [x, x],
+        [y_origin, y],
+        color=_CONSTRAINT_COLOR,
+        linestyle=line_style,
+        linewidth=1.4,
+        zorder=3,
+    )
+    axis.scatter(
+        [x],
+        [y],
+        color=_CONSTRAINT_COLOR,
+        marker="o",
+        s=38,
+        zorder=5,
+        clip_on=False,
+        label=legend_label,
+    )
+    text_box = {
+        "facecolor": "white",
+        "edgecolor": "none",
+        "alpha": 0.85,
+        "pad": 0.8,
+    }
+    axis.annotate(
+        x_label,
+        xy=(x, 0.0),
+        xycoords=("data", "axes fraction"),
+        xytext=(0, -18),
+        textcoords="offset points",
+        color=_CONSTRAINT_COLOR,
+        fontsize=8,
+        ha="center",
+        va="top",
+        annotation_clip=False,
+        bbox=text_box,
+    )
+    axis.annotate(
+        y_label,
+        xy=(0.0, y),
+        xycoords=("axes fraction", "data"),
+        xytext=(5, 0),
+        textcoords="offset points",
+        color=_CONSTRAINT_COLOR,
+        fontsize=8,
+        ha="left",
+        va="center",
+        annotation_clip=False,
+        bbox=text_box,
+    )
+
+
 def _probit(values: np.ndarray, *, clip: float = 1.0e-4) -> np.ndarray:
     """Map probabilities to normal-deviate coordinates for a DET plot."""
 
@@ -102,6 +281,8 @@ def write_detection_plots(
     threshold: float,
     metrics: dict[str, float],
     dpi: int = DEFAULT_PLOT_DPI,
+    min_recall: float | None = None,
+    max_fpr: float | None = None,
 ) -> dict[str, Any]:
     """Write ROC and normal-deviate DET plots for the utterance score."""
 
@@ -115,6 +296,11 @@ def write_detection_plots(
         }
     if dpi <= 0:
         raise ValueError("plot_dpi must be positive")
+    constraint = select_roc_constraint_point(
+        curve,
+        min_recall=min_recall,
+        max_fpr=max_fpr,
+    )
 
     try:
         import matplotlib
@@ -173,13 +359,27 @@ def write_detection_plots(
             zorder=3,
             label=f"EER={float(metrics['eer']):.4f}",
         )
+        if constraint is not None:
+            constraint_fpr = float(constraint["guide_fpr"])
+            constraint_recall = float(constraint["guide_recall"])
+            _draw_constraint_guides(
+                axis,
+                x=constraint_fpr,
+                y=constraint_recall,
+                x_origin=0.0,
+                y_origin=0.0,
+                x_label=f"FPR={constraint_fpr:.4f}",
+                y_label=f"Recall={constraint_recall:.4f}",
+                legend_label=_constraint_legend_label(constraint),
+            )
         axis.set(
             xlim=(0.0, 1.0),
             ylim=(0.0, 1.0),
             xlabel="False Positive Rate",
-            ylabel="True Positive Rate",
+            ylabel="Recall (True Positive Rate)",
             title="Stage II ROC Curve",
         )
+        axis.xaxis.labelpad = 16
         axis.grid(True, alpha=0.25)
         axis.legend(loc="lower right")
         figure.tight_layout()
@@ -203,6 +403,7 @@ def write_detection_plots(
             0.95,
             0.99,
             0.999,
+            0.9999,
         ],
         dtype=np.float64,
     )
@@ -220,11 +421,18 @@ def write_detection_plots(
         "95",
         "99",
         "99.9",
+        "99.99",
     ]
     det_ticks = _probit(det_tick_probabilities)
     figure, axis = plt.subplots(figsize=(6.4, 5.2))
     try:
-        axis.plot(_probit(fpr), _probit(fnr), linewidth=2.0, label="QbyT")
+        axis.step(
+            _probit(fpr),
+            _probit(fnr),
+            where="post",
+            linewidth=2.0,
+            label="QbyT",
+        )
         axis.scatter(
             _probit(np.asarray([deploy_fpr])),
             _probit(np.asarray([1.0 - deploy_tpr])),
@@ -242,6 +450,29 @@ def write_detection_plots(
             zorder=3,
             label=f"EER={float(metrics['eer']):.4f}",
         )
+        if constraint is not None:
+            constraint_fpr = float(constraint["guide_fpr"])
+            constraint_recall = float(constraint["guide_recall"])
+            constraint_fnr = 1.0 - constraint_recall
+            constraint_det_x = float(
+                _probit(np.asarray([constraint_fpr], dtype=np.float64))[0]
+            )
+            constraint_det_y = float(
+                _probit(np.asarray([constraint_fnr], dtype=np.float64))[0]
+            )
+            _draw_constraint_guides(
+                axis,
+                x=constraint_det_x,
+                y=constraint_det_y,
+                x_origin=float(det_ticks[0]),
+                y_origin=float(det_ticks[0]),
+                x_label=f"FPR={constraint_fpr:.2%}",
+                y_label=(
+                    f"FNR={constraint_fnr:.2%}\n"
+                    f"Recall={constraint_recall:.2%}"
+                ),
+                legend_label=_constraint_legend_label(constraint),
+            )
         axis.set_xticks(det_ticks, det_tick_labels)
         axis.set_yticks(det_ticks, det_tick_labels)
         axis.set(
@@ -251,6 +482,7 @@ def write_detection_plots(
             ylabel="False Negative Rate (%)",
             title="Stage II DET Curve",
         )
+        axis.xaxis.labelpad = 16
         axis.grid(True, alpha=0.25)
         axis.legend(loc="upper right")
         figure.tight_layout()
@@ -258,7 +490,7 @@ def write_detection_plots(
     finally:
         plt.close(figure)
 
-    return {
+    result = {
         "status": "generated",
         "score_field": score_field,
         "num_samples": curve["num_samples"],
@@ -267,3 +499,6 @@ def write_detection_plots(
         "roc": str(roc_path.resolve()),
         "det": str(det_path.resolve()),
     }
+    if constraint is not None:
+        result["constraint"] = constraint
+    return result

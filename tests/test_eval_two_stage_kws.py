@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 from omegaconf import OmegaConf
 
+import dma_kws.inference.detection_plots as detection_plots
+from dma_kws.inference.detection_plots import select_roc_constraint_point
 from dma_kws.inference.manifest import load_manifest
 from dma_kws.inference.metrics import binary_eer, summarize_labeled_results
 import scripts.eval_stage2_clips as eval_stage2_clips
@@ -64,6 +66,152 @@ def test_binary_roc_points_keep_tied_scores_at_one_operating_point():
     assert curve["tpr"] == pytest.approx([0.0, 0.5, 1.0, 1.0])
 
 
+@pytest.mark.parametrize(
+    ("constraint", "expected"),
+    [
+        (
+            {"min_recall": 0.75},
+            {
+                "kind": "min_recall",
+                "metric": "recall",
+                "requested": 0.75,
+                "exact": False,
+                "actual_recall": 0.8,
+                "actual_fpr": 0.1,
+                "guide_recall": 0.75,
+                "guide_fpr": 0.1,
+                "threshold": 0.8,
+            },
+        ),
+        (
+            {"min_recall": 0.8},
+            {
+                "kind": "min_recall",
+                "metric": "recall",
+                "requested": 0.8,
+                "exact": True,
+                "actual_recall": 0.8,
+                "actual_fpr": 0.1,
+                "guide_recall": 0.8,
+                "guide_fpr": 0.1,
+                "threshold": 0.8,
+            },
+        ),
+        (
+            {"max_fpr": 0.25},
+            {
+                "kind": "max_fpr",
+                "metric": "fpr",
+                "requested": 0.25,
+                "exact": False,
+                "actual_recall": 0.8,
+                "actual_fpr": 0.1,
+                "guide_recall": 0.8,
+                "guide_fpr": 0.25,
+                "threshold": 0.8,
+            },
+        ),
+        (
+            {"max_fpr": 0.1},
+            {
+                "kind": "max_fpr",
+                "metric": "fpr",
+                "requested": 0.1,
+                "exact": True,
+                "actual_recall": 0.8,
+                "actual_fpr": 0.1,
+                "guide_recall": 0.8,
+                "guide_fpr": 0.1,
+                "threshold": 0.8,
+            },
+        ),
+    ],
+)
+def test_select_roc_constraint_point_uses_scan_selector_tie_breaks(
+    constraint, expected
+):
+    curve = {
+        "fpr": np.asarray([0.0, 0.05, 0.1, 0.1, 0.2, 0.3]),
+        "tpr": np.asarray([0.0, 0.5, 0.8, 0.8, 0.8, 0.9]),
+        "thresholds": np.asarray([np.inf, 0.9, 0.8, 0.7, 0.6, 0.5]),
+    }
+
+    point = select_roc_constraint_point(curve, **constraint)
+
+    assert point == expected
+
+
+def test_select_roc_constraint_point_returns_none_without_constraint():
+    curve = {
+        "fpr": np.asarray([0.0, 1.0]),
+        "tpr": np.asarray([0.0, 1.0]),
+        "thresholds": np.asarray([np.inf, 0.5]),
+    }
+
+    assert select_roc_constraint_point(curve) is None
+
+
+@pytest.mark.parametrize(
+    ("constraint", "expected_actual", "expected_guide"),
+    [
+        ({"min_recall": 0.0}, (0.5, 0.0), (0.0, 0.0)),
+        ({"max_fpr": 1.0}, (1.0, 0.5), (1.0, 1.0)),
+    ],
+)
+def test_select_roc_constraint_point_marks_empirical_endpoints_exact(
+    constraint,
+    expected_actual,
+    expected_guide,
+):
+    curve = {
+        "fpr": np.asarray([0.0, 0.0, 0.5, 1.0]),
+        "tpr": np.asarray([0.0, 0.5, 1.0, 1.0]),
+        "thresholds": np.asarray([np.inf, 0.9, 0.8, 0.1]),
+    }
+
+    point = select_roc_constraint_point(curve, **constraint)
+
+    assert point is not None
+    assert point["exact"] is True
+    assert (point["actual_recall"], point["actual_fpr"]) == expected_actual
+    assert (point["guide_recall"], point["guide_fpr"]) == expected_guide
+
+
+def test_select_roc_constraint_point_rejects_multiple_constraints():
+    curve = {
+        "fpr": np.asarray([0.0, 1.0]),
+        "tpr": np.asarray([0.0, 1.0]),
+        "thresholds": np.asarray([np.inf, 0.5]),
+    }
+
+    with pytest.raises(ValueError):
+        select_roc_constraint_point(curve, min_recall=0.5, max_fpr=0.5)
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        {"min_recall": -0.01},
+        {"min_recall": 1.01},
+        {"min_recall": np.nan},
+        {"min_recall": np.inf},
+        {"max_fpr": -0.01},
+        {"max_fpr": 1.01},
+        {"max_fpr": np.nan},
+        {"max_fpr": np.inf},
+    ],
+)
+def test_select_roc_constraint_point_rejects_invalid_rates(constraint):
+    curve = {
+        "fpr": np.asarray([0.0, 1.0]),
+        "tpr": np.asarray([0.0, 1.0]),
+        "thresholds": np.asarray([np.inf, 0.5]),
+    }
+
+    with pytest.raises(ValueError):
+        select_roc_constraint_point(curve, **constraint)
+
+
 def test_detection_plots_skip_single_class_without_creating_files(tmp_path):
     plot_summary = _write_detection_plots(
         [
@@ -118,6 +266,71 @@ def test_detection_plots_write_roc_and_det_pngs(tmp_path):
     }
     assert roc_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert det_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_detection_plots_write_constraint_marker_and_summary(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    guide_calls = []
+    real_draw_constraint_guides = detection_plots._draw_constraint_guides
+
+    def capture_constraint_guides(axis, **kwargs):
+        guide_calls.append(kwargs)
+        return real_draw_constraint_guides(axis, **kwargs)
+
+    monkeypatch.setattr(
+        detection_plots,
+        "_draw_constraint_guides",
+        capture_constraint_guides,
+    )
+    records = [
+        {"label": 1, "qbyt_score": 0.95},
+        {"label": 0, "qbyt_score": 0.75},
+        {"label": 1, "qbyt_score": 0.65},
+        {"label": 0, "qbyt_score": 0.10},
+    ]
+    metrics = summarize_labeled_results(
+        [
+            {"label": record["label"], "best_qbyt_score": record["qbyt_score"]}
+            for record in records
+        ],
+        threshold=0.5,
+    )
+
+    plot_summary = _write_detection_plots(
+        records,
+        output_dir=tmp_path,
+        threshold=0.5,
+        metrics=metrics,
+        dpi=72,
+        min_recall=0.75,
+    )
+
+    assert plot_summary["constraint"] == {
+        "kind": "min_recall",
+        "metric": "recall",
+        "requested": 0.75,
+        "exact": False,
+        "actual_recall": 1.0,
+        "actual_fpr": 0.5,
+        "guide_recall": 0.75,
+        "guide_fpr": 0.5,
+        "threshold": 0.65,
+    }
+    assert len(guide_calls) == 2
+    assert guide_calls[0]["x"] == pytest.approx(0.5)
+    assert guide_calls[0]["y"] == pytest.approx(0.75)
+    assert guide_calls[0]["x_label"] == "FPR=0.5000"
+    assert guide_calls[0]["y_label"] == "Recall=0.7500"
+    assert guide_calls[1]["x"] == pytest.approx(0.0)
+    assert guide_calls[1]["y"] < 0.0
+    assert guide_calls[1]["x_label"] == "FPR=50.00%"
+    assert guide_calls[1]["y_label"] == "FNR=25.00%\nRecall=75.00%"
+    assert (tmp_path / "roc_curve.png").read_bytes().startswith(
+        b"\x89PNG\r\n\x1a\n"
+    )
+    assert (tmp_path / "det_curve.png").read_bytes().startswith(
+        b"\x89PNG\r\n\x1a\n"
+    )
 
 
 def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypatch):
@@ -216,6 +429,17 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
         eval_stage2_clips, "resolve_accelerator", lambda _device: ("cpu", 1)
     )
     monkeypatch.setattr(eval_stage2_clips, "Stage2ClipRunner", FakeRunnerFactory)
+    real_write_detection_plots = eval_stage2_clips._write_detection_plots
+
+    def capture_plot_options(*args, **kwargs):
+        captured["plot_options"] = kwargs
+        return real_write_detection_plots(*args, **kwargs)
+
+    monkeypatch.setattr(
+        eval_stage2_clips,
+        "_write_detection_plots",
+        capture_plot_options,
+    )
 
     cfg = OmegaConf.create(
         {
@@ -224,6 +448,8 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
                 "stage2_ckpt": str(checkpoint_path),
                 "output_dir": str(tmp_path),
                 "num_workers": 1,
+                "plot_min_recall": 0.8,
+                "plot_max_fpr": None,
             },
             "run": {"device": "cpu"},
         }
@@ -238,6 +464,8 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert captured["kwargs"]["include_score_details"] is True
     assert captured["kwargs"]["include_eps_positions"] is True
     assert captured["kwargs"]["include_seq_positions"] is True
+    assert captured["plot_options"]["min_recall"] == pytest.approx(0.8)
+    assert captured["plot_options"]["max_fpr"] is None
     assert summary["audio_padding_ms"] == {"left": 160, "right": 160}
     assert summary["audio_aug"]["enabled"] is False
     assert summary["musan_mix"]["enabled"] is False

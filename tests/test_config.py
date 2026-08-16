@@ -335,8 +335,20 @@ def test_adapt_sweep_plot_defaults_match_structured_config():
     config = config_to_dict(compose_config())
     structured = AdaptSweepConfig()
 
+    assert config["prep"]["plot_min_recall"] is None
+    assert config["prep"]["plot_max_fpr"] is None
     assert config["adapt"]["sweep"]["plot_curves"] is structured.plot_curves
     assert config["adapt"]["sweep"]["plot_dpi"] == structured.plot_dpi
+    assert structured.plot_min_recall is None
+    assert structured.plot_max_fpr is None
+    assert (
+        config["adapt"]["sweep"]["plot_min_recall"]
+        is structured.plot_min_recall
+    )
+    assert (
+        config["adapt"]["sweep"]["plot_max_fpr"]
+        is structured.plot_max_fpr
+    )
 
 
 def test_adapter_v2_stage2_config_freezes_the_domain_adapted_trunk(monkeypatch):
