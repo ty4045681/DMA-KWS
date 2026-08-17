@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - clean
+  - _self_
+
+prep:
+  musan_mix:
+    speech:
+      enabled: true
+      relative_db: 6.0

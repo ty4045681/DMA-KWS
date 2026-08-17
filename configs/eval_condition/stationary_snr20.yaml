@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - clean
+  - _self_
+
+prep:
+  musan_mix:
+    stationary_noise:
+      enabled: true
+      kind: white_gaussian
+      snr_db: 20.0

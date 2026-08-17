@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - clean
+  - _self_
+
+prep:
+  musan_mix:
+    burst_noise:
+      enabled: true
+      snr_db: 10.0
+      snr_scope: active_event
+      event_count_min: 1
+      event_count_max: 1
+      duration_ms_min: 100.0
+      duration_ms_max: 400.0
+      fade_ms: 10.0
+      allow_overlap: false
+      min_gap_ms: 50.0

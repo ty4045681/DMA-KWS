@@ -1,0 +1,38 @@
+# @package _global_
+
+prep:
+  musan_mix:
+    seed: 2025
+    noise:
+      enabled: false
+    music:
+      enabled: false
+    speech:
+      enabled: false
+    stationary_noise:
+      enabled: false
+    burst_noise:
+      enabled: false
+    volume_variation:
+      enabled: false
+  audio_aug:
+    seed: 2025
+    transforms:
+      volume_gain:
+        enabled: false
+      speed_change:
+        enabled: false
+      noise_mix:
+        enabled: false
+      subband_eq:
+        enabled: false
+      band_limit:
+        enabled: false
+      narrowband:
+        enabled: false
+      spectral_mask:
+        enabled: false
+      amp_distortion:
+        enabled: false
+      signal_mimic:
+        enabled: false
