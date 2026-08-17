@@ -20,6 +20,8 @@ waveform augmentation in memory before the existing zero-valued padding. MUSAN
 mixing also supports stationary synthetic noise, MUSAN noise bursts and
 time-varying volume without modifying source files. Stationary noise and volume
 variation need no ``prep.musan_root``; burst noise uses its ``noise/**`` pool.
+Optional ``prep.audio_export`` writes selected post-augmentation, pre-padding
+waveforms as unclipped IEEE float WAV files beside the evaluation report.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from omegaconf import DictConfig, OmegaConf
 from dma_kws.config import require_sections
 from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.inference.audio_aug import AudioAugWaveformTransform
+from dma_kws.inference.audio_export import SelectedWaveformExporter
 from dma_kws.inference.detection_plots import (
     DEFAULT_PLOT_DPI,
     binary_roc_points as _binary_roc_points,
@@ -161,6 +164,15 @@ def run_eval(cfg: DictConfig) -> dict:
         audio_aug=audio_aug,
         musan_mixer=musan_mixer,
     )
+    try:
+        audio_exporter = SelectedWaveformExporter.from_prep(
+            prep,
+            output_dir=output_dir / "exported_audio",
+            audio_paths=audio_paths,
+        )
+        audio_exporter.prepare()
+    except (OSError, TypeError, ValueError) as exc:
+        raise SystemExit(f"Invalid prep.audio_export configuration: {exc}") from exc
     accelerator, _ = resolve_accelerator(str(run_cfg.device))
     device = torch.device(accelerator if accelerator == "cpu" else "cuda")
     runner = Stage2ClipRunner.from_config(config, prep, device)
@@ -191,10 +203,15 @@ def run_eval(cfg: DictConfig) -> dict:
         waveform_transform=(
             waveform_augmentation if waveform_augmentation.enabled else None
         ),
+        waveform_observer=audio_exporter if audio_exporter.enabled else None,
         include_score_details=True,
         include_eps_positions=True,
         include_seq_positions=True,
     )
+    try:
+        audio_export_summary = audio_exporter.finalize()
+    except (OSError, TypeError, ValueError) as exc:
+        raise SystemExit(f"Failed to finalize transformed WAV exports: {exc}") from exc
     results = []
     for index, (row, runner_result) in enumerate(zip(rows, runner_results)):
         record = _result_record(
@@ -205,6 +222,9 @@ def run_eval(cfg: DictConfig) -> dict:
         )
         if waveform_augmentation.enabled:
             record.update(waveform_augmentation.recipe_metadata(index))
+        exported_audio_path = audio_exporter.result_path(index)
+        if exported_audio_path is not None:
+            record["exported_audio_path"] = exported_audio_path
         results.append(record)
 
     results_path = output_dir / "results.jsonl"
@@ -225,6 +245,7 @@ def run_eval(cfg: DictConfig) -> dict:
         "stream": stream_description,
         "num_skipped": sum(bool(record.get("skipped", False)) for record in results),
         "provenance": provenance,
+        "audio_exports": audio_export_summary,
     }
     summary.update(waveform_augmentation.summary())
     scored_results = [record for record in results if not record.get("skipped", False)]

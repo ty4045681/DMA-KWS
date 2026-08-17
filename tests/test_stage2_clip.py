@@ -226,6 +226,120 @@ def test_clip_feature_dataset_transforms_prepared_audio_before_padding(monkeypat
     )
 
 
+def test_clip_feature_dataset_observes_transformed_waveform_before_padding(monkeypatch):
+    torch = pytest.importorskip("torch")
+    source = torch.tensor([[1.0, 2.0]])
+    captured = {"events": []}
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.load_audio",
+        lambda _path, *, sample_rate: (source, sample_rate),
+    )
+    monkeypatch.setattr(
+        "dma_kws.inference.audio_utils.has_min_fbank_frames",
+        lambda *_args, **_kwargs: True,
+    )
+
+    def fake_waveform_to_fbank(waveform, *, sample_rate, **_kwargs):
+        captured["events"].append("fbank")
+        captured["fbank"] = (waveform.clone(), sample_rate)
+        return torch.ones(1, 80)
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.waveform_to_fbank",
+        fake_waveform_to_fbank,
+    )
+
+    class PreparingExtractor:
+        @staticmethod
+        def prepare_waveform(waveform, sample_rate):
+            return waveform + 1.0, sample_rate * 2
+
+    def transform(index, waveform, sample_rate):
+        assert (index, sample_rate) == (0, 2000)
+        return waveform * 10.0
+
+    def observe(index, waveform, sample_rate):
+        captured["events"].append("observer")
+        captured["observed"] = (index, waveform.clone(), sample_rate)
+
+    dataset = ClipFeatureDataset(
+        audio_paths=["clip.wav"],
+        sample_rate=1000,
+        fbank_extractor=PreparingExtractor(),
+        fbank_kwargs={
+            "frame_length": 25,
+            "frame_shift": 10,
+            "snip_edges": True,
+        },
+        min_fbank_frames=1,
+        left_padding_ms=1,
+        right_padding_ms=1,
+        waveform_transform=transform,
+        waveform_observer=observe,
+    )
+
+    dataset[0]
+
+    observed_index, observed_waveform, observed_rate = captured["observed"]
+    assert observed_index == 0
+    assert observed_rate == 2000
+    assert torch.equal(observed_waveform, torch.tensor([[20.0, 30.0]]))
+    fbank_waveform, fbank_rate = captured["fbank"]
+    assert fbank_rate == 2000
+    assert torch.equal(
+        fbank_waveform,
+        torch.tensor([[0.0, 0.0, 20.0, 30.0, 0.0, 0.0]]),
+    )
+    assert captured["events"] == ["observer", "fbank"]
+
+
+def test_clip_feature_dataset_observer_runs_without_transform(monkeypatch):
+    torch = pytest.importorskip("torch")
+    source = torch.tensor([[0.25, -0.5]])
+    observed = []
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.load_audio",
+        lambda _path, *, sample_rate: (source, sample_rate),
+    )
+    monkeypatch.setattr(
+        "dma_kws.inference.audio_utils.has_min_fbank_frames",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.waveform_to_fbank",
+        lambda *_args, **_kwargs: torch.ones(1, 80),
+    )
+
+    class PassthroughExtractor:
+        @staticmethod
+        def prepare_waveform(waveform, sample_rate):
+            return waveform, sample_rate
+
+    dataset = ClipFeatureDataset(
+        audio_paths=["clean.wav"],
+        sample_rate=16000,
+        fbank_extractor=PassthroughExtractor(),
+        fbank_kwargs={
+            "frame_length": 25,
+            "frame_shift": 10,
+            "snip_edges": True,
+        },
+        min_fbank_frames=1,
+        waveform_observer=lambda index, waveform, sample_rate: observed.append(
+            (index, waveform.clone(), sample_rate)
+        ),
+    )
+
+    dataset[0]
+
+    assert len(observed) == 1
+    assert observed[0][0] == 0
+    assert torch.equal(observed[0][1], source)
+    assert observed[0][2] == 16000
+
+
 def test_clip_feature_dataset_allows_variable_length_transform_and_reports_duration(
     monkeypatch,
 ):
@@ -796,7 +910,15 @@ def test_clip_runner_run_batch(monkeypatch):
         },
         {"audio_path": "/tmp/b.wav", "keyword": "hello"},
     ]
-    results = runner.run_batch(rows, batch_size=8, num_workers=0)
+    observed_indices = []
+    results = runner.run_batch(
+        rows,
+        batch_size=8,
+        num_workers=0,
+        waveform_observer=(
+            lambda index, _waveform, _sample_rate: observed_indices.append(index)
+        ),
+    )
 
     assert [record["skipped"] for record in results] == [False, True, False]
     assert results[0]["qbyt_score"] == 0.9
@@ -814,6 +936,7 @@ def test_clip_runner_run_batch(monkeypatch):
     assert results[2]["detected"] is False
     assert g2p_calls == ["hello", "hey eva"]
     assert verifier.batches == [2]
+    assert observed_indices == [0, 1, 2]
     assert set(results[0]) == {
         "audio",
         "keyword",

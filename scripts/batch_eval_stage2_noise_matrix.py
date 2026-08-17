@@ -36,7 +36,7 @@ RUN_LOG_FILENAME = "run.log"
 MATRIX_JSON_FILENAME = "matrix_summary.json"
 MATRIX_CSV_FILENAME = "matrix_summary.csv"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-_FINGERPRINT_SCHEMA_VERSION = 1
+_FINGERPRINT_SCHEMA_VERSION = 2
 _RESERVED_OVERRIDE_KEYS = {
     "+experiment",
     "experiment",
@@ -45,11 +45,18 @@ _RESERVED_OVERRIDE_KEYS = {
     "prep.manifest",
     "prep.stage2_ckpt",
     "prep.output_dir",
+    "prep.audio_export.mode",
+    "prep.audio_export.count",
+    "prep.audio_export.seed",
     "prep.musan_mix.seed",
     "prep.audio_aug.seed",
     "run.device",
 }
-_RESERVED_OVERRIDE_PREFIXES = ("prep.musan_mix.", "prep.audio_aug.")
+_RESERVED_OVERRIDE_PREFIXES = (
+    "prep.audio_export.",
+    "prep.musan_mix.",
+    "prep.audio_aug.",
+)
 
 
 @dataclass(frozen=True)
@@ -57,13 +64,29 @@ class ConditionSpec:
     name: str
     family: str
     snr_db: float | None = None
+    music_snr_db: float | None = None
     speech_relative_db: float | None = None
     requires_noise: bool = False
+    requires_music: bool = False
     requires_speech: bool = False
+
+
+@dataclass(frozen=True)
+class AudioExportSpec:
+    mode: str
+    count: int
+    seed: int
+
+    @property
+    def requested_count(self) -> int | str:
+        if self.mode == "all":
+            return "all"
+        return self.count
 
 
 CONDITIONS: tuple[ConditionSpec, ...] = (
     ConditionSpec("clean", "clean"),
+    ConditionSpec("volume_variation", "volume_variation"),
     ConditionSpec("stationary_snr10", "stationary_noise", snr_db=10.0),
     ConditionSpec("stationary_snr20", "stationary_noise", snr_db=20.0),
     ConditionSpec(
@@ -77,6 +100,22 @@ CONDITIONS: tuple[ConditionSpec, ...] = (
     ),
     ConditionSpec(
         "musan_noise_snr20", "musan_noise", snr_db=20.0, requires_noise=True
+    ),
+    ConditionSpec(
+        "musan_noise_snr10_music_snr10",
+        "musan_noise_music",
+        snr_db=10.0,
+        music_snr_db=10.0,
+        requires_noise=True,
+        requires_music=True,
+    ),
+    ConditionSpec(
+        "musan_noise_snr20_music_snr20",
+        "musan_noise_music",
+        snr_db=20.0,
+        music_snr_db=20.0,
+        requires_noise=True,
+        requires_music=True,
     ),
     ConditionSpec(
         "musan_noise_snr10_speech_equal",
@@ -131,10 +170,52 @@ class JobSpec:
     output_dir: Path
     fingerprint: str
     command: tuple[str, ...]
+    audio_export: AudioExportSpec = AudioExportSpec(
+        mode="disabled",
+        count=0,
+        seed=2025,
+    )
 
 
 class BatchConfigError(ValueError):
     """Raised when a batch request is unsafe or internally inconsistent."""
+
+
+def _parse_audio_export(value: str) -> int | str:
+    normalized = str(value).strip().lower()
+    if normalized in {"all", "none"}:
+        return normalized
+    try:
+        count = int(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--export-audio expects a positive integer, all, or none"
+        ) from exc
+    if count < 0:
+        raise argparse.ArgumentTypeError(
+            "--export-audio expects a positive integer, all, or none"
+        )
+    return "none" if count == 0 else count
+
+
+def resolve_audio_export(
+    value: int | str,
+    *,
+    seed: int,
+    export_seed: int | None,
+) -> AudioExportSpec:
+    resolved_seed = seed if export_seed is None else export_seed
+    if resolved_seed < 0:
+        raise BatchConfigError("--export-audio-seed must be >= 0")
+    if value == "all":
+        return AudioExportSpec(mode="all", count=0, seed=resolved_seed)
+    if value == "none" or value == 0:
+        return AudioExportSpec(mode="disabled", count=0, seed=resolved_seed)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise BatchConfigError(
+            "--export-audio expects a positive integer, all, or none"
+        )
+    return AudioExportSpec(mode="random", count=value, seed=resolved_seed)
 
 
 METRIC_FIELDS = (
@@ -159,6 +240,7 @@ CSV_FIELDS = (
     "condition",
     "family",
     "snr_db",
+    "music_snr_db",
     "speech_relative_db",
     "status",
     "attempt",
@@ -173,6 +255,11 @@ CSV_FIELDS = (
     "error",
     "num_samples",
     "num_skipped",
+    "audio_export_mode",
+    "audio_export_requested_count",
+    "num_audio_exported",
+    "audio_export_dir",
+    "audio_export_manifest",
     *METRIC_FIELDS,
 )
 
@@ -463,15 +550,20 @@ def validate_inputs(
         _validate_experiment(model.experiment)
 
     needs_noise = any(condition.requires_noise for condition in conditions)
+    needs_music = any(condition.requires_music for condition in conditions)
     needs_speech = any(condition.requires_speech for condition in conditions)
-    if needs_noise or needs_speech:
+    if needs_noise or needs_music or needs_speech:
         if musan_root is None:
             raise BatchConfigError(
                 "--musan-root is required by the selected burst/MUSAN conditions"
             )
         if not musan_root.is_dir():
             raise BatchConfigError(f"MUSAN root not found: {musan_root}")
-        for subset, needed in (("noise", needs_noise), ("speech", needs_speech)):
+        for subset, needed in (
+            ("noise", needs_noise),
+            ("music", needs_music),
+            ("speech", needs_speech),
+        ):
             subset_dir = musan_root / subset
             if needed and not subset_dir.is_dir():
                 raise BatchConfigError(f"MUSAN subset not found: {subset_dir}")
@@ -505,7 +597,10 @@ def build_eval_command(
     num_workers: int,
     seed: int,
     common_overrides: Sequence[str],
+    audio_export: AudioExportSpec | None = None,
 ) -> tuple[str, ...]:
+    if audio_export is None:
+        audio_export = AudioExportSpec(mode="random", count=5, seed=seed)
     command = [
         sys.executable,
         str(EVAL_SCRIPT),
@@ -518,6 +613,9 @@ def build_eval_command(
         f"prep.output_dir={_hydra_string(output_dir)}",
         f"prep.musan_mix.seed={seed}",
         f"prep.audio_aug.seed={seed}",
+        f"prep.audio_export.mode={audio_export.mode}",
+        f"prep.audio_export.count={audio_export.count}",
+        f"prep.audio_export.seed={audio_export.seed}",
         f"run.device={_hydra_string(device)}",
     ]
     if musan_root is not None:
@@ -579,6 +677,7 @@ def _musan_catalog_identity(
         subset
         for subset, needed in (
             ("noise", any(condition.requires_noise for condition in conditions)),
+            ("music", any(condition.requires_music for condition in conditions)),
             ("speech", any(condition.requires_speech for condition in conditions)),
         )
         if needed
@@ -604,7 +703,11 @@ def _musan_catalog_identity(
 def _condition_musan_identity(
     catalog: Mapping[str, Any] | None, condition: ConditionSpec
 ) -> dict[str, Any] | None:
-    if catalog is None or not (condition.requires_noise or condition.requires_speech):
+    if catalog is None or not (
+        condition.requires_noise
+        or condition.requires_music
+        or condition.requires_speech
+    ):
         return None
     all_subsets = catalog.get("subsets")
     if not isinstance(all_subsets, Mapping):
@@ -613,6 +716,7 @@ def _condition_musan_identity(
         subset
         for subset, needed in (
             ("noise", condition.requires_noise),
+            ("music", condition.requires_music),
             ("speech", condition.requires_speech),
         )
         if needed
@@ -637,7 +741,10 @@ def build_jobs(
     num_workers: int,
     seed: int,
     common_overrides: Sequence[str],
+    audio_export: AudioExportSpec | None = None,
 ) -> tuple[list[JobSpec], dict[str, Any]]:
+    if audio_export is None:
+        audio_export = AudioExportSpec(mode="random", count=5, seed=seed)
     manifest_identity = _file_identity(manifest)
     audio_identity = _manifest_audio_identity(manifest)
     model_identities = {
@@ -664,6 +771,7 @@ def build_jobs(
                 num_workers=num_workers,
                 seed=seed,
                 common_overrides=common_overrides,
+                audio_export=audio_export,
             )
             resolved_config = _resolved_job_config(model=model, command=command)
             tokenizer_path = resolve_dict_path(resolved_config).resolve()
@@ -695,6 +803,7 @@ def build_jobs(
                 "num_workers": num_workers,
                 "seed": seed,
                 "common_overrides": list(common_overrides),
+                "audio_export": asdict(audio_export),
             }
             fingerprint = _canonical_digest(fingerprint_payload)
             jobs.append(
@@ -704,6 +813,7 @@ def build_jobs(
                     output_dir=output_dir,
                     fingerprint=fingerprint,
                     command=command,
+                    audio_export=audio_export,
                 )
             )
     identities = {
@@ -715,6 +825,7 @@ def build_jobs(
             str(path): identity for path, identity in tokenizer_identities.items()
         },
         "evaluation_code": runtime_identity,
+        "audio_export": asdict(audio_export),
     }
     return jobs, identities
 
@@ -746,6 +857,60 @@ def _result_line_count(path: Path) -> int | None:
         return None
 
 
+def _cached_audio_exports_valid(
+    job: JobSpec,
+    summary: Mapping[str, Any],
+) -> bool:
+    spec = job.audio_export
+    exports = summary.get("audio_exports")
+    if spec.mode == "disabled":
+        return exports is None or (
+            isinstance(exports, Mapping)
+            and exports.get("status") == "disabled"
+        )
+    if not isinstance(exports, Mapping):
+        return False
+    if (
+        exports.get("status") != "generated"
+        or exports.get("mode") != spec.mode
+        or exports.get("seed") != spec.seed
+        or exports.get("requested_count") != spec.requested_count
+    ):
+        return False
+    num_samples = summary.get("num_samples")
+    if not isinstance(num_samples, int) or isinstance(num_samples, bool):
+        return False
+    expected = num_samples if spec.mode == "all" else min(spec.count, num_samples)
+    if exports.get("num_exported") != expected:
+        return False
+    manifest_value = exports.get("manifest")
+    if not isinstance(manifest_value, str) or not manifest_value:
+        return False
+    manifest_path = Path(manifest_value)
+    if not manifest_path.is_absolute():
+        manifest_path = job.output_dir / manifest_path
+    try:
+        lines = [
+            json.loads(line)
+            for line in manifest_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError):
+        return False
+    if len(lines) != expected or not all(isinstance(line, Mapping) for line in lines):
+        return False
+    for line in lines:
+        exported_value = line.get("exported_audio_path")
+        if not isinstance(exported_value, str) or not exported_value:
+            return False
+        exported_path = Path(exported_value)
+        if not exported_path.is_absolute():
+            exported_path = job.output_dir / exported_path
+        if not exported_path.is_file():
+            return False
+    return True
+
+
 def cached_summary(
     job: JobSpec, *, checkpoint_sha256: str
 ) -> dict[str, Any] | None:
@@ -766,6 +931,8 @@ def cached_summary(
     if _summary_checkpoint_sha256(summary) != checkpoint_sha256:
         return None
     if Path(str(summary.get("output_dir", ""))).resolve() != job.output_dir.resolve():
+        return None
+    if not _cached_audio_exports_valid(job, summary):
         return None
     return summary
 
@@ -799,6 +966,7 @@ def _base_row(job: JobSpec, *, checkpoint_sha256: str) -> dict[str, Any]:
         "condition": job.condition.name,
         "family": job.condition.family,
         "snr_db": job.condition.snr_db,
+        "music_snr_db": job.condition.music_snr_db,
         "speech_relative_db": job.condition.speech_relative_db,
         "status": "pending",
         "attempt": 0,
@@ -813,6 +981,11 @@ def _base_row(job: JobSpec, *, checkpoint_sha256: str) -> dict[str, Any]:
         "error": None,
         "num_samples": None,
         "num_skipped": None,
+        "audio_export_mode": job.audio_export.mode,
+        "audio_export_requested_count": job.audio_export.requested_count,
+        "num_audio_exported": None,
+        "audio_export_dir": None,
+        "audio_export_manifest": None,
         **{field: None for field in METRIC_FIELDS},
     }
 
@@ -841,6 +1014,17 @@ def _summary_row(
     if isinstance(metrics, Mapping):
         for field in METRIC_FIELDS:
             row[field] = metrics.get(field)
+    audio_exports = summary.get("audio_exports")
+    if isinstance(audio_exports, Mapping):
+        row["audio_export_mode"] = audio_exports.get(
+            "mode", row["audio_export_mode"]
+        )
+        row["audio_export_requested_count"] = audio_exports.get(
+            "requested_count", row["audio_export_requested_count"]
+        )
+        row["num_audio_exported"] = audio_exports.get("num_exported")
+        row["audio_export_dir"] = audio_exports.get("directory")
+        row["audio_export_manifest"] = audio_exports.get("manifest")
     return row
 
 
@@ -1031,6 +1215,28 @@ def run_job(
             error=error,
         )
 
+    if not _cached_audio_exports_valid(job, summary):
+        error = "evaluator audio export artifacts are missing or inconsistent"
+        status_payload.update(
+            {
+                "status": "failed",
+                "returncode": completed.returncode,
+                "elapsed_seconds": elapsed,
+                "finished_at_unix": time.time(),
+                "error": error,
+            }
+        )
+        _atomic_json(status_path, status_payload)
+        return _failure_row(
+            job,
+            status="failed",
+            attempt=attempt,
+            checkpoint_sha256=checkpoint_sha256,
+            returncode=completed.returncode,
+            elapsed_seconds=elapsed,
+            error=error,
+        )
+
     status_payload.update(
         {
             "status": "succeeded",
@@ -1078,6 +1284,7 @@ def write_matrix_summary(
     seed: int,
     rows: Sequence[Mapping[str, Any]],
     input_identities: Mapping[str, Any] | None = None,
+    audio_export: AudioExportSpec | None = None,
 ) -> dict[str, Any]:
     statuses = ("pending", "planned", "cached", "succeeded", "failed", "interrupted")
     counts = {status: sum(row.get("status") == status for row in rows) for status in statuses}
@@ -1088,6 +1295,7 @@ def write_matrix_summary(
         "musan_root": str(musan_root) if musan_root is not None else None,
         "output_root": str(output_root),
         "seed": seed,
+        "audio_export": asdict(audio_export) if audio_export is not None else None,
         "inputs": dict(input_identities) if input_identities is not None else None,
         "counts": counts,
         "runs": list(rows),
@@ -1099,7 +1307,7 @@ def write_matrix_summary(
 
 def _validate_forwarded_override(value: str, *, option: str) -> str:
     key, separator, _ = value.partition("=")
-    key = key.strip()
+    key = key.strip().lstrip("+~")
     if not separator or not key:
         raise argparse.ArgumentTypeError(f"{option} expects a Hydra KEY=VALUE override")
     if key in _RESERVED_OVERRIDE_KEYS or key.startswith(_RESERVED_OVERRIDE_PREFIXES):
@@ -1114,7 +1322,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Batch-evaluate exported Stage II models across deterministic clean, "
-            "stationary, burst, MUSAN noise, and MUSAN speech conditions."
+            "source-volume variation, stationary, burst, MUSAN noise/music, "
+            "and MUSAN speech conditions."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -1167,7 +1376,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--musan-root",
         type=Path,
-        help="MUSAN root containing noise/ and speech/ subsets.",
+        help="MUSAN root containing noise/, music/, and speech/ subsets.",
     )
     parser.add_argument(
         "--output-root",
@@ -1195,6 +1404,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shared augmentation seed for fair cross-model comparison.",
     )
     parser.add_argument(
+        "--export-audio",
+        type=_parse_audio_export,
+        default=5,
+        metavar="N|all|none",
+        help=(
+            "Export a deterministic random sample of N transformed WAVs per "
+            "model/condition; use all for every row or none to disable."
+        ),
+    )
+    parser.add_argument(
+        "--export-audio-seed",
+        type=int,
+        help="Sampling seed for WAV export; defaults to --seed.",
+    )
+    parser.add_argument(
         "--override",
         action="append",
         default=[],
@@ -1215,24 +1439,32 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def print_conditions() -> None:
-    print("condition\tfamily\tSNR(dB)\tspeech relative(dB)\tMUSAN subsets")
+    print(
+        "condition\tfamily\tnoise/burst SNR(dB)\tmusic SNR(dB)\t"
+        "speech relative(dB)\tMUSAN subsets"
+    )
     for condition in CONDITIONS:
         subsets = ",".join(
             subset
             for subset, needed in (
                 ("noise", condition.requires_noise),
+                ("music", condition.requires_music),
                 ("speech", condition.requires_speech),
             )
             if needed
         )
         snr = "" if condition.snr_db is None else f"{condition.snr_db:g}"
+        music_snr = (
+            "" if condition.music_snr_db is None else f"{condition.music_snr_db:g}"
+        )
         speech = (
             ""
             if condition.speech_relative_db is None
             else f"{condition.speech_relative_db:g}"
         )
         print(
-            f"{condition.name}\t{condition.family}\t{snr}\t{speech}\t{subsets or '-'}"
+            f"{condition.name}\t{condition.family}\t{snr}\t{music_snr}\t"
+            f"{speech}\t{subsets or '-'}"
         )
 
 
@@ -1248,6 +1480,11 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any] | None:
         raise BatchConfigError("--num-workers must be >= 0")
     if args.seed < 0:
         raise BatchConfigError("--seed must be >= 0")
+    audio_export = resolve_audio_export(
+        args.export_audio,
+        seed=args.seed,
+        export_seed=args.export_audio_seed,
+    )
     if not str(args.device).strip():
         raise BatchConfigError("--device must not be empty")
     for override in args.override:
@@ -1280,6 +1517,7 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any] | None:
         num_workers=args.num_workers,
         seed=args.seed,
         common_overrides=args.override,
+        audio_export=audio_export,
     )
 
     if args.dry_run:
@@ -1288,6 +1526,7 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any] | None:
             print(shlex.join(job.command))
         return {
             "counts": {"total": len(jobs), "planned": len(jobs)},
+            "audio_export": asdict(audio_export),
             "runs": [],
         }
 
@@ -1320,6 +1559,7 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any] | None:
         seed=args.seed,
         rows=rows,
         input_identities=identities,
+        audio_export=audio_export,
     )
 
     interrupted = False
@@ -1353,6 +1593,7 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any] | None:
             seed=args.seed,
             rows=rows,
             input_identities=identities,
+            audio_export=audio_export,
         )
         if interrupted or (args.fail_fast and rows[index]["status"] == "failed"):
             break

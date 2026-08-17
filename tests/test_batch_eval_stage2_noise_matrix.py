@@ -50,21 +50,26 @@ def _make_inputs(tmp_path: Path, *, model_count: int = 1):
         checkpoints.append(checkpoint)
     musan_root = tmp_path / "musan"
     (musan_root / "noise").mkdir(parents=True)
+    (musan_root / "music").mkdir()
     (musan_root / "speech").mkdir()
     (musan_root / "noise" / "noise.wav").write_bytes(b"noise")
+    (musan_root / "music" / "music.wav").write_bytes(b"music")
     (musan_root / "speech" / "speech.wav").write_bytes(b"speech")
     return manifest, checkpoints, musan_root
 
 
-def test_condition_catalog_covers_requested_12_runs_per_model():
+def test_condition_catalog_covers_requested_15_runs_per_model():
     assert [condition.name for condition in MODULE.CONDITIONS] == [
         "clean",
+        "volume_variation",
         "stationary_snr10",
         "stationary_snr20",
         "burst_snr10",
         "burst_snr20",
         "musan_noise_snr10",
         "musan_noise_snr20",
+        "musan_noise_snr10_music_snr10",
+        "musan_noise_snr20_music_snr20",
         "musan_noise_snr10_speech_equal",
         "musan_noise_snr20_speech_equal",
         "musan_speech_quieter",
@@ -74,9 +79,19 @@ def test_condition_catalog_covers_requested_12_runs_per_model():
     assert MODULE.CONDITION_BY_NAME["musan_speech_quieter"].speech_relative_db == -6
     assert MODULE.CONDITION_BY_NAME["musan_speech_equal"].speech_relative_db == 0
     assert MODULE.CONDITION_BY_NAME["musan_speech_louder"].speech_relative_db == 6
+    for level in (10, 20):
+        condition = MODULE.CONDITION_BY_NAME[
+            f"musan_noise_snr{level}_music_snr{level}"
+        ]
+        assert condition.snr_db == level
+        assert condition.music_snr_db == level
+        assert condition.requires_noise is True
+        assert condition.requires_music is True
 
 
-def test_four_model_dry_run_expands_to_48_jobs(tmp_path, capsys):
+def test_four_model_dry_run_expands_to_60_jobs_and_exports_five_wavs(
+    tmp_path, capsys
+):
     manifest, checkpoints, musan_root = _make_inputs(tmp_path, model_count=4)
     argv = [
         "--manifest",
@@ -93,11 +108,21 @@ def test_four_model_dry_run_expands_to_48_jobs(tmp_path, capsys):
     args = MODULE.build_parser().parse_args(argv)
     payload = MODULE.run_batch(args)
 
-    assert payload["counts"] == {"total": 48, "planned": 48}
+    assert payload["counts"] == {"total": 60, "planned": 60}
+    assert payload["audio_export"] == {
+        "mode": "random",
+        "count": 5,
+        "seed": 2025,
+    }
     output = capsys.readouterr().out
-    assert output.count("eval_stage2_clips.py") == 48
+    assert output.count("eval_stage2_clips.py") == 60
     assert "+eval_condition=clean" in output
+    assert "+eval_condition=volume_variation" in output
+    assert "+eval_condition=musan_noise_snr10_music_snr10" in output
     assert "+eval_condition=musan_speech_louder" in output
+    assert "prep.audio_export.mode=random" in output
+    assert "prep.audio_export.count=5" in output
+    assert "prep.audio_export.seed=2025" in output
     assert not (tmp_path / "out").exists()
 
 
@@ -146,6 +171,10 @@ def test_augmentation_overrides_cannot_make_condition_metadata_lie():
         parser.parse_args(
             ["--override", "prep.musan_mix.noise.snr_db=3"]
         )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--override", "+prep.audio_export.mode=all"]
+        )
 
     args = parser.parse_args(
         [
@@ -193,8 +222,43 @@ def test_build_eval_command_forwards_condition_seed_and_paths(tmp_path):
     assert f"prep.output_dir={json.dumps(str(output_dir))}" in command
     assert "prep.musan_mix.seed=99" in command
     assert "prep.audio_aug.seed=99" in command
+    assert "prep.audio_export.mode=random" in command
+    assert "prep.audio_export.count=5" in command
+    assert "prep.audio_export.seed=99" in command
     assert "prep.batch_size=16" in command
     assert "prep.num_workers=2" in command
+
+
+def test_audio_export_cli_supports_all_none_and_independent_seed():
+    parser = MODULE.build_parser()
+
+    defaults = parser.parse_args([])
+    assert MODULE.resolve_audio_export(
+        defaults.export_audio,
+        seed=7,
+        export_seed=defaults.export_audio_seed,
+    ) == MODULE.AudioExportSpec(mode="random", count=5, seed=7)
+
+    all_args = parser.parse_args(
+        ["--export-audio", "all", "--export-audio-seed", "19"]
+    )
+    assert MODULE.resolve_audio_export(
+        all_args.export_audio,
+        seed=7,
+        export_seed=all_args.export_audio_seed,
+    ) == MODULE.AudioExportSpec(mode="all", count=0, seed=19)
+
+    none_args = parser.parse_args(["--export-audio", "none"])
+    assert MODULE.resolve_audio_export(
+        none_args.export_audio,
+        seed=7,
+        export_seed=none_args.export_audio_seed,
+    ) == MODULE.AudioExportSpec(mode="disabled", count=0, seed=7)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--export-audio", "-1"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--export-audio", "sometimes"])
 
 
 def test_job_fingerprint_does_not_depend_on_other_selected_conditions(tmp_path):
@@ -239,6 +303,42 @@ def test_job_fingerprint_does_not_depend_on_other_selected_conditions(tmp_path):
     )
     assert changed_jobs[0].fingerprint != single_jobs[0].fingerprint
 
+    music_jobs_before, _ = MODULE.build_jobs(
+        conditions=[
+            MODULE.CONDITION_BY_NAME["musan_noise_snr10_music_snr10"]
+        ],
+        **common,
+    )
+    (musan_root / "music" / "music.wav").write_bytes(b"changed-music")
+    music_jobs_after, _ = MODULE.build_jobs(
+        conditions=[
+            MODULE.CONDITION_BY_NAME["musan_noise_snr10_music_snr10"]
+        ],
+        **common,
+    )
+    assert music_jobs_after[0].fingerprint != music_jobs_before[0].fingerprint
+    noise_jobs_after_music_change, _ = MODULE.build_jobs(
+        conditions=[MODULE.CONDITION_BY_NAME["musan_noise_snr10"]],
+        **common,
+    )
+    assert (
+        noise_jobs_after_music_change[0].fingerprint
+        == changed_jobs[0].fingerprint
+    )
+
+    all_export_jobs, _ = MODULE.build_jobs(
+        conditions=[MODULE.CONDITION_BY_NAME["musan_noise_snr10"]],
+        audio_export=MODULE.AudioExportSpec(mode="all", count=0, seed=2025),
+        **common,
+    )
+    different_export_seed_jobs, _ = MODULE.build_jobs(
+        conditions=[MODULE.CONDITION_BY_NAME["musan_noise_snr10"]],
+        audio_export=MODULE.AudioExportSpec(mode="random", count=5, seed=99),
+        **common,
+    )
+    assert all_export_jobs[0].fingerprint != changed_jobs[0].fingerprint
+    assert different_export_seed_jobs[0].fingerprint != changed_jobs[0].fingerprint
+
 
 def test_validate_inputs_requires_both_binary_labels_and_needed_musan_subset(tmp_path):
     manifest, checkpoints, musan_root = _make_inputs(tmp_path)
@@ -257,6 +357,26 @@ def test_validate_inputs_requires_both_binary_labels_and_needed_musan_subset(tmp
             models=[model],
             conditions=[MODULE.CONDITION_BY_NAME["clean"]],
             musan_root=None,
+        )
+
+    validated = MODULE.validate_inputs(
+        manifest=manifest,
+        models=[model],
+        conditions=[MODULE.CONDITION_BY_NAME["volume_variation"]],
+        musan_root=None,
+    )
+    assert len(validated) == 2
+
+    (musan_root / "music" / "music.wav").unlink()
+    (musan_root / "music").rmdir()
+    with pytest.raises(MODULE.BatchConfigError, match="MUSAN subset not found"):
+        MODULE.validate_inputs(
+            manifest=manifest,
+            models=[model],
+            conditions=[
+                MODULE.CONDITION_BY_NAME["musan_noise_snr10_music_snr10"]
+            ],
+            musan_root=musan_root,
         )
 
     (musan_root / "speech" / "speech.wav").unlink()
@@ -351,6 +471,67 @@ def test_run_job_writes_status_then_reuses_matching_success(tmp_path, monkeypatc
     assert status["fingerprint"] == "fingerprint"
 
 
+def test_cached_summary_rejects_missing_exported_wav(tmp_path):
+    _, checkpoints, _ = _make_inputs(tmp_path)
+    checkpoint_sha256 = MODULE._sha256_file(checkpoints[0])
+    output_dir = tmp_path / "outputs" / "candidate" / "clean"
+    export_dir = output_dir / "exported_audio"
+    export_dir.mkdir(parents=True)
+    wav_path = export_dir / "row_000000.wav"
+    wav_path.write_bytes(b"wav")
+    manifest_path = export_dir / "index.jsonl"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "row_index": 0,
+                "exported_audio_path": str(wav_path),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    job = MODULE.JobSpec(
+        model=MODULE.ModelSpec(
+            "candidate", checkpoints[0], "icefall_zipformer_stage2"
+        ),
+        condition=MODULE.CONDITION_BY_NAME["clean"],
+        output_dir=output_dir,
+        fingerprint="fingerprint",
+        command=(sys.executable, str(MODULE.EVAL_SCRIPT)),
+        audio_export=MODULE.AudioExportSpec(mode="random", count=1, seed=7),
+    )
+    (output_dir / MODULE.RESULTS_FILENAME).write_text("{}\n{}\n", encoding="utf-8")
+    MODULE._atomic_json(
+        output_dir / MODULE.SUMMARY_FILENAME,
+        {
+            "num_samples": 2,
+            "output_dir": str(output_dir.resolve()),
+            "provenance": {"checkpoint": {"sha256": checkpoint_sha256}},
+            "audio_exports": {
+                "status": "generated",
+                "mode": "random",
+                "requested_count": 1,
+                "seed": 7,
+                "num_exported": 1,
+                "directory": str(export_dir),
+                "manifest": str(manifest_path),
+            },
+        },
+    )
+    MODULE._atomic_json(
+        output_dir / MODULE.STATUS_FILENAME,
+        {
+            "status": "succeeded",
+            "attempt": 1,
+            "fingerprint": job.fingerprint,
+        },
+    )
+
+    assert MODULE.cached_summary(job, checkpoint_sha256=checkpoint_sha256) is not None
+    wav_path.unlink()
+    assert MODULE.cached_summary(job, checkpoint_sha256=checkpoint_sha256) is None
+
+
 def test_fail_fast_preserves_later_matching_cache_status(tmp_path, monkeypatch):
     manifest, checkpoints, _ = _make_inputs(tmp_path)
     output_root = tmp_path / "matrix"
@@ -366,6 +547,8 @@ def test_fail_fast_preserves_later_matching_cache_status(tmp_path, monkeypatch):
             "clean",
             "--condition",
             "stationary_snr10",
+            "--export-audio",
+            "none",
             "--fail-fast",
         ]
     )
@@ -382,6 +565,9 @@ def test_fail_fast_preserves_later_matching_cache_status(tmp_path, monkeypatch):
         num_workers=0,
         seed=2025,
         common_overrides=(),
+        audio_export=MODULE.AudioExportSpec(
+            mode="disabled", count=0, seed=2025
+        ),
     )
     cached_job = jobs[1]
     checkpoint_sha256 = identities["models"]["candidate"]["sha256"]

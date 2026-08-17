@@ -658,6 +658,40 @@ def test_stage2_clip_eval_records_enabled_waveform_augmentations(
                 "musan_mix": self.musan_mixer.recipe_metadata(index),
             }
 
+    class FakeAudioExporter:
+        enabled = True
+
+        @classmethod
+        def from_prep(cls, prep, *, output_dir, audio_paths):
+            captured["audio_export_prep"] = prep
+            captured["audio_export_dir"] = output_dir
+            captured["audio_export_paths"] = audio_paths
+            return cls()
+
+        def prepare(self):
+            captured["audio_export_prepared"] = True
+
+        @staticmethod
+        def finalize():
+            return {
+                "status": "generated",
+                "mode": "random",
+                "requested_count": 1,
+                "seed": 13,
+                "num_selected": 1,
+                "num_exported": 1,
+                "stage": "post_augmentation_pre_padding",
+                "format": "WAV",
+                "subtype": "FLOAT",
+                "directory": "/exports",
+                "manifest": "/exports/index.jsonl",
+                "row_indices": [0],
+            }
+
+        @staticmethod
+        def result_path(index):
+            return "/exports/row_00000000.wav" if index == 0 else None
+
     class FakeStreamPolicy:
         @staticmethod
         def describe():
@@ -704,6 +738,9 @@ def test_stage2_clip_eval_records_enabled_waveform_augmentations(
     monkeypatch.setattr(
         eval_stage2_clips, "WaveformAugmentationPipeline", FakePipeline
     )
+    monkeypatch.setattr(
+        eval_stage2_clips, "SelectedWaveformExporter", FakeAudioExporter
+    )
     monkeypatch.setattr(eval_stage2_clips, "Stage2ClipRunner", FakeRunnerFactory)
     monkeypatch.setattr(
         eval_stage2_clips, "resolve_accelerator", lambda _device: ("cpu", 1)
@@ -728,6 +765,7 @@ def test_stage2_clip_eval_records_enabled_waveform_augmentations(
                 "manifest": "manifest.csv",
                 "stage2_ckpt": "stage2.pt",
                 "output_dir": str(tmp_path),
+                "audio_export": {"mode": "random", "count": 1, "seed": 13},
                 "musan_root": "/musan",
                 "musan_mix": {
                     "seed": 7,
@@ -790,8 +828,14 @@ def test_stage2_clip_eval_records_enabled_waveform_augmentations(
     }
     assert captured["rows"] == rows
     assert isinstance(captured["run_kwargs"]["waveform_transform"], FakePipeline)
+    assert isinstance(
+        captured["run_kwargs"]["waveform_observer"], FakeAudioExporter
+    )
+    assert captured["audio_export_prepared"] is True
+    assert captured["audio_export_paths"] == ["clip.wav"]
     assert summary["audio_aug"] == {"enabled": True, "seed": 11}
     assert summary["musan_mix"] == FakeMixer.summary()
+    assert summary["audio_exports"]["num_exported"] == 1
     saved_result = json.loads(
         (tmp_path / "results.jsonl").read_text(encoding="utf-8").strip()
     )
@@ -834,6 +878,7 @@ def test_stage2_clip_eval_records_enabled_waveform_augmentations(
         "applied_order": ["volume_gain"],
         "transforms": {"volume_gain": {"gain_db": 3.0}},
     }
+    assert saved_result["exported_audio_path"] == "/exports/row_00000000.wav"
 
 
 def test_legacy_musan_mix_schema_remains_valid_without_new_sections(tmp_path):

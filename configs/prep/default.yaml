@@ -47,6 +47,12 @@ last_k: 10
 output: ""
 stage1_ckpt: ""
 stage2_ckpt: ""
+# Optional WAV side artifacts for eval_stage2_clips.py. Batch robustness
+# evaluation overrides this to a deterministic random sample of five rows.
+audio_export:
+  mode: disabled
+  count: 5
+  seed: 2025
 musan_root: ""
 # Optional in-memory interference for eval_stage2_clips.py. Noise/music SNR is
 # the clean/interference RMS ratio. Speech relative_db is speech RMS relative

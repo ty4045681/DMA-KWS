@@ -37,6 +37,19 @@ _CONDITIONS = [
         {"stationary_noise": {"kind": "white_gaussian", "snr_db": 20.0}},
     ),
     (
+        "volume_variation",
+        {"volume_variation"},
+        {
+            "volume_variation": {
+                "low_gain_db": -12.0,
+                "high_gain_db": 6.0,
+                "segment_ms_min": 250.0,
+                "segment_ms_max": 750.0,
+                "transition_ms": 50.0,
+            }
+        },
+    ),
+    (
         "burst_snr10",
         {"burst_noise"},
         {
@@ -79,6 +92,16 @@ _CONDITIONS = [
         "musan_noise_snr20",
         {"noise"},
         {"noise": {"snr_db": 20.0}},
+    ),
+    (
+        "musan_noise_snr10_music_snr10",
+        {"noise", "music"},
+        {"noise": {"snr_db": 10.0}, "music": {"snr_db": 10.0}},
+    ),
+    (
+        "musan_noise_snr20_music_snr20",
+        {"noise", "music"},
+        {"noise": {"snr_db": 20.0}, "music": {"snr_db": 20.0}},
     ),
     (
         "musan_noise_snr10_speech_equal",

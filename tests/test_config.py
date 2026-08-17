@@ -148,6 +148,30 @@ def test_musan_mix_config_accepts_regular_hydra_overrides():
     }
 
 
+def test_audio_export_config_defaults_disabled_and_accepts_overrides():
+    defaults = config_to_dict(compose_config())
+    assert defaults["prep"]["audio_export"] == {
+        "mode": "disabled",
+        "count": 5,
+        "seed": 2025,
+    }
+
+    configured = config_to_dict(
+        compose_config(
+            overrides=[
+                "prep.audio_export.mode=all",
+                "prep.audio_export.count=0",
+                "prep.audio_export.seed=17",
+            ]
+        )
+    )
+    assert configured["prep"]["audio_export"] == {
+        "mode": "all",
+        "count": 0,
+        "seed": 17,
+    }
+
+
 def test_musan_mix_music_defaults_to_disabled_at_20_db():
     config = config_to_dict(compose_config())
 

@@ -7,7 +7,7 @@ the Stage II QbyT verifier, bypassing Stage I locator models entirely.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from dma_kws.audio import load_audio
 from dma_kws.g2p import make_g2p, text_to_phonemes
@@ -93,6 +93,7 @@ class ClipFeatureDataset:
         left_padding_ms: int = 0,
         right_padding_ms: int = 0,
         waveform_transform: WaveformTransform | None = None,
+        waveform_observer: Callable[[int, Any, int], None] | None = None,
         include_augmented_duration: bool = False,
     ) -> None:
         left_padding_ms = int(left_padding_ms)
@@ -107,6 +108,7 @@ class ClipFeatureDataset:
         self._left_padding_ms = left_padding_ms
         self._right_padding_ms = right_padding_ms
         self._waveform_transform = waveform_transform
+        self._waveform_observer = waveform_observer
         self._include_augmented_duration = bool(include_augmented_duration)
 
     def __len__(self) -> int:
@@ -136,6 +138,8 @@ class ClipFeatureDataset:
                     "waveform_transform must return a non-empty mono 2-D waveform "
                     f"with shape (1, samples), got {transformed_shape}"
                 )
+        if self._waveform_observer is not None:
+            self._waveform_observer(index, waveform, sample_rate)
         augmented_duration_sec = waveform.size(1) / sample_rate
         left_samples = round(sample_rate * self._left_padding_ms / 1000)
         right_samples = round(sample_rate * self._right_padding_ms / 1000)
@@ -288,6 +292,7 @@ class Stage2ClipRunner:
         left_padding_ms: int = 0,
         right_padding_ms: int = 0,
         waveform_transform: WaveformTransform | None = None,
+        waveform_observer: Callable[[int, Any, int], None] | None = None,
         include_score_details: bool = False,
         include_eps_positions: bool = False,
         include_seq_positions: bool = False,
@@ -307,7 +312,9 @@ class Stage2ClipRunner:
         sample count may change. A phased
         ``WaveformAugmentationPipeline`` satisfies the same callable contract. It
         runs before optional zero-valued padding. Source audio files are not
-        modified. The padding counts
+        modified. ``waveform_observer``, when supplied, receives the prepared and
+        transformed waveform immediately before padding and cannot replace it.
+        It is also called when ``waveform_transform`` is absent. The padding counts
         toward the minimum encoder-input length and can make a short clip
         scoreable. ``include_eps_positions`` requires score details and exposes
         one EPS readout logit per enrollment phoneme when that readout is active.
@@ -413,6 +420,7 @@ class Stage2ClipRunner:
             left_padding_ms=left_padding_ms,
             right_padding_ms=right_padding_ms,
             waveform_transform=waveform_transform,
+            waveform_observer=waveform_observer,
             include_augmented_duration=True,
         )
         loader = DataLoader(

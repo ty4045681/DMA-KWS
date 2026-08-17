@@ -1,0 +1,14 @@
+# @package _global_
+
+defaults:
+  - clean
+  - _self_
+
+prep:
+  musan_mix:
+    noise:
+      enabled: true
+      snr_db: 10.0
+    music:
+      enabled: true
+      snr_db: 10.0
