@@ -8,10 +8,13 @@ per-subset (music/noise/speech) FA/hour.
 Output schema matches ``scripts/eval_stage2_clips.py``:
   - ``results.jsonl`` has one JSON object per scored window.
   - ``summary.json`` contains aggregate metrics.
+  - ``fa_per_hour_curve.png`` plots the exact threshold/FA-hour sweep when
+    ``prep.plot_curves`` is enabled and valid scored windows are available.
 
 Set ``prep.keyword_phonemes`` to a space-separated ARPAbet sequence (or a
 Hydra list) to override keyword G2P. A missing or blank value retains automatic
-G2P. These are the only two files written to ``prep.output_dir``.
+G2P. These are the only JSON files written to ``prep.output_dir``; the plot is
+the only optional side artifact.
 """
 
 from __future__ import annotations
@@ -26,6 +29,10 @@ from omegaconf import DictConfig, OmegaConf
 
 from dma_kws.config import require_sections
 from dma_kws.hydra_app import CONFIG_DIR, resolved_config
+from dma_kws.inference.detection_plots import (
+    DEFAULT_PLOT_DPI,
+    write_false_accept_rate_plot as _write_false_accept_rate_plot,
+)
 from dma_kws.inference.manifest import iter_audio_files
 from dma_kws.inference.metrics import summarize_false_accept_rate
 from dma_kws.inference.musan_fa import (
@@ -203,6 +210,15 @@ def run_eval(cfg: DictConfig) -> dict:
         )
     if subsets:
         summary["subsets"] = subsets
+
+    if bool(prep.get("plot_curves", True)):
+        summary["plots"] = _write_false_accept_rate_plot(
+            all_results,
+            output_dir=output_dir,
+            threshold=threshold,
+            total_hours=total_hours,
+            dpi=int(prep.get("plot_dpi", DEFAULT_PLOT_DPI)),
+        )
 
     summary_path = output_dir / "summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:

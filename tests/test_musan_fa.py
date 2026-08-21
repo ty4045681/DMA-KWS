@@ -7,6 +7,10 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+from dma_kws.inference.detection_plots import (
+    false_accept_rate_points,
+    write_false_accept_rate_plot,
+)
 from dma_kws.inference.metrics import summarize_false_accept_rate
 from dma_kws.inference.musan_fa import detect_subset
 from dma_kws.inference.stage2_clip import Stage2ClipRunner
@@ -195,7 +199,7 @@ def test_run_file_windows_counts_and_spans(monkeypatch):
         ),
     ],
 )
-def test_eval_musan_writes_only_rich_json_outputs(
+def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
     tmp_path,
     monkeypatch,
     configured_phonemes,
@@ -203,6 +207,7 @@ def test_eval_musan_writes_only_rich_json_outputs(
     expected_source,
 ):
     pytest.importorskip("torch")
+    pytest.importorskip("matplotlib")
     musan_root = tmp_path / "musan"
     audio_path = musan_root / "speech" / "sample.wav"
     audio_path.parent.mkdir(parents=True)
@@ -307,6 +312,7 @@ def test_eval_musan_writes_only_rich_json_outputs(
                 "window_sec": 3.0,
                 "hop_sec": 1.0,
                 "output_dir": str(output_dir),
+                "plot_dpi": 72,
             },
             "run": {"device": "cpu"},
         }
@@ -315,12 +321,28 @@ def test_eval_musan_writes_only_rich_json_outputs(
     summary = eval_musan_fa.run_eval(cfg)
 
     assert {path.name for path in output_dir.iterdir()} == {
+        "fa_per_hour_curve.png",
         "results.jsonl",
         "summary.json",
     }
     assert summary["keyword_phonemes"] == expected_phonemes
     assert summary["keyword_phonemes_source"] == expected_source
     assert summary["num_samples"] == 1
+    assert summary["plots"] == {
+        "status": "generated",
+        "score_field": "qbyt_score",
+        "num_samples": 1,
+        "total_hours": pytest.approx(3.0 / 3600.0),
+        "deployment_threshold": 0.5,
+        "deployment_false_accepts": 1,
+        "deployment_fa_per_hour": pytest.approx(1200.0),
+        "fa_per_hour_curve": str(
+            (output_dir / "fa_per_hour_curve.png").resolve()
+        ),
+    }
+    assert (output_dir / "fa_per_hour_curve.png").read_bytes().startswith(
+        b"\x89PNG\r\n\x1a\n"
+    )
     assert "manifest" not in summary
     run_keyword_phonemes = expected_phonemes if configured_phonemes else None
     assert captured["run"][2] == {
@@ -366,6 +388,58 @@ def test_summarize_false_accept_rate_computes_fa_per_hour():
     assert summary["fa_per_hour"] == pytest.approx(1.0)
     assert summary["fa_per_1000_hours"] == pytest.approx(1000.0)
     assert summary["fpr"] == pytest.approx(0.5)
+
+
+def test_false_accept_rate_points_keep_tied_scores_at_one_threshold():
+    curve = false_accept_rate_points(
+        [
+            {"label": 0, "qbyt_score": 0.9},
+            {"label": 0, "qbyt_score": 0.8},
+            {"label": 0, "qbyt_score": 0.8},
+            {"label": 0, "qbyt_score": 0.1},
+            {"label": 0, "qbyt_score": 0.95, "skipped": True},
+        ],
+        score_field="qbyt_score",
+        total_hours=2.0,
+    )
+
+    assert curve is not None
+    assert curve["num_samples"] == 4
+    assert curve["total_hours"] == pytest.approx(2.0)
+    assert curve["thresholds"] == pytest.approx([0.0, 0.1, 0.8, 0.9, 1.0])
+    assert curve["false_accepts"] == pytest.approx([4, 4, 3, 1, 0])
+    assert curve["fa_per_hour"] == pytest.approx([2.0, 2.0, 1.5, 0.5, 0.0])
+
+
+def test_false_accept_rate_plot_writes_png_and_deployment_point(tmp_path):
+    pytest.importorskip("matplotlib")
+    records = [
+        {"label": 0, "qbyt_score": 0.9},
+        {"label": 0, "qbyt_score": 0.8},
+        {"label": 0, "qbyt_score": 0.8},
+        {"label": 0, "qbyt_score": 0.1},
+    ]
+
+    plot_summary = write_false_accept_rate_plot(
+        records,
+        output_dir=tmp_path,
+        threshold=0.5,
+        total_hours=2.0,
+        dpi=72,
+    )
+
+    plot_path = tmp_path / "fa_per_hour_curve.png"
+    assert plot_summary == {
+        "status": "generated",
+        "score_field": "qbyt_score",
+        "num_samples": 4,
+        "total_hours": 2.0,
+        "deployment_threshold": 0.5,
+        "deployment_false_accepts": 3,
+        "deployment_fa_per_hour": 1.5,
+        "fa_per_hour_curve": str(plot_path.resolve()),
+    }
+    assert plot_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
 
 def test_detect_subset(tmp_path):

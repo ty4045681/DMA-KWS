@@ -1,7 +1,7 @@
 manifest: ""
 output_dir: outputs/eval_two_stage_kws
 stage2_clip_output_dir: outputs/eval_stage2_clips
-# Generate ROC/DET PNGs when the manifest contains both positive and negative labels.
+# Generate ROC/DET PNGs for labeled clip evaluation and an FA/hour curve for MUSAN.
 plot_curves: true
 plot_dpi: 160
 # Optional ROC/DET guide: rates use [0, 1]; configure at most one bound.

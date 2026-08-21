@@ -1842,10 +1842,13 @@ Checkpoints run sequentially on one GPU; to use multiple GPUs, split the checkpo
 To measure the false-accept (FA) rate of a Stage-II QbyT checkpoint on continuous
 background audio, use `scripts/eval_musan_fa.py` or the batch wrapper
 `scripts/batch_eval_musan_fa.sh`. These scripts slide a fixed-length window over
-every MUSAN file and score each window with Stage-II only. Each run writes only
-`results.jsonl` and `summary.json`; the summary reports both overall and
-per-subset (`music`/`noise`/`speech`) FA/hour, while each result row records the
-effective keyword phonemes and position-level Stage-II diagnostics.
+every MUSAN file and score each window with Stage-II only. Each run writes
+`results.jsonl`, `summary.json`, and—when `prep.plot_curves=true` (the default)—
+`fa_per_hour_curve.png`. The plot shows the exact QbyT threshold versus overall
+FA/hour curve and marks the configured deployment threshold. The summary reports
+both overall and per-subset (`music`/`noise`/`speech`) FA/hour, while each result
+row records the effective keyword phonemes and position-level Stage-II
+diagnostics.
 
 Single keyword, single checkpoint with an explicit pronunciation:
 

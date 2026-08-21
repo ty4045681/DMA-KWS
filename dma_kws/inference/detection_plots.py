@@ -1,4 +1,4 @@
-"""Reusable ROC and DET plot generation for binary detection scores."""
+"""Reusable detection plot generation for Stage-II scores."""
 
 from __future__ import annotations
 
@@ -61,6 +61,59 @@ def binary_roc_points(
         "num_samples": len(usable),
         "num_positive": num_positive,
         "num_negative": num_negative,
+    }
+
+
+def false_accept_rate_points(
+    records: list[dict],
+    *,
+    score_field: str,
+    total_hours: float,
+) -> dict[str, Any] | None:
+    """Build exact threshold/FA-hour points for negative-only evaluation."""
+
+    hours = float(total_hours)
+    if not np.isfinite(hours) or hours <= 0.0:
+        raise ValueError("total_hours used for an FA/hour plot must be positive")
+
+    usable = [
+        record
+        for record in records
+        if "label" in record
+        and not bool(record.get("skipped", False))
+        and record.get(score_field) is not None
+    ]
+    if not usable:
+        return None
+
+    labels = np.asarray([int(record["label"]) for record in usable], dtype=np.int64)
+    if not np.all(labels == 0):
+        raise ValueError("FA/hour plots require negative-only records with label=0")
+
+    scores = np.asarray(
+        [float(record[score_field]) for record in usable],
+        dtype=np.float64,
+    )
+    if not np.isfinite(scores).all():
+        raise ValueError(f"{score_field} used for an FA/hour plot must be finite")
+    if np.any((scores < 0.0) | (scores > 1.0)):
+        raise ValueError(
+            f"{score_field} used for an FA/hour plot must be in [0, 1]"
+        )
+
+    thresholds = np.unique(np.r_[0.0, scores, 1.0])
+    sorted_scores = np.sort(scores)
+    false_accepts = scores.size - np.searchsorted(
+        sorted_scores,
+        thresholds,
+        side="left",
+    )
+    return {
+        "thresholds": thresholds,
+        "false_accepts": false_accepts,
+        "fa_per_hour": false_accepts.astype(np.float64) / hours,
+        "num_samples": len(usable),
+        "total_hours": hours,
     }
 
 
@@ -502,3 +555,112 @@ def write_detection_plots(
     if constraint is not None:
         result["constraint"] = constraint
     return result
+
+
+def write_false_accept_rate_plot(
+    records: list[dict],
+    *,
+    output_dir: Path,
+    threshold: float,
+    total_hours: float,
+    dpi: int = DEFAULT_PLOT_DPI,
+) -> dict[str, Any]:
+    """Write a threshold-versus-FA/hour plot for negative-only MUSAN scores."""
+
+    score_field = "qbyt_score"
+    hours = float(total_hours)
+    if not np.isfinite(hours) or hours <= 0.0:
+        return {
+            "status": "skipped",
+            "score_field": score_field,
+            "reason": "FA/hour plots require positive total audio duration",
+        }
+    curve = false_accept_rate_points(
+        records,
+        score_field=score_field,
+        total_hours=hours,
+    )
+    if curve is None:
+        return {
+            "status": "skipped",
+            "score_field": score_field,
+            "reason": "FA/hour plots require at least one valid negative sample",
+        }
+    if dpi <= 0:
+        raise ValueError("plot_dpi must be positive")
+
+    deployment_threshold = float(threshold)
+    if not np.isfinite(deployment_threshold):
+        raise ValueError("threshold used for an FA/hour plot must be finite")
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return {
+            "status": "skipped",
+            "score_field": score_field,
+            "reason": "matplotlib is not installed",
+        }
+
+    thresholds = np.asarray(curve["thresholds"], dtype=np.float64)
+    fa_per_hour = np.asarray(curve["fa_per_hour"], dtype=np.float64)
+    false_accepts = np.asarray(curve["false_accepts"], dtype=np.int64)
+    deploy_index = int(
+        np.searchsorted(thresholds, deployment_threshold, side="left")
+    )
+    if deploy_index >= thresholds.size:
+        deploy_false_accepts = 0
+    else:
+        deploy_false_accepts = int(false_accepts[deploy_index])
+    deploy_fa_per_hour = deploy_false_accepts / hours
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plot_path = output_dir / "fa_per_hour_curve.png"
+    figure, axis = plt.subplots(figsize=(6.4, 5.2))
+    try:
+        axis.step(
+            thresholds,
+            fa_per_hour,
+            where="pre",
+            linewidth=2.0,
+            label="QbyT",
+        )
+        axis.scatter(
+            [deployment_threshold],
+            [deploy_fa_per_hour],
+            color="tab:orange",
+            marker="o",
+            zorder=3,
+            label=(
+                f"Deploy threshold={deployment_threshold:.4g} "
+                f"(FA/hour={deploy_fa_per_hour:.4g})"
+            ),
+        )
+        axis.set(
+            xlim=(min(0.0, deployment_threshold), max(1.0, deployment_threshold)),
+            xlabel="QbyT Threshold",
+            ylabel="False Accepts per Hour",
+            title="Stage II MUSAN False Accept Rate",
+        )
+        axis.set_ylim(bottom=0.0)
+        axis.grid(True, alpha=0.25)
+        axis.legend(loc="upper right")
+        figure.tight_layout()
+        figure.savefig(plot_path, dpi=dpi, bbox_inches="tight")
+    finally:
+        plt.close(figure)
+
+    return {
+        "status": "generated",
+        "score_field": score_field,
+        "num_samples": curve["num_samples"],
+        "total_hours": hours,
+        "deployment_threshold": deployment_threshold,
+        "deployment_false_accepts": deploy_false_accepts,
+        "deployment_fa_per_hour": deploy_fa_per_hour,
+        "fa_per_hour_curve": str(plot_path.resolve()),
+    }
