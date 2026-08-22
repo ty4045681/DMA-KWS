@@ -227,6 +227,7 @@ def test_detection_plots_skip_single_class_without_creating_files(tmp_path):
     assert "positive and negative" in plot_summary["reason"]
     assert not (tmp_path / "roc_curve.png").exists()
     assert not (tmp_path / "det_curve.png").exists()
+    assert not (tmp_path / "roc_curve.csv").exists()
 
 
 def test_detection_plots_write_roc_and_det_pngs(tmp_path):
@@ -255,6 +256,7 @@ def test_detection_plots_write_roc_and_det_pngs(tmp_path):
 
     roc_path = tmp_path / "roc_curve.png"
     det_path = tmp_path / "det_curve.png"
+    csv_path = tmp_path / "roc_curve.csv"
     assert plot_summary == {
         "status": "generated",
         "score_field": "qbyt_score",
@@ -263,9 +265,18 @@ def test_detection_plots_write_roc_and_det_pngs(tmp_path):
         "num_negative": 2,
         "roc": str(roc_path.resolve()),
         "det": str(det_path.resolve()),
+        "roc_curve_csv": str(csv_path.resolve()),
     }
     assert roc_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert det_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    curve = _binary_roc_points(records, score_field="qbyt_score")
+    assert curve is not None
+    csv_rows = csv_path.read_text(encoding="utf-8").strip().splitlines()
+    assert csv_rows[0] == "threshold,tpr,fpr"
+    parsed = [tuple(row.split(",")) for row in csv_rows[1:]]
+    assert [row[0] for row in parsed] == ["inf", "0.95", "0.75", "0.65", "0.1"]
+    assert [float(row[1]) for row in parsed] == pytest.approx(curve["tpr"].tolist())
+    assert [float(row[2]) for row in parsed] == pytest.approx(curve["fpr"].tolist())
 
 
 def test_detection_plots_write_constraint_marker_and_summary(tmp_path, monkeypatch):

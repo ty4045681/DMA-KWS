@@ -338,7 +338,7 @@ def write_detection_plots(
     min_recall: float | None = None,
     max_fpr: float | None = None,
 ) -> dict[str, Any]:
-    """Write ROC and normal-deviate DET plots for the utterance score."""
+    """Write ROC/DET plots and a matching ``roc_curve.csv`` for the utterance score."""
 
     score_field = "qbyt_score"
     curve = binary_roc_points(records, score_field=score_field)
@@ -356,6 +356,21 @@ def write_detection_plots(
         max_fpr=max_fpr,
     )
 
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fpr = curve["fpr"]
+    tpr = curve["tpr"]
+    csv_path = output_dir / "roc_curve.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["threshold", "tpr", "fpr"])
+        for threshold_value, recall, false_positive_rate in zip(
+            curve["thresholds"], tpr, fpr
+        ):
+            writer.writerow(
+                [float(threshold_value), float(recall), float(false_positive_rate)]
+            )
+
     try:
         import matplotlib
 
@@ -366,12 +381,8 @@ def write_detection_plots(
             "status": "skipped",
             "score_field": score_field,
             "reason": "matplotlib is not installed",
+            "roc_curve_csv": str(csv_path.resolve()),
         }
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    fpr = curve["fpr"]
-    tpr = curve["tpr"]
     fnr = 1.0 - tpr
     deploy_fpr, deploy_tpr = _threshold_point(
         records,
@@ -552,6 +563,7 @@ def write_detection_plots(
         "num_negative": curve["num_negative"],
         "roc": str(roc_path.resolve()),
         "det": str(det_path.resolve()),
+        "roc_curve_csv": str(csv_path.resolve()),
     }
     if constraint is not None:
         result["constraint"] = constraint

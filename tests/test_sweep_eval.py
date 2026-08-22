@@ -67,6 +67,12 @@ def test_target_eval_report_writes_scores_summary_and_curves(tmp_path: Path):
     assert (output_dir / "det_curve.png").read_bytes().startswith(
         b"\x89PNG\r\n\x1a\n"
     )
+    csv_rows = (output_dir / "roc_curve.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert csv_rows[0] == "threshold,tpr,fpr"
+    assert csv_rows[1] == "inf,0.0,0.0"
+    assert report["plots"]["roc_curve_csv"] == str(
+        (output_dir / "roc_curve.csv").resolve()
+    )
     predictions = [
         json.loads(line)
         for line in (output_dir / "predictions.jsonl").read_text().splitlines()
@@ -222,3 +228,4 @@ def test_target_eval_report_can_disable_curves(tmp_path: Path):
     }
     assert not (output_dir / "roc_curve.png").exists()
     assert not (output_dir / "det_curve.png").exists()
+    assert not (output_dir / "roc_curve.csv").exists()

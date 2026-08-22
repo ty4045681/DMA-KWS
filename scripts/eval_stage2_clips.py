@@ -14,7 +14,9 @@ default. Override with ``+prep.left_padding_ms=...`` and
 ``+prep.right_padding_ms=...``; use zero to disable either side.
 Padding is part of the scored model input and counts toward its minimum length.
 When valid positive and negative labels are present, the output directory also
-receives ``roc_curve.png`` and ``det_curve.png`` for the utterance QbyT score.
+receives ``roc_curve.png``, ``det_curve.png``, and ``roc_curve.csv`` for the
+utterance QbyT score. The CSV lists every empirical ROC point as
+``threshold,tpr,fpr``.
 Optional ``prep.audio_aug`` and ``prep.musan_mix`` settings apply deterministic
 waveform augmentation in memory before the existing zero-valued padding. MUSAN
 mixing also supports stationary synthetic noise, MUSAN noise bursts and
