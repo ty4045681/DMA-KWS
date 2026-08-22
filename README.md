@@ -1852,7 +1852,7 @@ Each run writes `results.jsonl` and `summary.json`. With
 - `fa_per_hour_curve.png` — threshold versus FA/hour, with the deployment
   threshold marked
 - `fa_per_hour_curve.csv` — the same points (`threshold`, `false_accepts`,
-  `fa_per_hour`, `fa_per_1000_hours`)
+  `fa_per_hour`, `fa_per_24_hours`, `fa_per_1000_hours`)
 
 `summary.json` reports overall and per-subset (`music`/`noise`/`speech`)
 FA/hour. Each result row keeps the keyword phonemes and Stage-II position

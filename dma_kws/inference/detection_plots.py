@@ -612,7 +612,13 @@ def write_false_accept_rate_plot(
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
-            ["threshold", "false_accepts", "fa_per_hour", "fa_per_1000_hours"]
+            [
+                "threshold",
+                "false_accepts",
+                "fa_per_hour",
+                "fa_per_24_hours",
+                "fa_per_1000_hours",
+            ]
         )
         for threshold_value, count, rate in zip(
             thresholds, false_accepts, fa_per_hour
@@ -622,6 +628,7 @@ def write_false_accept_rate_plot(
                     float(threshold_value),
                     int(count),
                     float(rate),
+                    float(rate) * 24.0,
                     float(rate) * 1000.0,
                 ]
             )

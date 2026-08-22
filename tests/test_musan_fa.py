@@ -491,8 +491,10 @@ def test_false_accept_rate_plot_writes_png_and_deployment_point(tmp_path):
     }
     assert plot_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     csv_rows = csv_path.read_text(encoding="utf-8").strip().splitlines()
-    assert csv_rows[0] == "threshold,false_accepts,fa_per_hour,fa_per_1000_hours"
-    assert csv_rows[1].startswith("0.0,4,2.0,")
+    assert csv_rows[0] == (
+        "threshold,false_accepts,fa_per_hour,fa_per_24_hours,fa_per_1000_hours"
+    )
+    assert csv_rows[1].startswith("0.0,4,2.0,48.0,")
 
 
 def test_detect_subset(tmp_path):
