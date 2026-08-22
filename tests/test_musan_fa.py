@@ -12,7 +12,12 @@ from dma_kws.inference.detection_plots import (
     write_false_accept_rate_plot,
 )
 from dma_kws.inference.metrics import summarize_false_accept_rate
-from dma_kws.inference.musan_fa import detect_subset
+from dma_kws.inference.musan_fa import (
+    assign_files_to_shards,
+    detect_subset,
+    merge_musan_summaries,
+    select_shard,
+)
 from dma_kws.inference.stage2_clip import Stage2ClipRunner
 from dma_kws.tokenizer import load_char_tokenizer
 import scripts.eval_musan_fa as eval_musan_fa
@@ -169,6 +174,22 @@ def test_run_file_windows_counts_and_spans(monkeypatch):
 
     assert len(results) == num_windows
     assert verifier.batches == [num_windows]
+    verifier._scores = [0.1 * (i + 1) for i in range(num_windows)]
+    chunked = runner.run_file_windows(
+        "/tmp/musan/speech/x.wav",
+        "hey eva",
+        window_sec=1.0,
+        hop_sec=0.5,
+        keyword_phonemes=keyword_phonemes,
+        include_score_details=True,
+        include_eps_positions=True,
+        include_seq_positions=True,
+        batch_size=4,
+    )
+    assert [result["qbyt_score"] for result in chunked] == [
+        result["qbyt_score"] for result in results
+    ]
+    assert verifier.batches == [num_windows, 4, 4, 1]
     assert [result["window_index"] for result in results] == list(
         range(num_windows)
     )
@@ -181,7 +202,12 @@ def test_run_file_windows_counts_and_spans(monkeypatch):
     )
     tokenizer = runner._tokenizer
     expected_ids = [tokenizer.symbol_table[phone] for phone in keyword_phonemes]
-    assert verifier.keyword_ids_batches == [[expected_ids] * num_windows]
+    assert verifier.keyword_ids_batches[0] == [expected_ids] * num_windows
+    assert verifier.keyword_ids_batches[1:] == [
+        [expected_ids] * 4,
+        [expected_ids] * 4,
+        [expected_ids] * 1,
+    ]
     assert len(results[0]["eps_position_logits"]) == len(keyword_phonemes)
     assert len(results[0]["seq_position_logits"]) == len(keyword_phonemes)
     assert results[4]["detected"] is True  # score 0.5 >= threshold 0.5
@@ -236,15 +262,24 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
                 return ["HH", "EY1", "IY1", "V", "AH0"]
             return str(keyword_phonemes).split()
 
-        def run_file_windows(self, audio, keyword, **kwargs):
-            captured["run"] = (audio, keyword, kwargs)
+        def prepare_file_windows(self, audio, keyword, **kwargs):
+            captured["prepare"] = (audio, keyword, kwargs)
             phones = list(kwargs["keyword_phonemes"] or expected_phonemes)
+            return {
+                "audio": audio,
+                "keyword": keyword,
+                "keyword_phonemes": phones,
+            }
+
+        def score_prepared_windows(self, prepared, **kwargs):
+            captured["score"] = kwargs
+            phones = list(prepared["keyword_phonemes"])
             qbyt_logit = math.log(3.0)
             completion_logit = 0.0
             return [
                 {
-                    "audio": audio,
-                    "keyword": keyword,
+                    "audio": prepared["audio"],
+                    "keyword": prepared["keyword"],
                     "keyword_phonemes": phones,
                     "clip_span_sec": {"start_sec": 0.0, "end_sec": 3.0},
                     "window_index": 0,
@@ -345,14 +380,23 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
     )
     assert "manifest" not in summary
     run_keyword_phonemes = expected_phonemes if configured_phonemes else None
-    assert captured["run"][2] == {
+    assert captured["prepare"][2] == {
         "window_sec": 3.0,
         "hop_sec": 1.0,
         "keyword_phonemes": run_keyword_phonemes,
+        "fbank_windows": "independent",
+    }
+    assert captured["score"] == {
         "include_score_details": True,
         "include_eps_positions": True,
         "include_seq_positions": True,
+        "batch_size": 64,
     }
+    assert summary["batch_size"] == 64
+    assert summary["amp"] == "off"
+    assert summary["fbank_windows"] == "independent"
+    assert summary["num_shards"] == 1
+    assert summary["shard_index"] == 0
     result = json.loads(
         (output_dir / "results.jsonl").read_text(encoding="utf-8").strip()
     )
@@ -461,6 +505,100 @@ def test_detect_subset(tmp_path):
     assert detect_subset(music_file, musan_root) == "music"
     assert detect_subset(noise_file, musan_root) == "noise"
     assert detect_subset(outside_file, musan_root) == "other"
+
+
+def test_assign_files_to_shards_balances_duration_deterministically():
+    files = [
+        {"audio_path": "a.wav", "duration_sec": 3600.0, "subset": "speech"},
+        {"audio_path": "b.wav", "duration_sec": 1800.0, "subset": "noise"},
+        {"audio_path": "c.wav", "duration_sec": 1800.0, "subset": "music"},
+        {"audio_path": "d.wav", "duration_sec": 900.0, "subset": "speech"},
+    ]
+    first = assign_files_to_shards(files, num_shards=2)
+    second = assign_files_to_shards(files, num_shards=2)
+    assert first == second
+    assigned = {row["audio_path"] for bucket in first for row in bucket}
+    assert assigned == {"a.wav", "b.wav", "c.wav", "d.wav"}
+    assert not {row["audio_path"] for row in first[0]} & {
+        row["audio_path"] for row in first[1]
+    }
+    hours = [
+        sum(row["duration_sec"] for row in bucket) / 3600.0 for bucket in first
+    ]
+    assert abs(hours[0] - hours[1]) <= 0.25
+    assert select_shard(files, num_shards=2, shard_index=0) == first[0]
+    assert select_shard(files, num_shards=2, shard_index=1) == first[1]
+
+
+def test_merge_musan_summaries_pools_hours_and_false_accepts():
+    shard0_results = [
+        {
+            "audio_path": "/musan/speech/a.wav",
+            "window_index": 0,
+            "label": 0,
+            "qbyt_score": 0.9,
+            "best_qbyt_score": 0.9,
+            "detected": True,
+            "skipped": False,
+            "manifest_meta": {"subset": "speech"},
+        }
+    ]
+    shard1_results = [
+        {
+            "audio_path": "/musan/noise/b.wav",
+            "window_index": 0,
+            "label": 0,
+            "qbyt_score": 0.1,
+            "best_qbyt_score": 0.1,
+            "detected": False,
+            "skipped": False,
+            "manifest_meta": {"subset": "noise"},
+        }
+    ]
+    identity = {
+        "keyword": "hey eva",
+        "keyword_phonemes": ["HH", "EY1"],
+        "keyword_phonemes_source": "prep.keyword_phonemes",
+        "stage2_ckpt": "stage2.pt",
+        "window_sec": 3.0,
+        "hop_sec": 3.0,
+        "musan_root": "/musan",
+        "stream": {"mode": "test"},
+        "provenance": {"qbyt_readout": {"mode": "eps_mean"}},
+        "amp": "off",
+        "fbank_windows": "independent",
+        "batch_size": 64,
+        "num_shards": 2,
+    }
+    merged, results = merge_musan_summaries(
+        [
+            {
+                **identity,
+                "total_files": 1,
+                "total_hours": 1.0,
+                "subsets": {"speech": {"total_hours": 1.0}},
+            },
+            {
+                **identity,
+                "total_files": 1,
+                "total_hours": 3.0,
+                "subsets": {"noise": {"total_hours": 3.0}},
+            },
+        ],
+        [shard0_results, shard1_results],
+        output_dir="/tmp/merged",
+        threshold=0.5,
+    )
+    assert [row["audio_path"] for row in results] == [
+        "/musan/noise/b.wav",
+        "/musan/speech/a.wav",
+    ]
+    assert merged["total_files"] == 2
+    assert merged["total_hours"] == pytest.approx(4.0)
+    assert merged["metrics"]["fp"] == 1.0
+    assert merged["metrics"]["fa_per_hour"] == pytest.approx(0.25)
+    assert merged["subsets"]["speech"]["metrics"]["fa_per_hour"] == pytest.approx(1.0)
+    assert merged["subsets"]["noise"]["metrics"]["fa_per_hour"] == pytest.approx(0.0)
 
 
 def test_aggregate_musan_fa(tmp_path):

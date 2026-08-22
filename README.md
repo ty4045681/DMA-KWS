@@ -1842,13 +1842,16 @@ Checkpoints run sequentially on one GPU; to use multiple GPUs, split the checkpo
 To measure the false-accept (FA) rate of a Stage-II QbyT checkpoint on continuous
 background audio, use `scripts/eval_musan_fa.py` or the batch wrapper
 `scripts/batch_eval_musan_fa.sh`. These scripts slide a fixed-length window over
-every MUSAN file and score each window with Stage-II only. Each run writes
-`results.jsonl`, `summary.json`, and—when `prep.plot_curves=true` (the default)—
-`fa_per_hour_curve.png`. The plot shows the exact QbyT threshold versus overall
-FA/hour curve and marks the configured deployment threshold. The summary reports
-both overall and per-subset (`music`/`noise`/`speech`) FA/hour, while each result
-row records the effective keyword phonemes and position-level Stage-II
-diagnostics.
+every MUSAN file and score each window with Stage-II only. The official grid is
+`prep.window_sec=3.0` / `prep.hop_sec=3.0` (no overlap). Setting the two equal
+always means a non-overlapping grid; FA/hour is **not** comparable across hops
+because the numerator counts windows over the threshold and the denominator is
+audio hours. Each run writes `results.jsonl`, `summary.json`, and—when
+`prep.plot_curves=true` (the default)—`fa_per_hour_curve.png`. The plot shows
+the exact QbyT threshold versus overall FA/hour curve and marks the configured
+deployment threshold. The summary reports both overall and per-subset
+(`music`/`noise`/`speech`) FA/hour, while each result row records the effective
+keyword phonemes and position-level Stage-II diagnostics.
 
 Single keyword, single checkpoint with an explicit pronunciation:
 
@@ -1860,11 +1863,60 @@ python3 scripts/eval_musan_fa.py \
   prep.musan_root=/path/to/musan \
   prep.stage2_ckpt=/path/to/stage2_step020000.pt \
   prep.window_sec=3.0 \
-  prep.hop_sec=1.0 \
+  prep.hop_sec=3.0 \
+  prep.batch_size=64 \
   prep.output_dir=/path/to/out
 ```
 
 Omit `prep.keyword_phonemes` (or leave it blank) to retain automatic G2P.
+
+`prep.batch_size` (default 64) chunks GPU scoring so a long speech file cannot
+OOM. `prep.num_workers` prefetches the next files' fbank on CPU (`0` keeps the
+historical serial path). Same-grid scores stay bit-identical to the old path
+when `prep.amp=off` (the default) and `prep.fbank_windows=independent` (also
+the default). `prep.amp=fp16` is the V100 option and changes logits.
+`prep.fbank_windows=file` extracts fbank once per file and slices frames; that
+is faster, but not identical when the configured fbank uses `snip_edges=false`
+(Icefall).
+
+Two GPUs: do not point each process at a different MUSAN subset directory
+(that breaks subset names). Shard by file duration and merge:
+
+```bash
+bash scripts/eval_musan_fa_shards.sh \
+  --num-shards 2 \
+  --gpus 0,1 \
+  +experiment=icefall_zipformer_stage2 \
+  prep.keyword="hey eva" \
+  'prep.keyword_phonemes=HH EY1 IY1 V AH0' \
+  prep.musan_root=/path/to/musan \
+  prep.stage2_ckpt=/path/to/stage2_step020000.pt \
+  prep.output_dir=/path/to/out \
+  prep.batch_size=64 \
+  prep.num_workers=8
+```
+
+That writes `/path/to/out/shard_0`, `/path/to/out/shard_1`, and a pooled
+`/path/to/out/merged` whose FA/hour matches a single-GPU run (total FP / total
+hours, never the average of shard FA/hour). You can also merge later with
+`python3 scripts/merge_musan_fa.py /path/to/out /path/to/out/merged`.
+
+To regenerate only the FA/hour plot from an existing MUSAN eval directory
+(no inference):
+
+```bash
+python3 scripts/plot_musan_fa_curve.py /path/to/musan_test
+```
+
+The script reads `results.jsonl` and, when present, `summary.json` for
+`total_hours` and the deployment threshold. Override with `--total-hours`,
+`--threshold`, or `--output-dir` if needed.
+
+Faster but not bit-identical:
+
+```bash
+prep.amp=fp16 prep.fbank_windows=file
+```
 
 Batch evaluation across multiple checkpoints and keywords:
 
@@ -1877,7 +1929,7 @@ bash scripts/batch_eval_musan_fa.sh \
   --pt /path/to/stage2_step020000.pt \
   --base-out /path/to/musan_fa_outputs \
   --window-sec 3.0 \
-  --hop-sec 1.0
+  --hop-sec 3.0
 ```
 
 `--keyword-phonemes` applies to the immediately preceding `--keyword`. Keywords

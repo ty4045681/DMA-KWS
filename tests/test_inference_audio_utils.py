@@ -2,6 +2,7 @@ from dma_kws.inference.audio_utils import (
     has_min_fbank_frames,
     min_samples_for_fbank_frames,
     num_fbank_frames,
+    window_fbank_frame_span,
 )
 
 
@@ -25,3 +26,24 @@ def test_snip_edges_false_seven_frame_boundary():
 
 def test_snip_edges_false_one_second_has_100_frames():
     assert num_fbank_frames(16000, sample_rate=16000, snip_edges=False) == 100
+
+
+def test_window_fbank_frame_span_matches_independent_window_width():
+    start, end = window_fbank_frame_span(
+        16000,
+        16000 + 48000,
+        sample_rate=16000,
+        snip_edges=True,
+    )
+    assert end - start == num_fbank_frames(48000, sample_rate=16000, snip_edges=True)
+    assert start == 100
+
+    start, end = window_fbank_frame_span(
+        16000,
+        16000 + 48000,
+        sample_rate=16000,
+        snip_edges=False,
+    )
+    assert end - start == num_fbank_frames(
+        48000, sample_rate=16000, snip_edges=False
+    )

@@ -219,3 +219,69 @@ def test_waveform_to_fbank_differs_from_extract_fbank():
 
     assert not torch.allclose(legacy, aligned)
     assert (legacy - aligned).abs().mean() > 0.1
+
+
+def test_file_fbank_slice_matches_independent_window_when_snip_edges():
+    from dma_kws.inference.audio_utils import window_fbank_frame_span
+
+    sample_rate = 16000
+    waveform = torch.linspace(-0.4, 0.4, sample_rate * 6).unsqueeze(0)
+    extractor = FbankExtractor(dither=0.0, snip_edges=True)
+    file_feat = waveform_to_fbank(
+        waveform,
+        sample_rate=sample_rate,
+        extractor=extractor,
+        dither=0.0,
+        snip_edges=True,
+    )
+    start_sample = sample_rate
+    end_sample = start_sample + 3 * sample_rate
+    start_frame, end_frame = window_fbank_frame_span(
+        start_sample,
+        end_sample,
+        sample_rate=sample_rate,
+        snip_edges=True,
+    )
+    sliced = file_feat[start_frame:end_frame]
+    independent = waveform_to_fbank(
+        waveform[:, start_sample:end_sample],
+        sample_rate=sample_rate,
+        extractor=extractor,
+        dither=0.0,
+        snip_edges=True,
+    )
+    assert sliced.shape == independent.shape
+    assert torch.allclose(sliced, independent, atol=1e-5, rtol=1e-5)
+
+
+def test_file_fbank_slice_keeps_icefall_window_width():
+    from dma_kws.inference.audio_utils import window_fbank_frame_span
+
+    sample_rate = 16000
+    waveform = torch.linspace(-0.4, 0.4, sample_rate * 6).unsqueeze(0)
+    extractor = FbankExtractor(dither=0.0, snip_edges=False, high_freq=-400.0)
+    file_feat = waveform_to_fbank(
+        waveform,
+        sample_rate=sample_rate,
+        extractor=extractor,
+        dither=0.0,
+        snip_edges=False,
+        high_freq=-400.0,
+    )
+    start_sample = sample_rate
+    end_sample = start_sample + 3 * sample_rate
+    start_frame, end_frame = window_fbank_frame_span(
+        start_sample,
+        end_sample,
+        sample_rate=sample_rate,
+        snip_edges=False,
+    )
+    independent = waveform_to_fbank(
+        waveform[:, start_sample:end_sample],
+        sample_rate=sample_rate,
+        extractor=extractor,
+        dither=0.0,
+        snip_edges=False,
+        high_freq=-400.0,
+    )
+    assert file_feat[start_frame:end_frame].shape == independent.shape

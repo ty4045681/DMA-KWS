@@ -14,7 +14,7 @@
 #   --pts-file FILE         Text file with one PT:OUT_DIR per non-comment line
 #   --base-out DIR          Fallback root output dir when no per-pt OUT is given
 #   --window-sec SEC        Sliding window length in seconds (default: 3.0)
-#   --hop-sec SEC           Sliding window hop in seconds (default: 1.0)
+#   --hop-sec SEC           Sliding window hop in seconds (default: 3.0)
 #   --experiment NAME       Hydra experiment override (default: icefall_zipformer_stage2)
 #   -h, --help              Show this help
 #
@@ -32,7 +32,7 @@
 #     --pt /path/to/stage2_step010000.pt:/path/to/out/step10000 \
 #     --pt /path/to/stage2_step020000.pt:/path/to/out/step20000 \
 #     --window-sec 3.0 \
-#     --hop-sec 1.0
+#     --hop-sec 3.0
 #
 #   # Multiple keywords from file, directory-style output:
 #   bash scripts/batch_eval_musan_fa.sh \
@@ -58,7 +58,7 @@ EXPLICIT_PTS=()
 PTS_FILE=""
 BASE_OUT=""
 WINDOW_SEC="3.0"
-HOP_SEC="1.0"
+HOP_SEC="3.0"
 EXPERIMENT="icefall_zipformer_stage2"
 
 usage() {

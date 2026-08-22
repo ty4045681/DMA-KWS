@@ -147,7 +147,20 @@ audio_aug:
       spectral_mask_probability: 0.0
       narrowband_probability: 0.0
 window_sec: 3.0
-hop_sec: 1.0
+# window_sec == hop_sec is a non-overlapping grid. FA/hour is not comparable
+# across hops because the numerator counts windows over threshold.
+hop_sec: 3.0
+# Inference AMP for Stage-II scoring: off | fp16 | bf16. V100 should use fp16.
+# Scores are not bit-identical to fp32 when this is enabled.
+amp: off
+# independent = extract fbank on each window (matches the historical path).
+# file = extract once per file and slice frames (faster; not identical when
+# snip_edges is false).
+fbank_windows: independent
+# File-duration sharding for multi-GPU MUSAN FA. Use scripts/eval_musan_fa_shards.sh
+# rather than pointing each process at a different subset directory.
+num_shards: 1
+shard_index: 0
 audio: ""
 keyword: ""
 keyword_phonemes: ""

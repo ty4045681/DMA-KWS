@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from collections.abc import Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -40,11 +42,59 @@ from dma_kws.inference.musan_fa import (
     detect_subset,
     metrics_record,
     musan_result_record,
+    select_shard,
     subset_summary,
 )
-from dma_kws.inference.stage2_clip import Stage2ClipRunner
+from dma_kws.inference.stage2_clip import PreparedFileWindows, Stage2ClipRunner
 from dma_kws.inference.stage2_reporting import build_score_provenance
+from dma_kws.inference.stage2_verifier import resolve_inference_amp
 from dma_kws.training.device import resolve_accelerator
+
+
+def _positive_int(value: object, *, default: int, name: str) -> int:
+    parsed = int(value or 0)
+    if parsed < 0:
+        raise SystemExit(f"{name} must be >= 0")
+    return default if parsed == 0 else parsed
+
+
+def _iter_prepared_windows(
+    runner: Stage2ClipRunner,
+    source_rows: Sequence[Mapping[str, Any]],
+    *,
+    keyword: str,
+    window_sec: float,
+    hop_sec: float,
+    keyword_phonemes: list[str] | None,
+    fbank_windows: str,
+    num_workers: int,
+) -> Iterator[tuple[Mapping[str, Any], PreparedFileWindows]]:
+    """Yield ``(source_row, prepared windows)``, prefetching when requested."""
+
+    def prepare(row: Mapping[str, Any]) -> PreparedFileWindows:
+        return runner.prepare_file_windows(
+            row["audio_path"],
+            keyword,
+            window_sec=window_sec,
+            hop_sec=hop_sec,
+            keyword_phonemes=keyword_phonemes,
+            fbank_windows=fbank_windows,
+        )
+
+    if num_workers <= 1:
+        for row in source_rows:
+            yield row, prepare(row)
+        return
+
+    pending: list[tuple[Mapping[str, Any], Future[PreparedFileWindows]]] = []
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        for row in source_rows:
+            pending.append((row, pool.submit(prepare, row)))
+            if len(pending) >= num_workers:
+                ready_row, future = pending.pop(0)
+                yield ready_row, future.result()
+        for ready_row, future in pending:
+            yield ready_row, future.result()
 
 
 def run_eval(cfg: DictConfig) -> dict:
@@ -78,9 +128,31 @@ def run_eval(cfg: DictConfig) -> dict:
         raise SystemExit("prep.stage2_ckpt is required")
 
     window_sec = float(prep.get("window_sec", 0.0) or 3.0)
-    hop_sec = float(prep.get("hop_sec", 0.0) or 1.0)
+    hop_sec = float(prep.get("hop_sec", 0.0) or 3.0)
     if window_sec <= 0 or hop_sec <= 0:
         raise SystemExit("window_sec and hop_sec must be positive")
+    batch_size = _positive_int(prep.get("batch_size"), default=64, name="prep.batch_size")
+    num_workers = int(prep.get("num_workers", 0) or 0)
+    if num_workers < 0:
+        raise SystemExit("prep.num_workers must be >= 0")
+    try:
+        amp = resolve_inference_amp(prep.get("amp"))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    fbank_windows = str(prep.get("fbank_windows") or "independent").strip().lower()
+    if fbank_windows not in {"independent", "file"}:
+        raise SystemExit(
+            "prep.fbank_windows must be 'independent' or 'file', "
+            f"got {prep.get('fbank_windows')!r}"
+        )
+    num_shards = int(prep.get("num_shards", 1) or 1)
+    shard_index = int(prep.get("shard_index", 0) or 0)
+    if num_shards < 1:
+        raise SystemExit("prep.num_shards must be >= 1")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise SystemExit(
+            f"prep.shard_index must be in [0, {num_shards}), got {shard_index}"
+        )
 
     output_dir_override = str(prep.get("output_dir", ""))
     output_dir = Path(output_dir_override or "outputs/eval_musan_fa")
@@ -124,39 +196,55 @@ def run_eval(cfg: DictConfig) -> dict:
     if not audio_files:
         raise SystemExit(f"No audio files found under {musan_root}")
 
-    source_rows = [
+    catalog = [
         {
             "audio_path": str(audio_path.resolve()),
             "subset": detect_subset(audio_path, musan_root_path),
+            "duration_sec": audio_duration_sec(audio_path),
         }
         for audio_path in audio_files
     ]
+    try:
+        source_rows = select_shard(
+            catalog,
+            num_shards=num_shards,
+            shard_index=shard_index,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     results_path = output_dir / "results.jsonl"
     all_results: list[dict[str, Any]] = []
     subset_results: dict[str, list[dict[str, Any]]] = defaultdict(list)
     subset_hours: dict[str, float] = defaultdict(float)
     total_hours = 0.0
+    override_phonemes = (
+        keyword_phonemes if use_keyword_phoneme_override else None
+    )
 
     with results_path.open("w", encoding="utf-8") as results_handle:
-        for source_row in source_rows:
+        for source_row, prepared in _iter_prepared_windows(
+            runner,
+            source_rows,
+            keyword=keyword,
+            window_sec=window_sec,
+            hop_sec=hop_sec,
+            keyword_phonemes=override_phonemes,
+            fbank_windows=fbank_windows,
+            num_workers=num_workers,
+        ):
             audio_path = source_row["audio_path"]
             subset = source_row["subset"]
-            duration = audio_duration_sec(audio_path)
+            duration = float(source_row["duration_sec"])
             total_hours += duration / 3600.0
             subset_hours[subset] += duration / 3600.0
 
-            window_results = runner.run_file_windows(
-                audio_path,
-                keyword,
-                window_sec=window_sec,
-                hop_sec=hop_sec,
-                keyword_phonemes=(
-                    keyword_phonemes if use_keyword_phoneme_override else None
-                ),
+            window_results = runner.score_prepared_windows(
+                prepared,
                 include_score_details=True,
                 include_eps_positions=True,
                 include_seq_positions=True,
+                batch_size=batch_size,
             )
             for window_result in window_results:
                 record = musan_result_record(
@@ -187,6 +275,12 @@ def run_eval(cfg: DictConfig) -> dict:
         "stage2_ckpt": stage2_ckpt,
         "window_sec": window_sec,
         "hop_sec": hop_sec,
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "amp": amp or "off",
+        "fbank_windows": fbank_windows,
+        "num_shards": num_shards,
+        "shard_index": shard_index,
         "total_files": len(source_rows),
         "total_hours": total_hours,
         "stream": stream_description,

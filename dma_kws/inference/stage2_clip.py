@@ -7,7 +7,10 @@ the Stage II QbyT verifier, bypassing Stage I locator models entirely.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+import threading
+from typing import TYPE_CHECKING, Any, Callable, Mapping, NamedTuple, Sequence
+
+_THREAD_EXTRACTORS = threading.local()
 
 from dma_kws.audio import load_audio
 from dma_kws.g2p import make_g2p, text_to_phonemes
@@ -24,6 +27,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ClipFeatureDataset",
+    "PreparedFileWindows",
     "Stage2ClipRunner",
     "collate_clip_feature_batch",
     "parse_phoneme_sequence",
@@ -182,6 +186,17 @@ def collate_clip_feature_batch(batch):
 # private names before the feature-loading path became shared by PER evaluation.
 _ClipFeatureDataset = ClipFeatureDataset
 _list_collate = collate_clip_feature_batch
+
+
+class PreparedFileWindows(NamedTuple):
+    """Window features extracted from one audio file, ready to score."""
+
+    audio_path: str
+    keyword: str
+    keyword_phonemes: list[str]
+    keyword_ids: list[int]
+    feats: list[Any]
+    spans: list[tuple[int, float, float]]
 
 
 class Stage2ClipRunner:
@@ -565,7 +580,7 @@ class Stage2ClipRunner:
                 result["seq_position_logits"] = score_details["seq_position_logits"]
         return result
 
-    def run_file_windows(
+    def prepare_file_windows(
         self,
         audio_path: str,
         keyword: str,
@@ -573,26 +588,21 @@ class Stage2ClipRunner:
         window_sec: float,
         hop_sec: float,
         keyword_phonemes: object | None = None,
-        include_score_details: bool = False,
-        include_eps_positions: bool = False,
-        include_seq_positions: bool = False,
-    ) -> list[dict]:
-        """Run Stage-II verification on sliding windows of a long audio file.
+        fbank_windows: str = "independent",
+    ) -> PreparedFileWindows:
+        """Load one file and extract hop-grid window features on CPU."""
 
-        The file is divided into overlapping windows of length ``window_sec``
-        advanced by ``hop_sec``. Each window is scored independently and a result
-        dict in the same format as :meth:`run` is returned. ``keyword_phonemes``
-        overrides automatic G2P when supplied. Position-level exports require
-        ``include_score_details=True``.
-        """
-        from dma_kws.inference.audio_utils import has_min_fbank_frames
+        from dma_kws.inference.audio_utils import (
+            has_min_fbank_frames,
+            window_fbank_frame_span,
+        )
         from dma_kws.stage2.features import waveform_to_fbank
 
-        if not include_score_details and (
-            include_eps_positions or include_seq_positions
-        ):
+        mode = str(fbank_windows or "independent").strip().lower()
+        if mode not in {"independent", "file"}:
             raise ValueError(
-                "Position-logit export requires include_score_details=True"
+                "fbank_windows must be 'independent' or 'file', "
+                f"got {fbank_windows!r}"
             )
 
         keyword_phonemes = self.resolve_keyword_phonemes(
@@ -609,21 +619,48 @@ class Stage2ClipRunner:
                 f"keyword={keyword!r}, phonemes={len(keyword_phonemes)}, "
                 f"token_ids={len(keyword_ids)}"
             )
-        threshold = float(self._demo_cfg.get("qbyt_threshold", 0.5))
         min_stage2_fbank_frames = self._verifier.min_fbank_frames
+        extractor = getattr(_THREAD_EXTRACTORS, "extractor", None)
+        if extractor is None:
+            from dma_kws.stage2.fbank import FbankExtractor
+
+            extractor = FbankExtractor(**self._verifier.fbank_kwargs)
+            _THREAD_EXTRACTORS.extractor = extractor
 
         waveform, sample_rate = load_audio(audio_path, sample_rate=self._sample_rate)
-        waveform, sample_rate = self._verifier.fbank_extractor.prepare_waveform(
+        waveform, sample_rate = extractor.prepare_waveform(
             waveform, sample_rate
         )
         total_samples = waveform.size(1)
         window_samples = int(window_sec * sample_rate)
         hop_samples = int(hop_sec * sample_rate)
-
+        empty = PreparedFileWindows(
+            audio_path=audio_path,
+            keyword=keyword,
+            keyword_phonemes=keyword_phonemes,
+            keyword_ids=keyword_ids,
+            feats=[],
+            spans=[],
+        )
         if window_samples <= 0 or hop_samples <= 0 or total_samples < window_samples:
-            return []
+            return empty
 
         fbank_kwargs = self._verifier.fbank_kwargs
+        frame_kwargs = {
+            "sample_rate": sample_rate,
+            "frame_length_ms": float(fbank_kwargs["frame_length"]),
+            "frame_shift_ms": float(fbank_kwargs["frame_shift"]),
+            "snip_edges": bool(fbank_kwargs.get("snip_edges", True)),
+        }
+        file_feat = None
+        if mode == "file":
+            file_feat = waveform_to_fbank(
+                waveform,
+                sample_rate=sample_rate,
+                extractor=extractor,
+                **fbank_kwargs,
+            )
+
         feats = []
         spans: list[tuple[int, float, float]] = []
         for window_index, start in enumerate(
@@ -633,57 +670,81 @@ class Stage2ClipRunner:
             if not has_min_fbank_frames(
                 end - start,
                 min_frames=min_stage2_fbank_frames,
-                sample_rate=sample_rate,
-                frame_length_ms=float(fbank_kwargs["frame_length"]),
-                frame_shift_ms=float(fbank_kwargs["frame_shift"]),
-                snip_edges=bool(fbank_kwargs.get("snip_edges", True)),
+                **frame_kwargs,
             ):
                 continue
-            window_wave = waveform[:, start:end]
-            feat = waveform_to_fbank(
-                window_wave,
-                sample_rate=sample_rate,
-                extractor=self._verifier.fbank_extractor,
-                **fbank_kwargs,
-            )
+            if mode == "file":
+                start_frame, end_frame = window_fbank_frame_span(
+                    start,
+                    end,
+                    **frame_kwargs,
+                )
+                if end_frame > file_feat.size(0):
+                    raise RuntimeError(
+                        "Full-file fbank is shorter than the sliced window: "
+                        f"file_frames={file_feat.size(0)}, "
+                        f"window=[{start_frame}, {end_frame})"
+                    )
+                feat = file_feat[start_frame:end_frame]
+            else:
+                feat = waveform_to_fbank(
+                    waveform[:, start:end],
+                    sample_rate=sample_rate,
+                    extractor=extractor,
+                    **fbank_kwargs,
+                )
             feats.append(feat)
             spans.append((window_index, start / sample_rate, end / sample_rate))
+        return PreparedFileWindows(
+            audio_path=audio_path,
+            keyword=keyword,
+            keyword_phonemes=keyword_phonemes,
+            keyword_ids=keyword_ids,
+            feats=feats,
+            spans=spans,
+        )
 
-        if not feats:
-            return []
+    def score_prepared_windows(
+        self,
+        prepared: PreparedFileWindows,
+        *,
+        include_score_details: bool = False,
+        include_eps_positions: bool = False,
+        include_seq_positions: bool = False,
+        batch_size: int = 64,
+    ) -> list[dict]:
+        """Score previously extracted window features."""
 
-        if include_score_details:
-            position_kwargs = {}
-            if include_eps_positions:
-                position_kwargs["include_eps_positions"] = True
-            if include_seq_positions:
-                position_kwargs["include_seq_positions"] = True
-            score_details = self._verifier.score_clip_feats_detailed(
-                feats,
-                [keyword_ids] * len(feats),
-                **position_kwargs,
+        if not include_score_details and (
+            include_eps_positions or include_seq_positions
+        ):
+            raise ValueError(
+                "Position-logit export requires include_score_details=True"
             )
-        else:
-            score_details = [
-                {"qbyt_score": score}
-                for score in self._verifier.score_clip_feats(
-                    feats,
-                    [keyword_ids] * len(feats),
-                )
-            ]
-        if len(score_details) != len(spans):
+        if not prepared.feats:
+            return []
+        threshold = float(self._demo_cfg.get("qbyt_threshold", 0.5))
+        score_details = self._score_window_feats(
+            prepared.feats,
+            prepared.keyword_ids,
+            include_score_details=include_score_details,
+            include_eps_positions=include_eps_positions,
+            include_seq_positions=include_seq_positions,
+            batch_size=batch_size,
+        )
+        if len(score_details) != len(prepared.spans):
             raise RuntimeError(
                 "Stage-II window scorer returned an unexpected result count: "
-                f"expected={len(spans)}, actual={len(score_details)}"
+                f"expected={len(prepared.spans)}, actual={len(score_details)}"
             )
         results = []
         for (window_index, start_sec, end_sec), details in zip(
-            spans, score_details
+            prepared.spans, score_details
         ):
             result = self._clip_result(
-                audio_path,
-                keyword,
-                keyword_phonemes,
+                prepared.audio_path,
+                prepared.keyword,
+                prepared.keyword_phonemes,
                 end_sec=end_sec,
                 qbyt_score=float(details["qbyt_score"]),
                 threshold=threshold,
@@ -691,8 +752,93 @@ class Stage2ClipRunner:
                 start_sec=start_sec,
                 score_details=details if include_score_details else None,
             )
-            # This is the original hop-grid index, not the compacted position
-            # among scoreable windows.
             result["window_index"] = window_index
             results.append(result)
         return results
+
+    def _score_window_feats(
+        self,
+        feats: Sequence,
+        keyword_ids: Sequence[int],
+        *,
+        include_score_details: bool,
+        include_eps_positions: bool,
+        include_seq_positions: bool,
+        batch_size: int,
+    ) -> list[dict]:
+        """Score window features in bounded GPU batches, preserving order."""
+
+        if not feats:
+            return []
+        chunk = max(1, int(batch_size))
+        keyword_ids_list = list(keyword_ids)
+        details: list[dict] = []
+        for start in range(0, len(feats), chunk):
+            batch_feats = list(feats[start : start + chunk])
+            batch_ids = [keyword_ids_list] * len(batch_feats)
+            if include_score_details:
+                position_kwargs = {}
+                if include_eps_positions:
+                    position_kwargs["include_eps_positions"] = True
+                if include_seq_positions:
+                    position_kwargs["include_seq_positions"] = True
+                details.extend(
+                    self._verifier.score_clip_feats_detailed(
+                        batch_feats,
+                        batch_ids,
+                        **position_kwargs,
+                    )
+                )
+            else:
+                details.extend(
+                    {"qbyt_score": score}
+                    for score in self._verifier.score_clip_feats(
+                        batch_feats,
+                        batch_ids,
+                    )
+                )
+        return details
+
+    def run_file_windows(
+        self,
+        audio_path: str,
+        keyword: str,
+        *,
+        window_sec: float,
+        hop_sec: float,
+        keyword_phonemes: object | None = None,
+        include_score_details: bool = False,
+        include_eps_positions: bool = False,
+        include_seq_positions: bool = False,
+        batch_size: int = 64,
+        fbank_windows: str = "independent",
+    ) -> list[dict]:
+        """Run Stage-II verification on sliding windows of a long audio file.
+
+        The file is divided into windows of length ``window_sec`` advanced by
+        ``hop_sec``. ``window_sec == hop_sec`` is a non-overlapping grid. Each
+        window is scored independently and a result dict in the same format as
+        :meth:`run` is returned. ``keyword_phonemes`` overrides automatic G2P
+        when supplied. Position-level exports require
+        ``include_score_details=True``.
+
+        ``fbank_windows="independent"`` extracts fbank on each window waveform
+        (bit-identical to the original path). ``fbank_windows="file"`` extracts
+        fbank once on the full file and slices frames; that is faster but not
+        bit-identical when ``snip_edges`` is false.
+        """
+        prepared = self.prepare_file_windows(
+            audio_path,
+            keyword,
+            window_sec=window_sec,
+            hop_sec=hop_sec,
+            keyword_phonemes=keyword_phonemes,
+            fbank_windows=fbank_windows,
+        )
+        return self.score_prepared_windows(
+            prepared,
+            include_score_details=include_score_details,
+            include_eps_positions=include_eps_positions,
+            include_seq_positions=include_seq_positions,
+            batch_size=batch_size,
+        )

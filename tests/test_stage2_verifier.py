@@ -106,6 +106,18 @@ def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch, tmp_path):
 
     assert calls == [{"mode": "eval", "chunk_size": 16}]
     assert "eval=16/64" in verifier.stream_policy.describe()
+    assert verifier.amp is None
+
+
+def test_resolve_inference_amp_accepts_aliases():
+    from dma_kws.inference.stage2_verifier import resolve_inference_amp
+
+    assert resolve_inference_amp("off") is None
+    assert resolve_inference_amp("fp16") == "fp16"
+    assert resolve_inference_amp("float16") == "fp16"
+    assert resolve_inference_amp("bf16") == "bf16"
+    with pytest.raises(ValueError, match="prep.amp"):
+        resolve_inference_amp("int8")
 
 
 def test_stage2_verifier_uses_waveform_to_fbank(monkeypatch):

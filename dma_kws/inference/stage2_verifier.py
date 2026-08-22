@@ -7,7 +7,31 @@ the QbyT query-by-text model, returning per-candidate detection scores.
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Sequence
+from contextlib import contextmanager
+from typing import Any, Iterator, Mapping, Sequence
+
+_AMP_DTYPES = {
+    "fp16": "float16",
+    "float16": "float16",
+    "bf16": "bfloat16",
+    "bfloat16": "bfloat16",
+}
+
+
+def resolve_inference_amp(value: object) -> str | None:
+    """Return ``fp16`` / ``bf16`` or ``None`` when mixed precision is off."""
+
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text or text in {"off", "false", "0", "none", "32", "fp32", "float32"}:
+        return None
+    if text in _AMP_DTYPES:
+        return "fp16" if _AMP_DTYPES[text] == "float16" else "bf16"
+    raise ValueError(
+        "prep.amp must be one of off, fp16, bf16 "
+        f"(got {value!r})"
+    )
 
 from dma_kws.config import (
     FbankConfig,
@@ -66,6 +90,7 @@ class Stage2Verifier:
         stage2_ckpt: str,
         vocab_size: int,
         device,
+        amp: str | None = None,
     ) -> None:
         try:
             import torch
@@ -79,6 +104,7 @@ class Stage2Verifier:
         self._torch = torch
         self._demo_cfg = dict(demo_cfg)
         self._device = device
+        self._amp = resolve_inference_amp(amp)
         self._fbank_kwargs = fbank_kwargs(fbank_cfg)
         self._fbank_extractor = FbankExtractor(**self._fbank_kwargs)
         stage2_encoder_dim = int(stage2_cfg.get("encoder_output_dim", 144))
@@ -254,6 +280,22 @@ class Stage2Verifier:
         )
 
     @property
+    def amp(self) -> str | None:
+        """Requested mixed-precision mode, or ``None`` for fp32."""
+        return getattr(self, "_amp", None)
+
+    @contextmanager
+    def _inference_amp(self) -> Iterator[None]:
+        torch = self._torch
+        amp = getattr(self, "_amp", None)
+        if amp is None or getattr(self._device, "type", None) != "cuda":
+            yield
+            return
+        dtype = torch.float16 if amp == "fp16" else torch.bfloat16
+        with torch.autocast(device_type="cuda", dtype=dtype):
+            yield
+
+    @property
     def fbank_extractor(self) -> FbankExtractor:
         return self._fbank_extractor
 
@@ -294,6 +336,10 @@ class Stage2Verifier:
         # The text embedding table is sized by the phoneme vocabulary, so it has
         # to come from the same dict the checkpoint was trained with.
         tokenizer = load_char_tokenizer(resolve_dict_path(config))
+        try:
+            amp = resolve_inference_amp(prep.get("amp"))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
         return cls(
             stage1_cfg=stage1_cfg,
@@ -303,6 +349,7 @@ class Stage2Verifier:
             stage2_ckpt=stage2_ckpt,
             vocab_size=len(tokenizer.symbol_table),
             device=device,
+            amp=amp,
         )
 
     def score_clip_feats(
@@ -326,7 +373,7 @@ class Stage2Verifier:
         anchor_lengths = torch.tensor(
             [len(ids) for ids in keyword_ids_batch], dtype=torch.long
         )
-        with torch.no_grad():
+        with torch.no_grad(), self._inference_amp():
             scores = self._model(
                 padded_feats.to(self._device),
                 feat_lengths.to(self._device),
@@ -380,7 +427,7 @@ class Stage2Verifier:
         anchor_lengths = torch.tensor(
             [len(ids) for ids in keyword_ids_batch], dtype=torch.long
         )
-        with torch.no_grad():
+        with torch.no_grad(), self._inference_amp():
             model_args = (
                 padded_feats.to(self._device),
                 feat_lengths.to(self._device),
@@ -565,7 +612,7 @@ class Stage2Verifier:
             [feat.size(0) for feat in feats],
             dtype=torch.long,
         )
-        with torch.no_grad():
+        with torch.no_grad(), self._inference_amp():
             encoder_out, encoder_mask = run_encoder(
                 self._model.encoder,
                 padded_feats.to(self._device),
@@ -637,7 +684,7 @@ class Stage2Verifier:
                 **self._fbank_kwargs,
             ).unsqueeze(0)
             candidate_lens = torch.tensor([candidate_feat.size(1)], dtype=torch.long)
-            with torch.no_grad():
+            with torch.no_grad(), self._inference_amp():
                 score = float(
                     self._model(
                         candidate_feat.to(self._device),
