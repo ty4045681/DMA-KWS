@@ -60,6 +60,7 @@ def test_plot_musan_fa_curve_reads_eval_directory(tmp_path):
     plot_summary = plot_musan_fa_curve(eval_dir, dpi=72)
 
     plot_path = eval_dir / "fa_per_hour_curve.png"
+    csv_path = eval_dir / "fa_per_hour_curve.csv"
     assert plot_summary["status"] == "generated"
     assert plot_summary["num_samples"] == 2
     assert plot_summary["total_hours"] == pytest.approx(2.0)
@@ -67,7 +68,15 @@ def test_plot_musan_fa_curve_reads_eval_directory(tmp_path):
     assert plot_summary["deployment_false_accepts"] == 1
     assert plot_summary["deployment_fa_per_hour"] == pytest.approx(0.5)
     assert plot_summary["fa_per_hour_curve"] == str(plot_path.resolve())
+    assert plot_summary["fa_per_hour_curve_csv"] == str(csv_path.resolve())
     assert plot_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    csv_rows = csv_path.read_text(encoding="utf-8").strip().splitlines()
+    assert csv_rows[0] == "threshold,false_accepts,fa_per_hour,fa_per_1000_hours"
+    thresholds = [row.split(",", 1)[0] for row in csv_rows[1:]]
+    assert "0.0" in thresholds
+    assert "0.4" in thresholds
+    assert "0.9" in thresholds
+    assert "1.0" in thresholds
 
 
 def test_plot_musan_fa_curve_requires_hours_without_summary(tmp_path):

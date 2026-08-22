@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 from statistics import NormalDist
 from typing import Any
@@ -593,18 +594,6 @@ def write_false_accept_rate_plot(
     if not np.isfinite(deployment_threshold):
         raise ValueError("threshold used for an FA/hour plot must be finite")
 
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg", force=True)
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return {
-            "status": "skipped",
-            "score_field": score_field,
-            "reason": "matplotlib is not installed",
-        }
-
     thresholds = np.asarray(curve["thresholds"], dtype=np.float64)
     fa_per_hour = np.asarray(curve["fa_per_hour"], dtype=np.float64)
     false_accepts = np.asarray(curve["false_accepts"], dtype=np.int64)
@@ -619,6 +608,37 @@ def write_false_accept_rate_plot(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "fa_per_hour_curve.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            ["threshold", "false_accepts", "fa_per_hour", "fa_per_1000_hours"]
+        )
+        for threshold_value, count, rate in zip(
+            thresholds, false_accepts, fa_per_hour
+        ):
+            writer.writerow(
+                [
+                    float(threshold_value),
+                    int(count),
+                    float(rate),
+                    float(rate) * 1000.0,
+                ]
+            )
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return {
+            "status": "skipped",
+            "score_field": score_field,
+            "reason": "matplotlib is not installed",
+            "fa_per_hour_curve_csv": str(csv_path.resolve()),
+        }
+
     plot_path = output_dir / "fa_per_hour_curve.png"
     figure, axis = plt.subplots(figsize=(6.4, 5.2))
     try:
@@ -663,4 +683,5 @@ def write_false_accept_rate_plot(
         "deployment_false_accepts": deploy_false_accepts,
         "deployment_fa_per_hour": deploy_fa_per_hour,
         "fa_per_hour_curve": str(plot_path.resolve()),
+        "fa_per_hour_curve_csv": str(csv_path.resolve()),
     }

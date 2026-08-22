@@ -1839,21 +1839,26 @@ Checkpoints run sequentially on one GPU; to use multiple GPUs, split the checkpo
 
 ## 11. MUSAN false-accept evaluation
 
-To measure the false-accept (FA) rate of a Stage-II QbyT checkpoint on continuous
-background audio, use `scripts/eval_musan_fa.py` or the batch wrapper
-`scripts/batch_eval_musan_fa.sh`. These scripts slide a fixed-length window over
-every MUSAN file and score each window with Stage-II only. The official grid is
-`prep.window_sec=3.0` / `prep.hop_sec=3.0` (no overlap). Setting the two equal
-always means a non-overlapping grid; FA/hour is **not** comparable across hops
-because the numerator counts windows over the threshold and the denominator is
-audio hours. Each run writes `results.jsonl`, `summary.json`, and—when
-`prep.plot_curves=true` (the default)—`fa_per_hour_curve.png`. The plot shows
-the exact QbyT threshold versus overall FA/hour curve and marks the configured
-deployment threshold. The summary reports both overall and per-subset
-(`music`/`noise`/`speech`) FA/hour, while each result row records the effective
-keyword phonemes and position-level Stage-II diagnostics.
+`scripts/eval_musan_fa.py` and `scripts/batch_eval_musan_fa.sh` score Stage II
+only: they slide a fixed window over every MUSAN file and treat every window as
+a negative. The official grid is `prep.window_sec=3.0` / `prep.hop_sec=3.0`.
+Equal window and hop means no overlap. FA/hour is **not** comparable across hops:
+the numerator is the number of windows over the threshold, the denominator is
+audio hours.
 
-Single keyword, single checkpoint with an explicit pronunciation:
+Each run writes `results.jsonl` and `summary.json`. With
+`prep.plot_curves=true` (the default) it also writes a matching pair:
+
+- `fa_per_hour_curve.png` — threshold versus FA/hour, with the deployment
+  threshold marked
+- `fa_per_hour_curve.csv` — the same points (`threshold`, `false_accepts`,
+  `fa_per_hour`, `fa_per_1000_hours`)
+
+`summary.json` reports overall and per-subset (`music`/`noise`/`speech`)
+FA/hour. Each result row keeps the keyword phonemes and Stage-II position
+diagnostics.
+
+Single keyword, single checkpoint:
 
 ```bash
 python3 scripts/eval_musan_fa.py \
@@ -1868,19 +1873,28 @@ python3 scripts/eval_musan_fa.py \
   prep.output_dir=/path/to/out
 ```
 
-Omit `prep.keyword_phonemes` (or leave it blank) to retain automatic G2P.
+Omit `prep.keyword_phonemes` (or leave it blank) to keep automatic G2P.
 
-`prep.batch_size` (default 64) chunks GPU scoring so a long speech file cannot
-OOM. `prep.num_workers` prefetches the next files' fbank on CPU (`0` keeps the
-historical serial path). Same-grid scores stay bit-identical to the old path
-when `prep.amp=off` (the default) and `prep.fbank_windows=independent` (also
-the default). `prep.amp=fp16` is the V100 option and changes logits.
-`prep.fbank_windows=file` extracts fbank once per file and slices frames; that
-is faster, but not identical when the configured fbank uses `snip_edges=false`
-(Icefall).
+### Throughput knobs
 
-Two GPUs: do not point each process at a different MUSAN subset directory
-(that breaks subset names). Shard by file duration and merge:
+These do not change the hop grid. Defaults keep same-grid scores identical to
+the historical per-window fp32 path:
+
+| Override | Default | Effect |
+| --- | --- | --- |
+| `prep.batch_size` | `64` | GPU windows per forward. Caps memory on long speech files. |
+| `prep.num_workers` | `0` | CPU prefetch of the next files' fbank. `0` is serial. |
+| `prep.amp` | `off` | `fp16` is the V100 option and **changes logits**. |
+| `prep.fbank_windows` | `independent` | `file` extracts fbank once per file and slices frames. Faster, but **not** bit-identical when fbank uses `snip_edges=false` (Icefall). |
+
+Faster and not bit-identical: add `prep.amp=fp16 prep.fbank_windows=file`. Copy
+`musan_root` to local disk when two processes would otherwise share a network
+filesystem.
+
+### Two GPUs
+
+Do not point each process at `music/`, `noise/`, or `speech/` as
+`prep.musan_root`. That breaks subset names. Shard files by duration, then merge:
 
 ```bash
 bash scripts/eval_musan_fa_shards.sh \
@@ -1896,29 +1910,25 @@ bash scripts/eval_musan_fa_shards.sh \
   prep.num_workers=8
 ```
 
-That writes `/path/to/out/shard_0`, `/path/to/out/shard_1`, and a pooled
-`/path/to/out/merged` whose FA/hour matches a single-GPU run (total FP / total
-hours, never the average of shard FA/hour). You can also merge later with
+That writes `shard_0/`, `shard_1/`, and a pooled `merged/` whose FA/hour is
+total FP / total hours (never the average of shard FA/hour). Merge later with
 `python3 scripts/merge_musan_fa.py /path/to/out /path/to/out/merged`.
 
-To regenerate only the FA/hour plot from an existing MUSAN eval directory
-(no inference):
+### Plot an existing eval directory
+
+`scripts/plot_musan_fa_curve.py` does not run inference. It reads
+`results.jsonl` and, when present, `summary.json` for `total_hours` and the
+deployment threshold, then rewrites the PNG/CSV pair:
 
 ```bash
 python3 scripts/plot_musan_fa_curve.py /path/to/musan_test
 ```
 
-The script reads `results.jsonl` and, when present, `summary.json` for
-`total_hours` and the deployment threshold. Override with `--total-hours`,
-`--threshold`, or `--output-dir` if needed.
+Override with `--total-hours`, `--threshold`, `--summary`, or `--output-dir`.
+`scripts/scan_stage2_thresholds.py` is the related table scan over the same
+`qbyt_score` values.
 
-Faster but not bit-identical:
-
-```bash
-prep.amp=fp16 prep.fbank_windows=file
-```
-
-Batch evaluation across multiple checkpoints and keywords:
+### Many checkpoints or keywords
 
 ```bash
 bash scripts/batch_eval_musan_fa.sh \
@@ -1953,10 +1963,9 @@ bash scripts/batch_eval_musan_fa.sh \
   --base-out /path/to/musan_fa_outputs
 ```
 
-Each checkpoint × keyword combination produces its own `results.jsonl` and
-`summary.json`. The batch wrapper does not create CSV or TSV output. If a
-consolidated TSV is needed for manual analysis, run the retained aggregation
-utility explicitly:
+Each checkpoint × keyword combination writes its own `results.jsonl`,
+`summary.json`, and (by default) the PNG/CSV curve pair. The batch wrapper does
+not build a cross-run table. For that, use:
 
 ```bash
 python3 scripts/aggregate_musan_fa.py \

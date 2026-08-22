@@ -356,6 +356,7 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
     summary = eval_musan_fa.run_eval(cfg)
 
     assert {path.name for path in output_dir.iterdir()} == {
+        "fa_per_hour_curve.csv",
         "fa_per_hour_curve.png",
         "results.jsonl",
         "summary.json",
@@ -373,6 +374,9 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
         "deployment_fa_per_hour": pytest.approx(1200.0),
         "fa_per_hour_curve": str(
             (output_dir / "fa_per_hour_curve.png").resolve()
+        ),
+        "fa_per_hour_curve_csv": str(
+            (output_dir / "fa_per_hour_curve.csv").resolve()
         ),
     }
     assert (output_dir / "fa_per_hour_curve.png").read_bytes().startswith(
@@ -473,6 +477,7 @@ def test_false_accept_rate_plot_writes_png_and_deployment_point(tmp_path):
     )
 
     plot_path = tmp_path / "fa_per_hour_curve.png"
+    csv_path = tmp_path / "fa_per_hour_curve.csv"
     assert plot_summary == {
         "status": "generated",
         "score_field": "qbyt_score",
@@ -482,8 +487,12 @@ def test_false_accept_rate_plot_writes_png_and_deployment_point(tmp_path):
         "deployment_false_accepts": 3,
         "deployment_fa_per_hour": 1.5,
         "fa_per_hour_curve": str(plot_path.resolve()),
+        "fa_per_hour_curve_csv": str(csv_path.resolve()),
     }
     assert plot_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    csv_rows = csv_path.read_text(encoding="utf-8").strip().splitlines()
+    assert csv_rows[0] == "threshold,false_accepts,fa_per_hour,fa_per_1000_hours"
+    assert csv_rows[1].startswith("0.0,4,2.0,")
 
 
 def test_detect_subset(tmp_path):

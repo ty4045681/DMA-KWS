@@ -3,7 +3,8 @@
 
 The script never reruns inference. It reads ``results.jsonl`` written by
 ``eval_musan_fa.py`` or ``merge_musan_fa.py`` and writes
-``fa_per_hour_curve.png`` with the same helper those scripts use.
+``fa_per_hour_curve.png`` plus ``fa_per_hour_curve.csv`` with the same helper
+those scripts use.
 
 Examples:
 
@@ -90,7 +91,7 @@ def plot_musan_fa_curve(
     total_hours: float | None = None,
     dpi: int = DEFAULT_PLOT_DPI,
 ) -> dict[str, Any]:
-    """Load one MUSAN eval output and write ``fa_per_hour_curve.png``."""
+    """Load one MUSAN eval output and write the FA/hour PNG and CSV."""
 
     results_path = resolve_results_path(source)
     if summary_path is None:
@@ -113,15 +114,15 @@ def plot_musan_fa_curve(
     )
     if plot_summary.get("status") != "generated":
         reason = plot_summary.get("reason", "unknown plot failure")
-        raise SystemExit(f"Did not write fa_per_hour_curve.png: {reason}")
+        raise SystemExit(f"Did not write fa_per_hour_curve.png/.csv: {reason}")
     return plot_summary
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot fa_per_hour_curve.png from an eval_musan_fa.py directory "
-            "or results.jsonl. Does not rerun inference."
+            "Plot fa_per_hour_curve.png and fa_per_hour_curve.csv from an "
+            "eval_musan_fa.py directory or results.jsonl. Does not rerun inference."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -138,7 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        help="Directory for fa_per_hour_curve.png; defaults to the results directory",
+        help="Directory for the PNG/CSV pair; defaults to the results directory",
     )
     parser.add_argument(
         "--threshold",

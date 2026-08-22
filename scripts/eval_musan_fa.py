@@ -8,13 +8,14 @@ per-subset (music/noise/speech) FA/hour.
 Output schema matches ``scripts/eval_stage2_clips.py``:
   - ``results.jsonl`` has one JSON object per scored window.
   - ``summary.json`` contains aggregate metrics.
-  - ``fa_per_hour_curve.png`` plots the exact threshold/FA-hour sweep when
-    ``prep.plot_curves`` is enabled and valid scored windows are available.
+  - ``fa_per_hour_curve.png`` and ``fa_per_hour_curve.csv`` record the exact
+    threshold/FA-hour sweep when ``prep.plot_curves`` is enabled and valid
+    scored windows are available.
 
 Set ``prep.keyword_phonemes`` to a space-separated ARPAbet sequence (or a
 Hydra list) to override keyword G2P. A missing or blank value retains automatic
-G2P. These are the only JSON files written to ``prep.output_dir``; the plot is
-the only optional side artifact.
+G2P. These are the only JSON files written to ``prep.output_dir``; the plot and
+its CSV are the only optional side artifacts.
 """
 
 from __future__ import annotations
