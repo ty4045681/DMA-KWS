@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Mapping
@@ -11,6 +12,36 @@ import numpy as np
 from dma_kws.audio import load_audio
 from dma_kws.inference.audio_utils import apply_margin_to_span
 from dma_kws.stage1.candidates import KeywordCandidate
+
+DEFAULT_WAKEUP_WINDOW_SEC = 1.5
+DEFAULT_STREAM_CHUNK_SEC = 0.1
+
+
+def span_from_sherpa_hit(
+    *,
+    audio_duration_sec: float,
+    wakeup_window_sec: float,
+    decoded_sec: float,
+) -> tuple[float, float]:
+    """Return a short crop ending at the absolute decoded-audio frontier.
+
+    sherpa timestamps are decoder-local after an internal or explicit reset,
+    while its Python API does not expose the corresponding absolute origin.
+    The caller-maintained source-audio frontier is therefore authoritative.
+    """
+    window = float(wakeup_window_sec)
+    if not math.isfinite(window) or window <= 0.0:
+        raise ValueError("locator.wakeup_window_sec must be positive")
+    duration = float(audio_duration_sec)
+    frontier = float(decoded_sec)
+    if not math.isfinite(duration) or duration < 0.0:
+        raise ValueError("audio_duration_sec must be finite and non-negative")
+    if not math.isfinite(frontier):
+        raise ValueError("decoded_sec must be finite")
+
+    end_sec = min(duration, max(0.0, frontier))
+    start_sec = max(0.0, end_sec - window)
+    return start_sec, end_sec
 
 
 def _import_sherpa_onnx():
@@ -59,6 +90,18 @@ class SherpaOnnxKwsLocator:
 
         self._margin_sec = float(demo.get("stage1_candidate_margin_sec", 0.15))
         self._tail_padding_sec = float(locator_cfg.get("tail_padding_sec", 0.66))
+        self._stream_chunk_sec = float(
+            locator_cfg.get("stream_chunk_sec", DEFAULT_STREAM_CHUNK_SEC)
+        )
+        self._wakeup_window_sec = float(
+            locator_cfg.get("wakeup_window_sec", DEFAULT_WAKEUP_WINDOW_SEC)
+        )
+        if not math.isfinite(self._stream_chunk_sec) or self._stream_chunk_sec <= 0.0:
+            raise ValueError("locator.stream_chunk_sec must be positive")
+        if not math.isfinite(self._tail_padding_sec) or self._tail_padding_sec < 0.0:
+            raise ValueError("locator.tail_padding_sec must be non-negative")
+        if not math.isfinite(self._wakeup_window_sec) or self._wakeup_window_sec <= 0.0:
+            raise ValueError("locator.wakeup_window_sec must be positive")
         stage1_cfg = config.get("stage1")
         if not isinstance(stage1_cfg, Mapping):
             stage1_cfg = {}
@@ -102,43 +145,60 @@ class SherpaOnnxKwsLocator:
             audio_path, sample_rate=self._sample_rate
         )
         samples = waveform.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
+        audio_duration_sec = float(len(samples) / sample_rate)
 
         # Official sherpa-onnx path: keywords come only from keywords.txt.
         stream = self._kws.create_stream()
-        stream.accept_waveform(sample_rate, samples)
-
-        tail = np.zeros(int(self._tail_padding_sec * sample_rate), dtype=np.float32)
-        stream.accept_waveform(sample_rate, tail)
-        stream.input_finished()
-
         candidates: list[KeywordCandidate] = []
-        while self._kws.is_ready(stream):
-            self._kws.decode_stream(stream)
-            result = self._kws.get_result(stream)
-            if not result:
-                continue
 
-            timestamps = list(self._kws.timestamps(stream))
-            if timestamps:
-                start_sec = float(min(timestamps))
-                end_sec = float(max(timestamps))
-            else:
-                start_sec = 0.0
-                end_sec = float(len(samples) / sample_rate)
-
-            start_sec, end_sec = apply_margin_to_span(
-                start_sec,
-                end_sec,
-                margin_sec=self._margin_sec,
-            )
-            candidates.append(
-                KeywordCandidate(
-                    start_sec=start_sec,
-                    end_sec=end_sec,
-                    stage1_score=1.0,
-                    phonemes=[],
+        def drain_ready(*, source_samples_fed: int) -> None:
+            # ``source_samples_fed`` excludes synthetic tail padding and remains
+            # absolute across sherpa's internal and explicit decoder resets.
+            decoded_sec = source_samples_fed / sample_rate
+            while self._kws.is_ready(stream):
+                self._kws.decode_stream(stream)
+                # Read exactly once. Calling ``timestamps()`` afterwards would
+                # consume the same native result again in sherpa-onnx 1.13.x.
+                result = self._kws.get_result(stream)
+                keyword_result = (
+                    result.strip()
+                    if isinstance(result, str)
+                    else str(getattr(result, "keyword", "")).strip()
                 )
-            )
-            self._kws.reset_stream(stream)
+                if not keyword_result:
+                    continue
+
+                start_sec, end_sec = span_from_sherpa_hit(
+                    audio_duration_sec=audio_duration_sec,
+                    wakeup_window_sec=self._wakeup_window_sec,
+                    decoded_sec=decoded_sec,
+                )
+                start_sec, end_sec = apply_margin_to_span(
+                    start_sec,
+                    end_sec,
+                    margin_sec=self._margin_sec,
+                    audio_duration_sec=audio_duration_sec,
+                )
+                candidates.append(
+                    KeywordCandidate(
+                        start_sec=start_sec,
+                        end_sec=end_sec,
+                        stage1_score=1.0,
+                        phonemes=[],
+                    )
+                )
+                self._kws.reset_stream(stream)
+
+        chunk_samples = max(1, round(self._stream_chunk_sec * sample_rate))
+        for begin in range(0, len(samples), chunk_samples):
+            end = min(len(samples), begin + chunk_samples)
+            stream.accept_waveform(sample_rate, samples[begin:end])
+            drain_ready(source_samples_fed=end)
+
+        tail = np.zeros(round(self._tail_padding_sec * sample_rate), dtype=np.float32)
+        if tail.size:
+            stream.accept_waveform(sample_rate, tail)
+        stream.input_finished()
+        drain_ready(source_samples_fed=len(samples))
 
         return candidates

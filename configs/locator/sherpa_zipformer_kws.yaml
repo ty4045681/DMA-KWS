@@ -10,5 +10,11 @@ keywords_file: ""
 keywords_threshold: 0.25
 modeling_unit: cjkchar
 tail_padding_sec: 0.66
+# Source audio is fed incrementally and decoded after every block. Smaller
+# blocks reduce candidate end-time quantization at the cost of more Python calls.
+stream_chunk_sec: 0.1
+# Lookback from the decoded source-audio frontier handed to Stage II. This must
+# cover the wake phrase plus sherpa's decoding latency.
+wakeup_window_sec: 1.5
 provider: cpu
 num_threads: 2

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -59,6 +61,7 @@ def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch, tmp_path):
     class _StubQbyT(nn.Module):
         def __init__(self, **kwargs):
             super().__init__()
+            self.pos_enc = SimpleNamespace(pe=torch.empty(1, 5000, 1))
 
         def forward(self, speech, text, speech_lengths=None, text_lengths=None):
             del text, speech_lengths, text_lengths
@@ -107,6 +110,80 @@ def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch, tmp_path):
     assert calls == [{"mode": "eval", "chunk_size": 16}]
     assert "eval=16/64" in verifier.stream_policy.describe()
     assert verifier.amp is None
+
+
+def test_stage2_verifier_rejects_overlong_candidate_before_encoding(
+    monkeypatch, tmp_path
+):
+    """A bad locator span must fail clearly instead of crashing in QbyT."""
+    import torch.nn as nn
+
+    encoder_calls = 0
+
+    class _StubEncoder(nn.Module):
+        def output_frames(self, num_input_frames):
+            return num_input_frames
+
+        def forward(self, feats, feat_lengths):
+            del feats, feat_lengths
+            raise AssertionError("the capacity guard must run before the encoder")
+
+    class _StubQbyT(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.pos_enc = SimpleNamespace(pe=torch.empty(1, 10, 1))
+
+        def forward(self, speech, text, speech_lengths=None, text_lengths=None):
+            del speech, text, speech_lengths, text_lengths
+            raise AssertionError("an overlong candidate must not reach QbyT")
+
+    def _spy_run_encoder(*args, **kwargs):
+        nonlocal encoder_calls
+        encoder_calls += 1
+        raise AssertionError("the capacity guard must run before the encoder")
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_verifier.build_encoder", lambda *_a, **_k: _StubEncoder()
+    )
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_verifier.load_qbyt_class", lambda: _StubQbyT
+    )
+    monkeypatch.setattr("dma_kws.inference.stage2_verifier.run_encoder", _spy_run_encoder)
+
+    ckpt_path = tmp_path / "stage2.pt"
+    torch.save({"model_state_dict": {}}, ckpt_path)
+    verifier = Stage2Verifier(
+        stage1_cfg={
+            "encoder_type": "icefall_zipformer",
+            "causal": True,
+            "downsampling_factor": "1,2,4,8,4,2",
+            "cnn_module_kernel": "31,31,15,15,15,31",
+            "stream": {
+                "chunk_size": 16,
+                "left_context_frames": 64,
+                "train_policy": "multi",
+                "train_chunk_size": "16,32,64,-1",
+                "train_left_context_frames": "64,128,256,-1",
+            },
+        },
+        stage2_cfg={"encoder_output_dim": 8},
+        demo_cfg={},
+        fbank_cfg=FbankConfig(dither=0.0, window_type="povey"),
+        stage2_ckpt=str(ckpt_path),
+        device=torch.device("cpu"),
+        vocab_size=73,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "padded_fbank_frames=11, projected_encoder_frames=11, "
+            "qbyt_capacity=10"
+        ),
+    ):
+        verifier.score_clip_feats([torch.zeros(11, 80)], [[1, 2, 3]])
+
+    assert encoder_calls == 0
 
 
 def test_resolve_inference_amp_accepts_aliases():

@@ -482,6 +482,8 @@ class SherpaKwsLocatorConfig:
     keywords_threshold: float = 0.25
     modeling_unit: str = "cjkchar"
     tail_padding_sec: float = 0.66
+    stream_chunk_sec: float = 0.1
+    wakeup_window_sec: float = 1.5
     provider: str = "cpu"
     num_threads: int = 2
 
@@ -506,6 +508,8 @@ class LocatorConfig:
     keywords_threshold: float = 0.25
     modeling_unit: str = "cjkchar"
     tail_padding_sec: float = 0.66
+    stream_chunk_sec: float = 0.1
+    wakeup_window_sec: float = 1.5
     provider: str = "cpu"
     num_threads: int = 2
     wekws: WekwsWenetLocatorConfig = field(default_factory=WekwsWenetLocatorConfig)

@@ -41,7 +41,12 @@ from dma_kws.config import (
     resolve_stream_policy,
 )
 from dma_kws.inference.audio_utils import has_min_fbank_frames
-from dma_kws.nn import build_encoder, min_input_frames_for_encoder, run_encoder
+from dma_kws.nn import (
+    build_encoder,
+    encoder_output_frames,
+    min_input_frames_for_encoder,
+    run_encoder,
+)
 from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage1.candidates import KeywordCandidate
 from dma_kws.stage2.fbank import FbankExtractor
@@ -158,6 +163,20 @@ class Stage2Verifier:
                 *,
                 include_readout_details=False,
             ):
+                padded_fbank_frames = int(feats.size(1))
+                projected_encoder_frames = encoder_output_frames(
+                    self.encoder, padded_fbank_frames
+                )
+                qbyt_capacity = int(self.qbyt.pos_enc.pe.size(1))
+                if projected_encoder_frames > qbyt_capacity:
+                    raise ValueError(
+                        "Stage II candidate exceeds QbyT positional capacity: "
+                        f"padded_fbank_frames={padded_fbank_frames}, "
+                        f"projected_encoder_frames={projected_encoder_frames}, "
+                        f"qbyt_capacity={qbyt_capacity}. "
+                        "Check the Stage I locator/window boundaries; automatic "
+                        "truncation is disabled because it could remove the wake word."
+                    )
                 # Inference always runs at the deployment operating point.
                 encoder_out, encoder_mask = run_encoder(
                     self.encoder,
