@@ -105,9 +105,16 @@ def test_sherpa_locator_uses_keywords_file_stream_without_inline_keyword(
     import numpy as np
     import torch
 
+    captured = {}
+
+    def fake_load_audio(path, *, sample_rate: int):
+        captured["path"] = path
+        captured["sample_rate"] = sample_rate
+        return torch.zeros(1, sample_rate), sample_rate
+
     monkeypatch.setattr(
         "dma_kws.inference.locators.sherpa_kws.load_audio",
-        lambda path: (torch.zeros(1, 16000), 16000),
+        fake_load_audio,
     )
 
     locator = SherpaOnnxKwsLocator(
@@ -117,6 +124,7 @@ def test_sherpa_locator_uses_keywords_file_stream_without_inline_keyword(
     assert Path(FakeKeywordSpotter.last_kwargs["keywords_file"]) == keywords.resolve()
 
     locator.locate("/tmp/audio.wav", "hey eva", keyword_phonemes=["HH", "EY1"])
+    assert captured["sample_rate"] == 16000
     assert FakeKeywordSpotter.last_stream_keywords is None
     assert locator._kws.stream.finished is True
     assert len(locator._kws.stream.waveforms) == 2

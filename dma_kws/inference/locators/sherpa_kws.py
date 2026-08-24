@@ -59,6 +59,10 @@ class SherpaOnnxKwsLocator:
 
         self._margin_sec = float(demo.get("stage1_candidate_margin_sec", 0.15))
         self._tail_padding_sec = float(locator_cfg.get("tail_padding_sec", 0.66))
+        stage1_cfg = config.get("stage1")
+        if not isinstance(stage1_cfg, Mapping):
+            stage1_cfg = {}
+        self._sample_rate = int(stage1_cfg.get("sample_rate", 16000))
 
         required = ("tokens", "encoder", "decoder", "joiner", "keywords_file")
         missing = [name for name in required if not _optional_path(locator_cfg.get(name))]
@@ -94,7 +98,9 @@ class SherpaOnnxKwsLocator:
         keyword_phonemes: Sequence[str] | None = None,
     ) -> list[KeywordCandidate]:
         del keyword, keyword_phonemes
-        waveform, sample_rate = load_audio(audio_path)
+        waveform, sample_rate = load_audio(
+            audio_path, sample_rate=self._sample_rate
+        )
         samples = waveform.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
 
         # Official sherpa-onnx path: keywords come only from keywords.txt.
