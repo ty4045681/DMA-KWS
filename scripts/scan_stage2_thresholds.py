@@ -12,6 +12,11 @@ Examples:
 
     python3 scripts/scan_stage2_thresholds.py outputs/eval_musan_fa/results.jsonl \
       --max-fa-per-hour 0.5 --workers 8
+
+Pass an evaluation directory that contains ``results.jsonl``, or the file
+itself. Mixed clip labels write the usual metric table. Positive-only clips
+also write a threshold-versus-recall plot; negative-only results write
+threshold versus FPR.
 """
 
 from __future__ import annotations
@@ -266,12 +271,6 @@ def load_scan_input(
     positives = int(np.sum(label_array == 1))
     negatives = int(np.sum(label_array == 0))
 
-    if resolved_mode == "clips" and (positives == 0 or negatives == 0):
-        raise SystemExit(
-            "Clip threshold scanning needs both positive and negative labeled rows; "
-            f"found positives={positives}, negatives={negatives}. Use --mode musan "
-            "for an intentional negative-only false-accept scan."
-        )
     if resolved_mode == "musan" and positives:
         raise SystemExit(
             f"MUSAN results must be negative-only, but found {positives} positive rows"
@@ -535,6 +534,65 @@ def _csv_columns(mode: str, arrays: dict[str, np.ndarray]) -> list[str]:
     return base + sorted(key for key in arrays if key not in base and key not in {"tp", "fn"})
 
 
+def write_single_class_plot(
+    arrays: dict[str, np.ndarray],
+    *,
+    metric: str,
+    output_path: Path,
+    dpi: int = 160,
+) -> dict[str, Any]:
+    """Plot threshold versus recall or FPR for a one-class score file."""
+
+    if metric not in {"recall", "fpr"}:
+        raise ValueError(f"unsupported single-class plot metric: {metric}")
+    if metric not in arrays:
+        raise ValueError(f"{metric} is missing from the scanned threshold arrays")
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return {
+            "status": "skipped",
+            "reason": "matplotlib is not installed",
+            "metric": metric,
+        }
+
+    order = np.argsort(arrays["threshold"])
+    thresholds = np.asarray(arrays["threshold"][order], dtype=np.float64)
+    values = np.asarray(arrays[metric][order], dtype=np.float64)
+    ylabel = "Recall" if metric == "recall" else "False Positive Rate"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure, axis = plt.subplots(figsize=(6.4, 5.2))
+    try:
+        axis.step(thresholds, values, where="pre", linewidth=2.0)
+        x_min = float(np.min(thresholds))
+        x_max = float(np.max(thresholds))
+        if x_min == x_max:
+            pad = 0.05
+            x_min -= pad
+            x_max += pad
+        axis.set(
+            xlim=(x_min, x_max),
+            ylim=(0.0, 1.0),
+            xlabel="Threshold",
+            ylabel=ylabel,
+            title=f"Stage II {ylabel} vs Threshold",
+        )
+        axis.grid(True, alpha=0.25)
+        figure.tight_layout()
+        figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    finally:
+        plt.close(figure)
+    return {
+        "status": "generated",
+        "metric": metric,
+        "path": str(output_path.resolve()),
+    }
+
+
 def write_curve_csv(
     arrays: dict[str, np.ndarray],
     *,
@@ -626,6 +684,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Scan summary JSON; defaults to <results-dir>/threshold_scan_summary.json",
     )
+    parser.add_argument(
+        "--out-plot",
+        type=Path,
+        help="Single-class PNG; defaults to <results-dir>/threshold_scan.png",
+    )
     return parser
 
 
@@ -680,6 +743,25 @@ def run_scan(args: argparse.Namespace) -> dict[str, Any]:
 
     positives = int(np.sum(scan_input.labels == 1))
     negatives = int(np.sum(scan_input.labels == 0))
+    plot_metric = None
+    if positives > 0 and negatives == 0:
+        plot_metric = "recall"
+    elif negatives > 0 and positives == 0:
+        plot_metric = "fpr"
+    plot_summary = None
+    if plot_metric is not None:
+        requested_plot = getattr(args, "out_plot", None)
+        output_plot = (
+            requested_plot.expanduser()
+            if requested_plot
+            else scan_input.results_path.parent / "threshold_scan.png"
+        ).resolve()
+        plot_summary = write_single_class_plot(
+            arrays,
+            metric=plot_metric,
+            output_path=output_plot,
+        )
+
     summary: dict[str, Any] = {
         "results": str(scan_input.results_path),
         "source_summary": str(scan_input.summary_path) if scan_input.summary_path else None,
@@ -696,7 +778,7 @@ def run_scan(args: argparse.Namespace) -> dict[str, Any]:
         "workers": actual_workers,
         "curve_csv": str(output_csv),
     }
-    if scan_input.mode == "clips":
+    if scan_input.mode == "clips" and positives > 0 and negatives > 0:
         eer, eer_threshold = binary_eer(scan_input.labels, scan_input.scores)
         summary.update(
             {
@@ -723,6 +805,8 @@ def run_scan(args: argparse.Namespace) -> dict[str, Any]:
         }
     if selection is not None:
         summary["selection"] = selection
+    if plot_summary is not None:
+        summary["plot"] = plot_summary
 
     output_summary.parent.mkdir(parents=True, exist_ok=True)
     output_summary.write_text(
@@ -738,6 +822,11 @@ def run_scan(args: argparse.Namespace) -> dict[str, Any]:
         print(f"Excluded: {scan_input.num_skipped} skipped row(s).")
     print(f"Curve:   {output_csv}")
     print(f"Summary: {output_summary}")
+    if plot_summary is not None:
+        if plot_summary.get("status") == "generated":
+            print(f"Plot:    {plot_summary['path']}")
+        else:
+            print(f"Plot:    skipped ({plot_summary.get('reason', 'unavailable')})")
     if selection is not None:
         if selection["found"]:
             point = selection["operating_point"]

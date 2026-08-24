@@ -5,6 +5,7 @@ import csv
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from scripts.scan_stage2_thresholds import (
@@ -13,6 +14,7 @@ from scripts.scan_stage2_thresholds import (
     run_scan,
     scan_thresholds,
     select_operating_point,
+    write_single_class_plot,
 )
 
 
@@ -223,15 +225,108 @@ def test_run_scan_writes_curve_and_summary(tmp_path):
     assert {"threshold", "recall", "fpr", "tp", "tn", "fp", "fn"} <= set(rows[0])
 
 
-def test_clip_scan_requires_both_classes(tmp_path):
-    results = tmp_path / "results.jsonl"
+def test_positive_only_clip_scan_writes_recall_plot(tmp_path):
+    pytest.importorskip("matplotlib")
+    results = tmp_path / "clips" / "results.jsonl"
     _write_jsonl(
         results,
-        [{"label": 0, "qbyt_score": 0.2}, {"label": 0, "qbyt_score": 0.8}],
+        [
+            {"audio_path": "p1.wav", "keyword": "hey eva", "label": 1, "qbyt_score": 0.9},
+            {"audio_path": "p2.wav", "keyword": "hey eva", "label": 1, "qbyt_score": 0.4},
+        ],
     )
 
-    with pytest.raises(SystemExit, match="both positive and negative"):
-        load_scan_input(results, mode="clips")
+    scan_input = load_scan_input(tmp_path / "clips")
+    thresholds = build_thresholds(scan_input.scores)
+    arrays, _ = scan_thresholds(scan_input, thresholds, workers=1)
+
+    assert scan_input.mode == "clips"
+    assert int(np.sum(scan_input.labels == 1)) == 2
+    assert int(np.sum(scan_input.labels == 0)) == 0
+    index = list(arrays["threshold"]).index(0.9)
+    assert arrays["tp"][index] == 1
+    assert arrays["fn"][index] == 1
+    assert arrays["recall"][index] == pytest.approx(0.5)
+    assert arrays["fp"][index] == 0
+    assert arrays["fpr"][index] == pytest.approx(0.0)
+
+    out_plot = tmp_path / "recall.png"
+    plot = write_single_class_plot(arrays, metric="recall", output_path=out_plot)
+    assert plot["status"] == "generated"
+    assert plot["metric"] == "recall"
+    assert out_plot.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+    summary = run_scan(
+        argparse.Namespace(
+            results=tmp_path / "clips",
+            mode="auto",
+            summary=None,
+            total_hours=None,
+            workers=1,
+            threshold_step=None,
+            max_fpr=None,
+            min_recall=None,
+            max_fa_per_hour=None,
+            no_subsets=False,
+            out_csv=tmp_path / "pos_curve.csv",
+            out_summary=tmp_path / "pos_scan.json",
+            out_plot=out_plot,
+        )
+    )
+    assert summary["positives"] == 2
+    assert summary["negatives"] == 0
+    assert "auc" not in summary
+    assert summary["plot"]["metric"] == "recall"
+    assert summary["plot"]["path"] == str(out_plot.resolve())
+
+
+def test_negative_only_clip_scan_writes_fpr_plot(tmp_path):
+    pytest.importorskip("matplotlib")
+    results = tmp_path / "clips" / "results.jsonl"
+    _write_jsonl(
+        results,
+        [
+            {"audio_path": "n1.wav", "keyword": "hey eva", "label": 0, "qbyt_score": 0.8},
+            {"audio_path": "n2.wav", "keyword": "hey eva", "label": 0, "qbyt_score": 0.2},
+        ],
+    )
+
+    scan_input = load_scan_input(tmp_path / "clips")
+    thresholds = build_thresholds(scan_input.scores)
+    arrays, _ = scan_thresholds(scan_input, thresholds, workers=1)
+
+    assert scan_input.mode == "clips"
+    index = list(arrays["threshold"]).index(0.8)
+    assert arrays["fp"][index] == 1
+    assert arrays["tn"][index] == 1
+    assert arrays["fpr"][index] == pytest.approx(0.5)
+    assert arrays["tp"][index] == 0
+    assert arrays["recall"][index] == pytest.approx(0.0)
+
+    out_plot = tmp_path / "fpr.png"
+    summary = run_scan(
+        argparse.Namespace(
+            results=tmp_path / "clips",
+            mode="clips",
+            summary=None,
+            total_hours=None,
+            workers=1,
+            threshold_step=None,
+            max_fpr=0.0,
+            min_recall=None,
+            max_fa_per_hour=None,
+            no_subsets=False,
+            out_csv=tmp_path / "neg_curve.csv",
+            out_summary=tmp_path / "neg_scan.json",
+            out_plot=out_plot,
+        )
+    )
+    assert summary["positives"] == 0
+    assert summary["negatives"] == 2
+    assert summary["plot"]["metric"] == "fpr"
+    assert out_plot.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert summary["selection"]["found"] is True
+    assert summary["selection"]["operating_point"]["fpr"] == pytest.approx(0.0)
 
 
 def test_musan_scan_requires_total_hours(tmp_path):

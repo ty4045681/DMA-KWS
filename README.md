@@ -1990,7 +1990,9 @@ python3 scripts/plot_musan_fa_curve.py /path/to/musan_test
 
 Override with `--total-hours`, `--threshold`, `--summary`, or `--output-dir`.
 `scripts/scan_stage2_thresholds.py` is the related table scan over the same
-`qbyt_score` values.
+`qbyt_score` values. Point it at the eval directory. Mixed labels keep the
+usual metric table; a positive-only file also writes a threshold-versus-recall
+plot, and a negative-only file writes threshold versus FPR.
 
 ### Many checkpoints or keywords
 
