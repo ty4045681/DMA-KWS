@@ -6,6 +6,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, Mapping
 
 from dma_kws.inference.audio_utils import apply_margin_to_span
@@ -164,7 +165,13 @@ class WeKwsWenetLocator:
         }
         return self._spotter_cls(**kwargs)
 
-    def locate(self, audio_path: str, keyword: str) -> list[KeywordCandidate]:
+    def locate(
+        self,
+        audio_path: str,
+        keyword: str,
+        keyword_phonemes: Sequence[str] | None = None,
+    ) -> list[KeywordCandidate]:
+        del keyword_phonemes
         spotter = self._build_spotter(keyword)
         pcm = _wav_to_pcm_bytes(audio_path)
         interval = int(self._chunk_seconds * SAMPLE_RATE) * 2

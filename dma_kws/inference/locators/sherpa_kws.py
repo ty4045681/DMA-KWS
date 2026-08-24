@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
 from dma_kws.audio import load_audio
 from dma_kws.inference.audio_utils import apply_margin_to_span
-from dma_kws.inference.locators.sherpa_keywords import format_sherpa_keyword
 from dma_kws.stage1.candidates import KeywordCandidate
 
 
@@ -58,43 +59,46 @@ class SherpaOnnxKwsLocator:
 
         self._margin_sec = float(demo.get("stage1_candidate_margin_sec", 0.15))
         self._tail_padding_sec = float(locator_cfg.get("tail_padding_sec", 0.66))
-        self._modeling_unit = str(locator_cfg.get("modeling_unit", "cjkchar"))
-        self._tokens_path = _optional_path(locator_cfg.get("tokens"))
 
-        required = ("tokens", "encoder", "decoder", "joiner")
+        required = ("tokens", "encoder", "decoder", "joiner", "keywords_file")
         missing = [name for name in required if not _optional_path(locator_cfg.get(name))]
         if missing:
             joined = ", ".join(f"locator.{name}" for name in missing)
             raise ValueError(f"Missing required sherpa locator settings: {joined}")
+
+        keywords_file = Path(str(locator_cfg["keywords_file"])).expanduser()
+        if not keywords_file.is_file():
+            raise ValueError(f"locator.keywords_file not found: {keywords_file}")
 
         spotter_kwargs: dict[str, Any] = {
             "tokens": str(locator_cfg["tokens"]),
             "encoder": str(locator_cfg["encoder"]),
             "decoder": str(locator_cfg["decoder"]),
             "joiner": str(locator_cfg["joiner"]),
+            "keywords_file": str(keywords_file),
             "num_threads": int(locator_cfg.get("num_threads", 2)),
             "provider": str(locator_cfg.get("provider", "cpu")),
         }
-        keywords_file = _optional_path(locator_cfg.get("keywords_file"))
-        if keywords_file is not None:
-            spotter_kwargs["keywords_file"] = keywords_file
         if "keywords_threshold" in locator_cfg:
             spotter_kwargs["keywords_threshold"] = float(locator_cfg["keywords_threshold"])
         if "keywords_score" in locator_cfg:
             spotter_kwargs["keywords_score"] = float(locator_cfg["keywords_score"])
 
+        self._keywords_file = str(keywords_file)
         self._kws = sherpa_onnx.KeywordSpotter(**spotter_kwargs)
 
-    def locate(self, audio_path: str, keyword: str) -> list[KeywordCandidate]:
+    def locate(
+        self,
+        audio_path: str,
+        keyword: str,
+        keyword_phonemes: Sequence[str] | None = None,
+    ) -> list[KeywordCandidate]:
+        del keyword, keyword_phonemes
         waveform, sample_rate = load_audio(audio_path)
         samples = waveform.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
 
-        keyword_line = format_sherpa_keyword(
-            keyword,
-            modeling_unit=self._modeling_unit,
-            tokens_path=self._tokens_path,
-        )
-        stream = self._kws.create_stream(keyword_line)
+        # Official sherpa-onnx path: keywords come only from keywords.txt.
+        stream = self._kws.create_stream()
         stream.accept_waveform(sample_rate, samples)
 
         tail = np.zeros(int(self._tail_padding_sec * sample_rate), dtype=np.float32)

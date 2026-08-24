@@ -1875,6 +1875,70 @@ python3 scripts/eval_musan_fa.py \
 
 Omit `prep.keyword_phonemes` (or leave it blank) to keep automatic G2P.
 
+### Two-stage MUSAN FA (Zipformer locate + QbyT)
+
+`scripts/eval_two_stage_musan_fa.py` and
+`scripts/batch_eval_two_stage_musan_fa.sh` run the deployed two-stage
+pipeline on whole MUSAN files. Stage I locates on the file, Stage II
+scores each remaining span, and FA/hour is **wake-ups / audio hours**:
+every span that meets `demo.qbyt_threshold` counts, including multiple
+hits in one file. Files with no scored Stage I spans still contribute
+duration. This is **not** comparable to the official 3s Stage-II-only
+grid above. `prep.window_sec` / `prep.hop_sec` are unused.
+
+```bash
+python3 scripts/eval_two_stage_musan_fa.py \
+  +experiment=icefall_zipformer_stage2 \
+  +locator=sherpa_zipformer_kws \
+  locator.tokens=/path/tokens.txt \
+  locator.encoder=/path/encoder.onnx \
+  locator.decoder=/path/decoder.onnx \
+  locator.joiner=/path/joiner.onnx \
+  locator.keywords_file=/path/keywords.txt \
+  stage2.qbyt_readout.mode=eps_softmin \
+  stage2.qbyt_readout.temperature=1.0 \
+  prep.keyword="hey eva" \
+  'prep.keyword_phonemes=HH EY1 IY1 V AH0' \
+  prep.musan_root=/path/to/musan \
+  prep.stage2_ckpt=/path/to/stage2.pt \
+  prep.output_dir=/path/to/out
+```
+
+Use the same `+experiment` as Stage II training so encoder, fbank, stream,
+and adapter match the checkpoint. `+locator=phoneme_ctc` still needs
+`prep.stage1_ckpt`; that locator searches the same ARPAbet sequence as QbyT,
+including `prep.keyword_phonemes`. sherpa-onnx does **not** accept ARPAbet:
+Stage I reads only `locator.keywords_file` (official sherpa-onnx
+`keywords.txt`, one phrase per line). The caller must put this evaluation's
+keyword in that file. `prep.keyword` still labels the run; `prep.keyword_phonemes`
+only changes Stage II scoring. icefall / WeKws still locate from keyword text.
+
+Batch and multi-GPU wrappers:
+
+```bash
+bash scripts/batch_eval_two_stage_musan_fa.sh \
+  --keyword "hey eva" \
+  --keyword-phonemes "HH EY1 IY1 V AH0" \
+  --musan-root /path/to/musan \
+  --pt /path/to/stage2.pt:/path/to/out \
+  +locator=sherpa_zipformer_kws \
+  locator.tokens=/path/tokens.txt \
+  locator.encoder=/path/encoder.onnx \
+  locator.decoder=/path/decoder.onnx \
+  locator.joiner=/path/joiner.onnx \
+  locator.keywords_file=/path/keywords.txt \
+  stage2.qbyt_readout.mode=eps_softmin
+
+bash scripts/eval_two_stage_musan_fa_shards.sh \
+  +experiment=icefall_zipformer_stage2 \
+  +locator=sherpa_zipformer_kws \
+  locator.keywords_file=/path/keywords.txt \
+  'prep.keyword=hey eva' \
+  prep.musan_root=/path/to/musan \
+  prep.stage2_ckpt=/path/to/stage2.pt \
+  prep.output_dir=/path/to/out
+```
+
 ### Throughput knobs
 
 These do not change the hop grid. Defaults keep same-grid scores identical to
@@ -2036,7 +2100,7 @@ Hydra presets live under `configs/locator/`. Select with `+locator=<name>` (defa
 | Locator | Hydra preset | Extra install | Required overrides |
 |---------|--------------|---------------|-------------------|
 | **phoneme_ctc** (default) | `+locator=phoneme_ctc` | core only | `prep.stage1_ckpt` |
-| **sherpa_zipformer_kws** | `+locator=sherpa_zipformer_kws` | `pip install -e ".[locator]"` | `locator.tokens`, `encoder`, `decoder`, `joiner` |
+| **sherpa_zipformer_kws** | `+locator=sherpa_zipformer_kws` | `pip install -e ".[locator]"` | `locator.tokens`, `encoder`, `decoder`, `joiner`, `keywords_file` |
 | **wekws_wenet** | `+locator=wekws_wenet` | `pip install -e ".[wekws]"` + local wekws checkout | `locator.wekws.config`, `checkpoint`, `symbol_table` |
 | **icefall_pt_kws** (optional) | `+locator=icefall_pt_kws` | core only | `locator.root`, `decode_script`, `checkpoint` |
 

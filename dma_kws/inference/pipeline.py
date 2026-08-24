@@ -13,6 +13,7 @@ from dma_kws.audio import load_audio
 from dma_kws.config import get_tokenizer_config
 from dma_kws.g2p import make_g2p, text_to_phonemes
 from dma_kws.inference.locator import KeywordLocator, build_locator
+from dma_kws.inference.stage2_clip import parse_phoneme_sequence
 from dma_kws.inference.stage2_verifier import Stage2Verifier
 from dma_kws.pathing import resolve_dict_path
 from dma_kws.tokenizer import load_char_tokenizer, tokenize_phoneme_string
@@ -67,13 +68,42 @@ class TwoStageKWSPipeline:
             sample_rate=int(stage1_cfg.get("sample_rate", 16000)),
         )
 
-    def run(self, audio_path: str, keyword: str) -> dict:
+    def resolve_keyword_phonemes(
+        self,
+        keyword: str,
+        keyword_phonemes: object | None = None,
+        *,
+        field_name: str = "keyword_phonemes",
+    ) -> list[str]:
+        """Return the effective enrollment sequence for one keyword.
+
+        ``None`` retains automatic G2P. Any explicit value uses the same strict
+        ARPAbet parser and vocabulary validation as Stage-II clip evaluation.
+        """
+        if keyword_phonemes is None:
+            return text_to_phonemes(self._g2p, keyword)
+        return parse_phoneme_sequence(keyword_phonemes, field_name=field_name)
+
+    def run(
+        self,
+        audio_path: str,
+        keyword: str,
+        keyword_phonemes: object | None = None,
+    ) -> dict:
         """Run the two-stage pipeline and return the demo-style result dict."""
-        keyword_phonemes = text_to_phonemes(self._g2p, keyword)
+        keyword_phonemes = self.resolve_keyword_phonemes(
+            keyword,
+            keyword_phonemes,
+            field_name="keyword_phonemes",
+        )
         keyword_g2p_text = " ".join(keyword_phonemes)
         keyword_ids = tokenize_phoneme_string(self._tokenizer, keyword_g2p_text)
 
-        candidates = self._locator.locate(audio_path, keyword)
+        candidates = self._locator.locate(
+            audio_path,
+            keyword,
+            keyword_phonemes=keyword_phonemes,
+        )
 
         if candidates:
             waveform, sample_rate = load_audio(audio_path, sample_rate=self._sample_rate)

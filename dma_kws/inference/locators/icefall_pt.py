@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, Mapping
 
 from dma_kws.config import resolve_stream_policy
@@ -150,7 +151,13 @@ class IcefallPtKwsLocator:
             *self._extra_args,
         ]
 
-    def locate(self, audio_path: str, keyword: str) -> list[KeywordCandidate]:
+    def locate(
+        self,
+        audio_path: str,
+        keyword: str,
+        keyword_phonemes: Sequence[str] | None = None,
+    ) -> list[KeywordCandidate]:
+        del keyword_phonemes
         command = self._build_command(audio_path, keyword)
         proc = subprocess.run(
             command,

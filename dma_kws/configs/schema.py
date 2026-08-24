@@ -478,6 +478,7 @@ class SherpaKwsLocatorConfig:
     encoder: str = ""
     decoder: str = ""
     joiner: str = ""
+    keywords_file: str = ""
     keywords_threshold: float = 0.25
     modeling_unit: str = "cjkchar"
     tail_padding_sec: float = 0.66
@@ -501,6 +502,7 @@ class LocatorConfig:
     encoder: str = ""
     decoder: str = ""
     joiner: str = ""
+    keywords_file: str = ""
     keywords_threshold: float = 0.25
     modeling_unit: str = "cjkchar"
     tail_padding_sec: float = 0.66

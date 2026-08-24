@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 from dma_kws.stage1.candidates import KeywordCandidate
@@ -10,8 +11,18 @@ from dma_kws.stage1.candidates import KeywordCandidate
 class KeywordLocator(Protocol):
     """Propose keyword time spans in audio."""
 
-    def locate(self, audio_path: str, keyword: str) -> list[KeywordCandidate]:
-        """Return Stage I candidate regions for ``keyword`` in ``audio_path``."""
+    def locate(
+        self,
+        audio_path: str,
+        keyword: str,
+        keyword_phonemes: Sequence[str] | None = None,
+    ) -> list[KeywordCandidate]:
+        """Return Stage I candidate regions for ``keyword`` in ``audio_path``.
+
+        ``keyword_phonemes`` is an optional enrollment sequence. Locators that
+        search phonemes (the in-repo CTC locator) must use it when supplied.
+        External locators whose modeling unit is not ARPAbet ignore it.
+        """
 
 
 def build_locator(config: dict[str, Any], prep: dict[str, Any], device: Any):

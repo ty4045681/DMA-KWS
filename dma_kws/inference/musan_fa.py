@@ -1,4 +1,8 @@
-"""Helpers for MUSAN false-accept evaluation with sliding-window Stage-II inference."""
+"""Helpers for MUSAN false-accept evaluation.
+
+The official path scores Stage-II sliding windows. The two-stage path scores
+Stage I spans that QbyT verifies; FA/hour then counts wake-ups per audio hour.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,8 @@ from typing import Any
 
 from dma_kws.inference.metrics import summarize_false_accept_rate
 from dma_kws.inference.stage2_reporting import build_result_record
+
+TWO_STAGE_WAKEUP_PROTOCOL = "two_stage_wakeup"
 
 
 def audio_duration_sec(path: str | Path) -> float:
@@ -67,6 +73,100 @@ def musan_result_record(
     )
 
 
+def two_stage_wakeup_result_record(
+    source_path: str,
+    keyword: str,
+    subset: str,
+    duration_sec: float,
+    keyword_phonemes: Sequence[str],
+    scored: Mapping[str, Any],
+    *,
+    candidate_index: int,
+    threshold: float,
+    sequence_objective: Mapping[str, object] | None = None,
+    qbyt_readout: Mapping[str, object] | None = None,
+) -> dict:
+    """Build one MUSAN result row for a Stage II-scored Stage I span."""
+
+    start_sec = float(scored["start_sec"])
+    end_sec = float(scored["end_sec"])
+    qbyt_score = float(scored["qbyt_score"])
+    runner_result = {
+        "keyword_phonemes": list(keyword_phonemes),
+        "clip_span_sec": {"start_sec": start_sec, "end_sec": end_sec},
+        "qbyt_score": qbyt_score,
+        "detected": qbyt_score >= float(threshold),
+        "threshold": float(threshold),
+        "skipped": False,
+    }
+    manifest_row = {
+        "audio_path": source_path,
+        "keyword": keyword,
+        "label": 0,
+        "subset": subset,
+        "duration_sec": float(duration_sec),
+        "candidate_index": int(candidate_index),
+        "start_sec": start_sec,
+        "end_sec": end_sec,
+    }
+    record = build_result_record(
+        manifest_row,
+        runner_result,
+        sequence_objective=sequence_objective,
+        qbyt_readout=qbyt_readout,
+    )
+    if "stage1_score" in scored and scored["stage1_score"] is not None:
+        record["stage1_score"] = float(scored["stage1_score"])
+    return record
+
+
+def empty_false_accept_metrics(
+    *,
+    threshold: float,
+    total_hours: float,
+) -> dict[str, float]:
+    """FA/hour metrics when a shard or subset has hours but no scored rows."""
+
+    return {
+        "num_samples": 0.0,
+        "accuracy": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "fpr": 0.0,
+        "fnr": 0.0,
+        "auc": 0.0,
+        "eer": 0.0,
+        "eer_threshold": 0.0,
+        "threshold": float(threshold),
+        "tp": 0.0,
+        "tn": 0.0,
+        "fp": 0.0,
+        "fn": 0.0,
+        "total_hours": float(total_hours),
+        "fa_per_hour": 0.0,
+        "fa_per_1000_hours": 0.0,
+    }
+
+
+def false_accept_metrics(
+    results: list[dict[str, Any]],
+    *,
+    threshold: float,
+    total_hours: float,
+) -> dict[str, float]:
+    """Like :func:`summarize_false_accept_rate`, but zero-fill empty result lists."""
+
+    summary = summarize_false_accept_rate(
+        [metrics_record(record) for record in results],
+        threshold=threshold,
+        total_hours=total_hours,
+    )
+    if summary:
+        return summary
+    return empty_false_accept_metrics(threshold=threshold, total_hours=total_hours)
+
+
 def metrics_record(record: dict) -> dict:
     """Convert a result row into the metric-summarizer input format."""
     metrics_row = dict(record)
@@ -81,15 +181,14 @@ def subset_summary(
     total_hours: float,
 ) -> dict[str, Any]:
     """Build a per-subset metric dict consistent with the overall summary."""
-    summary = summarize_false_accept_rate(
-        [metrics_record(record) for record in results],
-        threshold=threshold,
-        total_hours=total_hours,
-    )
     return {
         "total_hours": float(total_hours),
         "num_samples": len(results),
-        "metrics": summary,
+        "metrics": false_accept_metrics(
+            results,
+            threshold=threshold,
+            total_hours=total_hours,
+        ),
     }
 
 
@@ -105,6 +204,7 @@ def group_results_by_subset(
 
 
 _MERGE_IDENTITY_KEYS = (
+    "eval_protocol",
     "keyword",
     "keyword_phonemes",
     "keyword_phonemes_source",
@@ -117,6 +217,7 @@ _MERGE_IDENTITY_KEYS = (
     "amp",
     "fbank_windows",
     "batch_size",
+    "locator",
 )
 
 
@@ -168,10 +269,16 @@ def select_shard(
 
 
 def result_sort_key(record: Mapping[str, Any]) -> tuple[str, int]:
-    """Stable merge order: source path, then hop-grid window index."""
+    """Stable merge order: source path, then window or candidate index."""
     meta = record.get("manifest_meta") or {}
-    window_index = record.get("window_index", meta.get("window_index", 0))
-    return (str(record.get("audio_path", "")), int(window_index or 0))
+    index = record.get(
+        "window_index",
+        meta.get(
+            "window_index",
+            record.get("candidate_index", meta.get("candidate_index", 0)),
+        ),
+    )
+    return (str(record.get("audio_path", "")), int(index or 0))
 
 
 def load_jsonl_records(path: str | Path) -> list[dict[str, Any]]:
@@ -194,21 +301,73 @@ def load_jsonl_records(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
-def discover_shard_dirs(root: str | Path) -> list[Path]:
-    """Return sibling ``shard_*`` directories that contain a summary."""
+def parse_shard_dir_index(path: Path) -> int | None:
+    """Return the integer in ``shard_N`` or ``None`` if the name is not that form."""
+
+    name = path.name
+    if not name.startswith("shard_"):
+        return None
+    suffix = name.removeprefix("shard_")
+    if not suffix.isdigit() or str(int(suffix)) != suffix:
+        return None
+    return int(suffix)
+
+
+def discover_shard_dirs(
+    root: str | Path,
+    *,
+    num_shards: int | None = None,
+) -> list[Path]:
+    """Return sibling ``shard_*`` directories that contain a summary.
+
+    When ``num_shards`` is set, only ``shard_0`` … ``shard_{N-1}`` are used.
+    Leftover higher-index directories from an earlier wider run are ignored, and
+    a missing expected shard fails instead of silently pooling an incomplete set.
+    """
     directory = Path(root)
-    shards = [
-        path
-        for path in sorted(directory.iterdir())
-        if path.is_dir()
-        and path.name.startswith("shard_")
-        and (path / "summary.json").is_file()
-    ]
-    if shards:
-        return shards
-    if (directory / "summary.json").is_file():
-        return [directory]
-    raise FileNotFoundError(f"No shard_*/summary.json files found under {directory}")
+    found: dict[int, Path] = {}
+    extras: list[str] = []
+    for path in sorted(directory.iterdir()):
+        if not path.is_dir() or not (path / "summary.json").is_file():
+            continue
+        index = parse_shard_dir_index(path)
+        if index is None:
+            extras.append(path.name)
+            continue
+        found[index] = path
+
+    if num_shards is None:
+        if found:
+            return [found[index] for index in sorted(found)]
+        if (directory / "summary.json").is_file():
+            return [directory]
+        raise FileNotFoundError(
+            f"No shard_*/summary.json files found under {directory}"
+        )
+
+    expected = int(num_shards)
+    if expected < 1:
+        raise ValueError("num_shards must be >= 1")
+    missing = [index for index in range(expected) if index not in found]
+    if missing:
+        missing_names = ", ".join(f"shard_{index}" for index in missing)
+        raise FileNotFoundError(
+            f"Expected {expected} shards under {directory}; missing {missing_names}"
+        )
+    leftover = sorted(index for index in found if index >= expected)
+    ignored = leftover + extras
+    if ignored:
+        names = ", ".join(
+            f"shard_{index}" if isinstance(index, int) else index for index in ignored
+        )
+        import warnings
+
+        warnings.warn(
+            f"Ignoring leftover shard directories under {directory}: {names}",
+            UserWarning,
+            stacklevel=2,
+        )
+    return [found[index] for index in range(expected)]
 
 
 def merge_musan_summaries(
@@ -269,18 +428,28 @@ def merge_musan_summaries(
         "stream": reference.get("stream"),
         "provenance": reference.get("provenance"),
     }
-    overall_metrics = summarize_false_accept_rate(
-        [metrics_record(record) for record in all_results],
+    if "eval_protocol" in reference:
+        merged["eval_protocol"] = reference.get("eval_protocol")
+    if "locator" in reference:
+        merged["locator"] = reference.get("locator")
+    for key in (
+        "num_stage1_candidates",
+        "num_stage2_scored",
+        "num_wakeups",
+    ):
+        if any(key in summary for summary in shard_summaries):
+            merged[key] = sum(int(summary.get(key, 0)) for summary in shard_summaries)
+    overall_metrics = false_accept_metrics(
+        all_results,
         threshold=threshold,
         total_hours=total_hours,
     )
-    if overall_metrics:
-        merged["metrics"] = overall_metrics
+    merged["metrics"] = overall_metrics
 
     subsets: dict[str, dict[str, Any]] = {}
-    for subset in sorted(grouped):
+    for subset in sorted(set(grouped) | set(subset_hours)):
         subsets[subset] = subset_summary(
-            grouped[subset],
+            grouped.get(subset, []),
             threshold=threshold,
             total_hours=subset_hours.get(subset, 0.0),
         )

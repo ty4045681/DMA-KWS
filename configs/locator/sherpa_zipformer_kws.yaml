@@ -3,6 +3,10 @@ tokens: ""
 encoder: ""
 decoder: ""
 joiner: ""
+# Official sherpa-onnx keywords.txt. Required. One keyword per line, tokens
+# space-separated, optional @display name. The caller must ensure this file
+# contains the keyword being evaluated.
+keywords_file: ""
 keywords_threshold: 0.25
 modeling_unit: cjkchar
 tail_padding_sec: 0.66

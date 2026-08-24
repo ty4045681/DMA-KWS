@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
+import argparse
 import json
-import sys
 from pathlib import Path
 
 from dma_kws.inference.detection_plots import (
@@ -18,10 +18,16 @@ from dma_kws.inference.musan_fa import (
 )
 
 
-def merge_eval_dir(root: Path, output_dir: Path, *, plot_curves: bool = True) -> dict:
+def merge_eval_dir(
+    root: Path,
+    output_dir: Path,
+    *,
+    plot_curves: bool = True,
+    num_shards: int | None = None,
+) -> dict:
     """Pool ``shard_*/`` summaries under ``root`` into ``output_dir``."""
 
-    shard_dirs = discover_shard_dirs(root)
+    shard_dirs = discover_shard_dirs(root, num_shards=num_shards)
     summaries = []
     results = []
     for shard_dir in shard_dirs:
@@ -77,18 +83,27 @@ def merge_eval_dir(root: Path, output_dir: Path, *, plot_curves: bool = True) ->
 
 
 def main() -> None:
-    if len(sys.argv) not in {3, 4}:
-        raise SystemExit(
-            "Usage: python3 scripts/merge_musan_fa.py ROOT_DIR OUT_DIR [--no-plot]"
-        )
-    root = Path(sys.argv[1])
-    output_dir = Path(sys.argv[2])
-    plot_curves = True
-    if len(sys.argv) == 4:
-        if sys.argv[3] != "--no-plot":
-            raise SystemExit(f"Unknown option: {sys.argv[3]}")
-        plot_curves = False
-    merge_eval_dir(root, output_dir, plot_curves=plot_curves)
+    parser = argparse.ArgumentParser(
+        description="Merge sharded MUSAN FA outputs into one FA/hour result."
+    )
+    parser.add_argument("root_dir", type=Path)
+    parser.add_argument("out_dir", type=Path)
+    parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help="Only merge shard_0 … shard_{N-1}; ignore leftover higher-index dirs.",
+    )
+    args = parser.parse_args()
+    if args.num_shards is not None and args.num_shards < 1:
+        raise SystemExit("--num-shards must be >= 1")
+    merge_eval_dir(
+        args.root_dir,
+        args.out_dir,
+        plot_curves=not args.no_plot,
+        num_shards=args.num_shards,
+    )
 
 
 if __name__ == "__main__":

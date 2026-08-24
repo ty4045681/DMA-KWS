@@ -7,6 +7,7 @@ it produces coarse :class:`KeywordCandidate` regions for Stage II verification.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Mapping
 
 from dma_kws.audio import extract_fbank, load_audio
@@ -118,11 +119,21 @@ class PhonemeCtcLocator:
         """Build from a resolved config dict (compatibility shim)."""
         return cls(config=config, prep=prep, device=device)
 
-    def locate(self, audio_path: str, keyword: str) -> list[KeywordCandidate]:
+    def locate(
+        self,
+        audio_path: str,
+        keyword: str,
+        keyword_phonemes: Sequence[str] | None = None,
+    ) -> list[KeywordCandidate]:
         torch = self._torch
         tokenizer = self._tokenizer
 
-        keyword_phonemes = text_to_phonemes(self._g2p, keyword)
+        if keyword_phonemes is None:
+            keyword_phonemes = text_to_phonemes(self._g2p, keyword)
+        else:
+            keyword_phonemes = [str(phone) for phone in keyword_phonemes]
+            if not keyword_phonemes:
+                raise ValueError("keyword_phonemes must be a non-empty sequence")
         keyword_g2p_text = " ".join(keyword_phonemes)
         keyword_ids = tokenize_phoneme_string(tokenizer, keyword_g2p_text)
         self.last_keyword_phonemes = keyword_phonemes

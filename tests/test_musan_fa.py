@@ -15,6 +15,7 @@ from dma_kws.inference.metrics import summarize_false_accept_rate
 from dma_kws.inference.musan_fa import (
     assign_files_to_shards,
     detect_subset,
+    discover_shard_dirs,
     merge_musan_summaries,
     select_shard,
 )
@@ -539,6 +540,27 @@ def test_assign_files_to_shards_balances_duration_deterministically():
     assert abs(hours[0] - hours[1]) <= 0.25
     assert select_shard(files, num_shards=2, shard_index=0) == first[0]
     assert select_shard(files, num_shards=2, shard_index=1) == first[1]
+
+
+def test_discover_shard_dirs_with_num_shards_ignores_leftover_dirs(tmp_path):
+    for index in range(4):
+        shard = tmp_path / f"shard_{index}"
+        shard.mkdir()
+        (shard / "summary.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "summary.json").write_text("{}", encoding="utf-8")
+
+    with pytest.warns(UserWarning, match="Ignoring leftover shard"):
+        shards = discover_shard_dirs(tmp_path, num_shards=2)
+    assert [path.name for path in shards] == ["shard_0", "shard_1"]
+
+
+def test_discover_shard_dirs_with_num_shards_requires_complete_set(tmp_path):
+    shard = tmp_path / "shard_0"
+    shard.mkdir()
+    (shard / "summary.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match="missing shard_1"):
+        discover_shard_dirs(tmp_path, num_shards=2)
 
 
 def test_merge_musan_summaries_pools_hours_and_false_accepts():
