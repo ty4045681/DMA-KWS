@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import random
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,13 @@ def stage2_worker_init_fn(worker_id: int) -> None:
         # to the constructor is already the intended one.
         return
     rank_seed = int(info.seed) + 1_000_003 * process_rank()
+    # PyTorch seeds these module-global RNGs before invoking worker_init_fn, but
+    # its base seed can be identical across externally launched DDP ranks. Fold
+    # the rank in here as well so fbank dither and any future transforms do not
+    # replay the same random stream on every GPU.
+    random.seed(rank_seed)
+    np.random.seed(rank_seed % (2**32))
+    torch.manual_seed(rank_seed)
     _reseed_rng_holders(info.dataset, rank_seed, set())
 
 
@@ -119,6 +127,8 @@ class LibriPhraseTrainDataset(Dataset):
         df: pd.DataFrame | None = None,
         augment: bool = False,
         noise_list_path: str | Path | None = None,
+        noise_augmentation: Mapping[str, Any] | None = None,
+        fbank_kwargs: Mapping[str, Any] | None = None,
         seq_label_mode: str = DEFAULT_SEQ_LABEL_MODE,
     ) -> None:
         if tokenizer is None:
@@ -143,6 +153,8 @@ class LibriPhraseTrainDataset(Dataset):
         self.wav_dir = str(wav_dir)
         self._rng = random.Random(seed)
         self._feature_extractor = None
+        self._noise_augmenter = None
+        self._noise_probability = 0.0
         if augment:
             from dma_kws.stage2.features import FeatureExtractor
 
@@ -151,6 +163,58 @@ class LibriPhraseTrainDataset(Dataset):
                 wav_dir=wav_dir,
                 noise_list_path=noise_list_path,
             )
+
+        if noise_augmentation is not None and not isinstance(
+            noise_augmentation, Mapping
+        ):
+            raise ValueError("stage2.noise_augmentation must be a mapping")
+        noise_cfg = dict(noise_augmentation or {})
+        allowed_noise_keys = {
+            "enabled",
+            "probability",
+            "waveform_dir",
+            "noise_list_path",
+            "snr_db_min",
+            "snr_db_max",
+        }
+        unknown_noise_keys = sorted(set(noise_cfg) - allowed_noise_keys)
+        if unknown_noise_keys:
+            raise ValueError(
+                "Unknown stage2.noise_augmentation fields: "
+                + ", ".join(unknown_noise_keys)
+            )
+        if bool(noise_cfg.get("enabled", False)):
+            if augment:
+                raise ValueError(
+                    "Legacy Stage II augment and stage2.noise_augmentation cannot "
+                    "be enabled together"
+                )
+            probability = float(noise_cfg.get("probability", 0.3))
+            if not 0.0 <= probability <= 1.0:
+                raise ValueError(
+                    "Stage II noise augmentation probability must be between 0 and 1"
+                )
+            waveform_dir = str(noise_cfg.get("waveform_dir", "")).strip()
+            noise_path = str(noise_cfg.get("noise_list_path", "")).strip()
+            if not waveform_dir:
+                raise ValueError(
+                    "stage2.noise_augmentation.waveform_dir is required when enabled"
+                )
+            if not noise_path:
+                raise ValueError(
+                    "stage2.noise_augmentation.noise_list_path is required when enabled"
+                )
+
+            from dma_kws.stage2.features import TrainingNoiseAugmenter
+
+            self._noise_augmenter = TrainingNoiseAugmenter(
+                waveform_dir=waveform_dir,
+                noise_list_path=noise_path,
+                snr_db_min=float(noise_cfg.get("snr_db_min", 10.0)),
+                snr_db_max=float(noise_cfg.get("snr_db_max", 20.0)),
+                fbank_kwargs=fbank_kwargs,
+            )
+            self._noise_probability = probability
 
     def __len__(self) -> int:
         return self.sample_lens
@@ -191,6 +255,15 @@ class LibriPhraseTrainDataset(Dataset):
         return hard_ngram_wav, hard_ngram_g2p, hard_ngram
 
     def _load_fbank(self, query_wav: str) -> torch.Tensor:
+        should_add_noise = self._noise_augmenter is not None and (
+            self._noise_probability >= 1.0
+            or (
+                self._noise_probability > 0.0
+                and self._rng.random() < self._noise_probability
+            )
+        )
+        if should_add_noise:
+            return self._noise_augmenter.extract(query_wav, rng=self._rng)
         if self._feature_extractor is not None:
             return self._feature_extractor.process(query_wav)["feat"]
         fbank_path = _resolve_fbank_path(self.wav_dir, query_wav)

@@ -151,6 +151,40 @@ def resolve_training_fbank_plan(
     return fbank_dir, left_padding_ms, right_padding_ms
 
 
+def resolve_training_waveform_dir(
+    prep: dict[str, Any],
+    stage2: dict[str, Any],
+) -> Path | None:
+    """Resolve the optional loose-WAV cache used by online noise augmentation."""
+    prep_raw = str(prep.get("waveform_dir", "")).strip()
+    noise_cfg = stage2.get("noise_augmentation", {}) or {}
+    noise_enabled = isinstance(noise_cfg, dict) and bool(
+        noise_cfg.get("enabled", False)
+    )
+    stage2_raw = (
+        str(noise_cfg.get("waveform_dir", "")).strip()
+        if noise_enabled
+        else ""
+    )
+    if prep_raw and stage2_raw:
+        prep_path = Path(prep_raw).expanduser().resolve()
+        stage2_path = Path(stage2_raw).expanduser().resolve()
+        if prep_path != stage2_path:
+            raise SystemExit(
+                "prep.waveform_dir and "
+                "stage2.noise_augmentation.waveform_dir must point to the same "
+                f"cache (got {prep_raw!r} and {stage2_raw!r})"
+            )
+
+    raw = prep_raw or stage2_raw
+    if noise_enabled and not raw:
+        raise SystemExit(
+            "stage2.noise_augmentation.waveform_dir is required to prepare the "
+            "training waveform cache"
+        )
+    return Path(raw) if raw else None
+
+
 def load_decoded_audio(
     decoded_parquet_paths: list[Path],
     needed_keys: set[str],
@@ -250,6 +284,14 @@ def main(cfg: DictConfig) -> None:
         stage2,
         feature_root,
     )
+    waveform_dir = resolve_training_waveform_dir(prep, stage2)
+    if waveform_dir is not None and (left_padding_ms or right_padding_ms):
+        raise SystemExit(
+            "Stage II waveform caching/noise augmentation currently requires "
+            "prep.left_padding_ms=0 and prep.right_padding_ms=0. The loose-WAV "
+            "cache stores raw clips; mixing padded and unpadded fbank would make "
+            "clean/noisy training inputs inconsistent."
+        )
     output_parquet = output_dir / OUTPUT_PARQUET_NAME
 
     reporter.section("Plan")
@@ -261,6 +303,7 @@ def main(cfg: DictConfig) -> None:
             ("clips_dir", str(clips_dir)),
             ("distances_dir", str(distances_dir)),
             ("fbank_dir", str(fbank_dir)),
+            ("waveform_dir", str(waveform_dir or "disabled")),
             ("fbank_backend", fbank_cfg.backend),
             ("target_sample_rate", str(fbank_cfg.target_sample_rate or "source")),
             ("left_padding_ms", str(left_padding_ms)),
@@ -312,13 +355,14 @@ def main(cfg: DictConfig) -> None:
             clips_dir=clips_dir,
             distances_dir=distances_dir,
             fbank_dir=fbank_dir,
+            waveform_dir=waveform_dir,
             limit_anchors=limit_anchors,
             force_g2p_recompute=bool(prep.get("force_g2p_recompute", False)),
             on_progress=on_anchor,
         )
     reporter.info(
-        f"Prepared {stats['anchors']} anchors; {len(fbank_targets)} fbank files to compute "
-        f"({stats['fbank_skipped']} already present)"
+        f"Prepared {stats['anchors']} anchors; {len(fbank_targets)} decoded clips "
+        f"still need cached artifacts ({stats['fbank_skipped']} fbank files already present)"
     )
     if stats["g2p_recomputed"]:
         reporter.warn(
@@ -334,13 +378,32 @@ def main(cfg: DictConfig) -> None:
     reporter.section("Compute fbank (streaming decoded shards)")
     with reporter.tasks() as tasks:
         shard_task = tasks.add("Scan decoded parquet shards", total=len(decoded_parquet_paths))
-        fbank_task = tasks.add("Compute fbank features", total=len(fbank_targets))
+        fbank_task = tasks.add(
+            "Compute fbank features",
+            total=sum(int(target.write_fbank) for target in fbank_targets.values()),
+        )
+        waveform_task = (
+            tasks.add(
+                "Cache training waveforms",
+                total=sum(
+                    int(target.waveform_path is not None)
+                    for target in fbank_targets.values()
+                ),
+            )
+            if waveform_dir is not None
+            else None
+        )
 
         def on_fbank(stage: str, value: int) -> None:
             if stage == "fbank_total":
                 tasks.set_total(fbank_task, value)
             elif stage == "fbank":
                 tasks.advance(fbank_task, value)
+            elif stage == "waveform_total" and waveform_task is not None:
+                tasks.set_total(waveform_task, value)
+            elif stage == "waveform" and waveform_task is not None:
+                tasks.advance(waveform_task, value)
+                stats["waveform_written"] += value
 
         fbank_written, missing = stream_fbank_from_decoded(
             decoded_parquet_paths,
@@ -361,16 +424,21 @@ def main(cfg: DictConfig) -> None:
             ("clips_total", str(stats["clips_total"])),
             ("fbank_written", str(stats["fbank_written"])),
             ("fbank_skipped", str(stats["fbank_skipped"])),
+            ("waveform_written", str(stats["waveform_written"])),
+            ("waveform_skipped", str(stats["waveform_skipped"])),
             ("missing_in_decoded", str(missing)),
             ("output_parquet", str(output_parquet)),
         ]
     )
 
     if missing:
-        reporter.warn(
-            f"{missing} referenced clips were not found in decoded parquet "
-            "(their fbank files were skipped)"
+        message = (
+            f"{missing} referenced clips were not found in decoded parquet; "
+            "their requested fbank/waveform cache artifacts were not written"
         )
+        if waveform_dir is not None:
+            raise SystemExit(message)
+        reporter.warn(message)
 
     reporter.done("Stage II paper prep complete.")
 

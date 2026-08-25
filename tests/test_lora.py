@@ -53,6 +53,8 @@ def test_lora_targets_reject_empty_and_misspelled_entries():
 def test_lora_runtime_rejects_base_mutating_ema_and_true_half_precision():
     from dma_kws.stage2.adapt import _validate_lora_runtime_config
 
+    with pytest.raises(ValueError, match="noise_augmentation.*not supported"):
+        _validate_lora_runtime_config({"noise_augmentation": {"enabled": True}})
     with pytest.raises(ValueError, match="ema"):
         _validate_lora_runtime_config({"ema": {"enabled": True}})
     with pytest.raises(ValueError, match="precision"):

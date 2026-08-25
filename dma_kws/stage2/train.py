@@ -100,7 +100,12 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
             "Missing torch/pytorch-lightning. Install CUDA PyTorch on the training machine first."
         ) from exc
 
-    from dma_kws.config import get_tokenizer_config, require_sections
+    from dma_kws.config import (
+        fbank_kwargs,
+        get_fbank_config,
+        get_tokenizer_config,
+        require_sections,
+    )
     from dma_kws.runlog import build_loggers, logger_backend_names
     from dma_kws.stage2.collate import train_collate_fn
     from dma_kws.stage2.dataset import LibriPhraseTrainDataset, stage2_worker_init_fn
@@ -119,8 +124,12 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         restore_best_checkpoint_weights,
         stamp_qbyt_readout_version,
     )
-    from dma_kws.training.ddp import apply_step_based_validation, build_trainer_kwargs
-    from dma_kws.training.ddp import rank_zero_print
+    from dma_kws.training.ddp import (
+        apply_step_based_validation,
+        build_trainer_kwargs,
+        process_rank,
+        rank_zero_print,
+    )
     from dma_kws.training.metrics_history import (
         append_wide_row,
         build_metrics_history_callback,
@@ -158,7 +167,11 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
 
     seed = int(training.get("seed", 2025))
     pl.seed_everything(seed, workers=True)
+    dataset_seed = seed + 1_000_003 * process_rank()
     sequence_objective = resolve_sequence_objective(stage2)
+    noise_augmentation = stage2.get("noise_augmentation", {}) or {}
+    if not isinstance(noise_augmentation, dict):
+        raise ValueError("stage2.noise_augmentation must be a mapping")
 
     train_dataset = LibriPhraseTrainDataset(
         parquet_file=parquet_file,
@@ -167,7 +180,9 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         negative_ratio=int(stage2.get("negative_ratio", 1)),
         hard_negative_ratio=int(stage2.get("hard_negative_ratio", 1)),
         sample_lens=int(stage2.get("sample_lens", 5000)),
-        seed=seed,
+        seed=dataset_seed,
+        noise_augmentation=noise_augmentation,
+        fbank_kwargs=fbank_kwargs(get_fbank_config(config)),
         seq_label_mode=sequence_objective.target_mode,
     )
 
@@ -332,6 +347,14 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
             "checkpoint_dir": checkpoint_dir,
             "log_dir": log_dir,
             "run_dir": run_context.run_dir,
+            **(
+                {
+                    "noise_waveform_dir": noise_augmentation.get("waveform_dir", ""),
+                    "noise_list": noise_augmentation.get("noise_list_path", ""),
+                }
+                if noise_augmentation.get("enabled", False)
+                else {}
+            ),
             **(
                 {"resume_from": run_context.resume_from}
                 if run_context.resume_from

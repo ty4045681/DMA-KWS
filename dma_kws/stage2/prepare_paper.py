@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +36,16 @@ def resolve_fbank_rel_path(audio_path: str) -> str:
     for prefix in ("LP-460", "GP-1000", "LP-100"):
         path = path.replace(prefix, f"{prefix}-fbank")
     return path.replace(".wav", ".npy")
+
+
+def resolve_waveform_rel_path(audio_path: str) -> Path:
+    """Return a safe cache-relative path preserving the clip WAV layout."""
+    path = Path(audio_path)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(
+            f"Stage II clip audio_path must be a safe relative path: {audio_path}"
+        )
+    return path
 
 
 def parse_clips(raw_clips: Any) -> list[dict[str, str]]:
@@ -260,18 +272,58 @@ class _FbankJob:
     fbank_path: Path
     waveform: np.ndarray
     sample_rate: int
+    write_fbank: bool = True
+    waveform_path: Path | None = None
 
 
-def _run_fbank_job(job: _FbankJob, compute_fbank: Callable[..., str]) -> str:
+def _write_waveform_cache(
+    output_path: Path,
+    waveform: np.ndarray,
+    sample_rate: int,
+) -> str:
+    """Write one raw mono PCM16 WAV for online training augmentation."""
+    import soundfile as sf
+
+    array = np.asarray(waveform, dtype=np.float32)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(
+        f".{output_path.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        sf.write(
+            str(temporary_path),
+            array,
+            int(sample_rate),
+            format="WAV",
+            subtype="PCM_16",
+        )
+        os.replace(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return str(output_path)
+
+
+def _run_fbank_job(
+    job: _FbankJob,
+    compute_fbank: Callable[..., str],
+) -> tuple[int, int]:
     import torch
 
     torch.set_num_threads(1)
-    return compute_fbank(
-        job.audio_path,
-        job.fbank_path,
-        waveform=job.waveform,
-        sample_rate=job.sample_rate,
-    )
+    fbank_written = 0
+    waveform_written = 0
+    if job.write_fbank:
+        compute_fbank(
+            job.audio_path,
+            job.fbank_path,
+            waveform=job.waveform,
+            sample_rate=job.sample_rate,
+        )
+        fbank_written = 1
+    if job.waveform_path is not None:
+        _write_waveform_cache(job.waveform_path, job.waveform, job.sample_rate)
+        waveform_written = 1
+    return fbank_written, waveform_written
 
 
 def _compute_fbank_jobs(
@@ -285,29 +337,39 @@ def _compute_fbank_jobs(
         return 0
 
     if num_workers <= 1:
+        written = 0
         for job in jobs:
-            _run_fbank_job(job, compute_fbank)
+            fbank_written, waveform_written = _run_fbank_job(job, compute_fbank)
+            written += fbank_written
             if on_progress is not None:
-                on_progress("fbank", 1)
-        return len(jobs)
+                if fbank_written:
+                    on_progress("fbank", fbank_written)
+                if waveform_written:
+                    on_progress("waveform", waveform_written)
+        return written
 
     written = 0
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(_run_fbank_job, job, compute_fbank) for job in jobs]
         for future in as_completed(futures):
-            future.result()
-            written += 1
+            fbank_written, waveform_written = future.result()
+            written += fbank_written
             if on_progress is not None:
-                on_progress("fbank", 1)
+                if fbank_written:
+                    on_progress("fbank", fbank_written)
+                if waveform_written:
+                    on_progress("waveform", waveform_written)
     return written
 
 
 @dataclass(frozen=True)
 class FbankTarget:
-    """A fbank file that still needs to be computed for a given decoded clip."""
+    """Cached artifacts still needed for one decoded clip."""
 
     audio_path: str
     fbank_path: Path
+    write_fbank: bool = True
+    waveform_path: Path | None = None
 
 
 def build_anchor_metadata(
@@ -316,6 +378,7 @@ def build_anchor_metadata(
     clips_dir: Path,
     distances_dir: Path,
     fbank_dir: Path,
+    waveform_dir: Path | None = None,
     limit_anchors: int = 0,
     hard_negative_top_k: int = DEFAULT_HARD_NEGATIVE_TOP_K,
     g2p: Any | None = None,
@@ -334,6 +397,7 @@ def build_anchor_metadata(
     clips_dir = Path(clips_dir)
     distances_dir = Path(distances_dir)
     fbank_dir = Path(fbank_dir)
+    waveform_dir = Path(waveform_dir) if waveform_dir is not None else None
 
     rows: list[dict[str, str]] = []
     pending: list[dict[str, Any]] = []
@@ -362,12 +426,15 @@ def build_anchor_metadata(
         "missing_audio": 0,
         "fbank_written": 0,
         "fbank_skipped": 0,
+        "waveform_written": 0,
+        "waveform_skipped": 0,
         "clips_total": 0,
         "g2p_recomputed": int(recompute_g2p),
     }
 
     candidate_pairs = [(item["ngram"], item["ngram_g2p"]) for item in pending]
     fbank_targets: dict[str, FbankTarget] = {}
+    audio_rel_sources: dict[str, str] = {}
 
     if on_progress is not None:
         on_progress("anchor_total", len(pending))
@@ -395,12 +462,35 @@ def build_anchor_metadata(
             audio_path = clip["audio_path"]
             audio_rel = clip_to_audio_rel(audio_path)
             fbank_path = fbank_dir / resolve_fbank_rel_path(audio_path)
-
-            if fbank_path.exists():
+            write_fbank = not fbank_path.exists()
+            if not write_fbank:
                 stats["fbank_skipped"] += 1
-                continue
 
-            fbank_targets[audio_rel] = FbankTarget(audio_path=audio_path, fbank_path=fbank_path)
+            waveform_path = (
+                waveform_dir / resolve_waveform_rel_path(audio_path)
+                if waveform_dir is not None
+                else None
+            )
+            write_waveform = waveform_path is not None and not waveform_path.exists()
+            if waveform_path is not None and not write_waveform:
+                stats["waveform_skipped"] += 1
+
+            if write_fbank or write_waveform:
+                previous_source = audio_rel_sources.setdefault(audio_rel, audio_path)
+                if previous_source != audio_path:
+                    raise ValueError(
+                        "Stage II decoded audio key collision: "
+                        f"{previous_source!r} and {audio_path!r} both map to "
+                        f"audio_rel={audio_rel!r}. Prepare the datasets "
+                        "separately or preserve a dataset namespace in the "
+                        "decoded keys."
+                    )
+                fbank_targets[audio_rel] = FbankTarget(
+                    audio_path=audio_path,
+                    fbank_path=fbank_path,
+                    write_fbank=write_fbank,
+                    waveform_path=waveform_path if write_waveform else None,
+                )
 
         rows.append(
             {
@@ -436,7 +526,17 @@ def stream_fbank_from_decoded(
     full dataset. Returns ``(fbank_written, missing_audio)``.
     """
     if on_progress is not None:
-        on_progress("fbank_total", len(fbank_targets))
+        on_progress(
+            "fbank_total",
+            sum(int(target.write_fbank) for target in fbank_targets.values()),
+        )
+        on_progress(
+            "waveform_total",
+            sum(
+                int(target.waveform_path is not None)
+                for target in fbank_targets.values()
+            ),
+        )
 
     remaining: set[str] = set(fbank_targets)
     written = 0
@@ -470,6 +570,8 @@ def stream_fbank_from_decoded(
                     fbank_path=target.fbank_path,
                     waveform=array,
                     sample_rate=int(sample_rate),
+                    write_fbank=target.write_fbank,
+                    waveform_path=target.waveform_path,
                 )
             )
 
@@ -493,6 +595,7 @@ def convert_aggregated_to_paper_parquet(
     clips_dir: Path,
     distances_dir: Path,
     fbank_dir: Path,
+    waveform_dir: Path | None = None,
     audio_by_rel: dict[str, tuple[np.ndarray, int]] | None = None,
     limit_anchors: int = 0,
     hard_negative_top_k: int = DEFAULT_HARD_NEGATIVE_TOP_K,
@@ -516,6 +619,7 @@ def convert_aggregated_to_paper_parquet(
         clips_dir=clips_dir,
         distances_dir=distances_dir,
         fbank_dir=fbank_dir,
+        waveform_dir=waveform_dir,
         limit_anchors=limit_anchors,
         hard_negative_top_k=hard_negative_top_k,
         g2p=g2p,
@@ -536,17 +640,31 @@ def convert_aggregated_to_paper_parquet(
                 fbank_path=target.fbank_path,
                 waveform=waveform,
                 sample_rate=sample_rate,
+                write_fbank=target.write_fbank,
+                waveform_path=target.waveform_path,
             )
         )
 
     if on_progress is not None:
-        on_progress("fbank_total", len(fbank_jobs))
+        on_progress(
+            "fbank_total", sum(int(job.write_fbank) for job in fbank_jobs)
+        )
+        on_progress(
+            "waveform_total",
+            sum(int(job.waveform_path is not None) for job in fbank_jobs),
+        )
+
+    def on_compute_progress(stage: str, value: int) -> None:
+        if stage == "waveform":
+            stats["waveform_written"] += value
+        if on_progress is not None:
+            on_progress(stage, value)
 
     stats["fbank_written"] = _compute_fbank_jobs(
         fbank_jobs,
         compute_fbank=compute_fbank,
         num_workers=num_workers,
-        on_progress=on_progress,
+        on_progress=on_compute_progress,
     )
 
     return paper_df, stats

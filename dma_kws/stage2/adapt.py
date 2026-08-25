@@ -142,6 +142,15 @@ def _apply_adapt_overrides(config: dict[str, Any], args: Stage2AdaptArgs) -> dic
 
 
 def _validate_lora_runtime_config(stage2: dict[str, Any]) -> None:
+    noise_augmentation = stage2.get("noise_augmentation", {}) or {}
+    if bool(noise_augmentation.get("enabled", False)):
+        raise ValueError(
+            "stage2.noise_augmentation.enabled is not supported for LoRA "
+            "adaptation: adaptation manifests contain precomputed features, not "
+            "the source waveforms required for online mixing. Disable it for "
+            "adaptation or run base Stage II QbyT training."
+        )
+
     ema = stage2.get("ema", {}) or {}
     if bool(ema.get("enabled", False)):
         raise ValueError(

@@ -25,6 +25,21 @@ log_interval: 10
 val_check_interval: 1000
 freeze_encoder: false
 
+# Waveform-domain additive-noise augmentation for base Stage II QbyT training.
+# Clean samples keep using the precomputed fbank cache; only samples selected by
+# probability load a cached/raw waveform, mix one noise recording at a random
+# SNR, and recompute fbank with the shared top-level `fbank` settings. Validation
+# and evaluation are always clean. Generate a waveform cache during paper prep
+# with `prep.waveform_dir=...`, or point waveform_dir at an equivalent WAV tree.
+noise_augmentation:
+  enabled: false
+  probability: 0.3
+  waveform_dir: ""
+  # One audio path per line. Relative entries resolve from this file's parent.
+  noise_list_path: ""
+  snr_db_min: 10.0
+  snr_db_max: 20.0
+
 # Load QbyT weights trained before the pooled readout was fixed. Their parameter
 # shapes still match, so nothing else would notice, but they were trained to read
 # a different frame. Only the encoder/adapter weights survive a warm start this

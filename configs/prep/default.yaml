@@ -34,6 +34,10 @@ train_manifest: ""
 dev_manifest: ""
 fbank_root: ""
 audio_root: ""
+# Optional loose-WAV cache for Stage II online waveform augmentation. The
+# relative layout matches each LibriPhrase clip's audio_path (LP-*/...wav).
+# Existing fbank files are not recomputed when only this cache is missing.
+waveform_dir: ""
 no_skip_existing: false
 test_dir: ""
 from_csv: false

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import os
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import torch
@@ -18,6 +19,206 @@ DEFAULT_FRAME_LENGTH = 25
 DEFAULT_FRAME_SHIFT = 10
 
 
+class TrainingNoiseAugmenter:
+    """Mix a random noise recording into a Stage-II training waveform.
+
+    The augmenter deliberately owns no RNG state.  The caller supplies the
+    dataset's ``random.Random`` instance so DataLoader worker/DDP reseeding also
+    controls the augmentation gate, source choice, crop and SNR draw.
+    """
+
+    def __init__(
+        self,
+        *,
+        waveform_dir: str | Path,
+        noise_list_path: str | Path,
+        snr_db_min: float,
+        snr_db_max: float,
+        fbank_kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.snr_db_min = float(snr_db_min)
+        self.snr_db_max = float(snr_db_max)
+        if not math.isfinite(self.snr_db_min) or not math.isfinite(self.snr_db_max):
+            raise ValueError("Stage II noise SNR bounds must be finite")
+        if self.snr_db_min > self.snr_db_max:
+            raise ValueError("Stage II noise snr_db_min must be <= snr_db_max")
+
+        self.waveform_dir = Path(waveform_dir)
+        if not self.waveform_dir.is_dir():
+            raise FileNotFoundError(
+                f"Stage II waveform directory not found: {self.waveform_dir}"
+            )
+
+        self.noise_list_path = Path(noise_list_path)
+        self.noise_paths = self._load_noise_files(self.noise_list_path)
+        self._fbank_kwargs = dict(fbank_kwargs or {})
+        self._fbank_extractor: FbankExtractor | None = None
+
+    @staticmethod
+    def _load_noise_files(noise_list_path: Path) -> tuple[Path, ...]:
+        if not noise_list_path.is_file():
+            raise FileNotFoundError(
+                f"Stage II noise list file not found: {noise_list_path}"
+            )
+
+        paths: list[Path] = []
+        base = noise_list_path.parent
+        with noise_list_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                path = Path(line).expanduser()
+                if not path.is_absolute():
+                    path = base / path
+                paths.append(path)
+
+        if not paths:
+            raise ValueError(f"Stage II noise list is empty: {noise_list_path}")
+        missing = next((path for path in paths if not path.is_file()), None)
+        if missing is not None:
+            raise FileNotFoundError(f"Stage II noise audio not found: {missing}")
+        return tuple(paths)
+
+    @staticmethod
+    def _as_mono(waveform: torch.Tensor, *, source: Path) -> torch.Tensor:
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        if waveform.dim() != 2 or waveform.size(0) == 0:
+            raise ValueError(
+                f"Expected audio shaped (channels, samples) for {source}, "
+                f"got {tuple(waveform.shape)}"
+            )
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if waveform.size(1) == 0:
+            raise ValueError(f"Audio contains no samples: {source}")
+        return waveform.to(dtype=torch.float32).contiguous()
+
+    @staticmethod
+    def _match_noise_length(
+        noise: torch.Tensor,
+        target_samples: int,
+        *,
+        rng: random.Random,
+    ) -> torch.Tensor:
+        noise_samples = int(noise.size(1))
+        if noise_samples >= target_samples:
+            max_offset = noise_samples - target_samples
+            offset = rng.randint(0, max_offset) if max_offset else 0
+            return noise[:, offset : offset + target_samples]
+
+        # Repeat one extra period so a random phase still yields a complete
+        # target-length slice instead of always starting at noise sample zero.
+        offset = rng.randrange(noise_samples) if noise_samples > 1 else 0
+        repeats = math.ceil((target_samples + offset) / noise_samples)
+        tiled = noise.repeat(1, repeats)
+        return tiled[:, offset : offset + target_samples]
+
+    def _fbank(self) -> FbankExtractor:
+        # Construct lazily inside the DataLoader worker.  Some backends keep
+        # native extractor objects that should not be created in the parent and
+        # then pickled/forked into every worker.
+        if self._fbank_extractor is None:
+            self._fbank_extractor = FbankExtractor(**self._fbank_kwargs)
+        return self._fbank_extractor
+
+    def mix(
+        self,
+        waveform: torch.Tensor,
+        sample_rate: int,
+        *,
+        rng: random.Random,
+    ) -> tuple[torch.Tensor, float]:
+        """Return ``(mixed_waveform, sampled_snr_db)`` at the clean sample rate."""
+        if int(sample_rate) <= 0:
+            raise ValueError("Stage II clean sample rate must be positive")
+        waveform = self._as_mono(waveform, source=Path("<clean waveform>"))
+        signal_power = waveform.square().mean()
+        tiny = torch.finfo(torch.float32).tiny
+        if not torch.isfinite(signal_power) or float(signal_power) <= tiny:
+            raise ValueError(
+                "Cannot apply SNR noise augmentation to a silent clean waveform"
+            )
+
+        noise = None
+        noise_path = None
+        noise_power = None
+        # A long recording can be valid overall while one randomly selected crop
+        # is silent. Retry a bounded number of source/crop draws so an occasional
+        # quiet region does not kill a persistent DataLoader worker.
+        for _attempt in range(8):
+            candidate_path = rng.choice(self.noise_paths)
+            candidate, noise_sample_rate = _load_audio(
+                candidate_path,
+                rng=rng,
+                target_samples=int(waveform.size(1)),
+                target_sample_rate=int(sample_rate),
+            )
+            candidate = self._as_mono(candidate, source=candidate_path)
+            if int(noise_sample_rate) != int(sample_rate):
+                torchaudio = _import_torchaudio()
+                candidate = torchaudio.functional.resample(
+                    candidate,
+                    int(noise_sample_rate),
+                    int(sample_rate),
+                )
+                candidate = self._as_mono(candidate, source=candidate_path)
+            candidate = self._match_noise_length(
+                candidate, int(waveform.size(1)), rng=rng
+            )
+            candidate_power = candidate.square().mean()
+            if torch.isfinite(candidate_power) and float(candidate_power) > tiny:
+                noise = candidate
+                noise_path = candidate_path
+                noise_power = candidate_power
+                break
+        if noise is None or noise_path is None or noise_power is None:
+            raise ValueError(
+                "Could not draw a non-silent Stage II noise crop after 8 attempts"
+            )
+
+        snr_db = rng.uniform(self.snr_db_min, self.snr_db_max)
+        try:
+            snr_linear = 10.0 ** (snr_db / 10.0)
+        except OverflowError as exc:
+            raise ValueError(
+                f"Stage II noise SNR is outside numeric range: {snr_db}"
+            ) from exc
+        if not math.isfinite(snr_linear) or snr_linear <= 0.0:
+            raise ValueError(f"Stage II noise SNR is outside numeric range: {snr_db}")
+        scale = torch.sqrt(signal_power / (noise_power * snr_linear))
+        mixed = waveform + noise * scale
+        if not torch.isfinite(mixed).all():
+            raise ValueError(
+                f"Stage II noise augmentation produced non-finite samples: {noise_path}"
+            )
+        return mixed.contiguous(), snr_db
+
+    def extract(self, wav_path: str, *, rng: random.Random) -> torch.Tensor:
+        """Load one clean clip, mix noise, and compute configured Stage-II fbank."""
+        relative_path = Path(wav_path)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(
+                f"Stage II waveform path must be relative to waveform_dir: {wav_path}"
+            )
+        source_path = self.waveform_dir / relative_path
+        if not source_path.is_file():
+            raise FileNotFoundError(
+                f"Stage II cached waveform not found: {source_path}. "
+                "Run prepare_stage2_paper.py with prep.waveform_dir set, or point "
+                "stage2.noise_augmentation.waveform_dir at an existing WAV tree."
+            )
+        waveform, sample_rate = _load_audio(source_path)
+        waveform = self._as_mono(waveform, source=source_path)
+        extractor = self._fbank()
+        waveform, sample_rate = extractor.prepare_waveform(
+            waveform, int(sample_rate)
+        )
+        mixed, _snr_db = self.mix(waveform, int(sample_rate), rng=rng)
+        return extractor.extract(mixed, int(sample_rate))
+
+
 def _import_torchaudio():
     try:
         import torchaudio
@@ -26,6 +227,64 @@ def _import_torchaudio():
             "Missing torchaudio. Install CUDA PyTorch/torchaudio on the training machine first."
         ) from exc
     return torchaudio
+
+
+def _load_audio(
+    path: str | Path,
+    *,
+    rng: random.Random | None = None,
+    target_samples: int | None = None,
+    target_sample_rate: int | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Load audio without torchaudio's optional TorchCodec dependency.
+
+    Noise callers pass a target duration and RNG. In that mode, long recordings
+    are decoded from a random span instead of reading the entire file for every
+    augmented sample. Clean waveform-cache callers omit these arguments and read
+    the complete clip.
+    """
+    try:
+        import soundfile as sf
+    except ImportError as exc:
+        raise ImportError(
+            "Missing soundfile. Install the declared dma-kws runtime dependencies."
+        ) from exc
+
+    partial_args = (rng, target_samples, target_sample_rate)
+    if any(value is not None for value in partial_args) and not all(
+        value is not None for value in partial_args
+    ):
+        raise ValueError(
+            "rng, target_samples, and target_sample_rate must be provided together"
+        )
+
+    with sf.SoundFile(str(path)) as handle:
+        sample_rate = int(handle.samplerate)
+        frames = -1
+        if rng is not None:
+            assert target_samples is not None
+            assert target_sample_rate is not None
+            if target_samples <= 0 or target_sample_rate <= 0:
+                raise ValueError("Target noise duration and sample rate must be positive")
+            # Decode just enough source-rate samples to cover the target-rate
+            # clean clip. A final crop/repeat after resampling handles rounding.
+            frames = max(
+                1,
+                math.ceil(target_samples * sample_rate / target_sample_rate),
+            )
+            if len(handle) > frames:
+                handle.seek(rng.randint(0, len(handle) - frames))
+            else:
+                frames = -1
+        array = handle.read(
+            frames=frames,
+            dtype="float32",
+            always_2d=True,
+        )
+    # soundfile is [samples, channels]; all Stage-II waveform code uses
+    # [channels, samples]. copy() avoids a non-writable/strided NumPy view.
+    waveform = torch.from_numpy(np.asarray(array, dtype=np.float32).T.copy())
+    return waveform, int(sample_rate)
 
 
 def compute_fbank(

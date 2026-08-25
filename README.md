@@ -769,6 +769,56 @@ Fbank parameters (`backend`, `target_sample_rate`, `num_mel_bins`, frame setting
 
 Training consumes the paper parquet + fbank layout directly via `LibriPhraseTrainDataset` (random + hard negatives, utt + seq loss).
 
+### Optional Stage II waveform noise augmentation
+
+Stage II can mix additive noise into training clips before fbank extraction. The
+feature cache remains the clean fast path: only samples selected by
+`stage2.noise_augmentation.probability` load a waveform, mix noise at a random
+SNR, and recompute fbank. Validation and evaluation never use this augmentation.
+This switch applies to the base `train_stage2_qbyt.py`/`train_stage2_recipe.py`
+flow; keyword LoRA adaptation keeps its separately prepared feature manifests.
+
+The decoded LibriPhrase shards do not provide loose WAV files to the training
+dataset, so first build the optional waveform cache while preparing Stage II:
+
+```bash
+python3 scripts/prepare_stage2_paper.py \
+  +experiment=paper_ls460 \
+  prep.input_parquet=/data/dma-kws/raw/LibriPhrase-460/aggregated_segments_with_g2p_distance.parquet \
+  prep.waveform_dir=/data/dma-kws/features/stage2_waveforms \
+  prep.num_workers=4
+```
+
+This is incremental: if clean fbank files already exist, the prep reads decoded
+audio only to fill missing WAV cache entries and does not recompute those fbank
+files. WAVs are written as PCM16 under the original clip layout, for example
+`stage2_waveforms/LP-460/<phrase>/<clip>.wav`. The waveform cache currently
+requires zero training padding; prep fails explicitly if it is combined with
+non-zero `prep.left_padding_ms`/`prep.right_padding_ms`, rather than silently
+producing clean and noise-augmented features with different boundaries.
+
+Create a UTF-8 noise list containing one WAV/FLAC path per line. Blank lines and
+`#` comments are ignored; relative entries are resolved from the list file's
+directory. Then enable augmentation for training:
+
+```bash
+python3 scripts/train_stage2_recipe.py \
+  +experiment=paper_ls460 \
+  stage2.noise_augmentation.enabled=true \
+  stage2.noise_augmentation.probability=0.3 \
+  stage2.noise_augmentation.waveform_dir=/data/dma-kws/features/stage2_waveforms \
+  stage2.noise_augmentation.noise_list_path=/data/musan/noise.list \
+  stage2.noise_augmentation.snr_db_min=10 \
+  stage2.noise_augmentation.snr_db_max=20 \
+  run.devices=4
+```
+
+The probability gate, noise choice, crop and SNR draw use the Stage II dataset's
+worker/DDP-aware RNG. The mixed waveform is converted with the same top-level
+`fbank:` backend and parameters as the clean training features. A missing
+waveform/noise file, empty list, invalid probability, or invalid SNR interval
+fails before or at the first affected sample with a concrete path in the error.
+
 ### LibriPhrase eval data (required for validation)
 
 Stage II training runs LibriPhrase validation on a schedule (`stage2.validation.val_check_interval`). You need the official eval set under `stage2.eval.test_dir` (default `data/dma-kws/raw/LibriPhrase-100/eval`). It is **not** included in the LibriPhrase-100 training download; obtain it from the LibriPhrase-460 Hugging Face eval assets or symlink a shared eval tree. See [docs/paper-reproduction.md](docs/paper-reproduction.md) for LP-460 hard eval used in paper metrics.

@@ -400,6 +400,18 @@ class Stage2QbyTReadoutConfig:
 
 
 @dataclass
+class Stage2NoiseAugmentationConfig:
+    """Online waveform-domain noise mixing for Stage-II training only."""
+
+    enabled: bool = False
+    probability: float = 0.3
+    waveform_dir: str = ""
+    noise_list_path: str = ""
+    snr_db_min: float = 10.0
+    snr_db_max: float = 20.0
+
+
+@dataclass
 class Stage2Config:
     encoder_output_dim: int = 144
     qbyt_embed_dim: int = 128
@@ -449,6 +461,9 @@ class Stage2Config:
     )
     qbyt_readout: Stage2QbyTReadoutConfig = field(
         default_factory=Stage2QbyTReadoutConfig
+    )
+    noise_augmentation: Stage2NoiseAugmentationConfig = field(
+        default_factory=Stage2NoiseAugmentationConfig
     )
     phoneme_adapter: Stage2PhonemeAdapterConfig = field(
         default_factory=Stage2PhonemeAdapterConfig
