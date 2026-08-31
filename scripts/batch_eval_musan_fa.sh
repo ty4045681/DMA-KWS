@@ -10,8 +10,10 @@
 #                           ARPAbet override for the preceding --keyword
 #   --keywords-file FILE    One keyword, or keyword<TAB>phonemes, per line
 #   --musan-root DIR        Root of the MUSAN corpus (must contain music/noise/speech dirs)
+#   --audio-list FILE       Optional MUSAN evaluation allowlist (one audio path per line)
 #   --pt PT:OUT             Explicit .pt checkpoint and its required output directory (repeatable)
-#   --pts-file FILE         Text file with one PT:OUT_DIR per non-comment line
+#   --calibration FILE      Calibration JSON for the preceding --pt (optional)
+#   --pts-file FILE         PT:OUT_DIR, optionally followed by TAB+calibration, per line
 #   --base-out DIR          Fallback root output dir when no per-pt OUT is given
 #   --window-sec SEC        Sliding window length in seconds (default: 3.0)
 #   --hop-sec SEC           Sliding window hop in seconds (default: 3.0)
@@ -23,13 +25,20 @@
 #   keyword<TAB>HH EY1 IY1 V AH0
 #   Lines starting with '#' and blank lines are ignored. One-column rows use G2P.
 #
+# --pts-file format:
+#   /path/to/checkpoint.pt:/path/to/output
+#   /path/to/checkpoint.pt:/path/to/output<TAB>/path/to/calibration.json
+#   Calibration is checkpoint-specific; an omitted second column uses identity.
+#
 # Examples:
 #   # Single keyword, explicit checkpoints:
 #   bash scripts/batch_eval_musan_fa.sh \
 #     --keyword "hey eva" \
 #     --keyword-phonemes "HH EY1 IY1 V AH0" \
 #     --musan-root /path/to/musan \
+#     --audio-list /path/to/musan_split/eval_musan.list \
 #     --pt /path/to/stage2_step010000.pt:/path/to/out/step10000 \
+#     --calibration /path/to/stage2_step010000.calibration.json \
 #     --pt /path/to/stage2_step020000.pt:/path/to/out/step20000 \
 #     --window-sec 3.0 \
 #     --hop-sec 3.0
@@ -54,7 +63,10 @@ KEYWORD_PHONEMES=()
 KEYWORD_PHONEMES_SET=()
 KEYWORDS_FILE=""
 MUSAN_ROOT=""
+AUDIO_LIST=""
 EXPLICIT_PTS=()
+PT_CALIBRATIONS=()
+PT_CALIBRATION_SET=()
 PTS_FILE=""
 BASE_OUT=""
 WINDOW_SEC="3.0"
@@ -62,7 +74,7 @@ HOP_SEC="3.0"
 EXPERIMENT="icefall_zipformer_stage2"
 
 usage() {
-  sed -n '3,48p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,57p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -94,7 +106,31 @@ while [[ $# -gt 0 ]]; do
       ;;
     --keywords-file) KEYWORDS_FILE="$2"; shift 2 ;;
     --musan-root)    MUSAN_ROOT="$2";   shift 2 ;;
-    --pt)            EXPLICIT_PTS+=("$2"); shift 2 ;;
+    --audio-list)    AUDIO_LIST="$2";   shift 2 ;;
+    --pt)
+      EXPLICIT_PTS+=("$2")
+      PT_CALIBRATIONS+=("")
+      PT_CALIBRATION_SET+=("0")
+      shift 2
+      ;;
+    --calibration)
+      if [[ ${#EXPLICIT_PTS[@]} -eq 0 ]]; then
+        echo "ERROR: --calibration must follow --pt." >&2
+        exit 1
+      fi
+      checkpoint_index=$((${#EXPLICIT_PTS[@]} - 1))
+      if [[ "${PT_CALIBRATION_SET[${checkpoint_index}]}" == "1" ]]; then
+        echo "ERROR: duplicate --calibration for ${EXPLICIT_PTS[${checkpoint_index}]}" >&2
+        exit 1
+      fi
+      if [[ ! -f "$2" ]]; then
+        echo "ERROR: calibration file not found: $2" >&2
+        exit 1
+      fi
+      PT_CALIBRATIONS[${checkpoint_index}]="$2"
+      PT_CALIBRATION_SET[${checkpoint_index}]="1"
+      shift 2
+      ;;
     --pts-file)      PTS_FILE="$2";      shift 2 ;;
     --base-out)      BASE_OUT="$2";     shift 2 ;;
     --window-sec)    WINDOW_SEC="$2";   shift 2 ;;
@@ -149,6 +185,10 @@ if [[ ! -d "${MUSAN_ROOT}" ]]; then
   echo "ERROR: MUSAN root not found: ${MUSAN_ROOT}" >&2
   exit 1
 fi
+if [[ -n "${AUDIO_LIST}" && ! -f "${AUDIO_LIST}" ]]; then
+  echo "ERROR: --audio-list not found: ${AUDIO_LIST}" >&2
+  exit 1
+fi
 
 # Load explicit checkpoints from file if provided
 if [[ -n "${PTS_FILE}" ]]; then
@@ -157,7 +197,18 @@ if [[ -n "${PTS_FILE}" ]]; then
   fi
   while IFS= read -r line || [[ -n "${line}" ]]; do
     [[ -z "${line}" || "${line}" == \#* ]] && continue
-    EXPLICIT_PTS+=("${line}")
+    checkpoint_entry="${line%%$'\t'*}"
+    calibration=""
+    if [[ "${line}" == *$'\t'* ]]; then
+      calibration="${line#*$'\t'}"
+      if [[ "${calibration}" == *$'\t'* ]]; then
+        echo "ERROR: --pts-file accepts at most two tab-separated columns: ${line}" >&2
+        exit 1
+      fi
+    fi
+    EXPLICIT_PTS+=("${checkpoint_entry}")
+    PT_CALIBRATIONS+=("${calibration}")
+    [[ -n "${calibration}" ]] && PT_CALIBRATION_SET+=("1") || PT_CALIBRATION_SET+=("0")
   done < "${PTS_FILE}"
 fi
 
@@ -183,6 +234,7 @@ run_checkpoint_keyword() {
   local keyword="$3"
   local keyword_phonemes="$4"
   local display_label="$5"
+  local calibration="$6"
   local -a eval_command=(
     python3 scripts/eval_musan_fa.py
     "+experiment=${EXPERIMENT}"
@@ -195,6 +247,12 @@ run_checkpoint_keyword() {
   )
   if [[ -n "${keyword_phonemes}" ]]; then
     eval_command+=("prep.keyword_phonemes=${keyword_phonemes}")
+  fi
+  if [[ -n "${calibration}" ]]; then
+    eval_command+=("prep.stage2_calibration=${calibration}")
+  fi
+  if [[ -n "${AUDIO_LIST}" ]]; then
+    eval_command+=("prep.musan_audio_list_path=${AUDIO_LIST}")
   fi
 
   echo "--- [${display_label}] ---"
@@ -209,6 +267,7 @@ if [[ -n "${BASE_OUT}" ]]; then
 fi
 
 echo "MUSAN root : ${MUSAN_ROOT}"
+echo "Audio list : ${AUDIO_LIST:-<recursive scan>}"
 echo "Keywords   : ${#KEYWORDS[@]}"
 echo "Checkpoints: ${#EXPLICIT_PTS[@]}"
 echo "Window     : ${WINDOW_SEC}s / hop ${HOP_SEC}s"
@@ -216,7 +275,9 @@ echo "Experiment : ${EXPERIMENT}"
 echo "Base out   : ${BASE_OUT:-<none>}"
 echo ""
 
-for entry in "${EXPLICIT_PTS[@]}"; do
+for checkpoint_index in "${!EXPLICIT_PTS[@]}"; do
+  entry="${EXPLICIT_PTS[${checkpoint_index}]}"
+  calibration="${PT_CALIBRATIONS[${checkpoint_index}]}"
   ckpt="${entry%%:*}"
   per_out="${entry#*:}"
   [[ "${per_out}" == "${ckpt}" ]] && per_out=""
@@ -229,6 +290,10 @@ for entry in "${EXPLICIT_PTS[@]}"; do
     echo "WARNING: checkpoint not found, skipping: ${ckpt}" >&2
     continue
   fi
+  if [[ -n "${calibration}" && ! -f "${calibration}" ]]; then
+    echo "ERROR: calibration file not found: ${calibration}" >&2
+    exit 1
+  fi
 
   ckpt_name="$(basename "${ckpt}" .pt)"
 
@@ -236,7 +301,7 @@ for entry in "${EXPLICIT_PTS[@]}"; do
     # Single keyword + explicit output -> use output as-is
     run_checkpoint_keyword \
       "${ckpt}" "${per_out}" "${KEYWORDS[0]}" "${KEYWORD_PHONEMES[0]}" \
-      "${ckpt_name}/${KEYWORDS[0]}"
+      "${ckpt_name}/${KEYWORDS[0]}" "${calibration}"
   else
     for keyword_index in "${!KEYWORDS[@]}"; do
       keyword="${KEYWORDS[${keyword_index}]}"
@@ -252,7 +317,7 @@ for entry in "${EXPLICIT_PTS[@]}"; do
       fi
       run_checkpoint_keyword \
         "${ckpt}" "${out_dir}" "${keyword}" "${keyword_phonemes}" \
-        "${ckpt_name}/${keyword}"
+        "${ckpt_name}/${keyword}" "${calibration}"
     done
   fi
 done

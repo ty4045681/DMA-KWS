@@ -6,6 +6,7 @@ Stage I spans that QbyT verifies; FA/hour then counts wake-ups per audio hour.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -16,6 +17,39 @@ from dma_kws.inference.metrics import summarize_false_accept_rate
 from dma_kws.inference.stage2_reporting import build_result_record
 
 TWO_STAGE_WAKEUP_PROTOCOL = "two_stage_wakeup"
+
+
+def musan_catalog_sha256(
+    audio_files: Sequence[str | Path],
+    musan_root: str | Path,
+) -> str:
+    """Hash the sorted root-relative canonical paths in a MUSAN catalog.
+
+    This identity is independent of the host's absolute MUSAN location and the
+    order in an allowlist. Paths outside the canonical root are rejected. The
+    digest payload is the UTF-8 encoding of sorted relative POSIX paths, one
+    per line including the final newline. This matches the split manifest's
+    catalog identity contract.
+    """
+
+    root = Path(musan_root).resolve()
+    relative_paths: list[str] = []
+    seen: set[Path] = set()
+    for audio_file in audio_files:
+        resolved = Path(audio_file).resolve()
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                f"MUSAN audio path is outside musan_root: {resolved} (root: {root})"
+            ) from exc
+        if resolved in seen:
+            raise ValueError(f"Duplicate canonical MUSAN audio path: {resolved}")
+        seen.add(resolved)
+        relative_paths.append(relative.as_posix())
+
+    payload = "".join(f"{path}\n" for path in sorted(relative_paths)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def audio_duration_sec(path: str | Path) -> float:
@@ -90,6 +124,8 @@ def two_stage_wakeup_result_record(
         "threshold": float(threshold),
         "skipped": False,
     }
+    if "qbyt_raw_logit" in scored:
+        runner_result["qbyt_raw_logit"] = float(scored["qbyt_raw_logit"])
     manifest_row = {
         "audio_path": source_path,
         "keyword": keyword,
@@ -195,9 +231,11 @@ _MERGE_IDENTITY_KEYS = (
     "keyword_phonemes",
     "keyword_phonemes_source",
     "stage2_ckpt",
+    "stage2_calibration",
     "window_sec",
     "hop_sec",
     "musan_root",
+    "musan_catalog_sha256",
     "stream",
     "provenance",
     "amp",
@@ -399,10 +437,13 @@ def merge_musan_summaries(
         ),
         "output_dir": str(Path(output_dir).resolve()),
         "musan_root": reference.get("musan_root"),
+        "musan_audio_list_path": reference.get("musan_audio_list_path"),
+        "musan_catalog_sha256": reference.get("musan_catalog_sha256"),
         "keyword": reference.get("keyword"),
         "keyword_phonemes": reference.get("keyword_phonemes"),
         "keyword_phonemes_source": reference.get("keyword_phonemes_source"),
         "stage2_ckpt": reference.get("stage2_ckpt"),
+        "stage2_calibration": reference.get("stage2_calibration"),
         "window_sec": reference.get("window_sec"),
         "hop_sec": reference.get("hop_sec"),
         "batch_size": reference.get("batch_size"),

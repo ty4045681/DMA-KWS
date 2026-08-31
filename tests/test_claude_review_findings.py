@@ -22,7 +22,8 @@ def test_qbyt_forward_routes_lengths_through_structural_alignment():
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "aligner"
-        and len(node.args) == 3
+        and len(node.args) == 4
+        and any(keyword.arg == "duration_log_probs" for keyword in node.keywords)
         for node in ast.walk(forward)
     )
     assert any(

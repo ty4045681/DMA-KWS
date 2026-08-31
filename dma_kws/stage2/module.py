@@ -12,6 +12,7 @@ import torch
 import torchmetrics
 
 from dma_kws.config import resolve_stream_policy
+from dma_kws.inference.score_calibration import PositiveAffineCalibrator
 from dma_kws.nn import build_encoder, run_encoder
 from dma_kws.stage2.losses import compute_stage2_losses
 from dma_kws.stage2.model_factory import build_qbyt
@@ -95,6 +96,17 @@ class Stage2LightningModule(pl.LightningModule):
         self.qbyt_alignment = resolve_qbyt_alignment(stage2)
         self.seq_progress_weight = sequence_objective.progress_weight
         self.seq_normalization = sequence_objective.normalization
+        negative_tail_cfg = stage2.get("negative_tail_loss", {}) or {}
+        if not isinstance(negative_tail_cfg, dict):
+            raise ValueError("stage2.negative_tail_loss must be a mapping")
+        self.negative_tail_weight = (
+            float(negative_tail_cfg.get("weight", 0.5))
+            if bool(negative_tail_cfg.get("enabled", False))
+            else 0.0
+        )
+        self.negative_tail_fraction = float(
+            negative_tail_cfg.get("fraction", 0.1)
+        )
         # Minimal hand-written configs may omit this section. Stamp the resolved
         # objective into all new checkpoints so two same-shape QbyT models do not
         # become indistinguishable after being trained against different targets.
@@ -108,10 +120,9 @@ class Stage2LightningModule(pl.LightningModule):
         self.stream_policy = resolve_stream_policy(stage1)
         self.encoder = build_encoder(stage1, output_dim=encoder_dim)
 
-        # The phoneme adapter is the trunk the CTC loss and QbyT share. Without
-        # it QbyT reads the encoder output directly, which for a BPE/transducer
-        # encoder is not a space the phoneme text embedding can be compared
-        # against. Disabled by default so pre-adapter checkpoints still load.
+        # The v6 matcher learns phone/blank/noise competition directly from the
+        # encoder output. The optional adapter is only an auxiliary phoneme-CTC
+        # trunk; it is not required by the adapter-free architecture.
         adapter_cfg = stage2.get("phoneme_adapter", {}) or {}
         self.adapter_enabled = bool(adapter_cfg.get("enabled", False))
         self.freeze_adapter = self.adapter_enabled and bool(adapter_cfg.get("freeze", False))
@@ -197,6 +208,20 @@ class Stage2LightningModule(pl.LightningModule):
         self.deployment_threshold = float(
             (config.get("demo", {}) or {}).get("qbyt_threshold", 0.5)
         )
+        prep_cfg = config.get("prep", {}) or {}
+        if not isinstance(prep_cfg, dict):
+            raise ValueError("prep must be a mapping")
+        calibration_path = str(prep_cfg.get("stage2_calibration", "")).strip()
+        score_calibrator = (
+            PositiveAffineCalibrator.load_json(calibration_path)
+            if calibration_path
+            else PositiveAffineCalibrator(slope=1.0, bias=0.0)
+        )
+        # Keep calibration outside the model/state dict. These scalars affect
+        # validation/test diagnostics only; all training losses consume the raw
+        # structural logit produced by QbyT.
+        self._score_calibration_slope = float(score_calibrator.slope)
+        self._score_calibration_bias = float(score_calibrator.bias)
         validation_cfg = stage2.get("validation", {}) or {}
         self.ece_num_bins = int(validation_cfg.get("ece_num_bins", 15))
         self.score_diagnostics = BinaryScoreDiagnostics(
@@ -213,8 +238,11 @@ class Stage2LightningModule(pl.LightningModule):
                     "loss_seq_weighted",
                     "loss_seq_progress_raw",
                     "loss_seq_progress_weighted",
+                    "loss_negative_tail_raw",
+                    "loss_negative_tail_weighted",
                     "loss_ctc_raw",
                     "loss_ctc_weighted",
+                    "illegal_path_rate",
                 )
             }
         )
@@ -332,7 +360,7 @@ class Stage2LightningModule(pl.LightningModule):
                     )
             if qbyt_state:
                 self.qbyt.load_state_dict(qbyt_state, strict=True)
-                rank_zero_print(f"Loaded QbyT v5 weights from {checkpoint_path}")
+                rank_zero_print(f"Loaded QbyT v6 weights from {checkpoint_path}")
 
     def _load_adapter_checkpoint(self, checkpoint_path: Path) -> None:
         """Load a Step A adapter export produced by ``scripts/train_ctc_adapter.py``.
@@ -551,6 +579,16 @@ class Stage2LightningModule(pl.LightningModule):
         logits, seq_logits, (ctc_log_probs, encoder_mask) = self.forward_with_encoder(
             batch["feat"], batch["feat_lengths"], batch["anchor"], mode="train"
         )
+        encoder_lengths = encoder_mask.squeeze(1).sum(dim=1).to(dtype=torch.long)
+        anchor_lengths = batch["anchor"].ne(0).sum(dim=1).to(dtype=torch.long)
+        minimum_path_frames = (
+            anchor_lengths * self.qbyt_alignment.min_phone_duration_frames
+        )
+        valid_path_mask = (
+            anchor_lengths.gt(0)
+            & minimum_path_frames.le(encoder_lengths)
+            & minimum_path_frames.le(self.qbyt_alignment.max_keyword_span_frames)
+        )
         total_loss, losses = compute_stage2_losses(
             logits=logits,
             seq_logits=seq_logits,
@@ -559,9 +597,14 @@ class Stage2LightningModule(pl.LightningModule):
             seq_label_mask=batch["seq_label_mask"],
             seq_progress_weight=self.seq_progress_weight,
             seq_normalization=self.seq_normalization,
+            negative_tail_weight=self.negative_tail_weight,
+            negative_tail_fraction=self.negative_tail_fraction,
+            valid_path_mask=valid_path_mask,
             ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
             ctc_weight=self.ctc_weight,
         )
+        losses["valid_path_mask"] = valid_path_mask
+        losses["illegal_path_rate"] = (~valid_path_mask).float().mean()
         return total_loss, losses, logits
 
     def _log_train_losses(self, total_loss: torch.Tensor, losses: dict[str, torch.Tensor]) -> None:
@@ -573,15 +616,25 @@ class Stage2LightningModule(pl.LightningModule):
             "loss_seq_progress_weighted": losses[
                 "seq_progress_weighted_loss"
             ],
+            "illegal_path_rate": losses.get(
+                "illegal_path_rate",
+                total_loss.new_zeros(()),
+            ),
         }
         if "ctc_loss" in losses:
             metrics["loss_ctc_raw"] = losses["ctc_loss"]
             metrics["loss_ctc_weighted"] = losses["ctc_weighted_loss"]
+        if "negative_tail_loss" in losses:
+            metrics["loss_negative_tail_raw"] = losses["negative_tail_loss"]
+            metrics["loss_negative_tail_weighted"] = losses[
+                "negative_tail_weighted_loss"
+            ]
 
         progress_metrics = {
             "loss_total",
             "loss_utt_raw",
             "loss_seq_weighted",
+            "loss_negative_tail_weighted",
             "loss_ctc_weighted",
         }
         for name, value in metrics.items():
@@ -606,6 +659,8 @@ class Stage2LightningModule(pl.LightningModule):
             # Optional CTC metrics receive no updates when the adapter/auxiliary
             # loss is disabled; MeanMetric.compute() would otherwise emit NaN.
             if name.startswith("loss_ctc") and not self.ctc_weight:
+                continue
+            if name.startswith("loss_negative_tail") and not self.negative_tail_weight:
                 continue
             values[f"train/window/{name}"] = metric.compute()
             metric.reset()
@@ -684,7 +739,10 @@ class Stage2LightningModule(pl.LightningModule):
         labels: torch.Tensor,
         sample_ids: torch.Tensor | None = None,
     ) -> None:
-        score_metric.update(torch.sigmoid(logits), labels, sample_ids)
+        calibrated_logits = (
+            logits * self._score_calibration_slope + self._score_calibration_bias
+        )
+        score_metric.update(torch.sigmoid(calibrated_logits), labels, sample_ids)
 
     def _log_score_diagnostics(
         self,

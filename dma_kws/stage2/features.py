@@ -219,6 +219,83 @@ class TrainingNoiseAugmenter:
         return extractor.extract(mixed, int(sample_rate))
 
 
+class TrainingBackgroundSampler:
+    """Draw a fixed-duration pure-background crop and compute Stage-II fbank.
+
+    Unlike :class:`TrainingNoiseAugmenter`, this source does not mix background
+    into speech. It supplies a genuine negative clip, so the dataset can teach
+    the readout that music/noise alone must be explained as background. The RNG
+    remains owned by the dataset for worker/DDP reproducibility, and both the
+    fbank extractor and audio decode are lazy/partial inside each worker.
+    """
+
+    def __init__(
+        self,
+        *,
+        audio_list_path: str | Path,
+        duration_seconds_min: float,
+        duration_seconds_max: float,
+        fbank_kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.duration_seconds_min = float(duration_seconds_min)
+        self.duration_seconds_max = float(duration_seconds_max)
+        if not math.isfinite(self.duration_seconds_min) or not math.isfinite(
+            self.duration_seconds_max
+        ):
+            raise ValueError("Stage II background duration bounds must be finite")
+        if self.duration_seconds_min <= 0.0:
+            raise ValueError(
+                "Stage II background duration_seconds_min must be positive"
+            )
+        if self.duration_seconds_min > self.duration_seconds_max:
+            raise ValueError(
+                "Stage II background duration_seconds_min must be <= "
+                "duration_seconds_max"
+            )
+
+        self.audio_list_path = Path(audio_list_path)
+        self.audio_paths = TrainingNoiseAugmenter._load_noise_files(
+            self.audio_list_path
+        )
+        self._fbank_kwargs = dict(fbank_kwargs or {})
+        self._fbank_extractor: FbankExtractor | None = None
+
+    def _fbank(self) -> FbankExtractor:
+        if self._fbank_extractor is None:
+            self._fbank_extractor = FbankExtractor(**self._fbank_kwargs)
+        return self._fbank_extractor
+
+    def extract(self, *, rng: random.Random) -> torch.Tensor:
+        """Sample one background crop and return configured fbank features."""
+        duration_seconds = rng.uniform(
+            self.duration_seconds_min,
+            self.duration_seconds_max,
+        )
+        source_path = rng.choice(self.audio_paths)
+
+        # _load_audio only needs a target sample-count/rate ratio to determine
+        # the requested duration. Microsecond units preserve fractional seconds
+        # without first opening the file merely to discover its sample rate.
+        duration_units = max(1, round(duration_seconds * 1_000_000))
+        waveform, sample_rate = _load_audio(
+            source_path,
+            rng=rng,
+            target_samples=duration_units,
+            target_sample_rate=1_000_000,
+        )
+        waveform = TrainingNoiseAugmenter._as_mono(
+            waveform,
+            source=source_path,
+        )
+        target_samples = max(1, round(duration_seconds * sample_rate))
+        waveform = TrainingNoiseAugmenter._match_noise_length(
+            waveform,
+            target_samples,
+            rng=rng,
+        )
+        return self._fbank().extract(waveform, sample_rate)
+
+
 def _import_torchaudio():
     try:
         import torchaudio

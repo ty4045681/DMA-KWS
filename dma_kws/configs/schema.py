@@ -383,16 +383,26 @@ class Stage2SequenceLossConfig:
 
 
 @dataclass
-class Stage2QbyTAlignmentConfig:
-    """Only supported QbyT score topology: bounded segmental alignment."""
+class Stage2NegativeTailLossConfig:
+    """Extra pressure on the highest-scoring negative examples in each batch."""
 
-    topology: str = "bounded_segmental_v1"
+    enabled: bool = True
+    weight: float = 0.5
+    fraction: float = 0.1
+
+
+@dataclass
+class Stage2QbyTAlignmentConfig:
+    """Only supported QbyT score topology: keyword-vs-filler segmental CRF."""
+
+    topology: str = "keyword_filler_segmental_crf_v1"
     min_phone_duration_frames: int = 1
     max_phone_duration_frames: int = 8
-    max_inter_phone_gap_frames: int = 2
+    max_inter_phone_gap_frames: int = 1
     max_keyword_span_frames: int = 30
-    temperature: float = 0.2
     local_context_kernel: int = 5
+    weakest_phone_temperature: float = 0.2
+    weakest_phone_weight: float = 1.0
 
 
 @dataclass
@@ -405,6 +415,18 @@ class Stage2NoiseAugmentationConfig:
     noise_list_path: str = ""
     snr_db_min: float = 10.0
     snr_db_max: float = 20.0
+
+
+@dataclass
+class Stage2BackgroundNegativeConfig:
+    """Optional pure music/noise/ambient negatives for Stage-II training."""
+
+    enabled: bool = False
+    #: Conditional probability inside the existing 50% negative branch.
+    probability: float = 0.25
+    audio_list_path: str = ""
+    duration_seconds_min: float = 1.0
+    duration_seconds_max: float = 3.0
 
 
 @dataclass
@@ -450,11 +472,17 @@ class Stage2Config:
     sequence_loss: Stage2SequenceLossConfig = field(
         default_factory=Stage2SequenceLossConfig
     )
+    negative_tail_loss: Stage2NegativeTailLossConfig = field(
+        default_factory=Stage2NegativeTailLossConfig
+    )
     qbyt_alignment: Stage2QbyTAlignmentConfig = field(
         default_factory=Stage2QbyTAlignmentConfig
     )
     noise_augmentation: Stage2NoiseAugmentationConfig = field(
         default_factory=Stage2NoiseAugmentationConfig
+    )
+    background_negative: Stage2BackgroundNegativeConfig = field(
+        default_factory=Stage2BackgroundNegativeConfig
     )
     phoneme_adapter: Stage2PhonemeAdapterConfig = field(
         default_factory=Stage2PhonemeAdapterConfig

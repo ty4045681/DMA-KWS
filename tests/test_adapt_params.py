@@ -34,13 +34,14 @@ STAGE2_SECTION = {
     "accumulate_grad_batches": 1,
     "precision": "bf16-mixed",
     "qbyt_alignment": {
-        "topology": "bounded_segmental_v1",
+        "topology": "keyword_filler_segmental_crf_v1",
         "min_phone_duration_frames": 1,
         "max_phone_duration_frames": 8,
-        "max_inter_phone_gap_frames": 2,
+        "max_inter_phone_gap_frames": 1,
         "max_keyword_span_frames": 30,
-        "temperature": 0.2,
         "local_context_kernel": 5,
+        "weakest_phone_temperature": 0.2,
+        "weakest_phone_weight": 1.0,
     },
     "sequence_loss": {
         "target_mode": "ordered_contiguous_prefix",
@@ -197,10 +198,11 @@ def test_stage2_summary_rows_report_alignment_and_progress_objective():
     assert rows["warmup_steps"] == "2500"
     assert rows["max_steps"] == "50000"
     assert rows["batch_size_per_gpu"] == "64"
-    assert rows["qbyt_alignment_topology"] == "bounded_segmental_v1"
-    assert rows["qbyt_alignment_temperature"] == "0.2"
+    assert rows["qbyt_alignment_topology"] == "keyword_filler_segmental_crf_v1"
+    assert rows["qbyt_weakest_phone_temperature"] == "0.2"
+    assert rows["qbyt_weakest_phone_weight"] == "1.0"
     assert rows["qbyt_max_phone_duration_frames"] == "8"
-    assert rows["qbyt_max_inter_phone_gap_frames"] == "2"
+    assert rows["qbyt_max_inter_phone_gap_frames"] == "1"
     assert rows["qbyt_max_keyword_span_frames"] == "30"
     assert rows["qbyt_deployment_threshold"] == "0.5"
     assert rows["score_ece_num_bins"] == "15"

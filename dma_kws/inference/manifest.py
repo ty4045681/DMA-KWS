@@ -12,6 +12,47 @@ _REQUIRED_COLUMNS = ("audio_path", "keyword")
 _DEFAULT_AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a")
 
 
+def load_audio_file_list(path: str | Path) -> list[Path]:
+    """Load a deterministic list of canonical audio file paths.
+
+    Blank lines and lines whose first non-space character is ``#`` are ignored.
+    Relative entries are resolved against the list file's directory. Missing
+    files and duplicate canonical paths are rejected so train/eval allowlists
+    cannot overlap accidentally through alternate path spellings or symlinks.
+    """
+
+    list_path = Path(path).expanduser()
+    if not list_path.is_file():
+        raise FileNotFoundError(f"Audio file list not found: {list_path}")
+
+    base_dir = list_path.parent.resolve()
+    files: list[Path] = []
+    first_line_by_path: dict[Path, int] = {}
+    with list_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            entry = line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            candidate = Path(entry).expanduser()
+            if not candidate.is_absolute():
+                candidate = base_dir / candidate
+            resolved = candidate.resolve()
+            if not resolved.is_file():
+                raise FileNotFoundError(
+                    f"{list_path}:{line_number} audio file not found: {candidate}"
+                )
+            previous_line = first_line_by_path.get(resolved)
+            if previous_line is not None:
+                raise ValueError(
+                    f"{list_path}:{line_number} duplicates canonical audio path "
+                    f"from line {previous_line}: {resolved}"
+                )
+            first_line_by_path[resolved] = line_number
+            files.append(resolved)
+
+    return sorted(files, key=lambda item: str(item))
+
+
 def _normalize_row(
     row: Mapping[str, Any],
     base_dir: Path | None,

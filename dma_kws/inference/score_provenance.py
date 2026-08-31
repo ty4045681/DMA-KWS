@@ -6,11 +6,12 @@ from copy import deepcopy
 from typing import Any, Mapping
 
 
-PROVENANCE_SCHEMA_VERSION = 2
+PROVENANCE_SCHEMA_VERSION = 3
 
 _REQUIRED_FIELDS = {
     "schema_version",
     "checkpoint",
+    "calibration",
     "qbyt_alignment",
     "stream",
     "audio_padding_ms",
@@ -60,6 +61,24 @@ def validate_score_provenance(
                 f"{source} provenance {section!r} is missing: {missing_section}"
             )
 
+    calibration = provenance.get("calibration")
+    if not isinstance(calibration, Mapping):
+        raise ValueError(f"{source} provenance 'calibration' must be a mapping")
+    if calibration.get("type") == "identity_logit_sigmoid":
+        if set(calibration) != {"type"}:
+            raise ValueError(
+                f"{source} identity calibration has unexpected fields"
+            )
+    else:
+        missing_calibration = sorted(
+            {"path", "size_bytes", "sha256"} - set(calibration)
+        )
+        if missing_calibration:
+            raise ValueError(
+                f"{source} provenance 'calibration' is missing: "
+                f"{missing_calibration}"
+            )
+
     return dict(provenance)
 
 
@@ -73,6 +92,9 @@ def semantic_score_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
     tokenizer = value.get("tokenizer")
     if isinstance(tokenizer, dict):
         tokenizer.pop("path", None)
+    calibration = value.get("calibration")
+    if isinstance(calibration, dict):
+        calibration.pop("path", None)
     return value
 
 

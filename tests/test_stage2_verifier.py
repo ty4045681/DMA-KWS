@@ -6,6 +6,7 @@ torch = pytest.importorskip("torch")
 
 from dma_kws.config import fbank_kwargs
 from dma_kws.configs.schema import FbankConfig
+from dma_kws.inference.score_calibration import PositiveAffineCalibrator
 from dma_kws.inference.stage2_verifier import Stage2Verifier
 from dma_kws.stage1.candidates import KeywordCandidate
 from dma_kws.stage2.fbank import FbankExtractor
@@ -39,6 +40,7 @@ def _build_verifier_for_fbank_test(monkeypatch, captured: dict) -> Stage2Verifie
     verifier._fbank_extractor = FbankExtractor(**verifier._fbank_kwargs)
     verifier._model = _FakeStage2Model()
     verifier._min_fbank_frames = 7
+    verifier._calibrator = PositiveAffineCalibrator(slope=2.0, bias=-1.0)
     return verifier
 
 
@@ -113,6 +115,26 @@ def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch):
     assert verifier.amp is None
 
 
+def test_stage2_verifier_exposes_raw_logits_and_calibrates_once():
+    verifier = Stage2Verifier.__new__(Stage2Verifier)
+    verifier._torch = torch
+    verifier._device = torch.device("cpu")
+    verifier._model = _FakeStage2Model()
+    verifier._calibrator = PositiveAffineCalibrator(slope=2.0, bias=-1.0)
+
+    scored = verifier.score_clip_feats_with_logits(
+        [torch.zeros(3, 80)],
+        [[17, 14, 16]],
+    )
+
+    expected_probability = torch.sigmoid(torch.tensor(0.5)).item()
+    assert scored == [(pytest.approx(0.75), pytest.approx(expected_probability))]
+    assert verifier.score_clip_feats(
+        [torch.zeros(3, 80)],
+        [[17, 14, 16]],
+    ) == [pytest.approx(expected_probability)]
+
+
 def test_resolve_inference_amp_accepts_aliases():
     from dma_kws.inference.stage2_verifier import resolve_inference_amp
 
@@ -143,7 +165,10 @@ def test_stage2_verifier_uses_waveform_to_fbank(monkeypatch):
     assert captured["sample_rate"] == 16000
     assert captured["kwargs"]["window_type"] == "povey"
     assert captured["kwargs"]["dither"] == 0.0
-    assert scores[0]["qbyt_score"] == pytest.approx(0.75)
+    assert scores[0]["qbyt_raw_logit"] == pytest.approx(0.75)
+    assert scores[0]["qbyt_score"] == pytest.approx(
+        torch.sigmoid(torch.tensor(0.5)).item()
+    )
 
 
 def test_stage2_verifier_resamples_before_candidate_slicing(monkeypatch):
@@ -174,6 +199,7 @@ def test_stage2_verifier_resamples_before_candidate_slicing(monkeypatch):
     verifier._fbank_extractor = FbankExtractor(**verifier._fbank_kwargs)
     verifier._model = _FakeStage2Model()
     verifier._min_fbank_frames = 7
+    verifier._calibrator = PositiveAffineCalibrator(slope=2.0, bias=-1.0)
 
     waveform = torch.randn(1, 8000)
     candidates = [
@@ -190,7 +216,10 @@ def test_stage2_verifier_resamples_before_candidate_slicing(monkeypatch):
     assert captured["sample_rate"] == 16000
     assert captured["num_samples"] == 8000
     assert captured["kwargs"]["snip_edges"] is False
-    assert scores[0]["qbyt_score"] == pytest.approx(0.75)
+    assert scores[0]["qbyt_raw_logit"] == pytest.approx(0.75)
+    assert scores[0]["qbyt_score"] == pytest.approx(
+        torch.sigmoid(torch.tensor(0.5)).item()
+    )
 
 
 def test_stage2_verifier_decodes_batched_adapter_ctc(monkeypatch):

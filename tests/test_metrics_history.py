@@ -26,13 +26,14 @@ CONFIG = {
         "batch_size_per_gpu": 64,
         "accumulate_grad_batches": 2,
         "qbyt_alignment": {
-            "topology": "bounded_segmental_v1",
+            "topology": "keyword_filler_segmental_crf_v1",
             "min_phone_duration_frames": 1,
             "max_phone_duration_frames": 8,
-            "max_inter_phone_gap_frames": 2,
+            "max_inter_phone_gap_frames": 1,
             "max_keyword_span_frames": 30,
-            "temperature": 0.2,
             "local_context_kernel": 5,
+            "weakest_phone_temperature": 0.2,
+            "weakest_phone_weight": 1.0,
         },
         "sequence_loss": {
             "target_mode": "ordered_contiguous_prefix",
@@ -265,10 +266,11 @@ def test_collect_hparams_stage2_section():
     assert hparams["seq_target_mode"] == "ordered_contiguous_prefix"
     assert hparams["seq_progress_weight"] == 0.3
     assert hparams["seq_normalization"] == "sample"
-    assert hparams["qbyt_alignment_topology"] == "bounded_segmental_v1"
-    assert hparams["qbyt_alignment_temperature"] == 0.2
+    assert hparams["qbyt_alignment_topology"] == "keyword_filler_segmental_crf_v1"
+    assert hparams["qbyt_weakest_phone_temperature"] == 0.2
+    assert hparams["qbyt_weakest_phone_weight"] == 1.0
     assert hparams["qbyt_max_phone_duration_frames"] == 8
-    assert hparams["qbyt_max_inter_phone_gap_frames"] == 2
+    assert hparams["qbyt_max_inter_phone_gap_frames"] == 1
     assert hparams["qbyt_max_keyword_span_frames"] == 30
     assert hparams["qbyt_deployment_threshold"] == 0.5
     assert hparams["score_ece_num_bins"] == 15
@@ -280,20 +282,22 @@ def test_collect_hparams_records_alignment_overrides():
     config["stage2"] = dict(
         CONFIG["stage2"],
         qbyt_alignment={
-            "topology": "bounded_segmental_v1",
+            "topology": "keyword_filler_segmental_crf_v1",
             "min_phone_duration_frames": 2,
             "max_phone_duration_frames": 6,
             "max_inter_phone_gap_frames": 1,
             "max_keyword_span_frames": 24,
-            "temperature": 0.5,
             "local_context_kernel": 3,
+            "weakest_phone_temperature": 0.5,
+            "weakest_phone_weight": 0.75,
         },
     )
 
     hparams = collect_hparams(config)
 
-    assert hparams["qbyt_alignment_topology"] == "bounded_segmental_v1"
-    assert hparams["qbyt_alignment_temperature"] == 0.5
+    assert hparams["qbyt_alignment_topology"] == "keyword_filler_segmental_crf_v1"
+    assert hparams["qbyt_weakest_phone_temperature"] == 0.5
+    assert hparams["qbyt_weakest_phone_weight"] == 0.75
     assert hparams["qbyt_max_phone_duration_frames"] == 6
     assert hparams["qbyt_max_inter_phone_gap_frames"] == 1
     assert hparams["qbyt_max_keyword_span_frames"] == 24

@@ -1,4 +1,4 @@
-"""Stage-II integration tests for the single QbyT v5 alignment path."""
+"""Stage-II integration tests for the single QbyT v6 alignment path."""
 
 from unittest.mock import MagicMock
 
@@ -8,6 +8,7 @@ import torch.nn as nn
 
 pytest.importorskip("pytorch_lightning")
 
+from dma_kws.inference.score_calibration import PositiveAffineCalibrator
 from dma_kws.stage2.module import Stage2LightningModule
 
 
@@ -33,12 +34,13 @@ def _config(*, span: int = 30) -> dict:
             "total_scheduler_steps": 10,
             "max_steps": 10,
             "qbyt_alignment": {
-                "topology": "bounded_segmental_v1",
+                "topology": "keyword_filler_segmental_crf_v1",
                 "min_phone_duration_frames": 1,
                 "max_phone_duration_frames": 4,
                 "max_inter_phone_gap_frames": 1,
                 "max_keyword_span_frames": span,
-                "temperature": 0.2,
+                "weakest_phone_temperature": 0.2,
+                "weakest_phone_weight": 1.0,
                 "local_context_kernel": 5,
             },
             "sequence_loss": {
@@ -115,13 +117,90 @@ def test_forward_and_training_step_smoke(module):
     assert torch.isfinite(loss)
 
 
+def test_training_masks_structurally_illegal_paths(monkeypatch):
+    import dma_kws.stage2.module as stage2_module
+
+    _patch_model(monkeypatch)
+    module = Stage2LightningModule(_config(span=4), vocab_size=20)
+    real_compute_losses = stage2_module.compute_stage2_losses
+    captured = {}
+
+    def _capture_valid_path_mask(**kwargs):
+        captured["valid_path_mask"] = kwargs.get("valid_path_mask")
+        return real_compute_losses(**kwargs)
+
+    monkeypatch.setattr(
+        stage2_module,
+        "compute_stage2_losses",
+        _capture_valid_path_mask,
+    )
+    batch = {
+        "feat": torch.randn(3, 8, 80),
+        "feat_lengths": torch.tensor([8, 2, 8]),
+        "anchor": torch.tensor(
+            [
+                [3, 4, 5, 0, 0],
+                [6, 7, 8, 0, 0],
+                [9, 10, 11, 12, 13],
+            ]
+        ),
+        "label": torch.tensor([1, 0, 1]),
+        "seq_label": torch.tensor(
+            [
+                [1, 1, 1, -1, -1],
+                [1, 0, 0, -1, -1],
+                [1, 1, 1, 1, 1],
+            ]
+        ),
+        "seq_label_mask": torch.tensor(
+            [
+                [1, 1, 1, 0, 0],
+                [1, 1, 1, 0, 0],
+                [1, 1, 1, 1, 1],
+            ],
+            dtype=torch.float32,
+        ),
+    }
+    # min duration is one frame: sample 1 is valid, sample 2 has too few
+    # encoder frames, and sample 3 exceeds max_keyword_span_frames=4.
+
+    _, losses, _ = module._forward_train_losses(batch)
+
+    assert captured["valid_path_mask"].tolist() == [True, False, False]
+    assert torch.allclose(losses["illegal_path_rate"], torch.tensor(2.0 / 3.0))
+
+
 def test_module_stores_only_the_canonical_alignment_spec(module):
-    assert module.qbyt_alignment.topology == "bounded_segmental_v1"
+    assert module.qbyt_alignment.topology == "keyword_filler_segmental_crf_v1"
     assert module.qbyt_alignment.max_keyword_span_frames == 30
     stage2 = module._checkpoint_config["stage2"]
     assert stage2["qbyt_alignment"] == module.qbyt_alignment.as_dict()
     assert "qbyt_readout" not in stage2
     assert "allow_legacy_qbyt_readout" not in stage2
+
+
+def test_external_calibration_applies_only_at_score_diagnostics(monkeypatch, tmp_path):
+    _patch_model(monkeypatch)
+    calibration_path = tmp_path / "calibration.json"
+    PositiveAffineCalibrator(slope=2.0, bias=-1.0).save_json(calibration_path)
+    config = _config()
+    config["prep"] = {"stage2_calibration": str(calibration_path)}
+    module = Stage2LightningModule(config, vocab_size=20)
+
+    class _CaptureMetric:
+        def update(self, scores, labels, sample_ids):
+            self.scores = scores
+            self.labels = labels
+            self.sample_ids = sample_ids
+
+    metric = _CaptureMetric()
+    logits = torch.tensor([-1.0, 2.0])
+    labels = torch.tensor([0, 1])
+    module._update_score_diagnostics(metric, logits=logits, labels=labels)
+
+    assert torch.allclose(metric.scores, torch.sigmoid(2.0 * logits - 1.0))
+    assert torch.equal(metric.labels, labels)
+    assert metric.sample_ids is None
 
 
 def test_freeze_encoder_disables_encoder_gradients(monkeypatch):
@@ -143,7 +222,7 @@ def test_encoder_only_checkpoint_is_a_valid_warm_start(monkeypatch, tmp_path):
     assert all(torch.equal(value, torch.ones_like(value)) for value in module.encoder.state_dict().values())
 
 
-def test_pre_v5_qbyt_checkpoint_is_rejected(monkeypatch, tmp_path):
+def test_pre_v6_qbyt_checkpoint_is_rejected(monkeypatch, tmp_path):
     _patch_model(monkeypatch)
     module = Stage2LightningModule(_config(), vocab_size=20)
     path = tmp_path / "v4.pt"
@@ -158,7 +237,7 @@ def test_pre_v5_qbyt_checkpoint_is_rejected(monkeypatch, tmp_path):
         module._load_init_checkpoint(path)
 
 
-def test_full_v5_checkpoint_loads_strictly(monkeypatch, tmp_path):
+def test_full_v6_checkpoint_loads_strictly(monkeypatch, tmp_path):
     from dma_kws.training.checkpoint_io import stamp_qbyt_readout_version
 
     _patch_model(monkeypatch)
@@ -170,7 +249,7 @@ def test_full_v5_checkpoint_loads_strictly(monkeypatch, tmp_path):
         "config": module._checkpoint_config,
     }
     stamp_qbyt_readout_version(payload, alignment=module.qbyt_alignment)
-    path = tmp_path / "v5.pt"
+    path = tmp_path / "v6.pt"
     torch.save(payload, path)
     module._load_init_checkpoint(path, require_full_qbyt=True)
     assert module.qbyt.dummy.item() == 1.0
@@ -194,7 +273,7 @@ def test_saved_checkpoint_stamps_complete_alignment(module):
 
     checkpoint = {"state_dict": module.state_dict()}
     module.on_save_checkpoint(checkpoint)
-    assert checkpoint[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION == 5
+    assert checkpoint[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION == 6
     assert checkpoint[QBYT_ALIGNMENT_SPEC_KEY] == module.qbyt_alignment.as_dict()
     module.on_load_checkpoint(checkpoint)
 

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from dma_kws.stage2.losses import compute_stage2_losses
+from dma_kws.stage2.losses import compute_stage2_losses, negative_tail_cvar_loss
 
 
 def test_utt_loss_near_zero_when_logits_match_labels():
@@ -25,6 +25,93 @@ def test_utt_loss_near_zero_when_logits_match_labels():
         "seq_progress_weighted_loss",
         "total_loss",
     }
+
+
+def test_valid_path_mask_excludes_illegal_samples_from_all_qbyt_losses():
+    logits = torch.tensor([0.4, 50.0], requires_grad=True)
+    seq_logits = torch.tensor(
+        [[0.2, -0.1, 0.8], [-20.0, 30.0, 40.0]],
+        requires_grad=True,
+    )
+    labels = torch.tensor([1.0, 0.0])
+    seq_labels = torch.tensor([[1.0, 0.0, 1.0], [1.0, 1.0, 0.0]])
+    seq_mask = torch.ones_like(seq_labels)
+
+    total, losses = compute_stage2_losses(
+        logits=logits,
+        seq_logits=seq_logits,
+        labels=labels,
+        seq_labels=seq_labels,
+        seq_label_mask=seq_mask,
+        valid_path_mask=torch.tensor([True, False]),
+        seq_progress_weight=1.0,
+        negative_tail_weight=1.0,
+        negative_tail_fraction=1.0,
+    )
+    expected, expected_losses = compute_stage2_losses(
+        logits=logits.detach()[:1],
+        seq_logits=seq_logits.detach()[:1],
+        labels=labels[:1],
+        seq_labels=seq_labels[:1],
+        seq_label_mask=seq_mask[:1],
+        seq_progress_weight=1.0,
+        negative_tail_weight=1.0,
+        negative_tail_fraction=1.0,
+    )
+
+    assert torch.allclose(total, expected)
+    for name in (
+        "utt_loss",
+        "seq_progress_loss",
+        "seq_progress_weighted_loss",
+        "seq_loss",
+        "negative_tail_loss",
+        "negative_tail_weighted_loss",
+    ):
+        assert torch.allclose(losses[name], expected_losses[name])
+
+    total.backward()
+    assert logits.grad[0].abs().item() > 0.0
+    assert logits.grad[1].item() == 0.0
+    assert seq_logits.grad[0, :2].abs().sum().item() > 0.0
+    assert torch.equal(seq_logits.grad[1], torch.zeros(3))
+
+
+def test_all_illegal_paths_return_a_differentiable_zero_loss():
+    logits = torch.tensor([2.0, -3.0], requires_grad=True)
+    seq_logits = torch.tensor(
+        [[0.5, -0.5, 1.0], [2.0, -2.0, 3.0]],
+        requires_grad=True,
+    )
+
+    total, losses = compute_stage2_losses(
+        logits=logits,
+        seq_logits=seq_logits,
+        labels=torch.tensor([1.0, 0.0]),
+        seq_labels=torch.tensor([[1.0, 0.0, 1.0], [1.0, 1.0, 0.0]]),
+        seq_label_mask=torch.ones(2, 3),
+        valid_path_mask=torch.zeros(2, dtype=torch.bool),
+        seq_progress_weight=1.0,
+        negative_tail_weight=1.0,
+        negative_tail_fraction=1.0,
+    )
+
+    assert total.requires_grad
+    assert total.item() == 0.0
+    for name in (
+        "utt_loss",
+        "seq_progress_loss",
+        "seq_progress_weighted_loss",
+        "seq_loss",
+        "negative_tail_loss",
+        "negative_tail_weighted_loss",
+        "total_loss",
+    ):
+        assert losses[name].item() == 0.0
+
+    total.backward()
+    assert torch.equal(logits.grad, torch.zeros_like(logits))
+    assert torch.equal(seq_logits.grad, torch.zeros_like(seq_logits))
 
 
 def test_padding_and_final_prefix_do_not_change_progress_loss_or_receive_gradients():
@@ -254,3 +341,92 @@ def test_seq_loss_rejects_invalid_configuration():
 
     with pytest.raises(ValueError, match="normalization"):
         compute_stage2_losses(**common, seq_normalization="batch")
+
+
+def test_negative_tail_cvar_selects_highest_scoring_negatives_only():
+    logits = torch.tensor([2.0, 0.0, -2.0, 100.0], requires_grad=True)
+    labels = torch.tensor([0.0, 0.0, 0.0, 1.0])
+
+    loss = negative_tail_cvar_loss(logits, labels, fraction=0.5)
+
+    expected = torch.nn.functional.softplus(torch.tensor([2.0, 0.0])).mean()
+    assert torch.allclose(loss, expected)
+    loss.backward()
+    assert logits.grad[0].item() > 0.0
+    assert logits.grad[1].item() > 0.0
+    assert logits.grad[2].item() == 0.0
+    assert logits.grad[3].item() == 0.0
+
+
+def test_negative_tail_loss_is_added_with_configured_weight():
+    logits = torch.tensor([1.5, -0.5, 0.25])
+    labels = torch.tensor([0.0, 0.0, 1.0])
+    seq_logits = torch.empty(3, 0)
+    seq_labels = torch.empty(3, 0)
+    seq_mask = torch.empty(3, 0)
+
+    baseline, baseline_losses = compute_stage2_losses(
+        logits,
+        seq_logits,
+        labels,
+        seq_labels,
+        seq_mask,
+    )
+    total, losses = compute_stage2_losses(
+        logits,
+        seq_logits,
+        labels,
+        seq_labels,
+        seq_mask,
+        negative_tail_weight=0.4,
+        negative_tail_fraction=0.5,
+    )
+
+    expected_tail = torch.nn.functional.softplus(torch.tensor(1.5))
+    assert torch.allclose(losses["negative_tail_loss"], expected_tail)
+    assert torch.allclose(
+        losses["negative_tail_weighted_loss"],
+        0.4 * expected_tail,
+    )
+    assert torch.allclose(total, baseline + 0.4 * expected_tail)
+    assert "negative_tail_loss" not in baseline_losses
+
+
+def test_negative_tail_loss_returns_differentiable_zero_without_negatives():
+    logits = torch.tensor([0.5, -0.2], requires_grad=True)
+
+    loss = negative_tail_cvar_loss(
+        logits,
+        torch.ones_like(logits),
+        fraction=0.1,
+    )
+
+    assert loss.item() == 0.0
+    loss.backward()
+    assert torch.equal(logits.grad, torch.zeros_like(logits))
+
+
+@pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
+def test_negative_tail_loss_rejects_invalid_weight(weight):
+    with pytest.raises(ValueError, match="negative_tail_weight"):
+        compute_stage2_losses(
+            logits=torch.zeros(1),
+            seq_logits=torch.empty(1, 0),
+            labels=torch.zeros(1),
+            seq_labels=torch.empty(1, 0),
+            seq_label_mask=torch.empty(1, 0),
+            negative_tail_weight=weight,
+        )
+
+
+@pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1, float("nan"), float("inf")])
+def test_negative_tail_loss_rejects_invalid_fraction(fraction):
+    with pytest.raises(ValueError, match="negative_tail_fraction"):
+        compute_stage2_losses(
+            logits=torch.zeros(1),
+            seq_logits=torch.empty(1, 0),
+            labels=torch.zeros(1),
+            seq_labels=torch.empty(1, 0),
+            seq_label_mask=torch.empty(1, 0),
+            negative_tail_fraction=fraction,
+        )

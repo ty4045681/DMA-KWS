@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from dma_kws.inference.musan_fa import (
     detect_subset,
     discover_shard_dirs,
     merge_musan_summaries,
+    musan_catalog_sha256,
     select_shard,
 )
 from dma_kws.inference.stage2_clip import Stage2ClipRunner
@@ -201,6 +203,8 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
     audio_path = musan_root / "speech" / "sample.wav"
     audio_path.parent.mkdir(parents=True)
     audio_path.write_bytes(b"")
+    audio_list = tmp_path / "eval.list"
+    audio_list.write_text("musan/speech/sample.wav\n", encoding="utf-8")
     output_dir = tmp_path / "out"
     captured = {}
 
@@ -260,13 +264,14 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
 
     provenance = {
         "qbyt_alignment": {
-            "topology": "bounded_segmental_v1",
+            "topology": "keyword_filler_segmental_crf_v1",
             "min_phone_duration_frames": 1,
             "max_phone_duration_frames": 8,
-            "max_inter_phone_gap_frames": 2,
+            "max_inter_phone_gap_frames": 1,
             "max_keyword_span_frames": 30,
-            "temperature": 0.2,
             "local_context_kernel": 5,
+            "weakest_phone_temperature": 0.2,
+            "weakest_phone_weight": 1.0,
         },
         "sequence_objective": {
             "target_mode": "ordered_contiguous_prefix",
@@ -296,7 +301,11 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
         "build_score_provenance",
         lambda *_args, **_kwargs: provenance,
     )
-    monkeypatch.setattr(eval_musan_fa, "iter_audio_files", lambda _root: [audio_path])
+    monkeypatch.setattr(
+        eval_musan_fa,
+        "iter_audio_files",
+        lambda _root: pytest.fail("recursive scan must not run with an allowlist"),
+    )
     monkeypatch.setattr(eval_musan_fa, "audio_duration_sec", lambda _path: 3.0)
 
     cfg = OmegaConf.create(
@@ -305,6 +314,7 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
                 "keyword": "hey eva",
                 "keyword_phonemes": configured_phonemes,
                 "musan_root": str(musan_root),
+                "musan_audio_list_path": str(audio_list),
                 "stage2_ckpt": "stage2.pt",
                 "window_sec": 3.0,
                 "hop_sec": 1.0,
@@ -359,6 +369,10 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
     assert summary["fbank_windows"] == "independent"
     assert summary["num_shards"] == 1
     assert summary["shard_index"] == 0
+    assert summary["musan_audio_list_path"] == str(audio_list.resolve())
+    assert summary["musan_catalog_sha256"] == hashlib.sha256(
+        b"speech/sample.wav\n"
+    ).hexdigest()
     result = json.loads(
         (output_dir / "results.jsonl").read_text(encoding="utf-8").strip()
     )
@@ -472,6 +486,25 @@ def test_detect_subset(tmp_path):
     assert detect_subset(outside_file, musan_root) == "other"
 
 
+def test_musan_catalog_sha256_is_root_relative_sorted_and_rejects_outside(tmp_path):
+    musan_root = tmp_path / "musan"
+    speech = musan_root / "speech" / "b.wav"
+    noise = musan_root / "noise" / "a.wav"
+    speech.parent.mkdir(parents=True)
+    noise.parent.mkdir(parents=True)
+    speech.write_bytes(b"")
+    noise.write_bytes(b"")
+
+    expected = hashlib.sha256(b"noise/a.wav\nspeech/b.wav\n").hexdigest()
+    assert musan_catalog_sha256([speech, noise], musan_root) == expected
+    assert musan_catalog_sha256([noise, speech], musan_root) == expected
+
+    outside = tmp_path / "outside.wav"
+    outside.write_bytes(b"")
+    with pytest.raises(ValueError, match="outside musan_root"):
+        musan_catalog_sha256([outside], musan_root)
+
+
 def test_assign_files_to_shards_balances_duration_deterministically():
     files = [
         {"audio_path": "a.wav", "duration_sec": 3600.0, "subset": "speech"},
@@ -549,16 +582,19 @@ def test_merge_musan_summaries_pools_hours_and_false_accepts():
         "window_sec": 3.0,
         "hop_sec": 3.0,
         "musan_root": "/musan",
+        "musan_audio_list_path": "/split/eval.list",
+        "musan_catalog_sha256": "catalog-a",
         "stream": {"mode": "test"},
         "provenance": {
             "qbyt_alignment": {
-                "topology": "bounded_segmental_v1",
+                "topology": "keyword_filler_segmental_crf_v1",
                 "min_phone_duration_frames": 1,
                 "max_phone_duration_frames": 8,
-                "max_inter_phone_gap_frames": 2,
+                "max_inter_phone_gap_frames": 1,
                 "max_keyword_span_frames": 30,
-                "temperature": 0.2,
                 "local_context_kernel": 5,
+                "weakest_phone_temperature": 0.2,
+                "weakest_phone_weight": 1.0,
             }
         },
         "amp": "off",
@@ -591,10 +627,28 @@ def test_merge_musan_summaries_pools_hours_and_false_accepts():
     ]
     assert merged["total_files"] == 2
     assert merged["total_hours"] == pytest.approx(4.0)
+    assert merged["musan_audio_list_path"] == "/split/eval.list"
+    assert merged["musan_catalog_sha256"] == "catalog-a"
     assert merged["metrics"]["fp"] == 1.0
     assert merged["metrics"]["fa_per_hour"] == pytest.approx(0.25)
     assert merged["subsets"]["speech"]["metrics"]["fa_per_hour"] == pytest.approx(1.0)
     assert merged["subsets"]["noise"]["metrics"]["fa_per_hour"] == pytest.approx(0.0)
+
+
+def test_merge_musan_summaries_rejects_different_catalogs():
+    common = {
+        "keyword": "hey eva",
+        "musan_root": "/musan",
+        "musan_catalog_sha256": "catalog-a",
+        "total_hours": 1.0,
+    }
+    with pytest.raises(ValueError, match="musan_catalog_sha256"):
+        merge_musan_summaries(
+            [common, {**common, "musan_catalog_sha256": "catalog-b"}],
+            [[], []],
+            output_dir="/tmp/merged",
+            threshold=0.5,
+        )
 
 
 def test_aggregate_musan_fa(tmp_path):

@@ -282,3 +282,121 @@ def test_worker_init_fn_is_a_noop_outside_workers(monkeypatch):
     stage2_worker_init_fn(0)
 
     assert dataset._rng.random() == expected
+
+
+def test_dataset_can_replace_a_speech_negative_with_pure_background(
+    mock_npy_loader,
+    monkeypatch,
+):
+    constructed = {}
+
+    class _FakeBackgroundSampler:
+        def __init__(self, **kwargs):
+            constructed.update(kwargs)
+
+        def extract(self, *, rng):
+            assert isinstance(rng, random.Random)
+            return torch.full((7, 80), 9.0)
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.TrainingBackgroundSampler",
+        _FakeBackgroundSampler,
+    )
+    dataset = LibriPhraseTrainDataset(
+        wav_dir="/data/segments",
+        tokenizer=_FakeTokenizer(),
+        df=_mock_dataframe(),
+        sample_lens=1,
+        seed=0,
+        background_negative={
+            "enabled": True,
+            "probability": 1.0,
+            "audio_list_path": "/background/musan.list",
+            "duration_seconds_min": 1.25,
+            "duration_seconds_max": 2.5,
+        },
+        fbank_kwargs={"num_mel_bins": 80, "dither": 0.0},
+    )
+
+    sample = dataset[0]
+
+    # seed=0 enters the negative half; probability=1 replaces that speech
+    # negative while leaving the current anchor/query classification contract.
+    assert sample["label"].item() == 0
+    assert sample["query_seq"].numel() == 0
+    assert sample["seq_label"].tolist() == [0] * sample["anchor_seq"].numel()
+    assert sample["feat"].shape == (7, 80)
+    assert torch.all(sample["feat"] == 9.0)
+    assert constructed == {
+        "audio_list_path": "/background/musan.list",
+        "duration_seconds_min": 1.25,
+        "duration_seconds_max": 2.5,
+        "fbank_kwargs": {"num_mel_bins": 80, "dither": 0.0},
+    }
+
+
+def test_background_sampling_never_replaces_positive_half(
+    mock_npy_loader,
+    monkeypatch,
+):
+    class _FakeBackgroundSampler:
+        def __init__(self, **_kwargs):
+            pass
+
+        def extract(self, *, rng):
+            raise AssertionError("positive draws must not sample background")
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.TrainingBackgroundSampler",
+        _FakeBackgroundSampler,
+    )
+    dataset = LibriPhraseTrainDataset(
+        wav_dir="/data/segments",
+        tokenizer=_FakeTokenizer(),
+        df=_mock_dataframe(),
+        sample_lens=1,
+        seed=1,
+        background_negative={
+            "enabled": True,
+            "probability": 1.0,
+            "audio_list_path": "/background/musan.list",
+        },
+    )
+
+    sample = dataset[0]
+
+    assert sample["label"].item() == 1
+    assert sample["query_seq"].tolist() == sample["anchor_seq"].tolist()
+
+
+@pytest.mark.parametrize("probability", [-0.01, 1.01, float("nan")])
+def test_background_sampling_rejects_invalid_probability(monkeypatch, probability):
+    class _MustNotBeConstructed:
+        def __init__(self, **_kwargs):
+            raise AssertionError("probability must be checked before source I/O")
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.TrainingBackgroundSampler",
+        _MustNotBeConstructed,
+    )
+    with pytest.raises(ValueError, match="probability must be between 0 and 1"):
+        LibriPhraseTrainDataset(
+            wav_dir="/data/segments",
+            tokenizer=_FakeTokenizer(),
+            df=_mock_dataframe(),
+            background_negative={
+                "enabled": True,
+                "probability": probability,
+                "audio_list_path": "/background/musan.list",
+            },
+        )
+
+
+def test_background_sampling_rejects_unknown_configuration_field():
+    with pytest.raises(ValueError, match="Unknown stage2.background_negative fields"):
+        LibriPhraseTrainDataset(
+            wav_dir="/data/segments",
+            tokenizer=_FakeTokenizer(),
+            df=_mock_dataframe(),
+            background_negative={"enabled": False, "typo": True},
+        )

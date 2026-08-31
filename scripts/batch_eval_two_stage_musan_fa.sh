@@ -10,6 +10,7 @@
 #                           ARPAbet override for the preceding --keyword
 #   --keywords-file FILE    One keyword, or keyword<TAB>phonemes, per line
 #   --musan-root DIR        Root of the MUSAN corpus (must contain music/noise/speech dirs)
+#   --audio-list FILE       Optional MUSAN evaluation allowlist (one audio path per line)
 #   --pt PT:OUT             Explicit .pt checkpoint and its required output directory (repeatable)
 #   --pts-file FILE         Text file with one PT:OUT_DIR per non-comment line
 #   --base-out DIR          Fallback root output dir when no per-pt OUT is given
@@ -33,6 +34,7 @@
 #     --keyword "hey eva" \
 #     --keyword-phonemes "HH EY1 IY1 V AH0" \
 #     --musan-root /path/to/musan \
+#     --audio-list /path/to/musan_split/eval_musan.list \
 #     --pt /path/to/stage2.pt:/path/to/out \
 #     +locator=sherpa_zipformer_kws \
 #     locator.tokens=/path/tokens.txt \
@@ -55,6 +57,7 @@ KEYWORD_PHONEMES=()
 KEYWORD_PHONEMES_SET=()
 KEYWORDS_FILE=""
 MUSAN_ROOT=""
+AUDIO_LIST=""
 EXPLICIT_PTS=()
 PTS_FILE=""
 BASE_OUT=""
@@ -62,7 +65,7 @@ EXPERIMENT="icefall_zipformer_stage2"
 HYDRA_OVERRIDES=()
 
 usage() {
-  sed -n '3,46p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,51p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -94,6 +97,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --keywords-file) KEYWORDS_FILE="$2"; shift 2 ;;
     --musan-root)    MUSAN_ROOT="$2";   shift 2 ;;
+    --audio-list)    AUDIO_LIST="$2";   shift 2 ;;
     --pt)            EXPLICIT_PTS+=("$2"); shift 2 ;;
     --pts-file)      PTS_FILE="$2";      shift 2 ;;
     --base-out)      BASE_OUT="$2";     shift 2 ;;
@@ -156,6 +160,10 @@ if [[ -z "${MUSAN_ROOT}" ]]; then
 fi
 if [[ ! -d "${MUSAN_ROOT}" ]]; then
   echo "ERROR: MUSAN root not found: ${MUSAN_ROOT}" >&2
+  exit 1
+fi
+if [[ -n "${AUDIO_LIST}" && ! -f "${AUDIO_LIST}" ]]; then
+  echo "ERROR: --audio-list not found: ${AUDIO_LIST}" >&2
   exit 1
 fi
 
@@ -229,6 +237,9 @@ run_checkpoint_keyword() {
   if [[ -n "${keyword_phonemes}" ]]; then
     eval_command+=("prep.keyword_phonemes=${keyword_phonemes}")
   fi
+  if [[ -n "${AUDIO_LIST}" ]]; then
+    eval_command+=("prep.musan_audio_list_path=${AUDIO_LIST}")
+  fi
   eval_command+=("${HYDRA_OVERRIDES[@]}")
 
   echo "--- [${display_label}] ---"
@@ -243,6 +254,7 @@ if [[ -n "${BASE_OUT}" ]]; then
 fi
 
 echo "MUSAN root : ${MUSAN_ROOT}"
+echo "Audio list : ${AUDIO_LIST:-<recursive scan>}"
 echo "Keywords   : ${#KEYWORDS[@]}"
 echo "Checkpoints: ${#EXPLICIT_PTS[@]}"
 echo "Experiment : ${EXPERIMENT}"

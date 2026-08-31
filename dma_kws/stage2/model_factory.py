@@ -1,4 +1,4 @@
-"""Single construction path for the QbyT v5 verifier."""
+"""Single construction path for the QbyT v6 verifier."""
 
 from __future__ import annotations
 
@@ -29,7 +29,8 @@ def build_qbyt(
         max_phone_duration_frames=alignment.max_phone_duration_frames,
         max_inter_phone_gap_frames=alignment.max_inter_phone_gap_frames,
         max_keyword_span_frames=alignment.max_keyword_span_frames,
-        alignment_temperature=alignment.temperature,
+        weakest_phone_temperature=alignment.weakest_phone_temperature,
+        weakest_phone_weight=alignment.weakest_phone_weight,
     )
     return model
 

@@ -36,6 +36,7 @@ def build_score_provenance(
     config: dict,
     *,
     checkpoint_path: str | Path,
+    calibration_path: str | Path | None = None,
     stream: object,
     left_padding_ms: int,
     right_padding_ms: int,
@@ -66,13 +67,18 @@ def build_score_provenance(
         sequence_objective = checkpoint_sequence_objective(checkpoint)
     except ValueError as exc:
         raise SystemExit(
-            f"Stage II checkpoint is missing v5 objective metadata: {exc}"
+            f"Stage II checkpoint is missing v6 objective metadata: {exc}"
         ) from exc
     qbyt_alignment = resolve_qbyt_alignment(stage2)
 
     return {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
         "checkpoint": _file_identity(checkpoint_path, kind="Stage II checkpoint"),
+        "calibration": (
+            _file_identity(calibration_path, kind="Stage II calibration")
+            if calibration_path
+            else {"type": "identity_logit_sigmoid"}
+        ),
         "qbyt_alignment": qbyt_alignment.as_dict(),
         "stream": stream,
         "audio_padding_ms": {
@@ -130,6 +136,11 @@ def build_result_record(
         "threshold": _finite_float(runner_result["threshold"], field="threshold"),
         "skipped": bool(runner_result.get("skipped", False)),
     }
+    if "qbyt_raw_logit" in runner_result:
+        record["qbyt_raw_logit"] = _finite_float(
+            runner_result["qbyt_raw_logit"],
+            field="qbyt_raw_logit",
+        )
     if "label" in manifest_row:
         record["label"] = int(manifest_row["label"])
     if "clip_span_sec" in runner_result:

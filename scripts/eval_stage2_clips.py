@@ -136,6 +136,7 @@ def run_eval(cfg: DictConfig) -> dict:
     stage2_ckpt = str(prep.get("stage2_ckpt", ""))
     if not stage2_ckpt:
         raise SystemExit("prep.stage2_ckpt is required")
+    stage2_calibration = str(prep.get("stage2_calibration", "")).strip()
     left_padding_ms, right_padding_ms = _resolve_audio_padding_ms(prep)
     output_dir_override = str(prep.get("output_dir", ""))
     if output_dir_override == "outputs/eval_two_stage_kws":
@@ -187,6 +188,7 @@ def run_eval(cfg: DictConfig) -> dict:
     provenance = _score_provenance(
         config,
         checkpoint_path=stage2_ckpt,
+        calibration_path=stage2_calibration or None,
         stream=stream_description,
         left_padding_ms=left_padding_ms,
         right_padding_ms=right_padding_ms,

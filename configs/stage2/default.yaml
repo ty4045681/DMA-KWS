@@ -1,17 +1,19 @@
 encoder_output_dim: 144
 qbyt_embed_dim: 128
 qbyt_layers: 2
-# The deployed QbyT score is the normalized probability of completing one
-# monotonic, temporally compact path through every anchor phoneme.  Frame counts
-# are measured after encoder subsampling (25 Hz for the default encoders).
+# QbyT v6 scores a compact monotonic keyword graph against a filler/noise and
+# one-phone-deletion alternative graph. Frame counts are measured after encoder
+# subsampling (25 Hz for the default encoders). The weakest aligned phone can
+# only veto a detection; it cannot create a route around the graph.
 qbyt_alignment:
-  topology: bounded_segmental_v1
+  topology: keyword_filler_segmental_crf_v1
   min_phone_duration_frames: 1
   max_phone_duration_frames: 8
-  max_inter_phone_gap_frames: 2
+  max_inter_phone_gap_frames: 1
   max_keyword_span_frames: 30
-  temperature: 0.2
   local_context_kernel: 5
+  weakest_phone_temperature: 0.2
+  weakest_phone_weight: 1.0
 negative_ratio: 1
 learning_rate: 0.0005
 warmup_steps: 2500
@@ -52,8 +54,25 @@ sequence_loss:
   progress_weight: 0.3
   normalization: sample
 
+# Mean BCE learns the bulk of the negative distribution; this term also trains
+# against the highest-scoring fraction that determines low-FA deployment.
+negative_tail_loss:
+  enabled: true
+  weight: 0.5
+  fraction: 0.1
+
+# Pure background is sampled only inside the existing negative branch, so this
+# does not change the 50/50 positive/negative class balance. Populate the list
+# with a training-only mixture of music, noise and ambient/non-target speech.
+background_negative:
+  enabled: false
+  probability: 0.25
+  audio_list_path: ""
+  duration_seconds_min: 1.0
+  duration_seconds_max: 3.0
+
 # Phoneme-CTC trunk between the frozen encoder and QbyT (see configs/phoneme_adapter).
-# Off by default so pre-adapter checkpoints keep loading and stay comparable.
+# Off by default so the adapter-free v6 recipe remains the canonical baseline.
 phoneme_adapter:
   enabled: false
   init_checkpoint: ""

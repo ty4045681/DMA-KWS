@@ -111,7 +111,13 @@ def stage2_worker_init_fn(worker_id: int) -> None:
 
 
 class LibriPhraseTrainDataset(Dataset):
-    """LibriPhrase Stage II training dataset with random and hard negatives."""
+    """LibriPhrase Stage II dataset with speech and optional pure backgrounds.
+
+    ``background_negative.probability`` is conditional on entering the existing
+    50% negative branch: ``0.25`` therefore makes one quarter of negatives (one
+    eighth of all draws), not one quarter of the complete training stream, pure
+    background. Positive sampling and the overall class balance stay unchanged.
+    """
 
     def __init__(
         self,
@@ -128,6 +134,7 @@ class LibriPhraseTrainDataset(Dataset):
         augment: bool = False,
         noise_list_path: str | Path | None = None,
         noise_augmentation: Mapping[str, Any] | None = None,
+        background_negative: Mapping[str, Any] | None = None,
         fbank_kwargs: Mapping[str, Any] | None = None,
         seq_label_mode: str = DEFAULT_SEQ_LABEL_MODE,
     ) -> None:
@@ -155,6 +162,8 @@ class LibriPhraseTrainDataset(Dataset):
         self._feature_extractor = None
         self._noise_augmenter = None
         self._noise_probability = 0.0
+        self._background_sampler = None
+        self._background_probability = 0.0
         if augment:
             from dma_kws.stage2.features import FeatureExtractor
 
@@ -215,6 +224,54 @@ class LibriPhraseTrainDataset(Dataset):
                 fbank_kwargs=fbank_kwargs,
             )
             self._noise_probability = probability
+
+        if background_negative is not None and not isinstance(
+            background_negative, Mapping
+        ):
+            raise ValueError("stage2.background_negative must be a mapping")
+        background_cfg = dict(background_negative or {})
+        allowed_background_keys = {
+            "enabled",
+            "probability",
+            "audio_list_path",
+            "duration_seconds_min",
+            "duration_seconds_max",
+        }
+        unknown_background_keys = sorted(
+            set(background_cfg) - allowed_background_keys
+        )
+        if unknown_background_keys:
+            raise ValueError(
+                "Unknown stage2.background_negative fields: "
+                + ", ".join(unknown_background_keys)
+            )
+        if bool(background_cfg.get("enabled", False)):
+            probability = float(background_cfg.get("probability", 0.25))
+            if not 0.0 <= probability <= 1.0:
+                raise ValueError(
+                    "Stage II background negative probability must be between 0 and 1"
+                )
+            audio_list_path = str(
+                background_cfg.get("audio_list_path", "")
+            ).strip()
+            if not audio_list_path:
+                raise ValueError(
+                    "stage2.background_negative.audio_list_path is required when enabled"
+                )
+
+            from dma_kws.stage2.features import TrainingBackgroundSampler
+
+            self._background_sampler = TrainingBackgroundSampler(
+                audio_list_path=audio_list_path,
+                duration_seconds_min=float(
+                    background_cfg.get("duration_seconds_min", 1.0)
+                ),
+                duration_seconds_max=float(
+                    background_cfg.get("duration_seconds_max", 3.0)
+                ),
+                fbank_kwargs=fbank_kwargs,
+            )
+            self._background_probability = probability
 
     def __len__(self) -> int:
         return self.sample_lens
@@ -289,6 +346,8 @@ class LibriPhraseTrainDataset(Dataset):
         anchor_g2p = anchor_inform["ngram_g2p"]
         anchor_seq = tokenize_phoneme_string(self.tokenizer, anchor_g2p)
         label = 1
+        query_wav: str | None = None
+        background_feats: torch.Tensor | None = None
 
         if self._rng.random() < 0.5:
             anchor_clips = anchor_inform["clips_file"]
@@ -301,30 +360,57 @@ class LibriPhraseTrainDataset(Dataset):
             )
         else:
             label = 0
-            for _ in range(_MAX_CONTAINING_NEGATIVE_DRAWS):
-                query_wav, query_g2p = self._draw_negative(index, anchor_inform)
-                query_seq = tokenize_phoneme_string(self.tokenizer, query_g2p)
+            # This gate deliberately lives inside the negative half so enabling
+            # background data does not silently change the 50/50 class prior.
+            should_draw_background = self._background_sampler is not None and (
+                self._background_probability >= 1.0
+                or (
+                    self._background_probability > 0.0
+                    and self._rng.random() < self._background_probability
+                )
+            )
+            if should_draw_background:
+                # Pure background has no phoneme transcript. An empty query is
+                # also the correct auxiliary-CTC contract: the adapter loss
+                # explicitly skips zero-length targets instead of fabricating a
+                # speech label for music/noise.
+                query_seq = []
                 seq_label = build_seq_label(
                     anchor_seq,
                     query_seq,
                     mode=self.seq_label_mode,
                 )
-                # Stage II is keyword-occurrence detection: an n-gram that
-                # contains the complete anchor is a positive, not a hard
-                # negative. Re-draw so the intended 50/50 sampling ratio is not
-                # distorted by nested LibriPhrase n-grams.
-                if (
-                    self.seq_label_mode != SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
-                    or not seq_label[-1]
-                ):
-                    break
+                background_feats = self._background_sampler.extract(rng=self._rng)
             else:
-                # A tiny/adversarial phrase pool may contain no valid negative.
-                # The selected audio still contains the keyword, so relabeling
-                # is the only supervision-consistent fallback.
-                label = 1
+                for _ in range(_MAX_CONTAINING_NEGATIVE_DRAWS):
+                    query_wav, query_g2p = self._draw_negative(index, anchor_inform)
+                    query_seq = tokenize_phoneme_string(self.tokenizer, query_g2p)
+                    seq_label = build_seq_label(
+                        anchor_seq,
+                        query_seq,
+                        mode=self.seq_label_mode,
+                    )
+                    # Stage II is keyword-occurrence detection: an n-gram that
+                    # contains the complete anchor is a positive, not a hard
+                    # negative. Re-draw so the intended 50/50 sampling ratio is not
+                    # distorted by nested LibriPhrase n-grams.
+                    if (
+                        self.seq_label_mode != SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
+                        or not seq_label[-1]
+                    ):
+                        break
+                else:
+                    # A tiny/adversarial phrase pool may contain no valid negative.
+                    # The selected audio still contains the keyword, so relabeling
+                    # is the only supervision-consistent fallback.
+                    label = 1
 
-        feats = self._load_fbank(query_wav)
+        if background_feats is not None:
+            feats = background_feats
+        else:
+            if query_wav is None:
+                raise RuntimeError("Internal Stage II sample has no audio source")
+            feats = self._load_fbank(query_wav)
         if (
             self.seq_label_mode == SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
             and bool(seq_label[-1]) != bool(label)

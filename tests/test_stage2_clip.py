@@ -742,6 +742,23 @@ class FakeVerifier:
         return output
 
 
+class FakeRawVerifier(FakeVerifier):
+    def __init__(self, scored: list[tuple[float, float]]) -> None:
+        super().__init__([score for _raw_logit, score in scored])
+        self._raw_logits = [raw_logit for raw_logit, _score in scored]
+
+    def verify_candidates(self, waveform, sample_rate, keyword_ids, candidates):
+        output = super().verify_candidates(
+            waveform,
+            sample_rate,
+            keyword_ids,
+            candidates,
+        )
+        for result, raw_logit in zip(output, self._raw_logits):
+            result["qbyt_raw_logit"] = raw_logit
+        return output
+
+
 def _build_runner(
     *,
     threshold: float,
@@ -794,6 +811,20 @@ def test_clip_runner_detected_above_threshold(monkeypatch):
     assert result["skipped"] is False
 
 
+def test_clip_runner_preserves_raw_logit_from_best_candidate(monkeypatch):
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.load_audio", _fake_audio_loader)
+    runner = _build_runner(
+        threshold=0.6,
+        verifier=FakeRawVerifier(scored=[(1.25, 0.85)]),
+        monkeypatch=monkeypatch,
+    )
+
+    result = runner.run("/tmp/clip.wav", "hello")
+
+    assert result["qbyt_raw_logit"] == pytest.approx(1.25)
+    assert result["qbyt_score"] == pytest.approx(0.85)
+
+
 def test_clip_runner_skipped_when_too_short(monkeypatch):
     monkeypatch.setattr("dma_kws.inference.stage2_clip.load_audio", _fake_audio_loader)
     runner = _build_runner(
@@ -840,6 +871,22 @@ class FakeBatchVerifier:
         scores = self._scores[: len(feats)]
         self._scores = self._scores[len(feats):]
         return scores
+
+
+class FakeRawBatchVerifier(FakeBatchVerifier):
+    def __init__(self, scored: list[tuple[float, float]]) -> None:
+        super().__init__([score for _raw_logit, score in scored])
+        self._scored = list(scored)
+
+    def score_clip_feats_with_logits(self, feats, keyword_ids_batch):
+        assert len(feats) == len(keyword_ids_batch)
+        self.batches.append(len(feats))
+        self.keyword_ids_batches.append(
+            [list(keyword_ids) for keyword_ids in keyword_ids_batch]
+        )
+        scored = self._scored[: len(feats)]
+        self._scored = self._scored[len(feats):]
+        return scored
 
 
 def test_clip_runner_run_batch(monkeypatch):
@@ -926,7 +973,7 @@ def test_clip_runner_run_batch_reports_augmented_duration_and_preserves_source_s
         "dma_kws.inference.stage2_clip.text_to_phonemes",
         lambda _g2p, text: _fake_phonemes(text),
     )
-    verifier = FakeBatchVerifier(scores=[0.9])
+    verifier = FakeRawBatchVerifier(scored=[(1.75, 0.9)])
     runner = Stage2ClipRunner(
         verifier=verifier,
         tokenizer=load_char_tokenizer(
@@ -945,6 +992,8 @@ def test_clip_runner_run_batch_reports_augmented_duration_and_preserves_source_s
 
     assert result["clip_span_sec"] == {"start_sec": 0.0, "end_sec": 2.0}
     assert result["augmented_duration_sec"] == pytest.approx(1.0)
+    assert result["qbyt_raw_logit"] == pytest.approx(1.75)
+    assert result["qbyt_score"] == pytest.approx(0.9)
 
 
 def test_clip_runner_run_batch_uses_per_row_keyword_phoneme_overrides(monkeypatch):

@@ -432,7 +432,11 @@ def build_run_summary_rows(
         rows.extend(
             [
                 ("qbyt_alignment_topology", alignment.topology),
-                ("qbyt_alignment_temperature", str(alignment.temperature)),
+                (
+                    "qbyt_weakest_phone_temperature",
+                    str(alignment.weakest_phone_temperature),
+                ),
+                ("qbyt_weakest_phone_weight", str(alignment.weakest_phone_weight)),
                 ("qbyt_min_phone_duration_frames", str(alignment.min_phone_duration_frames)),
                 ("qbyt_max_phone_duration_frames", str(alignment.max_phone_duration_frames)),
                 ("qbyt_max_inter_phone_gap_frames", str(alignment.max_inter_phone_gap_frames)),

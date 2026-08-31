@@ -40,6 +40,7 @@ from dma_kws.config import (
     resolve_stream_policy,
 )
 from dma_kws.inference.audio_utils import has_min_fbank_frames
+from dma_kws.inference.score_calibration import PositiveAffineCalibrator
 from dma_kws.nn import (
     build_encoder,
     min_input_frames_for_encoder,
@@ -89,6 +90,7 @@ class Stage2Verifier:
         vocab_size: int,
         device,
         amp: str | None = None,
+        calibration_path: str | None = None,
     ) -> None:
         try:
             import torch
@@ -101,6 +103,11 @@ class Stage2Verifier:
         self._demo_cfg = dict(demo_cfg)
         self._device = device
         self._amp = resolve_inference_amp(amp)
+        self._calibrator = (
+            PositiveAffineCalibrator.load_json(calibration_path)
+            if calibration_path
+            else PositiveAffineCalibrator(slope=1.0, bias=0.0)
+        )
         self._fbank_kwargs = fbank_kwargs(fbank_cfg)
         self._fbank_extractor = FbankExtractor(**self._fbank_kwargs)
         stage2_encoder_dim = int(stage2_cfg.get("encoder_output_dim", 144))
@@ -178,7 +185,7 @@ class Stage2Verifier:
                     anchors,
                     anchor_lengths,
                 )
-                return torch.sigmoid(logits)
+                return logits
 
         model = Stage2Model()
         try:
@@ -206,6 +213,12 @@ class Stage2Verifier:
     def amp(self) -> str | None:
         """Requested mixed-precision mode, or ``None`` for fp32."""
         return getattr(self, "_amp", None)
+
+    @property
+    def calibrator(self) -> PositiveAffineCalibrator:
+        """Monotone score transform used by every Stage-II inference path."""
+
+        return self._calibrator
 
     @contextmanager
     def _inference_amp(self) -> Iterator[None]:
@@ -273,6 +286,9 @@ class Stage2Verifier:
             vocab_size=len(tokenizer.symbol_table),
             device=device,
             amp=amp,
+            calibration_path=(
+                str(prep.get("stage2_calibration", "")).strip() or None
+            ),
         )
 
     def score_clip_feats(
@@ -280,7 +296,23 @@ class Stage2Verifier:
         feats: Sequence,
         keyword_ids_batch: Sequence[Sequence[int]],
     ) -> list[float]:
-        """Score a batch of full-clip fbank features against per-clip keyword ids."""
+        """Return calibrated probabilities for a batch of full-clip features."""
+
+        return [
+            calibrated
+            for _raw_logit, calibrated in self.score_clip_feats_with_logits(
+                feats,
+                keyword_ids_batch,
+            )
+        ]
+
+    def score_clip_feats_with_logits(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+    ) -> list[tuple[float, float]]:
+        """Return ``(raw_logit, calibrated_probability)`` for every clip."""
+
         torch = self._torch
         if not feats:
             return []
@@ -301,13 +333,17 @@ class Stage2Verifier:
             [len(ids) for ids in keyword_ids_batch], dtype=torch.long
         )
         with torch.no_grad(), self._inference_amp():
-            scores = self._model(
+            raw_logits = self._model(
                 padded_feats.to(self._device),
                 feat_lengths.to(self._device),
                 anchors.to(self._device),
                 anchor_lengths.to(self._device),
             )
-        return [float(value) for value in scores.reshape(-1).cpu()]
+        raw_values = [float(value) for value in raw_logits.reshape(-1).cpu()]
+        return [
+            (raw_logit, self._calibrator.predict_one(raw_logit))
+            for raw_logit in raw_values
+        ]
 
     def decode_phoneme_feats(self, feats: Sequence) -> list[list[int]]:
         """Greedily decode phoneme ids from full-clip fbank features.
@@ -409,7 +445,7 @@ class Stage2Verifier:
             ).unsqueeze(0)
             candidate_lens = torch.tensor([candidate_feat.size(1)], dtype=torch.long)
             with torch.no_grad(), self._inference_amp():
-                score = float(
+                raw_logit = float(
                     self._model(
                         candidate_feat.to(self._device),
                         candidate_lens.to(self._device),
@@ -419,11 +455,13 @@ class Stage2Verifier:
                     .cpu()
                     .item()
                 )
+            score = self._calibrator.predict_one(raw_logit)
             scores.append(
                 {
                     "start_sec": candidate.start_sec,
                     "end_sec": candidate.end_sec,
                     "stage1_score": candidate.stage1_score,
+                    "qbyt_raw_logit": raw_logit,
                     "qbyt_score": score,
                 }
             )

@@ -51,17 +51,18 @@ def _payload(
     return payload
 
 
-def test_v5_alignment_defaults_are_the_only_topology() -> None:
-    assert QBYT_READOUT_VERSION == 5
+def test_v6_alignment_defaults_are_the_only_topology() -> None:
+    assert QBYT_READOUT_VERSION == 6
     assert normalize_qbyt_alignment_topology(None) == QBYT_ALIGNMENT_TOPOLOGY
     assert resolve_qbyt_alignment({}).as_dict() == {
-        "topology": "bounded_segmental_v1",
+        "topology": "keyword_filler_segmental_crf_v1",
         "min_phone_duration_frames": 1,
         "max_phone_duration_frames": 8,
-        "max_inter_phone_gap_frames": 2,
+        "max_inter_phone_gap_frames": 1,
         "max_keyword_span_frames": 30,
-        "temperature": 0.2,
         "local_context_kernel": 5,
+        "weakest_phone_temperature": 0.2,
+        "weakest_phone_weight": 1.0,
     }
 
 
@@ -69,24 +70,26 @@ def test_alignment_config_canonicalizes_numeric_strings() -> None:
     alignment = resolve_qbyt_alignment(
         {
             "qbyt_alignment": {
-                "topology": "bounded_segmental_v1",
+                "topology": "keyword_filler_segmental_crf_v1",
                 "min_phone_duration_frames": "2",
                 "max_phone_duration_frames": "9",
                 "max_inter_phone_gap_frames": "3",
                 "max_keyword_span_frames": "40",
-                "temperature": "0.35",
                 "local_context_kernel": "7",
+                "weakest_phone_temperature": "0.35",
+                "weakest_phone_weight": "0.75",
             }
         }
     )
     assert alignment.as_dict() == {
-        "topology": "bounded_segmental_v1",
+        "topology": "keyword_filler_segmental_crf_v1",
         "min_phone_duration_frames": 2,
         "max_phone_duration_frames": 9,
         "max_inter_phone_gap_frames": 3,
         "max_keyword_span_frames": 40,
-        "temperature": 0.35,
         "local_context_kernel": 7,
+        "weakest_phone_temperature": 0.35,
+        "weakest_phone_weight": 0.75,
     }
 
 
@@ -94,8 +97,15 @@ def test_alignment_config_canonicalizes_numeric_strings() -> None:
 def test_historical_readout_modes_are_not_configuration_options(mode: str) -> None:
     with pytest.raises(ValueError, match="legacy GRU/EPS switch"):
         resolve_qbyt_alignment({"qbyt_readout": {"mode": mode}})
-    with pytest.raises(ValueError, match="Historical GRU/EPS readouts"):
+    with pytest.raises(ValueError, match="Historical GRU/EPS"):
         resolve_qbyt_alignment({"qbyt_alignment": {"topology": mode}})
+
+
+def test_target_only_bounded_segmental_topology_is_rejected() -> None:
+    with pytest.raises(ValueError, match="target-only bounded-segmental"):
+        resolve_qbyt_alignment(
+            {"qbyt_alignment": {"topology": "bounded_segmental_v1"}}
+        )
 
 
 @pytest.mark.parametrize(
@@ -112,9 +122,20 @@ def test_historical_readout_modes_are_not_configuration_options(mode: str) -> No
             {"max_phone_duration_frames": 8, "max_keyword_span_frames": 7},
             "max_keyword_span_frames must be >=",
         ),
-        ({"temperature": True}, "temperature must be a finite number"),
-        ({"temperature": 0.0}, "temperature must be a finite number"),
-        ({"temperature": float("nan")}, "temperature must be a finite number"),
+        (
+            {"weakest_phone_temperature": True},
+            "temperature must be a finite number",
+        ),
+        (
+            {"weakest_phone_temperature": 0.0},
+            "temperature must be a finite number",
+        ),
+        (
+            {"weakest_phone_temperature": float("nan")},
+            "temperature must be a finite number",
+        ),
+        ({"weakest_phone_weight": True}, "weakest_phone_weight must be a finite"),
+        ({"weakest_phone_weight": -0.1}, "weakest_phone_weight must be a finite"),
         ({"local_context_kernel": 4}, "local_context_kernel must be odd"),
     ],
 )
@@ -134,7 +155,8 @@ def test_stamp_records_version_and_complete_actual_alignment() -> None:
     configured = _spec(
         max_inter_phone_gap_frames=1,
         max_keyword_span_frames=24,
-        temperature=0.3,
+        weakest_phone_temperature=0.3,
+        weakest_phone_weight=0.7,
     )
     payload = stamp_qbyt_readout_version(
         {
@@ -143,7 +165,7 @@ def test_stamp_records_version_and_complete_actual_alignment() -> None:
         },
         alignment=configured,
     )
-    assert payload[QBYT_READOUT_VERSION_KEY] == 5
+    assert payload[QBYT_READOUT_VERSION_KEY] == 6
     assert payload[QBYT_ALIGNMENT_SPEC_KEY] == configured
     assert checkpoint_qbyt_readout_spec(payload).as_dict() == configured
 
@@ -171,11 +193,11 @@ def test_stamp_rejects_explicit_spec_that_disagrees_with_embedded_config() -> No
 
 
 def test_current_checkpoint_requires_exact_stamped_and_configured_spec() -> None:
-    actual = _spec(max_inter_phone_gap_frames=0, temperature=0.4)
+    actual = _spec(max_inter_phone_gap_frames=0, weakest_phone_temperature=0.4)
     payload = _payload(stamped_spec=actual, config_spec=actual)
     assert_qbyt_readout_version(
         payload,
-        source="v5.pt",
+        source="v6.pt",
         expected_alignment=QbyTAlignmentSpec(**actual),
     )
 
@@ -183,13 +205,13 @@ def test_current_checkpoint_requires_exact_stamped_and_configured_spec() -> None
     with pytest.raises(SystemExit, match="current config expects.*max_inter_phone_gap_frames"):
         assert_qbyt_readout_version(
             payload,
-            source="v5.pt",
+            source="v6.pt",
             expected_alignment=expected,
         )
 
 
-@pytest.mark.parametrize("version", [None, 1, 2, 3, 4])
-def test_pre_v5_qbyt_weights_are_always_rejected(version: int | None) -> None:
+@pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5])
+def test_pre_v6_qbyt_weights_are_always_rejected(version: int | None) -> None:
     payload = _payload(
         version=version,
         stamped_spec=None,
@@ -220,7 +242,7 @@ def test_encoder_only_checkpoint_remains_a_valid_training_warm_start() -> None:
     )
 
 
-def test_v5_checkpoint_rejects_missing_partial_or_conflicting_spec() -> None:
+def test_v6_checkpoint_rejects_missing_partial_or_conflicting_spec() -> None:
     missing = _payload(stamped_spec=None, config_spec=_spec())
     with pytest.raises(SystemExit, match=QBYT_ALIGNMENT_SPEC_KEY):
         assert_qbyt_readout_version(missing, source="missing.pt")
@@ -250,7 +272,7 @@ def test_lora_adapter_payload_is_also_version_and_spec_checked() -> None:
 
 
 def test_non_strict_load_rejects_any_qbyt_state_mismatch() -> None:
-    with pytest.raises(SystemExit, match="complete.*bounded_segmental_v1"):
+    with pytest.raises(SystemExit, match="complete.*keyword_filler_segmental_crf_v1"):
         assert_qbyt_alignment_state_loaded(
             ["qbyt.alignment_emission.weight"],
             ["qbyt.final_pos_fc.weight"],

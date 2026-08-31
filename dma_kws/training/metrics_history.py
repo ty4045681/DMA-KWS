@@ -252,7 +252,8 @@ def collect_hparams(
         hparams.update(
             {
                 "qbyt_alignment_topology": alignment.topology,
-                "qbyt_alignment_temperature": alignment.temperature,
+                "qbyt_weakest_phone_temperature": alignment.weakest_phone_temperature,
+                "qbyt_weakest_phone_weight": alignment.weakest_phone_weight,
                 "qbyt_min_phone_duration_frames": alignment.min_phone_duration_frames,
                 "qbyt_max_phone_duration_frames": alignment.max_phone_duration_frames,
                 "qbyt_max_inter_phone_gap_frames": alignment.max_inter_phone_gap_frames,

@@ -19,8 +19,8 @@ paths:
   libriphrase100_root: data/dma-kws/raw/LibriPhrase-100
 
 prep:
-  # Un-adapted Stage II checkpoint used as the LoRA base and as the sweep baseline.
-  stage2_ckpt: data/dma-kws/exp/GP-1000/stage2_qbyt/checkpoints/hey-eva-pretrained-icefall-zipformer-frozen/export/step_037000.pt
+  # A freshly trained v6 checkpoint is mandatory; every v5 readout is rejected.
+  stage2_ckpt: ${oc.env:QBYT_V6_BASE_CHECKPOINT,""}
 
 run:
   device: cuda
@@ -94,17 +94,18 @@ stage2:
   gradient_diagnostics:
     enabled: false
 
-  # Must exactly match the v5 base checkpoint. These bounds are in post-encoder
+  # Must exactly match the v6 base checkpoint. These bounds are in post-encoder
   # frames (25 Hz): phones are 40--320 ms, adjacent phones may be separated by
-  # at most 80 ms, and the whole wake phrase must fit within 1.2 s.
+  # at most 40 ms, and the whole wake phrase must fit within 1.2 s.
   qbyt_alignment:
-    topology: bounded_segmental_v1
+    topology: keyword_filler_segmental_crf_v1
     min_phone_duration_frames: 1
     max_phone_duration_frames: 8
-    max_inter_phone_gap_frames: 2
+    max_inter_phone_gap_frames: 1
     max_keyword_span_frames: 30
-    temperature: 0.2
     local_context_kernel: 5
+    weakest_phone_temperature: 0.2
+    weakest_phone_weight: 1.0
 
   # Intermediate prefixes teach progress; the final legal path is trained once
   # by the utterance BCE and is not duplicated here.
@@ -112,6 +113,22 @@ stage2:
     target_mode: ordered_contiguous_prefix
     progress_weight: 0.3
     normalization: sample
+
+  # Keep pressure on the highest-scoring replay negatives throughout LoRA;
+  # this is the part of the batch that controls low-FA deployment.
+  negative_tail_loss:
+    enabled: true
+    weight: 0.5
+    fraction: 0.1
+
+  # Enable this with a training-only background list. Do not point it at the
+  # MUSAN files reserved for final FA evaluation.
+  background_negative:
+    enabled: false
+    probability: 0.25
+    audio_list_path: ""
+    duration_seconds_min: 1.0
+    duration_seconds_max: 3.0
 
   # If the base checkpoint was trained with the phoneme adapter, set enabled=true
   # and mirror the trunk shape here. The trunk stays frozen with no auxiliary CTC

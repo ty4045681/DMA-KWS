@@ -172,6 +172,9 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     noise_augmentation = stage2.get("noise_augmentation", {}) or {}
     if not isinstance(noise_augmentation, dict):
         raise ValueError("stage2.noise_augmentation must be a mapping")
+    background_negative = stage2.get("background_negative", {}) or {}
+    if not isinstance(background_negative, dict):
+        raise ValueError("stage2.background_negative must be a mapping")
 
     train_dataset = LibriPhraseTrainDataset(
         parquet_file=parquet_file,
@@ -182,6 +185,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         sample_lens=int(stage2.get("sample_lens", 5000)),
         seed=dataset_seed,
         noise_augmentation=noise_augmentation,
+        background_negative=background_negative,
         fbank_kwargs=fbank_kwargs(get_fbank_config(config)),
         seq_label_mode=sequence_objective.target_mode,
     )
@@ -353,6 +357,15 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
                     "noise_list": noise_augmentation.get("noise_list_path", ""),
                 }
                 if noise_augmentation.get("enabled", False)
+                else {}
+            ),
+            **(
+                {
+                    "background_audio_list": background_negative.get(
+                        "audio_list_path", ""
+                    )
+                }
+                if background_negative.get("enabled", False)
                 else {}
             ),
             **(

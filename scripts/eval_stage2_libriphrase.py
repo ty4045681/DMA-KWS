@@ -43,7 +43,7 @@ def _load_model(config: dict, checkpoint_path: Path, vocab_size: int) -> Stage2L
     ]
     if qbyt_mismatch:
         raise SystemExit(
-            f"Checkpoint {checkpoint_path} does not carry the complete QbyT v5 "
+            f"Checkpoint {checkpoint_path} does not carry the complete QbyT v6 "
             f"weights: {qbyt_mismatch}"
         )
     if missing:

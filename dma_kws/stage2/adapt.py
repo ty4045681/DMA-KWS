@@ -529,11 +529,12 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
 
         source = batch.get("source")
         if source is not None:
-            keyword_mask = source.bool()
+            valid_path_mask = losses["valid_path_mask"].bool()
+            keyword_mask = source.bool() & valid_path_mask
             per_sample = F.binary_cross_entropy_with_logits(
                 logits, batch["label"].float(), reduction="none"
             )
-            lph_mask = ~keyword_mask
+            lph_mask = ~source.bool() & valid_path_mask
             global_stats = sum_across_processes(
                 torch.stack(
                     (
@@ -676,7 +677,12 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             "Missing torch/pytorch-lightning. Install CUDA PyTorch on the training machine first."
         ) from exc
 
-    from dma_kws.config import get_tokenizer_config, require_sections
+    from dma_kws.config import (
+        fbank_kwargs,
+        get_fbank_config,
+        get_tokenizer_config,
+        require_sections,
+    )
     from dma_kws.runlog import build_loggers, logger_backend_names
     from dma_kws.stage2 import adapt_console
     from dma_kws.stage2.collate import test_collate_fn, train_collate_fn
@@ -784,6 +790,12 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     seed = int(training.get("seed", 2025))
     pl_mod.seed_everything(seed, workers=True)
     seq_label_mode = resolve_sequence_objective(stage2).target_mode
+    noise_augmentation = stage2.get("noise_augmentation", {}) or {}
+    if not isinstance(noise_augmentation, dict):
+        raise ValueError("stage2.noise_augmentation must be a mapping")
+    background_negative = stage2.get("background_negative", {}) or {}
+    if not isinstance(background_negative, dict):
+        raise ValueError("stage2.background_negative must be a mapping")
     # MixedAdaptationDataset ignores the sampler's index and samples from its own
     # RNG. Give num_workers=0 runs distinct streams too; worker processes apply
     # the same rank offset again from their DataLoader-provided base seed.
@@ -815,6 +827,9 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         hard_negative_ratio=int(stage2.get("hard_negative_ratio", 1)),
         sample_lens=int(adapt.get("sample_lens", stage2.get("sample_lens", 5000))),
         seed=sampling_seed,
+        noise_augmentation=noise_augmentation,
+        background_negative=background_negative,
+        fbank_kwargs=fbank_kwargs(get_fbank_config(config)),
         seq_label_mode=seq_label_mode,
     )
 

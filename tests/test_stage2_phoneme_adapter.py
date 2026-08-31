@@ -46,12 +46,13 @@ def _config(**adapter_overrides) -> dict:
             "qbyt_embed_dim": 128,
             "qbyt_layers": 2,
             "qbyt_alignment": {
-                "topology": "bounded_segmental_v1",
+                "topology": "keyword_filler_segmental_crf_v1",
                 "min_phone_duration_frames": 1,
                 "max_phone_duration_frames": 8,
-                "max_inter_phone_gap_frames": 2,
+                "max_inter_phone_gap_frames": 1,
                 "max_keyword_span_frames": 30,
-                "temperature": 0.2,
+                "weakest_phone_temperature": 0.2,
+                "weakest_phone_weight": 1.0,
                 "local_context_kernel": 5,
             },
             "sequence_loss": {

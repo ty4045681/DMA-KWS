@@ -136,9 +136,10 @@ def _write_qbyt_alignment_ckpt(
     [
         {"min_phone_duration_frames": 2},
         {"max_phone_duration_frames": 9},
-        {"max_inter_phone_gap_frames": 1},
+        {"max_inter_phone_gap_frames": 0},
         {"max_keyword_span_frames": 40},
-        {"temperature": 0.35},
+        {"weakest_phone_temperature": 0.35},
+        {"weakest_phone_weight": 0.75},
         {"local_context_kernel": 7},
     ],
 )
@@ -158,13 +159,13 @@ def test_average_rejects_any_qbyt_alignment_difference(
         )
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
-def test_average_rejects_pre_v5_qbyt_checkpoint(
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+def test_average_rejects_pre_v6_qbyt_checkpoint(
     tmp_path: Path,
     version: int,
 ) -> None:
     legacy = tmp_path / f"v{version}.ckpt"
-    current = tmp_path / "v5.ckpt"
+    current = tmp_path / "v6.ckpt"
     _write_qbyt_alignment_ckpt(legacy, version=version)
     _write_qbyt_alignment_ckpt(current)
 
@@ -172,11 +173,15 @@ def test_average_rejects_pre_v5_qbyt_checkpoint(
         average_lightning_checkpoints([legacy, current], tmp_path / "bad.ckpt")
 
 
-def test_average_accepts_only_same_v5_alignment(tmp_path: Path) -> None:
+def test_average_accepts_only_same_v6_alignment(tmp_path: Path) -> None:
     first = tmp_path / "first.ckpt"
     second = tmp_path / "second.ckpt"
     output = tmp_path / "mean.ckpt"
-    alignment = _alignment(max_keyword_span_frames=40, temperature=0.35)
+    alignment = _alignment(
+        max_keyword_span_frames=40,
+        weakest_phone_temperature=0.35,
+        weakest_phone_weight=0.75,
+    )
     _write_qbyt_alignment_ckpt(first, alignment=alignment, weight=1.0)
     _write_qbyt_alignment_ckpt(second, alignment=alignment, weight=3.0)
 
@@ -326,13 +331,13 @@ def test_lora_average_rejects_different_alignment_specs(tmp_path: Path):
         first,
         base=base,
         adapter_value=1.0,
-        alignment=_alignment(temperature=0.3),
+        alignment=_alignment(weakest_phone_temperature=0.3),
     )
     _write_lora_ckpt(
         second,
         base=base,
         adapter_value=3.0,
-        alignment=_alignment(temperature=0.4),
+        alignment=_alignment(weakest_phone_temperature=0.4),
     )
 
     with pytest.raises(ValueError, match="different QbyT alignments"):

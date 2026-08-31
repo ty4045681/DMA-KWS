@@ -216,7 +216,8 @@ def test_convert_stage2_checkpoint_writes_only_inference_payload(tmp_path: Path)
     alignment = _alignment(
         max_inter_phone_gap_frames=1,
         max_keyword_span_frames=40,
-        temperature=0.35,
+        weakest_phone_temperature=0.35,
+        weakest_phone_weight=0.75,
         local_context_kernel=7,
     )
     config = _config(alignment=alignment)
@@ -252,8 +253,8 @@ def test_convert_stage2_checkpoint_writes_only_inference_payload(tmp_path: Path)
     assert extract_state_dict(payload) is payload["model_state_dict"]
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
-def test_convert_rejects_pre_v5_full_qbyt_checkpoint(
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+def test_convert_rejects_pre_v6_full_qbyt_checkpoint(
     tmp_path: Path,
     version: int,
 ) -> None:
@@ -275,7 +276,7 @@ def test_convert_rejects_pre_v5_full_qbyt_checkpoint(
         convert_checkpoint(source, tmp_path / f"v{version}.pt")
 
 
-def test_convert_rejects_missing_partial_or_mismatched_v5_alignment_spec(
+def test_convert_rejects_missing_partial_or_mismatched_v6_alignment_spec(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "invalid.ckpt"
@@ -289,23 +290,27 @@ def test_convert_rejects_missing_partial_or_mismatched_v5_alignment_spec(
         convert_checkpoint(source, tmp_path / "missing.pt")
 
     partial = copy.deepcopy(checkpoint)
-    partial[QBYT_ALIGNMENT_SPEC_KEY] = {"topology": "bounded_segmental_v1"}
+    partial[QBYT_ALIGNMENT_SPEC_KEY] = {
+        "topology": "keyword_filler_segmental_crf_v1"
+    }
     torch.save(partial, source)
     with pytest.raises(CheckpointConversionError, match="missing="):
         convert_checkpoint(source, tmp_path / "partial.pt")
 
     mismatched = copy.deepcopy(checkpoint)
-    mismatched[QBYT_ALIGNMENT_SPEC_KEY] = _alignment(temperature=0.4)
+    mismatched[QBYT_ALIGNMENT_SPEC_KEY] = _alignment(
+        weakest_phone_temperature=0.4
+    )
     torch.save(mismatched, source)
     with pytest.raises(CheckpointConversionError, match="disagrees with config"):
         convert_checkpoint(source, tmp_path / "mismatched.pt")
 
 
-def test_v5_checkpoint_without_embedded_config_uses_explicit_fallback(
+def test_v6_checkpoint_without_embedded_config_uses_explicit_fallback(
     tmp_path: Path,
 ) -> None:
-    source = tmp_path / "v5.ckpt"
-    output = tmp_path / "v5.pt"
+    source = tmp_path / "v6.ckpt"
+    output = tmp_path / "v6.pt"
     config = _config()
     torch.save(_checkpoint(_stage2_state()), source)
 
@@ -401,7 +406,7 @@ def test_conversion_refuses_truncated_or_architecture_mismatched_state(
 ) -> None:
     source = tmp_path / "broken.ckpt"
     truncated = _stage2_state()
-    truncated.pop("qbyt.score_bias")
+    truncated.pop("qbyt.phone_bias")
     torch.save(_checkpoint(truncated, config=_config()), source)
     with pytest.raises(CheckpointConversionError, match="QbyT weights do not match"):
         convert_checkpoint(source, tmp_path / "truncated.pt")
@@ -556,7 +561,7 @@ def test_adapter_only_skips_tokenizer_validation_but_requires_a_complete_base(
     assert payload["config"] == config
 
     truncated = dict(state)
-    truncated.pop("qbyt.score_bias")
+    truncated.pop("qbyt.phone_bias")
     torch.save(_checkpoint(truncated, config=config), source)
     with pytest.raises(CheckpointConversionError, match="QbyT weights do not match"):
         convert_checkpoint(

@@ -215,6 +215,23 @@ class Stage2ClipRunner:
         """Resolved streaming operating point used for every score."""
         return self._verifier.stream_policy
 
+    def _score_feats_with_logits(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+    ) -> list[tuple[float | None, float]]:
+        """Score clips while retaining raw logits when the verifier exposes them."""
+
+        scorer = getattr(self._verifier, "score_clip_feats_with_logits", None)
+        if scorer is not None:
+            return list(scorer(feats, keyword_ids_batch))
+        # Compatibility for small test doubles and third-party wrappers using
+        # the pre-v6 probability-only verifier interface.
+        return [
+            (None, float(score))
+            for score in self._verifier.score_clip_feats(feats, keyword_ids_batch)
+        ]
+
     @classmethod
     def from_config(cls, config: Mapping[str, Any], prep: Mapping[str, Any], device) -> "Stage2ClipRunner":
         from dma_kws.config import get_tokenizer_config
@@ -265,7 +282,13 @@ class Stage2ClipRunner:
         )
 
         threshold = float(self._demo_cfg.get("qbyt_threshold", 0.5))
-        qbyt_score = max((item["qbyt_score"] for item in stage2_scores), default=0.0)
+        best = max(stage2_scores, key=lambda item: item["qbyt_score"], default=None)
+        qbyt_score = float(best["qbyt_score"]) if best is not None else 0.0
+        qbyt_raw_logit = (
+            float(best["qbyt_raw_logit"])
+            if best is not None and "qbyt_raw_logit" in best
+            else None
+        )
         return self._clip_result(
             audio_path,
             keyword,
@@ -274,6 +297,7 @@ class Stage2ClipRunner:
             qbyt_score,
             threshold,
             skipped=not stage2_scores,
+            qbyt_raw_logit=qbyt_raw_logit,
         )
 
     def resolve_keyword_phonemes(
@@ -429,12 +453,12 @@ class Stage2ClipRunner:
                 pending.append((index, end_sec, augmented_duration_sec))
             if not feats:
                 continue
-            scores = self._verifier.score_clip_feats(feats, keyword_ids_batch)
+            scores = self._score_feats_with_logits(feats, keyword_ids_batch)
             for (
                 index,
                 end_sec,
                 augmented_duration_sec,
-            ), score in zip(pending, scores):
+            ), (raw_logit, score) in zip(pending, scores):
                 keyword = rows[index]["keyword"]
                 phonemes, _ = keyword_cache[row_keyword_keys[index]]
                 results[index] = self._clip_result(
@@ -445,6 +469,7 @@ class Stage2ClipRunner:
                     float(score),
                     threshold,
                     skipped=False,
+                    qbyt_raw_logit=raw_logit,
                     augmented_duration_sec=(
                         augmented_duration_sec
                         if reports_augmented_duration
@@ -463,6 +488,7 @@ class Stage2ClipRunner:
         threshold: float,
         *,
         skipped: bool,
+        qbyt_raw_logit: float | None = None,
         start_sec: float = 0.0,
         augmented_duration_sec: float | None = None,
     ) -> dict:
@@ -476,6 +502,8 @@ class Stage2ClipRunner:
             "detected": qbyt_score >= threshold,
             "skipped": skipped,
         }
+        if qbyt_raw_logit is not None:
+            result["qbyt_raw_logit"] = float(qbyt_raw_logit)
         if augmented_duration_sec is not None:
             result["augmented_duration_sec"] = float(augmented_duration_sec)
         return result
@@ -626,7 +654,7 @@ class Stage2ClipRunner:
                 f"expected={len(prepared.spans)}, actual={len(scores)}"
             )
         results = []
-        for (window_index, start_sec, end_sec), score in zip(
+        for (window_index, start_sec, end_sec), (raw_logit, score) in zip(
             prepared.spans, scores
         ):
             result = self._clip_result(
@@ -637,6 +665,7 @@ class Stage2ClipRunner:
                 qbyt_score=float(score),
                 threshold=threshold,
                 skipped=False,
+                qbyt_raw_logit=raw_logit,
                 start_sec=start_sec,
             )
             result["window_index"] = window_index
@@ -649,18 +678,18 @@ class Stage2ClipRunner:
         keyword_ids: Sequence[int],
         *,
         batch_size: int,
-    ) -> list[float]:
+    ) -> list[tuple[float | None, float]]:
         """Score window features in bounded GPU batches, preserving order."""
 
         if not feats:
             return []
         chunk = max(1, int(batch_size))
         keyword_ids_list = list(keyword_ids)
-        scores: list[float] = []
+        scores: list[tuple[float | None, float]] = []
         for start in range(0, len(feats), chunk):
             batch_feats = list(feats[start : start + chunk])
             batch_ids = [keyword_ids_list] * len(batch_feats)
-            scores.extend(self._verifier.score_clip_feats(batch_feats, batch_ids))
+            scores.extend(self._score_feats_with_logits(batch_feats, batch_ids))
         return scores
 
     def run_file_windows(

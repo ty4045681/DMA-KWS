@@ -1,8 +1,9 @@
-"""Query-by-text keyword verifier with structural temporal alignment.
+"""Query-by-text verifier with a keyword-vs-filler segmental readout.
 
-The scorer deliberately has no text/audio global-attention path. It first
-builds a local phone/frame emission lattice and then permits the utterance score
-to see that lattice only through a bounded monotonic segmental aligner.
+The adapter-free v6 scorer learns one normalized inventory of phone, blank and
+noise evidence directly on top of the encoder.  A bounded segmental graph is the
+only route from that frame lattice to the deployed score; global audio/text
+pooling cannot bypass the ordered keyword path.
 """
 
 from __future__ import annotations
@@ -48,11 +49,11 @@ class _LocalContextBlock(nn.Module):
 
 
 class QbyT(nn.Module):
-    """Score a phoneme query against speech using one compact legal path.
+    """Score a phoneme query against explicit filler and near-miss hypotheses.
 
-    ``seq_logits[:, i]`` is the calibrated score for completing query phones
-    ``0..i``. The utterance logit is exactly the final valid prefix logit; there
-    is no independent classifier capable of bypassing the alignment topology.
+    ``seq_logits[:, i]`` is the raw structural logit for completing query phones
+    ``0..i``. The utterance logit is exactly the final valid prefix logit.
+    Probability calibration is intentionally external to this module.
     """
 
     def __init__(
@@ -65,9 +66,10 @@ class QbyT(nn.Module):
         local_context_kernel: int = 5,
         min_phone_duration_frames: int = 1,
         max_phone_duration_frames: int = 8,
-        max_inter_phone_gap_frames: int = 2,
+        max_inter_phone_gap_frames: int = 1,
         max_keyword_span_frames: int = 30,
-        alignment_temperature: float = 0.2,
+        weakest_phone_temperature: float = 0.2,
+        weakest_phone_weight: float = 1.0,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -75,6 +77,15 @@ class QbyT(nn.Module):
             raise ValueError("post_num_layers must be non-negative")
         if embed_dim <= 0:
             raise ValueError("embed_dim must be positive")
+        if num_embeds <= 1:
+            raise ValueError("num_embeds must contain blank and at least one phone")
+        if (
+            not math.isfinite(weakest_phone_temperature)
+            or weakest_phone_temperature <= 0
+        ):
+            raise ValueError("weakest_phone_temperature must be finite and positive")
+        if not math.isfinite(weakest_phone_weight) or weakest_phone_weight < 0:
+            raise ValueError("weakest_phone_weight must be finite and non-negative")
 
         self.audio_projection = nn.Linear(encoder_output_size, embed_dim)
         self.text_projection = nn.Embedding(
@@ -90,31 +101,37 @@ class QbyT(nn.Module):
             )
             for _ in range(post_num_layers)
         )
-        # Query context never sees the audio sequence.
-        self.text_context = nn.ModuleList(
-            _LocalContextBlock(embed_dim, kernel_size=3, dropout=dropout)
-            for _ in range(post_num_layers)
-        )
         self.audio_key = nn.Linear(embed_dim, embed_dim, bias=False)
         self.text_query = nn.Linear(embed_dim, embed_dim, bias=False)
         self.match_log_scale = nn.Parameter(torch.tensor(math.log(10.0)))
-        self.match_bias = nn.Parameter(torch.zeros(()))
+        # Token 0 is the CTC blank/padding id and is deliberately not represented
+        # by the padding-fixed embedding row. Phones 1..V-1 share the metric
+        # inventory; blank and non-speech have independent audio-conditioned
+        # logits and therefore remain meaningful without a phoneme adapter.
+        self.phone_bias = nn.Parameter(torch.zeros(num_embeds - 1))
+        self.blank_head = nn.Linear(embed_dim, 1)
+        self.noise_head = nn.Linear(embed_dim, 1)
+
+        duration_count = max_phone_duration_frames - min_phone_duration_frames + 1
+        if duration_count <= 0:
+            raise ValueError(
+                "max_phone_duration_frames must be >= min_phone_duration_frames"
+            )
+        self.duration_logits = nn.Embedding(
+            num_embeddings=num_embeds,
+            embedding_dim=duration_count,
+            padding_idx=0,
+        )
+        nn.init.zeros_(self.duration_logits.weight)
 
         self.aligner = BoundedSegmentalAligner(
             min_phone_duration_frames=min_phone_duration_frames,
             max_phone_duration_frames=max_phone_duration_frames,
             max_inter_phone_gap_frames=max_inter_phone_gap_frames,
             max_keyword_span_frames=max_keyword_span_frames,
-            temperature=alignment_temperature,
+            temperature=weakest_phone_temperature,
         )
-
-        # The aligner emits a normalized log probability (<= 0). A shared
-        # monotone calibration cannot create an alternate route around the DP.
-        initial_scale = 4.0
-        self.raw_score_scale = nn.Parameter(
-            torch.tensor(math.log(math.expm1(initial_scale)))
-        )
-        self.score_bias = nn.Parameter(torch.tensor(3.0))
+        self.weakest_phone_weight = float(weakest_phone_weight)
 
     @staticmethod
     def _resolve_lengths(
@@ -150,7 +167,15 @@ class QbyT(nn.Module):
         text: torch.Tensor,
         speech_lengths: torch.Tensor | None,
         text_lengths: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         if speech.ndim != 3:
             raise ValueError("speech must have shape [B, T, C]")
         if text.ndim != 2 or text.size(0) != speech.size(0):
@@ -184,22 +209,99 @@ class QbyT(nn.Module):
         for block in self.audio_context:
             audio_states = block(audio_states, frame_mask)
 
-        text_states = self.text_projection(text)
-        text_states = text_states * phone_mask.unsqueeze(-1).to(text_states.dtype)
-        for block in self.text_context:
-            text_states = block(text_states, phone_mask)
-
         audio_keys = F.normalize(self.audio_key(audio_states), dim=-1, eps=1e-6)
-        text_queries = F.normalize(self.text_query(text_states), dim=-1, eps=1e-6)
+        phone_prototypes = F.normalize(
+            self.text_query(self.text_projection.weight[1:]),
+            dim=-1,
+            eps=1e-6,
+        )
         match_scale = self.match_log_scale.clamp(
             min=math.log(1.0e-2), max=math.log(100.0)
         ).exp()
-        emissions = match_scale * torch.einsum(
-            "bud,btd->but", text_queries, audio_keys
-        ) + self.match_bias
+        phone_logits = match_scale * torch.einsum(
+            "btd,vd->btv", audio_keys, phone_prototypes
+        ) + self.phone_bias
+        class_logits = torch.cat(
+            (
+                phone_logits,
+                self.blank_head(audio_states),
+                self.noise_head(audio_states),
+            ),
+            dim=-1,
+        )
+        # The graph DP always runs in float32, and its probabilistic contract
+        # begins here with one normalized phone/blank/noise competition.
+        class_log_probs = F.log_softmax(class_logits.float(), dim=-1)
+
+        phone_class_count = self.text_projection.num_embeddings - 1
+        safe_phone_indices = (text - 1).clamp(min=0, max=phone_class_count - 1)
+        target_log_probs = class_log_probs[:, :, :phone_class_count].transpose(1, 2)
+        target_log_probs = target_log_probs.gather(
+            1,
+            safe_phone_indices.unsqueeze(-1).expand(-1, -1, frame_width),
+        )
+
+        # Filler is query-relative: blank, noise, and every inventory phone not
+        # used by this query. A one-phone deletion graph can consequently explain
+        # a substitution as filler while the exact graph must explain every phone.
+        query_phone_counts = torch.zeros(
+            batch_size,
+            phone_class_count,
+            device=text.device,
+            dtype=torch.long,
+        )
+        query_phone_counts.scatter_add_(
+            1,
+            safe_phone_indices,
+            phone_mask.to(dtype=torch.long),
+        )
+        filler_class_mask = torch.cat(
+            (
+                query_phone_counts.eq(0),
+                torch.ones(batch_size, 2, device=text.device, dtype=torch.bool),
+            ),
+            dim=1,
+        )
+        filler_log_probs = torch.logsumexp(
+            class_log_probs.masked_fill(
+                ~filler_class_mask.unsqueeze(1),
+                -torch.inf,
+            ),
+            dim=-1,
+        )
+        target_llr = target_log_probs - filler_log_probs.unsqueeze(1)
+
         valid_lattice = phone_mask.unsqueeze(2) & frame_mask.unsqueeze(1)
-        emissions = torch.where(valid_lattice, emissions, torch.zeros_like(emissions))
-        return emissions, text_lengths, speech_lengths, phone_mask, frame_mask
+        target_llr = torch.where(
+            valid_lattice,
+            target_llr,
+            torch.zeros_like(target_llr),
+        )
+        filler_log_probs = torch.where(
+            frame_mask,
+            filler_log_probs,
+            torch.zeros_like(filler_log_probs),
+        )
+
+        duration_count = self.duration_logits.embedding_dim
+        duration_potentials = F.log_softmax(
+            self.duration_logits(text).float(),
+            dim=-1,
+        ) + math.log(float(duration_count))
+        duration_potentials = torch.where(
+            phone_mask.unsqueeze(-1),
+            duration_potentials,
+            torch.zeros_like(duration_potentials),
+        )
+        return (
+            target_llr,
+            filler_log_probs,
+            duration_potentials,
+            text_lengths,
+            speech_lengths,
+            phone_mask,
+            frame_mask,
+        )
 
     def forward(
         self,
@@ -209,15 +311,36 @@ class QbyT(nn.Module):
         text_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         (
-            emissions,
+            target_llr,
+            filler_log_probs,
+            duration_potentials,
             text_lengths,
             speech_lengths,
-            _,
+            phone_mask,
             _,
         ) = self._encode_lattice(speech, text, speech_lengths, text_lengths)
-        prefix_evidence = self.aligner(emissions, text_lengths, speech_lengths)
-        score_scale = F.softplus(self.raw_score_scale) + 1.0e-4
-        seq_logits = score_scale * prefix_evidence + self.score_bias
+        alignment = self.aligner(
+            target_llr,
+            filler_log_probs,
+            text_lengths,
+            speech_lengths,
+            duration_log_probs=duration_potentials,
+        )
+        # log-sigmoid is always <= 0, so completeness can veto an incomplete
+        # keyword but can never create a positive route around the graph LLR.
+        legal_prefix = phone_mask & alignment.has_legal_path
+        completeness_veto = torch.where(
+            legal_prefix,
+            self.weakest_phone_weight
+            * F.logsigmoid(alignment.weakest_phone_evidence),
+            torch.zeros_like(alignment.weakest_phone_evidence),
+        )
+        seq_logits = alignment.prefix_llr + completeness_veto
+        seq_logits = torch.where(
+            legal_prefix,
+            seq_logits,
+            torch.full_like(seq_logits, self.aligner.invalid_score),
+        )
 
         if text.size(1) == 0:
             utterance_logits = seq_logits.new_full(
@@ -226,9 +349,10 @@ class QbyT(nn.Module):
         else:
             last = (text_lengths - 1).clamp_min(0)
             utterance_logits = seq_logits.gather(1, last.unsqueeze(1)).squeeze(1)
-            invalid = score_scale * self.aligner.invalid_score + self.score_bias
             utterance_logits = torch.where(
-                text_lengths.gt(0), utterance_logits, invalid.expand_as(utterance_logits)
+                text_lengths.gt(0),
+                utterance_logits,
+                torch.full_like(utterance_logits, self.aligner.invalid_score),
             )
         return utterance_logits, seq_logits
 

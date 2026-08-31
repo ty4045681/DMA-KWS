@@ -7,6 +7,7 @@ from dma_kws.inference.manifest import (
     build_manifest_rows,
     filename_keyword_candidate,
     iter_audio_files,
+    load_audio_file_list,
     load_manifest,
     match_keyword_from_filename,
     normalize_keyword,
@@ -44,6 +45,39 @@ def test_iter_audio_files_non_recursive_skips_subdirs(tmp_path):
 def test_iter_audio_files_missing_dir(tmp_path):
     with pytest.raises(NotADirectoryError):
         iter_audio_files(tmp_path / "missing")
+
+
+def test_load_audio_file_list_resolves_comments_relative_and_absolute_paths(tmp_path):
+    relative_audio = _touch_audio(tmp_path, "musan/noise/z.wav")
+    absolute_audio = _touch_audio(tmp_path, "musan/music/a.wav")
+    audio_list = tmp_path / "split" / "eval.list"
+    audio_list.parent.mkdir()
+    audio_list.write_text(
+        "\n# evaluation catalog\n"
+        "../musan/noise/z.wav\n"
+        f"{absolute_audio}\n",
+        encoding="utf-8",
+    )
+
+    assert load_audio_file_list(audio_list) == sorted(
+        [relative_audio.resolve(), absolute_audio.resolve()], key=str
+    )
+
+
+def test_load_audio_file_list_rejects_missing_and_duplicate_paths(tmp_path):
+    audio = _touch_audio(tmp_path, "musan/noise/a.wav")
+    missing_list = tmp_path / "missing.list"
+    missing_list.write_text("musan/noise/missing.wav\n", encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match="audio file not found"):
+        load_audio_file_list(missing_list)
+
+    duplicate_list = tmp_path / "duplicate.list"
+    duplicate_list.write_text(
+        f"musan/noise/a.wav\n{audio.resolve()}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicates canonical audio path"):
+        load_audio_file_list(duplicate_list)
 
 
 def test_build_write_load_roundtrip_relative(tmp_path):

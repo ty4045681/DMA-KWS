@@ -182,7 +182,7 @@ def _resolved_config(
             warnings.warn(
                 "The checkpoint already embeds its resolved training config, so the "
                 "supplied config fallback (--config/--experiment/--adapt-params) is "
-                "ignored. Config arguments are only needed for early v5 checkpoints "
+                "ignored. Config arguments are only needed for early v6 checkpoints "
                 "without embedded config.",
                 UserWarning,
                 stacklevel=3,
@@ -194,7 +194,7 @@ def _resolved_config(
         return copy.deepcopy(supplied_config)
     raise CheckpointConversionError(
         "Checkpoint does not embed its resolved training config. Supply the exact "
-        "v5 training config with --experiment/--override or --config. Pre-v5 "
+        "v6 training config with --experiment/--override or --config. Pre-v6 "
         "QbyT checkpoints are intentionally not convertible."
     )
 
@@ -203,7 +203,7 @@ def _require_compatible_readout(
     checkpoint: Mapping[str, Any],
     config: Mapping[str, Any],
 ) -> int:
-    """Require exact v5 alignment metadata; older score heads are not convertible."""
+    """Require exact v6 alignment metadata; older score heads are not convertible."""
 
     from dma_kws.stage2.readout import resolve_qbyt_alignment
     from dma_kws.training.checkpoint_io import assert_qbyt_readout_version
@@ -219,7 +219,7 @@ def _require_compatible_readout(
         )
     except (SystemExit, ValueError) as exc:
         raise CheckpointConversionError(
-            f"Checkpoint is not a complete QbyT v5 bounded-segmental model: {exc}"
+            f"Checkpoint is not a complete QbyT v6 segmental-CRF model: {exc}"
         ) from exc
     return QBYT_READOUT_VERSION
 
@@ -549,7 +549,7 @@ def _lora_groups(
         target_key = f"{match.group('module')}.{match.group('parameter')}"
         if _PROJECT_LORA_TARGET_RE.fullmatch(target_key) is None:
             raise CheckpointConversionError(
-                "Unsupported parametrization outside the QbyT v5 projection set "
+                "Unsupported parametrization outside the QbyT v6 projection set "
                 f"(audio_projection/audio_key/text_query weights): {target_key}"
             )
         groups.append((target_key, original_key, a_key, b_key))

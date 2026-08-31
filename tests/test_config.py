@@ -68,11 +68,12 @@ def test_demo_config_loads_with_tokenizer_and_training_seed():
     assert stage2["qbyt_alignment"] == {
         "min_phone_duration_frames": 1,
         "max_phone_duration_frames": 8,
-        "max_inter_phone_gap_frames": 2,
+        "max_inter_phone_gap_frames": 1,
         "max_keyword_span_frames": 30,
-        "temperature": 0.2,
         "local_context_kernel": 5,
-        "topology": "bounded_segmental_v1",
+        "weakest_phone_temperature": 0.2,
+        "weakest_phone_weight": 1.0,
+        "topology": "keyword_filler_segmental_crf_v1",
     }
     assert "qbyt_readout" not in stage2
     assert "allow_legacy_qbyt_readout" not in stage2
@@ -83,15 +84,16 @@ def test_demo_config_loads_with_tokenizer_and_training_seed():
 def test_alignment_experiment_inherits_the_single_stage2_alignment_config():
     config = config_to_dict(compose_config("icefall_zipformer_stage2_alignment"))
 
-    assert config["training"]["recipe"] == "icefall-zipformer-frozen-alignment"
+    assert config["training"]["recipe"] == "icefall-zipformer-frozen-segmental-crf-v6"
     assert config["stage2"]["qbyt_alignment"] == {
         "min_phone_duration_frames": 1,
         "max_phone_duration_frames": 8,
-        "max_inter_phone_gap_frames": 2,
+        "max_inter_phone_gap_frames": 1,
         "max_keyword_span_frames": 30,
-        "temperature": 0.2,
         "local_context_kernel": 5,
-        "topology": "bounded_segmental_v1",
+        "weakest_phone_temperature": 0.2,
+        "weakest_phone_weight": 1.0,
+        "topology": "keyword_filler_segmental_crf_v1",
     }
     assert "qbyt_readout" not in config["stage2"]
     assert "allow_legacy_qbyt_readout" not in config["stage2"]

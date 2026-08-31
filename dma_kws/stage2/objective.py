@@ -71,17 +71,17 @@ def resolve_sequence_objective(
 
 
 def checkpoint_sequence_objective(checkpoint: Any) -> SequenceObjective:
-    """Read the objective metadata required in every QbyT v5 checkpoint."""
+    """Read the objective metadata required in every QbyT v6 checkpoint."""
     if not isinstance(checkpoint, Mapping):
-        raise ValueError("QbyT v5 checkpoint must be a mapping")
+        raise ValueError("QbyT v6 checkpoint must be a mapping")
     config = checkpoint.get("config")
     if not isinstance(config, Mapping):
-        raise ValueError("QbyT v5 checkpoint must record config.stage2.sequence_loss")
+        raise ValueError("QbyT v6 checkpoint must record config.stage2.sequence_loss")
     stage2 = config.get("stage2")
     if not isinstance(stage2, Mapping):
-        raise ValueError("QbyT v5 checkpoint must record config.stage2.sequence_loss")
+        raise ValueError("QbyT v6 checkpoint must record config.stage2.sequence_loss")
     if "sequence_loss" not in stage2:
-        raise ValueError("QbyT v5 checkpoint must record config.stage2.sequence_loss")
+        raise ValueError("QbyT v6 checkpoint must record config.stage2.sequence_loss")
     return resolve_sequence_objective(stage2)
 
 

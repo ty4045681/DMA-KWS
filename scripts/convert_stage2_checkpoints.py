@@ -7,7 +7,7 @@ Examples:
   python scripts/convert_stage2_checkpoints.py \
       --checkpoint exp/stage2/checkpoints/step_001000.ckpt
 
-  # An early v5 checkpoint without embedded config needs its exact config.
+  # An early v6 checkpoint without embedded config needs its exact config.
   python scripts/convert_stage2_checkpoints.py \
       --checkpoint exp/stage2/checkpoints/step_001000.ckpt \
       --experiment paper_ls460 \
@@ -98,21 +98,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         help=(
-            "Fully resolved YAML config for a v5 checkpoint without embedded config. Ignored when "
+            "Fully resolved YAML config for a v6 checkpoint without embedded config. Ignored when "
             "the checkpoint already embeds config."
         ),
     )
     config_source.add_argument(
         "--experiment",
         help=(
-            "Hydra experiment used by a v5 checkpoint without embedded config. "
+            "Hydra experiment used by a v6 checkpoint without embedded config. "
             "Ignored when the checkpoint already embeds config."
         ),
     )
     config_source.add_argument(
         "--default-config",
         action="store_true",
-        help="Use the default config for a v5 checkpoint without embedded config.",
+        help="Use the default config for a v6 checkpoint without embedded config.",
     )
     parser.add_argument(
         "--override",
@@ -120,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="KEY=VALUE",
         help=(
-            "Hydra override for a v5 config fallback; repeatable and ignored "
+            "Hydra override for a v6 config fallback; repeatable and ignored "
             "when the checkpoint embeds config."
         ),
     )
@@ -128,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--adapt-params",
         type=Path,
         help=(
-            "Adaptation params for a v5 config fallback; ignored when the "
+            "Adaptation params for a v6 config fallback; ignored when the "
             "checkpoint embeds config."
         ),
     )

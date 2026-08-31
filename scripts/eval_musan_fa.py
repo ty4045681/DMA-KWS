@@ -36,12 +36,13 @@ from dma_kws.inference.detection_plots import (
     DEFAULT_PLOT_DPI,
     write_false_accept_rate_plot as _write_false_accept_rate_plot,
 )
-from dma_kws.inference.manifest import iter_audio_files
+from dma_kws.inference.manifest import iter_audio_files, load_audio_file_list
 from dma_kws.inference.metrics import summarize_false_accept_rate
 from dma_kws.inference.musan_fa import (
     audio_duration_sec,
     detect_subset,
     metrics_record,
+    musan_catalog_sha256,
     musan_result_record,
     select_shard,
     subset_summary,
@@ -127,6 +128,7 @@ def run_eval(cfg: DictConfig) -> dict:
     stage2_ckpt = str(prep.get("stage2_ckpt", ""))
     if not stage2_ckpt:
         raise SystemExit("prep.stage2_ckpt is required")
+    stage2_calibration = str(prep.get("stage2_calibration", "")).strip()
 
     window_sec = float(prep.get("window_sec", 0.0) or 3.0)
     hop_sec = float(prep.get("hop_sec", 0.0) or 3.0)
@@ -154,6 +156,20 @@ def run_eval(cfg: DictConfig) -> dict:
         raise SystemExit(
             f"prep.shard_index must be in [0, {num_shards}), got {shard_index}"
         )
+
+    musan_audio_list = str(prep.get("musan_audio_list_path", "") or "").strip()
+    try:
+        audio_files = (
+            load_audio_file_list(musan_audio_list)
+            if musan_audio_list
+            else iter_audio_files(musan_root_path)
+        )
+        catalog_sha256 = musan_catalog_sha256(audio_files, musan_root_path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    if not audio_files:
+        source = musan_audio_list or musan_root
+        raise SystemExit(f"No audio files found in MUSAN evaluation source: {source}")
 
     output_dir_override = str(prep.get("output_dir", ""))
     output_dir = Path(output_dir_override or "outputs/eval_musan_fa")
@@ -185,16 +201,13 @@ def run_eval(cfg: DictConfig) -> dict:
     provenance = build_score_provenance(
         config,
         checkpoint_path=stage2_ckpt,
+        calibration_path=stage2_calibration or None,
         stream=stream_description,
         # Sliding windows are scored as-is; unlike clip evaluation, this path
         # does not add zero-valued waveform context around each window.
         left_padding_ms=0,
         right_padding_ms=0,
     )
-    audio_files = iter_audio_files(musan_root_path)
-    if not audio_files:
-        raise SystemExit(f"No audio files found under {musan_root}")
-
     catalog = [
         {
             "audio_path": str(audio_path.resolve()),
@@ -263,10 +276,17 @@ def run_eval(cfg: DictConfig) -> dict:
         ),
         "output_dir": str(output_dir.resolve()),
         "musan_root": str(musan_root_path.resolve()),
+        "musan_audio_list_path": (
+            str(Path(musan_audio_list).expanduser().resolve())
+            if musan_audio_list
+            else None
+        ),
+        "musan_catalog_sha256": catalog_sha256,
         "keyword": keyword,
         "keyword_phonemes": keyword_phonemes,
         "keyword_phonemes_source": keyword_phonemes_source,
         "stage2_ckpt": stage2_ckpt,
+        "stage2_calibration": stage2_calibration or None,
         "window_sec": window_sec,
         "hop_sec": hop_sec,
         "batch_size": batch_size,

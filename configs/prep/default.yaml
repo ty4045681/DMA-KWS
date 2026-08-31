@@ -51,6 +51,9 @@ last_k: 10
 output: ""
 stage1_ckpt: ""
 stage2_ckpt: ""
+# Optional positive-affine calibration JSON fitted from held-out raw logits.
+# Empty keeps the identity-logit sigmoid; ranking is unchanged either way.
+stage2_calibration: ""
 # Optional WAV side artifacts for eval_stage2_clips.py. Batch robustness
 # evaluation overrides this to a deterministic random sample of five rows.
 audio_export:
@@ -58,6 +61,9 @@ audio_export:
   count: 5
   seed: 2025
 musan_root: ""
+# Optional evaluation allowlist: one audio path per line. Relative entries are
+# resolved against this list file. Empty keeps the recursive MUSAN-root scan.
+musan_audio_list_path: ""
 # Optional in-memory interference for eval_stage2_clips.py. Noise/music SNR is
 # the clean/interference RMS ratio. Speech relative_db is speech RMS relative
 # to clean: negative is quieter, zero is equal, and positive is louder.

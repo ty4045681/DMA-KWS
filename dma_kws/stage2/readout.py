@@ -1,4 +1,4 @@
-"""Canonical QbyT v5 bounded-segmental score configuration."""
+"""Canonical QbyT v6 keyword-vs-filler score configuration."""
 
 from __future__ import annotations
 
@@ -9,16 +9,18 @@ from numbers import Integral, Real
 from typing import Any
 
 
-QBYT_ALIGNMENT_TOPOLOGY = "bounded_segmental_v1"
+QBYT_ALIGNMENT_TOPOLOGY = "keyword_filler_segmental_crf_v1"
 DEFAULT_MIN_PHONE_DURATION_FRAMES = 1
 DEFAULT_MAX_PHONE_DURATION_FRAMES = 8
-DEFAULT_MAX_INTER_PHONE_GAP_FRAMES = 2
+DEFAULT_MAX_INTER_PHONE_GAP_FRAMES = 1
 DEFAULT_MAX_KEYWORD_SPAN_FRAMES = 30
-DEFAULT_QBYT_ALIGNMENT_TEMPERATURE = 0.2
 DEFAULT_LOCAL_CONTEXT_KERNEL = 5
+DEFAULT_WEAKEST_PHONE_TEMPERATURE = 0.2
+DEFAULT_WEAKEST_PHONE_WEIGHT = 1.0
+
 
 def normalize_qbyt_alignment_topology(value: Any) -> str:
-    """Return the sole v5 topology, rejecting every historical readout mode."""
+    """Return the sole v6 topology, rejecting every historical readout mode."""
 
     if isinstance(value, Mapping):
         value = value.get("topology", value.get("mode", QBYT_ALIGNMENT_TOPOLOGY))
@@ -28,8 +30,8 @@ def normalize_qbyt_alignment_topology(value: Any) -> str:
     if topology != QBYT_ALIGNMENT_TOPOLOGY:
         raise ValueError(
             f"Unsupported QbyT alignment topology {value!r}; expected "
-            f"{QBYT_ALIGNMENT_TOPOLOGY!r}. Historical GRU/EPS readouts are not "
-            "loadable by the v5 model."
+            f"{QBYT_ALIGNMENT_TOPOLOGY!r}. Historical GRU/EPS and target-only "
+            "bounded-segmental readouts are not loadable by the v6 model."
         )
     return topology
 
@@ -86,9 +88,27 @@ def _normalize_temperature(value: Any) -> float:
     return temperature
 
 
+def _normalize_non_negative_float(value: Any, *, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(
+            f"QbyT alignment {field} must be a finite number greater than or equal to 0"
+        )
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"QbyT alignment {field} must be a finite number greater than or equal to 0"
+        ) from exc
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise ValueError(
+            f"QbyT alignment {field} must be a finite number greater than or equal to 0"
+        )
+    return parsed
+
+
 @dataclass(frozen=True)
 class QbyTAlignmentSpec:
-    """Complete semantics of the single deployed v5 QbyT score.
+    """Complete semantics of the single deployed v6 QbyT score.
 
     Every field affects either the bounded segmental path set or the emission
     scores consumed by it. The complete mapping is therefore checkpoint
@@ -100,8 +120,9 @@ class QbyTAlignmentSpec:
     max_phone_duration_frames: int = DEFAULT_MAX_PHONE_DURATION_FRAMES
     max_inter_phone_gap_frames: int = DEFAULT_MAX_INTER_PHONE_GAP_FRAMES
     max_keyword_span_frames: int = DEFAULT_MAX_KEYWORD_SPAN_FRAMES
-    temperature: float = DEFAULT_QBYT_ALIGNMENT_TEMPERATURE
     local_context_kernel: int = DEFAULT_LOCAL_CONTEXT_KERNEL
+    weakest_phone_temperature: float = DEFAULT_WEAKEST_PHONE_TEMPERATURE
+    weakest_phone_weight: float = DEFAULT_WEAKEST_PHONE_WEIGHT
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -147,16 +168,24 @@ class QbyTAlignmentSpec:
         )
         object.__setattr__(
             self,
-            "temperature",
-            _normalize_temperature(self.temperature),
-        )
-        object.__setattr__(
-            self,
             "local_context_kernel",
             _normalize_integer(
                 self.local_context_kernel,
                 field="local_context_kernel",
                 minimum=1,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "weakest_phone_temperature",
+            _normalize_temperature(self.weakest_phone_temperature),
+        )
+        object.__setattr__(
+            self,
+            "weakest_phone_weight",
+            _normalize_non_negative_float(
+                self.weakest_phone_weight,
+                field="weakest_phone_weight",
             ),
         )
         if self.max_phone_duration_frames < self.min_phone_duration_frames:
@@ -181,8 +210,9 @@ class QbyTAlignmentSpec:
             "max_phone_duration_frames": self.max_phone_duration_frames,
             "max_inter_phone_gap_frames": self.max_inter_phone_gap_frames,
             "max_keyword_span_frames": self.max_keyword_span_frames,
-            "temperature": self.temperature,
             "local_context_kernel": self.local_context_kernel,
+            "weakest_phone_temperature": self.weakest_phone_temperature,
+            "weakest_phone_weight": self.weakest_phone_weight,
         }
 
 
@@ -198,7 +228,7 @@ def resolve_qbyt_alignment(
         if stage2_config.get("qbyt_readout") is not None:
             raise ValueError(
                 "stage2.qbyt_readout is a legacy GRU/EPS switch and is unsupported "
-                "by QbyT v5; replace it with stage2.qbyt_alignment"
+                "by QbyT v6; replace it with stage2.qbyt_alignment"
             )
         raw = {}
     if not isinstance(raw, Mapping):
@@ -218,7 +248,7 @@ def assert_qbyt_alignment_state_loaded(
     source: Any,
     expected_topology: str = QBYT_ALIGNMENT_TOPOLOGY,
 ) -> None:
-    """Reject any non-strict load that did not reproduce the complete v5 QbyT."""
+    """Reject any non-strict load that did not reproduce the complete v6 QbyT."""
 
     topology = normalize_qbyt_alignment_topology(expected_topology)
     mismatches = [
@@ -229,7 +259,7 @@ def assert_qbyt_alignment_state_loaded(
     if mismatches:
         raise SystemExit(
             f"Checkpoint {source} does not carry the complete {topology!r} "
-            f"QbyT v5 state: {mismatches}"
+            f"QbyT v6 state: {mismatches}"
         )
 
 
@@ -239,7 +269,8 @@ __all__ = [
     "DEFAULT_MAX_KEYWORD_SPAN_FRAMES",
     "DEFAULT_MAX_PHONE_DURATION_FRAMES",
     "DEFAULT_MIN_PHONE_DURATION_FRAMES",
-    "DEFAULT_QBYT_ALIGNMENT_TEMPERATURE",
+    "DEFAULT_WEAKEST_PHONE_TEMPERATURE",
+    "DEFAULT_WEAKEST_PHONE_WEIGHT",
     "QBYT_ALIGNMENT_TOPOLOGY",
     "QbyTAlignmentSpec",
     "assert_qbyt_alignment_state_loaded",

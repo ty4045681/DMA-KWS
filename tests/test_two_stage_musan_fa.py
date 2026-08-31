@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -17,12 +18,13 @@ import scripts.eval_two_stage_musan_fa as eval_two_stage_musan_fa
 
 def _qbyt_alignment() -> dict:
     return {
-        "topology": "bounded_segmental_v1",
+        "topology": "keyword_filler_segmental_crf_v1",
         "min_phone_duration_frames": 1,
         "max_phone_duration_frames": 8,
-        "max_inter_phone_gap_frames": 2,
+        "max_inter_phone_gap_frames": 1,
         "max_keyword_span_frames": 30,
-        "temperature": 0.2,
+        "weakest_phone_temperature": 0.2,
+        "weakest_phone_weight": 1.0,
         "local_context_kernel": 5,
     }
 
@@ -204,6 +206,8 @@ def test_eval_two_stage_musan_fa_counts_multiple_wakeups_in_one_file(
     audio_path = musan_root / "noise" / "long.wav"
     audio_path.parent.mkdir(parents=True)
     audio_path.write_bytes(b"")
+    audio_list = tmp_path / "eval.list"
+    audio_list.write_text("musan/noise/long.wav\n", encoding="utf-8")
     output_dir = tmp_path / "out"
 
     locator = FakeLocator(
@@ -218,12 +222,18 @@ def test_eval_two_stage_musan_fa_counts_multiple_wakeups_in_one_file(
     verifier = FakeVerifier(scores=[0.9, 0.2, 0.8])
     _install_pipeline(monkeypatch, locator=locator, verifier=verifier)
     _common_eval_patches(monkeypatch, [audio_path], duration_sec=3600.0)
+    monkeypatch.setattr(
+        eval_two_stage_musan_fa,
+        "iter_audio_files",
+        lambda _root: pytest.fail("recursive scan must not run with an allowlist"),
+    )
 
     cfg = OmegaConf.create(
         {
             "prep": {
                 "keyword": "hey eva",
                 "musan_root": str(musan_root),
+                "musan_audio_list_path": str(audio_list),
                 "stage2_ckpt": "stage2.pt",
                 "output_dir": str(output_dir),
                 "plot_dpi": 72,
@@ -247,6 +257,10 @@ def test_eval_two_stage_musan_fa_counts_multiple_wakeups_in_one_file(
     assert summary["subsets"]["noise"]["metrics"]["fp"] == pytest.approx(2.0)
     assert summary["keyword_phonemes"] == ["HH", "EY1", "IY1", "V", "AH0"]
     assert summary["keyword_phonemes_source"] == "g2p"
+    assert summary["musan_audio_list_path"] == str(audio_list.resolve())
+    assert summary["musan_catalog_sha256"] == hashlib.sha256(
+        b"noise/long.wav\n"
+    ).hexdigest()
 
     rows = [
         json.loads(line)

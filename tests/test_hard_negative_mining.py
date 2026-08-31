@@ -19,19 +19,21 @@ def _score_provenance(
     checkpoint_sha256: str = "a" * 64,
 ) -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "checkpoint": {
             "path": checkpoint_path,
             "size_bytes": 123,
             "sha256": checkpoint_sha256,
         },
+        "calibration": {"type": "identity_logit_sigmoid"},
         "qbyt_alignment": {
-            "topology": "bounded_segmental_v1",
+            "topology": "keyword_filler_segmental_crf_v1",
             "min_phone_duration_frames": 1,
             "max_phone_duration_frames": 8,
-            "max_inter_phone_gap_frames": 2,
+            "max_inter_phone_gap_frames": 1,
             "max_keyword_span_frames": 30,
-            "temperature": 0.2,
+            "weakest_phone_temperature": 0.2,
+            "weakest_phone_weight": 1.0,
             "local_context_kernel": 5,
         },
         "stream": "backend=zipformer chunking=off",
@@ -99,13 +101,20 @@ def test_comparable_results_reject_content_or_score_semantics_mismatch(tmp_path)
     different_tokenizer = deepcopy(baseline)
     different_tokenizer["tokenizer"]["sha256"] = "d" * 64
     different_alignment = deepcopy(baseline)
-    different_alignment["qbyt_alignment"]["max_inter_phone_gap_frames"] = 1
+    different_alignment["qbyt_alignment"]["max_inter_phone_gap_frames"] = 0
+    different_calibration = deepcopy(baseline)
+    different_calibration["calibration"] = {
+        "path": "/models/calibration.json",
+        "size_bytes": 128,
+        "sha256": "e" * 64,
+    }
 
     first = _results_with_summary(tmp_path, "first", baseline)
     second = _results_with_summary(tmp_path, "second", different_hash)
     third = _results_with_summary(tmp_path, "third", different_fbank)
     fourth = _results_with_summary(tmp_path, "fourth", different_tokenizer)
     fifth = _results_with_summary(tmp_path, "fifth", different_alignment)
+    sixth = _results_with_summary(tmp_path, "sixth", different_calibration)
 
     with pytest.raises(ValueError, match="Cannot mix hard-negative scores"):
         _validate_comparable_results([first, second])
@@ -115,12 +124,14 @@ def test_comparable_results_reject_content_or_score_semantics_mismatch(tmp_path)
         _validate_comparable_results([first, fourth])
     with pytest.raises(ValueError, match="Cannot mix hard-negative scores"):
         _validate_comparable_results([first, fifth])
+    with pytest.raises(ValueError, match="Cannot mix hard-negative scores"):
+        _validate_comparable_results([first, sixth])
 
 
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda value: value.update(schema_version=3), "unsupported score provenance"),
+        (lambda value: value.update(schema_version=2), "unsupported score provenance"),
         (lambda value: value.pop("schema_version"), "missing fields"),
         (lambda value: value["checkpoint"].pop("sha256"), "checkpoint.*missing"),
     ],

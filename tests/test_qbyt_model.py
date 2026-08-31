@@ -1,4 +1,4 @@
-"""Structural and padding invariants of the QbyT v5 alignment scorer."""
+"""Structural and padding invariants of the QbyT v6 segmental-CRF scorer."""
 
 import pytest
 import torch
@@ -24,7 +24,8 @@ def _model(seed: int = 0, *, layers: int = 2, kernel: int = 5):
         max_phone_duration_frames=4,
         max_inter_phone_gap_frames=1,
         max_keyword_span_frames=64,
-        alignment_temperature=0.2,
+        weakest_phone_temperature=0.2,
+        weakest_phone_weight=1.0,
         dropout=0.0,
     ).eval()
 
@@ -111,21 +112,23 @@ def test_local_lattice_masks_padding():
     queries = torch.tensor([[3, 4, 0], [5, 6, 7]])
     speech = torch.randn(2, 18, ENCODER_DIM)
     with torch.no_grad():
-        emissions, _, _, phone_mask, frame_mask = model._encode_lattice(
+        target_llr, filler, duration, _, _, phone_mask, frame_mask = model._encode_lattice(
             speech,
             queries,
             torch.tensor([12, 18]),
             torch.tensor([2, 3]),
         )
-    assert emissions.shape == (2, 3, 18)
+    assert target_llr.shape == (2, 3, 18)
+    assert filler.shape == (2, 18)
+    assert duration.shape == (2, 3, 4)
     assert phone_mask.tolist() == [[True, True, False], [True, True, True]]
     assert frame_mask[0].sum().item() == 12
     torch.testing.assert_close(
-        emissions[0, 2], torch.zeros_like(emissions[0, 2])
+        target_llr[0, 2], torch.zeros_like(target_llr[0, 2])
     )
     torch.testing.assert_close(
-        emissions[0, :, 12:],
-        torch.zeros_like(emissions[0, :, 12:]),
+        target_llr[0, :, 12:],
+        torch.zeros_like(target_llr[0, :, 12:]),
     )
 
 
@@ -154,7 +157,7 @@ def test_model_contains_no_global_text_audio_attention_path():
     assert not any("phone_matchor" in name for name, _ in model.named_modules())
 
 
-def test_deployment_loss_reaches_matcher_and_calibration_parameters():
+def test_deployment_loss_reaches_competitive_emission_and_duration_parameters():
     model = _model().train()
     query = torch.tensor([[3, 4, 5]])
     speech = torch.randn(1, 24, ENCODER_DIM)
@@ -164,11 +167,61 @@ def test_deployment_loss_reaches_matcher_and_calibration_parameters():
         model.audio_projection.weight,
         model.audio_key.weight,
         model.text_query.weight,
-        model.raw_score_scale,
-        model.score_bias,
+        model.text_projection.weight,
+        model.phone_bias,
+        model.blank_head.weight,
+        model.noise_head.weight,
+        model.duration_logits.weight,
+        model.match_log_scale,
     ):
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()
+
+
+def test_lattice_is_normalized_and_filler_is_query_relative():
+    model = _model(layers=0)
+    speech = torch.randn(1, 16, ENCODER_DIM)
+    query = torch.tensor([[3, 4]])
+    extended_query = torch.tensor([[3, 4, 5]])
+    lengths = torch.tensor([16])
+    with torch.no_grad():
+        target_llr, filler, duration, *_ = model._encode_lattice(
+            speech, query, lengths, torch.tensor([2])
+        )
+        _, extended_filler, _, *_ = model._encode_lattice(
+            speech, extended_query, lengths, torch.tensor([3])
+        )
+
+    target_log_probs = target_llr + filler.unsqueeze(1)
+    assert torch.all(filler <= 0.0)
+    assert torch.all(target_log_probs <= 0.0)
+    assert not torch.allclose(filler, extended_filler)
+    # Zero initialization is a centered uniform duration potential, so it adds
+    # no arbitrary per-phone offset to the graph score.
+    torch.testing.assert_close(duration, torch.zeros_like(duration))
+
+
+def test_weakest_phone_term_is_veto_only():
+    model = _model()
+    query = torch.tensor([[3, 4, 5]])
+    speech = torch.randn(1, 24, ENCODER_DIM)
+    speech_lengths = torch.tensor([24])
+    text_lengths = torch.tensor([3])
+    with torch.no_grad():
+        lattice = model._encode_lattice(
+            speech, query, speech_lengths, text_lengths
+        )
+        alignment = model.aligner(
+            lattice[0],
+            lattice[1],
+            lattice[3],
+            lattice[4],
+            duration_log_probs=lattice[2],
+        )
+        _, seq_logits = model(
+            speech, query, speech_lengths, text_lengths
+        )
+    assert torch.all(seq_logits[:, :3] <= alignment.prefix_llr[:, :3])
 
 
 def test_invalid_local_context_kernel_is_rejected():
@@ -187,3 +240,22 @@ def test_empty_anchor_has_a_finite_reject_logit():
     assert torch.isfinite(logits).all()
     assert logits.item() < -1000
     assert prefixes[0, 0].item() < -1000
+
+
+def test_illegal_full_keyword_path_returns_exactly_one_invalid_score():
+    model = _model()
+    query = torch.tensor([[3, 4, 5, 6, 7]])
+
+    # Five phones need at least five frames, so the full-keyword state has no
+    # legal segmental path.  The completeness veto must not be added on top of
+    # the aligner's reject sentinel (which would turn -1e4 into -2e4).
+    logits, prefixes = model(
+        torch.randn(1, 4, ENCODER_DIM),
+        query,
+        torch.tensor([4]),
+        torch.tensor([5]),
+    )
+
+    invalid_score = model.aligner.invalid_score
+    assert logits.item() == invalid_score
+    assert prefixes[0, 4].item() == invalid_score

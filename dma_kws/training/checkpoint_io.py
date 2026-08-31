@@ -23,10 +23,11 @@ from dma_kws.training.checkpoint_avg import average_lightning_checkpoints
 #: with GRU+FC. Version 3 makes the readout mode checkpoint-configured and adds
 #: EPS mean pooling over a shared scorer at valid anchor positions. Version 4
 #: adds temperature-configured EPS soft-min pooling. Version 5 replaces every
-#: historical GRU/EPS mode with one bounded segmental alignment score. Its path
-#: topology and bounds are metadata even when the dynamic program itself has no
-#: trainable parameters.
-QBYT_READOUT_VERSION = 5
+#: historical GRU/EPS mode with a target-only bounded segmental path average.
+#: Version 6 replaces that one-sided score with a normalized phone/filler
+#: competition, keyword-vs-near-miss segmental log-likelihood ratio, and an
+#: aligned weakest-phone veto.
+QBYT_READOUT_VERSION = 6
 
 QBYT_READOUT_VERSION_KEY = "qbyt_readout_version"
 QBYT_ALIGNMENT_SPEC_KEY = "qbyt_alignment_spec"
@@ -222,7 +223,7 @@ def stamp_qbyt_readout_version(
     *,
     alignment: Any,
 ) -> dict[str, Any]:
-    """Record the complete QbyT v5 score semantics in ``payload``, in place.
+    """Record the complete QbyT v6 score semantics in ``payload``, in place.
 
     ``alignment`` is mandatory so a writer cannot silently stamp default
     semantics that differ from the model which produced the weights.
@@ -265,11 +266,11 @@ def checkpoint_qbyt_readout_spec(
     *,
     saved_version: Any | None = None,
 ) -> Any:
-    """Resolve the complete bounded-segmental score carried by a v5 checkpoint.
+    """Resolve the complete segmental-CRF score carried by a v6 checkpoint.
 
-    Versions 4 and earlier are intentionally not inferred or upgraded. Their
-    weights were optimized for a different score, and the v5 aligner can be
-    parameter-free, so tensor shapes cannot establish compatibility.
+    Versions 5 and earlier are intentionally not inferred or upgraded. Their
+    weights were optimized for a different score, so tensor shapes cannot
+    establish semantic compatibility.
     """
 
     from dma_kws.stage2.readout import QbyTAlignmentSpec
@@ -285,7 +286,7 @@ def checkpoint_qbyt_readout_spec(
     raw = checkpoint.get(QBYT_ALIGNMENT_SPEC_KEY)
     if not isinstance(raw, Mapping):
         raise ValueError(
-            f"QbyT v5 checkpoint must explicitly record {QBYT_ALIGNMENT_SPEC_KEY}"
+            f"QbyT v6 checkpoint must explicitly record {QBYT_ALIGNMENT_SPEC_KEY}"
         )
     required = set(QbyTAlignmentSpec.__dataclass_fields__)
     missing = sorted(required - set(raw))
@@ -337,10 +338,10 @@ def assert_qbyt_readout_version(
     source: Any,
     expected_alignment: Any | None = None,
 ) -> None:
-    """Fail unless QbyT weights carry the exact v5 segmental score semantics.
+    """Fail unless QbyT weights carry the exact v6 segmental score semantics.
 
     Encoder-only checkpoints return before version validation and remain valid
-    warm starts. Pre-v5 QbyT weights are never loadable.
+    warm starts. Pre-v6 QbyT weights are never loadable.
     """
 
     if not _carries_qbyt_weights(checkpoint):
@@ -383,7 +384,7 @@ def assert_qbyt_readout_version(
         f"{source} carries QbyT weights at readout {described}{mode_detail}, but this build "
         f"uses version {QBYT_READOUT_VERSION}{expected_detail}. Readout semantics differ, "
         "so loading these weights would silently change the meaning of the deployed score."
-        " Re-train Stage II with the bounded segmental v5 alignment."
+        " Re-train Stage II with the v6 keyword-vs-filler segmental CRF."
     )
 
 
