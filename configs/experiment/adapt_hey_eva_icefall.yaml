@@ -12,7 +12,7 @@
 # CLI overrides still win over everything here.
 
 defaults:
-  - icefall_zipformer_stage2
+  - icefall_zipformer_stage2_alignment
   - _self_
 
 paths:
@@ -37,12 +37,11 @@ adapt:
   # --- LoRA capacity (the sweep overrides rank/alpha per trial) ---
   rank: 8
   alpha: 16
-  # Both attention matrices: with in_proj_weight alone only 2 matrices are
-  # injected (~8k trainable params), which leaves the rank search space inert.
+  # Adapt the two projections that construct the local phone/frame similarity
+  # matrix while keeping the shared encoder projection fixed.
   lora_targets:
-    - in_proj_weight
-    - out_proj.weight
-  allow_legacy_adapter: false
+    - audio_key.weight
+    - text_query.weight
 
   # --- optimization (the sweep overrides learning_rate/max_steps per trial) ---
   learning_rate: 4.0e-4
@@ -94,6 +93,25 @@ stage2:
   precision: bf16-mixed
   gradient_diagnostics:
     enabled: false
+
+  # Must exactly match the v5 base checkpoint. These bounds are in post-encoder
+  # frames (25 Hz): phones are 40--320 ms, adjacent phones may be separated by
+  # at most 80 ms, and the whole wake phrase must fit within 1.2 s.
+  qbyt_alignment:
+    topology: bounded_segmental_v1
+    min_phone_duration_frames: 1
+    max_phone_duration_frames: 8
+    max_inter_phone_gap_frames: 2
+    max_keyword_span_frames: 30
+    temperature: 0.2
+    local_context_kernel: 5
+
+  # Intermediate prefixes teach progress; the final legal path is trained once
+  # by the utterance BCE and is not duplicated here.
+  sequence_loss:
+    target_mode: ordered_contiguous_prefix
+    progress_weight: 0.3
+    normalization: sample
 
   # If the base checkpoint was trained with the phoneme adapter, set enabled=true
   # and mirror the trunk shape here. The trunk stays frozen with no auxiliary CTC

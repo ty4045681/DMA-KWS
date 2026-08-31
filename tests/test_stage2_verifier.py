@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -44,7 +42,7 @@ def _build_verifier_for_fbank_test(monkeypatch, captured: dict) -> Stage2Verifie
     return verifier
 
 
-def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch, tmp_path):
+def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch):
     """Inference must never inherit the randomized training chunk config."""
     import torch.nn as nn
 
@@ -61,11 +59,13 @@ def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch, tmp_path):
     class _StubQbyT(nn.Module):
         def __init__(self, **kwargs):
             super().__init__()
-            self.pos_enc = SimpleNamespace(pe=torch.empty(1, 5000, 1))
 
         def forward(self, speech, text, speech_lengths=None, text_lengths=None):
-            del text, speech_lengths, text_lengths
-            return torch.zeros(speech.size(0)), None
+            del speech_lengths, text_lengths
+            return (
+                torch.zeros(speech.size(0)),
+                torch.zeros(text.size(0), text.size(1)),
+            )
 
     def _spy_run_encoder(encoder, feat, feat_lengths, *, policy, mode="eval"):
         calls.append({"mode": mode, "chunk_size": policy.chunk_size})
@@ -75,12 +75,13 @@ def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch, tmp_path):
         "dma_kws.inference.stage2_verifier.build_encoder", lambda *_a, **_k: _StubEncoder()
     )
     monkeypatch.setattr(
-        "dma_kws.inference.stage2_verifier.load_qbyt_class", lambda: _StubQbyT
+        "dma_kws.stage2.model_factory.load_qbyt_class", lambda: _StubQbyT
+    )
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_verifier._load_model_state",
+        lambda model, *_args, **_kwargs: model,
     )
     monkeypatch.setattr("dma_kws.inference.stage2_verifier.run_encoder", _spy_run_encoder)
-
-    ckpt_path = tmp_path / "stage2.pt"
-    torch.save({"model_state_dict": {}}, ckpt_path)
 
     stage1_cfg = {
         "encoder_type": "icefall_zipformer",
@@ -100,7 +101,7 @@ def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch, tmp_path):
         stage2_cfg={"encoder_output_dim": 8},
         demo_cfg={},
         fbank_cfg=FbankConfig(dither=0.0, window_type="povey"),
-        stage2_ckpt=str(ckpt_path),
+        stage2_ckpt="unused-stage2.pt",
         device=torch.device("cpu"),
         vocab_size=73,
     )
@@ -110,80 +111,6 @@ def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch, tmp_path):
     assert calls == [{"mode": "eval", "chunk_size": 16}]
     assert "eval=16/64" in verifier.stream_policy.describe()
     assert verifier.amp is None
-
-
-def test_stage2_verifier_rejects_overlong_candidate_before_encoding(
-    monkeypatch, tmp_path
-):
-    """A bad locator span must fail clearly instead of crashing in QbyT."""
-    import torch.nn as nn
-
-    encoder_calls = 0
-
-    class _StubEncoder(nn.Module):
-        def output_frames(self, num_input_frames):
-            return num_input_frames
-
-        def forward(self, feats, feat_lengths):
-            del feats, feat_lengths
-            raise AssertionError("the capacity guard must run before the encoder")
-
-    class _StubQbyT(nn.Module):
-        def __init__(self, **kwargs):
-            super().__init__()
-            self.pos_enc = SimpleNamespace(pe=torch.empty(1, 10, 1))
-
-        def forward(self, speech, text, speech_lengths=None, text_lengths=None):
-            del speech, text, speech_lengths, text_lengths
-            raise AssertionError("an overlong candidate must not reach QbyT")
-
-    def _spy_run_encoder(*args, **kwargs):
-        nonlocal encoder_calls
-        encoder_calls += 1
-        raise AssertionError("the capacity guard must run before the encoder")
-
-    monkeypatch.setattr(
-        "dma_kws.inference.stage2_verifier.build_encoder", lambda *_a, **_k: _StubEncoder()
-    )
-    monkeypatch.setattr(
-        "dma_kws.inference.stage2_verifier.load_qbyt_class", lambda: _StubQbyT
-    )
-    monkeypatch.setattr("dma_kws.inference.stage2_verifier.run_encoder", _spy_run_encoder)
-
-    ckpt_path = tmp_path / "stage2.pt"
-    torch.save({"model_state_dict": {}}, ckpt_path)
-    verifier = Stage2Verifier(
-        stage1_cfg={
-            "encoder_type": "icefall_zipformer",
-            "causal": True,
-            "downsampling_factor": "1,2,4,8,4,2",
-            "cnn_module_kernel": "31,31,15,15,15,31",
-            "stream": {
-                "chunk_size": 16,
-                "left_context_frames": 64,
-                "train_policy": "multi",
-                "train_chunk_size": "16,32,64,-1",
-                "train_left_context_frames": "64,128,256,-1",
-            },
-        },
-        stage2_cfg={"encoder_output_dim": 8},
-        demo_cfg={},
-        fbank_cfg=FbankConfig(dither=0.0, window_type="povey"),
-        stage2_ckpt=str(ckpt_path),
-        device=torch.device("cpu"),
-        vocab_size=73,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            "padded_fbank_frames=11, projected_encoder_frames=11, "
-            "qbyt_capacity=10"
-        ),
-    ):
-        verifier.score_clip_feats([torch.zeros(11, 80)], [[1, 2, 3]])
-
-    assert encoder_calls == 0
 
 
 def test_resolve_inference_amp_accepts_aliases():
@@ -327,224 +254,11 @@ def test_stage2_verifier_per_decode_requires_adapter():
         verifier.decode_phoneme_feats([torch.zeros(3, 80)])
 
 
-def test_stage2_verifier_detailed_scores_preserve_raw_logits():
-    class _DetailedModel:
-        def __call__(self, feats, feat_lengths, anchors, anchor_lengths):
-            del feats, feat_lengths, anchors, anchor_lengths
-            return torch.sigmoid(torch.tensor([8.0, -8.0]))
-
-        def forward_logits(self, feats, feat_lengths, anchors, anchor_lengths):
-            del feats, feat_lengths, anchors, anchor_lengths
-            return (
-                torch.tensor([8.0, -8.0]),
-                torch.tensor([1.5, 0.0]),
-                torch.tensor([True, False]),
-            )
-
+def test_stage2_verifier_rejects_empty_keyword_ids():
     verifier = Stage2Verifier.__new__(Stage2Verifier)
     verifier._torch = torch
     verifier._device = torch.device("cpu")
-    verifier._model = _DetailedModel()
+    verifier._model = _FakeStage2Model()
 
-    details = verifier.score_clip_feats_detailed(
-        [torch.zeros(3, 80), torch.zeros(5, 80)],
-        [[1, 2], []],
-    )
-
-    assert details[0]["qbyt_logit"] == pytest.approx(8.0)
-    assert details[0]["qbyt_score"] == pytest.approx(float(torch.sigmoid(torch.tensor(8.0))))
-    assert details[0]["completion_logit"] == pytest.approx(1.5)
-    assert details[0]["completion_score"] == pytest.approx(
-        float(torch.sigmoid(torch.tensor(1.5)))
-    )
-    assert details[1]["qbyt_logit"] == pytest.approx(-8.0)
-    assert details[1]["completion_logit"] is None
-    assert details[1]["completion_score"] is None
-    assert "eps_position_logits" not in details[0]
-
-    legacy_scores = verifier.score_clip_feats(
-        [torch.zeros(3, 80), torch.zeros(5, 80)],
-        [[1, 2], []],
-    )
-    assert legacy_scores == pytest.approx(
-        [float(torch.sigmoid(torch.tensor(8.0))), float(torch.sigmoid(torch.tensor(-8.0)))]
-    )
-
-
-def test_stage2_verifier_detailed_scores_export_trimmed_eps_positions():
-    class _ReadoutDetails:
-        position_logits = torch.tensor(
-            [
-                [1.0, 3.0, 0.0],
-                [-1.0, 0.0, 0.0],
-            ]
-        )
-        position_mask = torch.tensor(
-            [
-                [True, True, False],
-                [True, False, False],
-            ]
-        )
-
-    class _DetailedModel:
-        def forward_logits_with_readout_details(
-            self, feats, feat_lengths, anchors, anchor_lengths
-        ):
-            del feats, feat_lengths, anchors, anchor_lengths
-            return (
-                torch.tensor([2.0, -1.0]),
-                torch.tensor([1.5, -0.5]),
-                torch.tensor([True, True]),
-                _ReadoutDetails(),
-            )
-
-    verifier = Stage2Verifier.__new__(Stage2Verifier)
-    verifier._torch = torch
-    verifier._device = torch.device("cpu")
-    verifier._model = _DetailedModel()
-
-    details = verifier.score_clip_feats_detailed(
-        [torch.zeros(3, 80), torch.zeros(5, 80)],
-        [[1, 2], [3]],
-        include_eps_positions=True,
-    )
-
-    assert details[0]["eps_position_logits"] == pytest.approx([1.0, 3.0])
-    assert details[1]["eps_position_logits"] == pytest.approx([-1.0])
-    assert details[0]["qbyt_logit"] == pytest.approx(2.0)
-    assert details[1]["qbyt_logit"] == pytest.approx(-1.0)
-
-
-def test_stage2_verifier_validates_softmin_eps_positions():
-    temperature = 0.5
-    raw_position_logits = torch.tensor([[1.0, 3.0]])
-    expected_logit = -temperature * (
-        torch.logsumexp(-raw_position_logits[0] / temperature, dim=0)
-        - torch.log(torch.tensor(2.0))
-    )
-
-    class _ReadoutDetails:
-        position_logits = raw_position_logits
-        position_mask = torch.tensor([[True, True]])
-
-    class _DetailedModel:
-        def forward_logits_with_readout_details(
-            self, feats, feat_lengths, anchors, anchor_lengths
-        ):
-            del feats, feat_lengths, anchors, anchor_lengths
-            return (
-                expected_logit.unsqueeze(0),
-                torch.tensor([0.0]),
-                torch.tensor([True]),
-                _ReadoutDetails(),
-            )
-
-    verifier = Stage2Verifier.__new__(Stage2Verifier)
-    verifier._torch = torch
-    verifier._device = torch.device("cpu")
-    verifier._model = _DetailedModel()
-    verifier.qbyt_readout_mode = "eps_softmin"
-    verifier.qbyt_readout_temperature = temperature
-
-    details = verifier.score_clip_feats_detailed(
-        [torch.zeros(3, 80)],
-        [[1, 2]],
-        include_eps_positions=True,
-    )
-
-    assert details[0]["qbyt_logit"] == pytest.approx(float(expected_logit))
-    assert details[0]["eps_position_logits"] == pytest.approx([1.0, 3.0])
-
-
-def test_stage2_verifier_eps_position_export_is_none_for_gru_readout():
-    class _ReadoutDetails:
-        position_logits = None
-        position_mask = torch.tensor([[True, True]])
-
-    class _DetailedModel:
-        def forward_logits_with_readout_details(
-            self, feats, feat_lengths, anchors, anchor_lengths
-        ):
-            del feats, feat_lengths, anchors, anchor_lengths
-            return (
-                torch.tensor([0.5]),
-                torch.tensor([0.25]),
-                torch.tensor([True]),
-                _ReadoutDetails(),
-            )
-
-    verifier = Stage2Verifier.__new__(Stage2Verifier)
-    verifier._torch = torch
-    verifier._device = torch.device("cpu")
-    verifier._model = _DetailedModel()
-
-    details = verifier.score_clip_feats_detailed(
-        [torch.zeros(3, 80)],
-        [[1, 2]],
-        include_eps_positions=True,
-    )
-
-    assert details[0]["eps_position_logits"] is None
-
-
-def test_stage2_verifier_exports_trimmed_sequence_positions():
-    class _ReadoutDetails:
-        position_logits = torch.tensor(
-            [
-                [0.25, 0.5, 0.75],
-                [-0.25, 0.0, 0.0],
-                [0.0, 0.0, 0.0],
-            ]
-        )
-        position_mask = torch.tensor(
-            [
-                [True, True, True],
-                [True, False, False],
-                [False, False, False],
-            ]
-        )
-
-    class _DetailedModel:
-        def forward_logits_with_position_details(
-            self, feats, feat_lengths, anchors, anchor_lengths
-        ):
-            del feats, feat_lengths, anchors, anchor_lengths
-            return (
-                torch.tensor([0.5, -0.25, 0.0]),
-                torch.tensor([-1.0, -2.0, 0.0]),
-                torch.tensor([True, True, False]),
-                torch.tensor(
-                    [
-                        [2.0, 0.0, -1.0],
-                        [-2.0, float("nan"), float("nan")],
-                        [float("nan"), float("nan"), float("nan")],
-                    ]
-                ),
-                _ReadoutDetails(),
-            )
-
-    verifier = Stage2Verifier.__new__(Stage2Verifier)
-    verifier._torch = torch
-    verifier._device = torch.device("cpu")
-    verifier._model = _DetailedModel()
-
-    details = verifier.score_clip_feats_detailed(
-        [torch.zeros(3, 80), torch.zeros(4, 80), torch.zeros(5, 80)],
-        [[1, 2, 3], [4], []],
-        include_eps_positions=True,
-        include_seq_positions=True,
-    )
-
-    assert details[0]["seq_position_logits"] == pytest.approx([2.0, 0.0, -1.0])
-    assert details[1]["seq_position_logits"] == pytest.approx([-2.0])
-    assert details[2]["seq_position_logits"] == []
-    assert details[0]["completion_logit"] == pytest.approx(
-        details[0]["seq_position_logits"][-1]
-    )
-    assert details[1]["completion_logit"] == pytest.approx(
-        details[1]["seq_position_logits"][-1]
-    )
-    assert details[2]["completion_logit"] is None
-    assert details[0]["eps_position_logits"] == pytest.approx([0.25, 0.5, 0.75])
-    assert details[1]["eps_position_logits"] == pytest.approx([-0.25])
-    assert details[2]["eps_position_logits"] == []
+    with pytest.raises(ValueError, match="non-empty"):
+        verifier.score_clip_feats([torch.zeros(3, 80)], [[]])

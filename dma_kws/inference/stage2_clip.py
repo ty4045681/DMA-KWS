@@ -182,12 +182,6 @@ def collate_clip_feature_batch(batch):
     return batch
 
 
-# Compatibility aliases for any out-of-tree callers that imported the old
-# private names before the feature-loading path became shared by PER evaluation.
-_ClipFeatureDataset = ClipFeatureDataset
-_list_collate = collate_clip_feature_batch
-
-
 class PreparedFileWindows(NamedTuple):
     """Window features extracted from one audio file, ready to score."""
 
@@ -308,17 +302,12 @@ class Stage2ClipRunner:
         right_padding_ms: int = 0,
         waveform_transform: WaveformTransform | None = None,
         waveform_observer: Callable[[int, Any, int], None] | None = None,
-        include_score_details: bool = False,
-        include_eps_positions: bool = False,
-        include_seq_positions: bool = False,
     ) -> list[dict]:
         """Run Stage II verification on many clips with batched GPU scoring.
 
         ``rows`` are mappings with ``audio_path`` and ``keyword`` keys. An
         optional ``keyword_phonemes`` value overrides G2P for that row; it may
-        be a space-separated ARPAbet string or a sequence of strings. A
-        ``text_variant_phonemes`` value similarly overrides diagnostic query
-        G2P; otherwise a non-empty ``text_variant`` is converted automatically.
+        be a space-separated ARPAbet string or a sequence of strings.
         Results are returned in the same order as ``rows`` and use the ``run``
         schema.
         ``waveform_transform``, when supplied, is a pickle-friendly callable that
@@ -330,11 +319,7 @@ class Stage2ClipRunner:
         modified. ``waveform_observer``, when supplied, receives the prepared and
         transformed waveform immediately before padding and cannot replace it.
         It is also called when ``waveform_transform`` is absent. The padding counts
-        toward the minimum encoder-input length and can make a short clip
-        scoreable. ``include_eps_positions`` requires score details and exposes
-        one EPS readout logit per enrollment phoneme when that readout is active.
-        ``include_seq_positions`` has the same requirement and exposes the
-        progress/completion head logit at every enrollment position.
+        toward the minimum encoder-input length and can make a short clip scoreable.
         """
         try:
             from torch.utils.data import DataLoader
@@ -342,13 +327,6 @@ class Stage2ClipRunner:
             raise SystemExit(
                 "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
             ) from exc
-
-        if not include_score_details and (
-            include_eps_positions or include_seq_positions
-        ):
-            raise ValueError(
-                "Position-logit export requires include_score_details=True"
-            )
 
         rows = list(rows)
         threshold = float(self._demo_cfg.get("qbyt_threshold", 0.5))
@@ -364,7 +342,6 @@ class Stage2ClipRunner:
             tuple[list[str], list[int]],
         ] = {}
         row_keyword_keys: list[tuple[str, tuple[str, ...] | None]] = []
-        row_text_variant_phonemes: list[list[str] | None] = []
         for row_index, row in enumerate(rows, start=1):
             keyword = str(row["keyword"])
             override = (
@@ -396,29 +373,6 @@ class Stage2ClipRunner:
                         f"token_ids={len(keyword_ids)}"
                     )
                 keyword_cache[keyword_key] = (phonemes, keyword_ids)
-
-            text_variant_override_raw = row.get("text_variant_phonemes")
-            has_text_variant_override = text_variant_override_raw is not None and not (
-                isinstance(text_variant_override_raw, str)
-                and not text_variant_override_raw.strip()
-            )
-            text_variant_override = (
-                parse_phoneme_sequence(
-                    text_variant_override_raw,
-                    field_name=f"Manifest row {row_index} text_variant_phonemes",
-                )
-                if has_text_variant_override
-                else None
-            )
-            text_variant_raw = row.get("text_variant")
-            text_variant = (
-                "" if text_variant_raw is None else str(text_variant_raw).strip()
-            )
-            row_text_variant_phonemes.append(
-                list(text_variant_override)
-                if text_variant_override is not None
-                else (list(auto_phonemes(text_variant)) if text_variant else None)
-            )
 
         transform_enabled = waveform_transform is not None and bool(
             getattr(waveform_transform, "enabled", True)
@@ -454,7 +408,6 @@ class Stage2ClipRunner:
             for index, feat, end_sec, augmented_duration_sec in batch:
                 keyword = rows[index]["keyword"]
                 phonemes, keyword_ids = keyword_cache[row_keyword_keys[index]]
-                text_variant_phonemes = row_text_variant_phonemes[index]
                 if feat is None:
                     results[index] = self._clip_result(
                         rows[index]["audio_path"],
@@ -464,26 +417,6 @@ class Stage2ClipRunner:
                         0.0,
                         threshold,
                         skipped=True,
-                        text_variant_phonemes=text_variant_phonemes,
-                        score_details=(
-                            {
-                                "qbyt_logit": None,
-                                "completion_logit": None,
-                                "completion_score": None,
-                                **(
-                                    {"eps_position_logits": None}
-                                    if include_eps_positions
-                                    else {}
-                                ),
-                                **(
-                                    {"seq_position_logits": None}
-                                    if include_seq_positions
-                                    else {}
-                                ),
-                            }
-                            if include_score_details
-                            else None
-                        ),
                         augmented_duration_sec=(
                             augmented_duration_sec
                             if reports_augmented_duration
@@ -496,27 +429,12 @@ class Stage2ClipRunner:
                 pending.append((index, end_sec, augmented_duration_sec))
             if not feats:
                 continue
-            if include_score_details:
-                position_kwargs = {}
-                if include_eps_positions:
-                    position_kwargs["include_eps_positions"] = True
-                if include_seq_positions:
-                    position_kwargs["include_seq_positions"] = True
-                detailed_scores = self._verifier.score_clip_feats_detailed(
-                    feats,
-                    keyword_ids_batch,
-                    **position_kwargs,
-                )
-            else:
-                detailed_scores = [
-                    {"qbyt_score": score}
-                    for score in self._verifier.score_clip_feats(feats, keyword_ids_batch)
-                ]
+            scores = self._verifier.score_clip_feats(feats, keyword_ids_batch)
             for (
                 index,
                 end_sec,
                 augmented_duration_sec,
-            ), score_details in zip(pending, detailed_scores):
+            ), score in zip(pending, scores):
                 keyword = rows[index]["keyword"]
                 phonemes, _ = keyword_cache[row_keyword_keys[index]]
                 results[index] = self._clip_result(
@@ -524,11 +442,9 @@ class Stage2ClipRunner:
                     keyword,
                     phonemes,
                     end_sec,
-                    float(score_details["qbyt_score"]),
+                    float(score),
                     threshold,
                     skipped=False,
-                    text_variant_phonemes=row_text_variant_phonemes[index],
-                    score_details=score_details if include_score_details else None,
                     augmented_duration_sec=(
                         augmented_duration_sec
                         if reports_augmented_duration
@@ -548,8 +464,6 @@ class Stage2ClipRunner:
         *,
         skipped: bool,
         start_sec: float = 0.0,
-        text_variant_phonemes: Sequence[str] | None = None,
-        score_details: Mapping[str, Any] | None = None,
         augmented_duration_sec: float | None = None,
     ) -> dict:
         result = {
@@ -562,22 +476,8 @@ class Stage2ClipRunner:
             "detected": qbyt_score >= threshold,
             "skipped": skipped,
         }
-        if text_variant_phonemes is not None:
-            result["text_variant_phonemes"] = list(text_variant_phonemes)
         if augmented_duration_sec is not None:
             result["augmented_duration_sec"] = float(augmented_duration_sec)
-        if score_details is not None:
-            result.update(
-                {
-                    "qbyt_logit": score_details.get("qbyt_logit"),
-                    "completion_logit": score_details.get("completion_logit"),
-                    "completion_score": score_details.get("completion_score"),
-                }
-            )
-            if "eps_position_logits" in score_details:
-                result["eps_position_logits"] = score_details["eps_position_logits"]
-            if "seq_position_logits" in score_details:
-                result["seq_position_logits"] = score_details["seq_position_logits"]
         return result
 
     def prepare_file_windows(
@@ -708,49 +608,36 @@ class Stage2ClipRunner:
         self,
         prepared: PreparedFileWindows,
         *,
-        include_score_details: bool = False,
-        include_eps_positions: bool = False,
-        include_seq_positions: bool = False,
         batch_size: int = 64,
     ) -> list[dict]:
         """Score previously extracted window features."""
 
-        if not include_score_details and (
-            include_eps_positions or include_seq_positions
-        ):
-            raise ValueError(
-                "Position-logit export requires include_score_details=True"
-            )
         if not prepared.feats:
             return []
         threshold = float(self._demo_cfg.get("qbyt_threshold", 0.5))
-        score_details = self._score_window_feats(
+        scores = self._score_window_feats(
             prepared.feats,
             prepared.keyword_ids,
-            include_score_details=include_score_details,
-            include_eps_positions=include_eps_positions,
-            include_seq_positions=include_seq_positions,
             batch_size=batch_size,
         )
-        if len(score_details) != len(prepared.spans):
+        if len(scores) != len(prepared.spans):
             raise RuntimeError(
                 "Stage-II window scorer returned an unexpected result count: "
-                f"expected={len(prepared.spans)}, actual={len(score_details)}"
+                f"expected={len(prepared.spans)}, actual={len(scores)}"
             )
         results = []
-        for (window_index, start_sec, end_sec), details in zip(
-            prepared.spans, score_details
+        for (window_index, start_sec, end_sec), score in zip(
+            prepared.spans, scores
         ):
             result = self._clip_result(
                 prepared.audio_path,
                 prepared.keyword,
                 prepared.keyword_phonemes,
                 end_sec=end_sec,
-                qbyt_score=float(details["qbyt_score"]),
+                qbyt_score=float(score),
                 threshold=threshold,
                 skipped=False,
                 start_sec=start_sec,
-                score_details=details if include_score_details else None,
             )
             result["window_index"] = window_index
             results.append(result)
@@ -761,43 +648,20 @@ class Stage2ClipRunner:
         feats: Sequence,
         keyword_ids: Sequence[int],
         *,
-        include_score_details: bool,
-        include_eps_positions: bool,
-        include_seq_positions: bool,
         batch_size: int,
-    ) -> list[dict]:
+    ) -> list[float]:
         """Score window features in bounded GPU batches, preserving order."""
 
         if not feats:
             return []
         chunk = max(1, int(batch_size))
         keyword_ids_list = list(keyword_ids)
-        details: list[dict] = []
+        scores: list[float] = []
         for start in range(0, len(feats), chunk):
             batch_feats = list(feats[start : start + chunk])
             batch_ids = [keyword_ids_list] * len(batch_feats)
-            if include_score_details:
-                position_kwargs = {}
-                if include_eps_positions:
-                    position_kwargs["include_eps_positions"] = True
-                if include_seq_positions:
-                    position_kwargs["include_seq_positions"] = True
-                details.extend(
-                    self._verifier.score_clip_feats_detailed(
-                        batch_feats,
-                        batch_ids,
-                        **position_kwargs,
-                    )
-                )
-            else:
-                details.extend(
-                    {"qbyt_score": score}
-                    for score in self._verifier.score_clip_feats(
-                        batch_feats,
-                        batch_ids,
-                    )
-                )
-        return details
+            scores.extend(self._verifier.score_clip_feats(batch_feats, batch_ids))
+        return scores
 
     def run_file_windows(
         self,
@@ -807,9 +671,6 @@ class Stage2ClipRunner:
         window_sec: float,
         hop_sec: float,
         keyword_phonemes: object | None = None,
-        include_score_details: bool = False,
-        include_eps_positions: bool = False,
-        include_seq_positions: bool = False,
         batch_size: int = 64,
         fbank_windows: str = "independent",
     ) -> list[dict]:
@@ -819,8 +680,7 @@ class Stage2ClipRunner:
         ``hop_sec``. ``window_sec == hop_sec`` is a non-overlapping grid. Each
         window is scored independently and a result dict in the same format as
         :meth:`run` is returned. ``keyword_phonemes`` overrides automatic G2P
-        when supplied. Position-level exports require
-        ``include_score_details=True``.
+        when supplied.
 
         ``fbank_windows="independent"`` extracts fbank on each window waveform
         (bit-identical to the original path). ``fbank_windows="file"`` extracts
@@ -837,8 +697,5 @@ class Stage2ClipRunner:
         )
         return self.score_prepared_windows(
             prepared,
-            include_score_details=include_score_details,
-            include_eps_positions=include_eps_positions,
-            include_seq_positions=include_seq_positions,
             batch_size=batch_size,
         )

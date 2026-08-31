@@ -62,12 +62,39 @@ def test_demo_config_loads_with_tokenizer_and_training_seed():
     assert stage2["warmup_steps"] == 2500
     assert stage2["sequence_loss"] == {
         "target_mode": "ordered_contiguous_prefix",
-        "progress_weight": 0.5,
-        "completion_weight": 0.5,
+        "progress_weight": 0.3,
         "normalization": "sample",
     }
+    assert stage2["qbyt_alignment"] == {
+        "min_phone_duration_frames": 1,
+        "max_phone_duration_frames": 8,
+        "max_inter_phone_gap_frames": 2,
+        "max_keyword_span_frames": 30,
+        "temperature": 0.2,
+        "local_context_kernel": 5,
+        "topology": "bounded_segmental_v1",
+    }
+    assert "qbyt_readout" not in stage2
+    assert "allow_legacy_qbyt_readout" not in stage2
     assert stage2["checkpoint"]["monitor"] == "val_auc"
     assert stage2["checkpoint"]["mode"] == "max"
+
+
+def test_alignment_experiment_inherits_the_single_stage2_alignment_config():
+    config = config_to_dict(compose_config("icefall_zipformer_stage2_alignment"))
+
+    assert config["training"]["recipe"] == "icefall-zipformer-frozen-alignment"
+    assert config["stage2"]["qbyt_alignment"] == {
+        "min_phone_duration_frames": 1,
+        "max_phone_duration_frames": 8,
+        "max_inter_phone_gap_frames": 2,
+        "max_keyword_span_frames": 30,
+        "temperature": 0.2,
+        "local_context_kernel": 5,
+        "topology": "bounded_segmental_v1",
+    }
+    assert "qbyt_readout" not in config["stage2"]
+    assert "allow_legacy_qbyt_readout" not in config["stage2"]
 
 
 def test_checkpoint_monitor_and_mode_accept_structured_overrides():

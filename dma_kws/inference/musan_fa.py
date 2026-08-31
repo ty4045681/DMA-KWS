@@ -49,8 +49,6 @@ def musan_result_record(
     runner_result: dict,
     *,
     window_index: int | None = None,
-    sequence_objective: Mapping[str, object] | None = None,
-    qbyt_readout: Mapping[str, object] | None = None,
 ) -> dict:
     """Build a rich Stage-II result row for one MUSAN sliding window."""
 
@@ -65,12 +63,7 @@ def musan_result_record(
     }
     if window_index is not None:
         manifest_row["window_index"] = int(window_index)
-    return build_result_record(
-        manifest_row,
-        runner_result,
-        sequence_objective=sequence_objective,
-        qbyt_readout=qbyt_readout,
-    )
+    return build_result_record(manifest_row, runner_result)
 
 
 def two_stage_wakeup_result_record(
@@ -83,8 +76,6 @@ def two_stage_wakeup_result_record(
     *,
     candidate_index: int,
     threshold: float,
-    sequence_objective: Mapping[str, object] | None = None,
-    qbyt_readout: Mapping[str, object] | None = None,
 ) -> dict:
     """Build one MUSAN result row for a Stage II-scored Stage I span."""
 
@@ -109,12 +100,7 @@ def two_stage_wakeup_result_record(
         "start_sec": start_sec,
         "end_sec": end_sec,
     }
-    record = build_result_record(
-        manifest_row,
-        runner_result,
-        sequence_objective=sequence_objective,
-        qbyt_readout=qbyt_readout,
-    )
+    record = build_result_record(manifest_row, runner_result)
     if "stage1_score" in scored and scored["stage1_score"] is not None:
         record["stage1_score"] = float(scored["stage1_score"])
     return record

@@ -423,16 +423,21 @@ def build_run_summary_rows(
         ]
     )
     if section in {"stage2", "adapt"}:
-        from dma_kws.stage2.readout import resolve_qbyt_readout
+        from dma_kws.stage2.readout import resolve_qbyt_alignment
 
         sequence_cfg = stage2.get("sequence_loss", {}) or {}
         adapter_cfg = stage2.get("phoneme_adapter", {}) or {}
         validation_diagnostics_cfg = stage2.get("validation", {}) or {}
-        readout = resolve_qbyt_readout(stage2)
+        alignment = resolve_qbyt_alignment(stage2)
         rows.extend(
             [
-                ("qbyt_readout_mode", readout.mode),
-                ("qbyt_readout_temperature", str(readout.temperature)),
+                ("qbyt_alignment_topology", alignment.topology),
+                ("qbyt_alignment_temperature", str(alignment.temperature)),
+                ("qbyt_min_phone_duration_frames", str(alignment.min_phone_duration_frames)),
+                ("qbyt_max_phone_duration_frames", str(alignment.max_phone_duration_frames)),
+                ("qbyt_max_inter_phone_gap_frames", str(alignment.max_inter_phone_gap_frames)),
+                ("qbyt_max_keyword_span_frames", str(alignment.max_keyword_span_frames)),
+                ("qbyt_local_context_kernel", str(alignment.local_context_kernel)),
                 (
                     "qbyt_deployment_threshold",
                     str(
@@ -448,26 +453,13 @@ def build_run_summary_rows(
                     str(int(validation_diagnostics_cfg.get("ece_num_bins", 15))),
                 ),
                 (
-                    "seq_diagnostic_threshold",
-                    str(
-                        float(
-                            validation_diagnostics_cfg.get(
-                                "seq_diagnostic_threshold", 0.5
-                            )
-                        )
-                    ),
-                ),
-                (
                     "sequence_objective",
-                    "target={target} progress={progress:g} completion={completion:g} "
+                    "target={target} progress={progress:g} "
                     "normalization={normalization}".format(
                         target=sequence_cfg.get(
                             "target_mode", "ordered_contiguous_prefix"
                         ),
-                        progress=float(sequence_cfg.get("progress_weight", 0.5)),
-                        completion=float(
-                            sequence_cfg.get("completion_weight", 0.5)
-                        ),
+                        progress=float(sequence_cfg.get("progress_weight", 0.3)),
                         normalization=sequence_cfg.get("normalization", "sample"),
                     ),
                 ),
@@ -574,8 +566,6 @@ def _include_result_metric(name: str) -> bool:
     if not name.startswith("val/"):
         return False
     leaf = name.removeprefix("val/")
-    if "completion_" in leaf:
-        return leaf.endswith(("_auc", "_eer", "_eer_threshold"))
     return leaf.endswith(
         (
             "/per",

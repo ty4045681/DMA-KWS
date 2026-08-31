@@ -189,7 +189,10 @@ def test_eval_metrics_smoke(monkeypatch, mock_eval_npy):
     }
 
     monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_args, **_kwargs: fake_encoder)
-    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _FakeQbyT)
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_qbyt",
+        lambda *_args, **_kwargs: _FakeQbyT(),
+    )
 
     module = Stage2LightningModule(config, vocab_size=71)
     module.eval()

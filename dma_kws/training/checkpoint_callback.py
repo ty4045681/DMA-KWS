@@ -1,4 +1,4 @@
-"""Stage II checkpoint callbacks aligned with main ``qbyt/train*.py``."""
+"""Stage II checkpoint callbacks."""
 
 from __future__ import annotations
 

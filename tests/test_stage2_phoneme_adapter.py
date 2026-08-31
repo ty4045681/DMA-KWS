@@ -45,6 +45,20 @@ def _config(**adapter_overrides) -> dict:
             "encoder_output_dim": ENCODER_DIM,
             "qbyt_embed_dim": 128,
             "qbyt_layers": 2,
+            "qbyt_alignment": {
+                "topology": "bounded_segmental_v1",
+                "min_phone_duration_frames": 1,
+                "max_phone_duration_frames": 8,
+                "max_inter_phone_gap_frames": 2,
+                "max_keyword_span_frames": 30,
+                "temperature": 0.2,
+                "local_context_kernel": 5,
+            },
+            "sequence_loss": {
+                "target_mode": "ordered_contiguous_prefix",
+                "progress_weight": 0.3,
+                "normalization": "sample",
+            },
             "learning_rate": 1e-3,
             "warmup_steps": 2,
             "total_scheduler_steps": 10,
@@ -88,7 +102,13 @@ def _build(
     fake_encoder.eval = MagicMock()
     fake_encoder.load_state_dict = MagicMock(return_value=([], []))
     monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_a, **_k: fake_encoder)
-    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _RecordingQbyT)
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_qbyt",
+        lambda *_a, **kwargs: _RecordingQbyT(
+            encoder_output_size=kwargs["input_dim"],
+            num_embeds=kwargs["vocab_size"],
+        ),
+    )
     return Stage2LightningModule(
         config,
         vocab_size=VOCAB_SIZE,
@@ -223,7 +243,6 @@ def test_train_logs_raw_weighted_and_windowed_loss_contract(monkeypatch):
         seq_labels=torch.tensor([[1, 0], [1, 1]]),
         seq_label_mask=torch.ones(2, 2),
         seq_progress_weight=0.25,
-        seq_completion_weight=0.75,
     )
 
     module._log_train_losses(total, losses)
@@ -232,8 +251,6 @@ def test_train_logs_raw_weighted_and_windowed_loss_contract(monkeypatch):
     assert "train/microbatch/loss_total" in microbatch_names
     assert "train/microbatch/loss_seq_progress_raw" in microbatch_names
     assert "train/microbatch/loss_seq_progress_weighted" in microbatch_names
-    assert "train/microbatch/loss_seq_completion_raw" in microbatch_names
-    assert "train/microbatch/loss_seq_completion_weighted" in microbatch_names
 
     module.log.reset_mock()
     module._log_train_window_metrics()
@@ -319,14 +336,13 @@ def test_adapter_checkpoint_roundtrip(monkeypatch, tmp_path):
 
 
 class _LoraReadyQbyT(_RecordingQbyT):
-    """Adds the phone_matchor attention layers LoRA injects into."""
+    """Adds the alignment projections LoRA injects into."""
 
     def __init__(self, encoder_output_size: int = ENCODER_DIM, num_embeds: int = 73, **kwargs):
         super().__init__(encoder_output_size=encoder_output_size, num_embeds=num_embeds)
-        attn_layer = nn.Module()
-        attn_layer.self_attn = nn.MultiheadAttention(embed_dim=8, num_heads=1)
-        self.phone_matchor = nn.Module()
-        self.phone_matchor.layers = nn.ModuleList([attn_layer])
+        self.audio_projection = nn.Linear(encoder_output_size, 8)
+        self.audio_key = nn.Linear(8, 8)
+        self.text_query = nn.Linear(8, 8)
 
 
 def test_lora_adaptation_freezes_the_trunk_and_drops_the_ctc_loss(monkeypatch):
@@ -346,7 +362,13 @@ def test_lora_adaptation_freezes_the_trunk_and_drops_the_ctc_loss(monkeypatch):
         "dma_kws.stage2.module.build_encoder",
         lambda *_a, **_k: _FakeEncoder(),
     )
-    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _LoraReadyQbyT)
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_qbyt",
+        lambda *_a, **kwargs: _LoraReadyQbyT(
+            encoder_output_size=kwargs["input_dim"],
+            num_embeds=kwargs["vocab_size"],
+        ),
+    )
 
     config = _config(ctc_weight=0.5)
     config["adapt"] = {"keyword": "hey eva"}
@@ -376,7 +398,13 @@ def test_lora_full_resume_does_not_require_external_adapter_init(monkeypatch):
         "dma_kws.stage2.module.build_encoder",
         lambda *_a, **_k: _FakeEncoder(),
     )
-    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _LoraReadyQbyT)
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_qbyt",
+        lambda *_a, **kwargs: _LoraReadyQbyT(
+            encoder_output_size=kwargs["input_dim"],
+            num_embeds=kwargs["vocab_size"],
+        ),
+    )
 
     config = _config(
         ctc_weight=0.0,
@@ -415,19 +443,33 @@ def test_verifier_architecture_matches_the_training_module(monkeypatch, tmp_path
 
     config = _config()
     monkeypatch.setattr("dma_kws.stage2.module.build_encoder", lambda *_a, **_k: _FakeEncoder())
-    monkeypatch.setattr("dma_kws.stage2.module._load_qbyt", lambda: _RecordingQbyT)
+    monkeypatch.setattr(
+        "dma_kws.stage2.module.build_qbyt",
+        lambda *_a, **kwargs: _RecordingQbyT(
+            encoder_output_size=kwargs["input_dim"],
+            num_embeds=kwargs["vocab_size"],
+        ),
+    )
     trained = Stage2LightningModule(config, vocab_size=VOCAB_SIZE, freeze_encoder=True)
 
     checkpoint = tmp_path / "stage2.pt"
     torch.save(
-        stamp_qbyt_readout_version({"model_state_dict": trained.state_dict()}), checkpoint
+        stamp_qbyt_readout_version(
+            {"model_state_dict": trained.state_dict()},
+            alignment=config["stage2"]["qbyt_alignment"],
+        ),
+        checkpoint,
     )
 
     monkeypatch.setattr(
         "dma_kws.inference.stage2_verifier.build_encoder", lambda *_a, **_k: _FakeEncoder()
     )
     monkeypatch.setattr(
-        "dma_kws.inference.stage2_verifier.load_qbyt_class", lambda: _RecordingQbyT
+        "dma_kws.stage2.model_factory.build_qbyt",
+        lambda *_a, **kwargs: _RecordingQbyT(
+            encoder_output_size=kwargs["input_dim"],
+            num_embeds=kwargs["vocab_size"],
+        ),
     )
 
     verifier = Stage2Verifier(
@@ -465,15 +507,23 @@ def test_init_checkpoint_without_adapter_weights_fails(monkeypatch, tmp_path):
     """The LoRA runner loads its base checkpoint through this path and then
     freezes the trunk immediately, so a checkpoint with no adapter.* would leave
     LoRA adapting on top of a random projection."""
+    config = _config()
+    qbyt_state = {
+        f"qbyt.{name}": value
+        for name, value in _RecordingQbyT(
+            encoder_output_size=TRUNK_DIM,
+            num_embeds=VOCAB_SIZE,
+        ).state_dict().items()
+    }
     checkpoint = tmp_path / "stage2_no_adapter.pt"
     torch.save(
         stamp_qbyt_readout_version(
-            {"model_state_dict": {"qbyt.proj.weight": torch.zeros(1, TRUNK_DIM)}}
+            {"model_state_dict": qbyt_state},
+            alignment=config["stage2"]["qbyt_alignment"],
         ),
         checkpoint,
     )
 
-    config = _config()
     with pytest.raises(SystemExit, match="carries no adapter"):
         _build_with_init(monkeypatch, config, init_checkpoint=checkpoint)
 

@@ -8,12 +8,15 @@ import pytest
 import torch
 import torch.nn as nn
 
+from dma_kws.stage2.model_factory import build_qbyt
+from dma_kws.stage2.readout import QbyTAlignmentSpec, resolve_qbyt_alignment
 from dma_kws.training.checkpoint_convert import (
     CheckpointConversionError,
     convert_checkpoint,
     merge_lora_checkpoint_state,
 )
 from dma_kws.training.checkpoint_io import (
+    QBYT_ALIGNMENT_SPEC_KEY,
     QBYT_READOUT_VERSION,
     QBYT_READOUT_VERSION_KEY,
     STAGE2_BASE_FINGERPRINT_KEY,
@@ -22,7 +25,6 @@ from dma_kws.training.checkpoint_io import (
     fingerprint_stage2_base,
 )
 from dma_kws.training.lora import inject_qbyt_lora, merge_lora
-from dma_kws.pathing import load_qbyt_class
 from scripts.convert_stage2_checkpoints import (
     build_parser,
     discover_checkpoints,
@@ -34,6 +36,12 @@ from scripts.convert_stage2_checkpoints import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DICT_PATH = REPO_ROOT / "data" / "dict" / "lang_char.txt"
 VOCAB_SIZE = 71
+
+
+def _alignment(**overrides) -> dict:
+    spec = QbyTAlignmentSpec().as_dict()
+    spec.update(overrides)
+    return QbyTAlignmentSpec(**spec).as_dict()
 
 
 @pytest.fixture(autouse=True)
@@ -50,24 +58,22 @@ def _config(
     rank: int = 2,
     alpha: float | None = 4.0,
     targets: list[str] | None = None,
-    readout_mode: str | None = None,
-    readout_temperature: float | None = None,
+    alignment: dict | None = None,
 ) -> dict:
     adapt = {
         "keyword": "hey eva",
         "slug": "",
         "phase": "tts",
         "rank": rank,
-        "lora_targets": targets or ["in_proj_weight", "out_proj.weight"],
+        "lora_targets": targets or ["audio_key.weight", "text_query.weight"],
     }
     if alpha is not None:
         adapt["alpha"] = alpha
-    stage2 = {"qbyt_embed_dim": 4, "qbyt_layers": 1}
-    if readout_mode is not None:
-        readout = {"mode": readout_mode}
-        if readout_temperature is not None:
-            readout["temperature"] = readout_temperature
-        stage2["qbyt_readout"] = readout
+    stage2 = {
+        "qbyt_embed_dim": 4,
+        "qbyt_layers": 1,
+        "qbyt_alignment": _alignment() if alignment is None else alignment,
+    }
     return {
         "tokenizer": {
             "dict_path": str(DICT_PATH),
@@ -84,17 +90,14 @@ def _config(
 
 def _stage2_state(
     *,
-    readout_mode: str = "gru_last",
-    readout_temperature: float = 1.0,
+    alignment: dict | None = None,
+    input_dim: int = 3,
 ) -> dict[str, torch.Tensor]:
-    QbyT = load_qbyt_class()
-    qbyt = QbyT(
-        encoder_output_size=3,
-        num_embeds=VOCAB_SIZE,
-        embed_dim=4,
-        post_num_layers=1,
-        readout_mode=readout_mode,
-        readout_temperature=readout_temperature,
+    stage2 = _config(alignment=alignment)["stage2"]
+    qbyt = build_qbyt(
+        stage2,
+        input_dim=input_dim,
+        vocab_size=VOCAB_SIZE,
     )
     state = {
         "encoder.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
@@ -116,6 +119,7 @@ def _checkpoint(
     global_step: int = 123,
     vocab_size: int = VOCAB_SIZE,
     readout_version: int | None = QBYT_READOUT_VERSION,
+    alignment_spec: dict | None = None,
 ) -> dict:
     checkpoint = {
         "state_dict": state,
@@ -129,6 +133,13 @@ def _checkpoint(
         checkpoint["config"] = config
     if readout_version is not None:
         checkpoint[QBYT_READOUT_VERSION_KEY] = readout_version
+        if alignment_spec is None and config is not None:
+            stage2 = config.get("stage2")
+            if isinstance(stage2, dict):
+                alignment_spec = resolve_qbyt_alignment(stage2).as_dict()
+        checkpoint[QBYT_ALIGNMENT_SPEC_KEY] = (
+            _alignment() if alignment_spec is None else copy.deepcopy(alignment_spec)
+        )
     return checkpoint
 
 
@@ -154,15 +165,15 @@ def _lora_state() -> tuple[
 ]:
     state = _stage2_state()
     groups = {
-        "qbyt.phone_matchor.layers.0.self_attn.in_proj_weight": (
-            torch.arange(48, dtype=torch.float32).reshape(12, 4),
+        "qbyt.audio_key.weight": (
+            state["qbyt.audio_key.weight"].clone(),
             torch.tensor(
                 [[1.0, 2.0, 3.0, 4.0], [0.5, 1.0, 1.5, 2.0]]
             ),
-            torch.arange(24, dtype=torch.float32).reshape(12, 2) / 10,
+            torch.arange(8, dtype=torch.float32).reshape(4, 2) / 10,
         ),
-        "qbyt.phone_matchor.layers.0.self_attn.out_proj.weight": (
-            torch.arange(16, dtype=torch.float32).reshape(4, 4),
+        "qbyt.text_query.weight": (
+            state["qbyt.text_query.weight"].clone(),
             torch.tensor(
                 [[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]]
             ),
@@ -202,8 +213,14 @@ def test_stage2_base_fingerprint_is_stable_across_lora_parametrization() -> None
 def test_convert_stage2_checkpoint_writes_only_inference_payload(tmp_path: Path) -> None:
     source = tmp_path / "step.ckpt"
     output = tmp_path / "step.pt"
-    config = _config()
-    original_state = _stage2_state()
+    alignment = _alignment(
+        max_inter_phone_gap_frames=1,
+        max_keyword_span_frames=40,
+        temperature=0.35,
+        local_context_kernel=7,
+    )
+    config = _config(alignment=alignment)
+    original_state = _stage2_state(alignment=alignment)
     torch.save(_checkpoint(original_state, config=config), source)
 
     result = convert_checkpoint(source, output)
@@ -218,164 +235,77 @@ def test_convert_stage2_checkpoint_writes_only_inference_payload(tmp_path: Path)
         "tokenizer_dict_path",
         "vocab_size",
         QBYT_READOUT_VERSION_KEY,
+        QBYT_ALIGNMENT_SPEC_KEY,
     }
     assert payload["step"] == 123
     assert payload["vocab_size"] == VOCAB_SIZE
     assert payload["tokenizer_dict_path"] == str(DICT_PATH)
     assert payload["config"] == config
+    assert payload[QBYT_ALIGNMENT_SPEC_KEY] == alignment
     for key, value in original_state.items():
         assert torch.equal(payload["model_state_dict"][key], value)
-    assert_qbyt_readout_version(payload, source=output)
+    assert_qbyt_readout_version(
+        payload,
+        source=output,
+        expected_alignment=resolve_qbyt_alignment(config["stage2"]),
+    )
     assert extract_state_dict(payload) is payload["model_state_dict"]
 
 
-def test_convert_v2_gru_checkpoint_preserves_v2_provenance(tmp_path: Path) -> None:
-    source = tmp_path / "v2_gru.ckpt"
-    output = tmp_path / "v2_gru.pt"
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_convert_rejects_pre_v5_full_qbyt_checkpoint(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    source = tmp_path / f"v{version}.ckpt"
     config = _config()
     torch.save(
         _checkpoint(
             _stage2_state(),
             config=config,
-            readout_version=2,
+            readout_version=version,
         ),
         source,
     )
 
-    convert_checkpoint(source, output)
-
-    payload = torch.load(output, map_location="cpu")
-    assert payload[QBYT_READOUT_VERSION_KEY] == 2
-    assert_qbyt_readout_version(
-        payload,
-        source=output,
-        expected_mode="gru_last",
-    )
+    with pytest.raises(
+        CheckpointConversionError,
+        match=rf"readout version {version!r}",
+    ):
+        convert_checkpoint(source, tmp_path / f"v{version}.pt")
 
 
-def test_convert_v2_checkpoint_rejects_eps_mode(tmp_path: Path) -> None:
-    source = tmp_path / "v2_eps.ckpt"
-    config = _config()
-    config["stage2"]["qbyt_readout"] = {"mode": "eps_mean"}
-    torch.save(
-        _checkpoint(
-            _stage2_state(),
-            config=config,
-            readout_version=2,
-        ),
-        source,
-    )
-
-    with pytest.raises(CheckpointConversionError, match="version 2 only with mode"):
-        convert_checkpoint(source, tmp_path / "v2_eps.pt")
-
-
-def test_convert_v3_eps_mean_checkpoint_preserves_v3_provenance(
+def test_convert_rejects_missing_partial_or_mismatched_v5_alignment_spec(
     tmp_path: Path,
 ) -> None:
-    source = tmp_path / "v3_mean.ckpt"
-    output = tmp_path / "v3_mean.pt"
-    config = _config(readout_mode="eps_mean")
-    torch.save(
-        _checkpoint(
-            _stage2_state(readout_mode="eps_mean"),
-            config=config,
-            readout_version=3,
-        ),
-        source,
-    )
+    source = tmp_path / "invalid.ckpt"
+    config = _config()
+    checkpoint = _checkpoint(_stage2_state(), config=config)
 
-    convert_checkpoint(source, output)
+    missing = copy.deepcopy(checkpoint)
+    missing.pop(QBYT_ALIGNMENT_SPEC_KEY)
+    torch.save(missing, source)
+    with pytest.raises(CheckpointConversionError, match=QBYT_ALIGNMENT_SPEC_KEY):
+        convert_checkpoint(source, tmp_path / "missing.pt")
 
-    payload = torch.load(output, map_location="cpu")
-    assert payload[QBYT_READOUT_VERSION_KEY] == 3
-    assert_qbyt_readout_version(
-        payload,
-        source=output,
-        expected_mode="eps_mean",
-    )
+    partial = copy.deepcopy(checkpoint)
+    partial[QBYT_ALIGNMENT_SPEC_KEY] = {"topology": "bounded_segmental_v1"}
+    torch.save(partial, source)
+    with pytest.raises(CheckpointConversionError, match="missing="):
+        convert_checkpoint(source, tmp_path / "partial.pt")
 
-
-def test_convert_v3_checkpoint_rejects_softmin_mode(tmp_path: Path) -> None:
-    source = tmp_path / "v3_softmin.ckpt"
-    config = _config(
-        readout_mode="eps_softmin",
-        readout_temperature=0.5,
-    )
-    torch.save(
-        _checkpoint(
-            _stage2_state(
-                readout_mode="eps_softmin",
-                readout_temperature=0.5,
-            ),
-            config=config,
-            readout_version=3,
-        ),
-        source,
-    )
-
-    with pytest.raises(
-        CheckpointConversionError,
-        match="version 3 only with modes",
-    ):
-        convert_checkpoint(source, tmp_path / "v3_softmin.pt")
+    mismatched = copy.deepcopy(checkpoint)
+    mismatched[QBYT_ALIGNMENT_SPEC_KEY] = _alignment(temperature=0.4)
+    torch.save(mismatched, source)
+    with pytest.raises(CheckpointConversionError, match="disagrees with config"):
+        convert_checkpoint(source, tmp_path / "mismatched.pt")
 
 
-def test_convert_v4_softmin_roundtrip_preserves_temperature(tmp_path: Path) -> None:
-    source = tmp_path / "v4_softmin.ckpt"
-    output = tmp_path / "v4_softmin.pt"
-    config = _config(
-        readout_mode="eps_softmin",
-        readout_temperature=0.5,
-    )
-    torch.save(
-        _checkpoint(
-            _stage2_state(
-                readout_mode="eps_softmin",
-                readout_temperature=0.5,
-            ),
-            config=config,
-        ),
-        source,
-    )
-
-    convert_checkpoint(source, output)
-
-    payload = torch.load(output, map_location="cpu")
-    assert payload[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION
-    assert payload["config"]["stage2"]["qbyt_readout"] == {
-        "mode": "eps_softmin",
-        "temperature": 0.5,
-    }
-    assert_qbyt_readout_version(
-        payload,
-        source=output,
-        expected_mode="eps_softmin",
-        expected_temperature=0.5,
-    )
-
-
-def test_convert_v4_softmin_requires_explicit_temperature(tmp_path: Path) -> None:
-    source = tmp_path / "v4_implicit_temperature.ckpt"
-    config = _config(readout_mode="eps_softmin")
-    torch.save(
-        _checkpoint(
-            _stage2_state(readout_mode="eps_softmin"),
-            config=config,
-        ),
-        source,
-    )
-
-    with pytest.raises(
-        CheckpointConversionError,
-        match="explicitly record.*temperature",
-    ):
-        convert_checkpoint(source, tmp_path / "ambiguous.pt")
-
-
-def test_historical_checkpoint_uses_explicit_fallback_config(tmp_path: Path) -> None:
-    source = tmp_path / "old.ckpt"
-    output = tmp_path / "old.pt"
+def test_v5_checkpoint_without_embedded_config_uses_explicit_fallback(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "v5.ckpt"
+    output = tmp_path / "v5.pt"
     config = _config()
     torch.save(_checkpoint(_stage2_state()), source)
 
@@ -413,7 +343,7 @@ def test_conversion_refuses_missing_config_or_readout_version(tmp_path: Path) ->
         _checkpoint(_stage2_state(), config=_config(), readout_version=None),
         source,
     )
-    with pytest.raises(CheckpointConversionError, match="Refusing to stamp"):
+    with pytest.raises(CheckpointConversionError, match="unversioned"):
         convert_checkpoint(source, tmp_path / "old.pt")
 
 
@@ -471,7 +401,7 @@ def test_conversion_refuses_truncated_or_architecture_mismatched_state(
 ) -> None:
     source = tmp_path / "broken.ckpt"
     truncated = _stage2_state()
-    truncated.pop("qbyt.fc.bias")
+    truncated.pop("qbyt.score_bias")
     torch.save(_checkpoint(truncated, config=_config()), source)
     with pytest.raises(CheckpointConversionError, match="QbyT weights do not match"):
         convert_checkpoint(source, tmp_path / "truncated.pt")
@@ -511,12 +441,10 @@ def test_conversion_validates_and_preserves_enabled_phoneme_adapter(
         input_dim=3,
         vocab_size=VOCAB_SIZE,
     )
-    QbyT = load_qbyt_class()
-    qbyt = QbyT(
-        encoder_output_size=adapter.output_dim,
-        num_embeds=VOCAB_SIZE,
-        embed_dim=4,
-        post_num_layers=1,
+    qbyt = build_qbyt(
+        config["stage2"],
+        input_dim=adapter.output_dim,
+        vocab_size=VOCAB_SIZE,
     )
     state = {
         "encoder.weight": torch.ones(2, 3),
@@ -565,11 +493,13 @@ def test_convert_lora_checkpoint_writes_merged_and_adapter_payloads(
 
     assert adapter["rank"] == 2
     assert adapter["alpha"] == 4.0
-    assert adapter["lora_targets"] == ["in_proj_weight", "out_proj.weight"]
+    assert adapter["lora_targets"] == ["audio_key.weight", "text_query.weight"]
     assert adapter["keyword"] == "hey eva"
     assert adapter["slug"] == "hey_eva"
     assert adapter["phase"] == "tts"
     assert adapter["checkpoint_kind"] == "stage2_lora_adapter"
+    assert adapter[QBYT_ALIGNMENT_SPEC_KEY] == _alignment()
+    assert merged[QBYT_ALIGNMENT_SPEC_KEY] == _alignment()
     assert adapter[STAGE2_BASE_FINGERPRINT_KEY] == fingerprint_stage2_base(state)
     assert adapter["lora_state_dict"]
     assert all(
@@ -626,7 +556,7 @@ def test_adapter_only_skips_tokenizer_validation_but_requires_a_complete_base(
     assert payload["config"] == config
 
     truncated = dict(state)
-    truncated.pop("qbyt.fc.bias")
+    truncated.pop("qbyt.score_bias")
     torch.save(_checkpoint(truncated, config=config), source)
     with pytest.raises(CheckpointConversionError, match="QbyT weights do not match"):
         convert_checkpoint(
@@ -667,34 +597,46 @@ def test_raw_lora_merge_matches_formula_and_rejects_incomplete_group() -> None:
 
     broken = dict(state)
     broken.pop(
-        "qbyt.phone_matchor.layers.0.self_attn.parametrizations."
-        "in_proj_weight.0.lora_B"
+        "qbyt.audio_key.parametrizations.weight.0.lora_B"
     )
     with pytest.raises(CheckpointConversionError, match="Incomplete LoRA"):
         merge_lora_checkpoint_state(broken, alpha=4.0)
 
-    unsupported = dict(state)
-    _add_lora_group(
-        unsupported,
-        "encoder.block.in_proj_weight",
-        original=torch.ones(4, 4),
-        lora_a=torch.ones(2, 4),
-        lora_b=torch.ones(4, 2),
-    )
-    with pytest.raises(CheckpointConversionError, match="outside QbyT"):
-        merge_lora_checkpoint_state(unsupported, alpha=4.0)
+    for unsupported_target in (
+        "encoder.block.weight",
+        "qbyt.phone_matchor.layers.0.self_attn.in_proj_weight",
+    ):
+        unsupported = dict(state)
+        _add_lora_group(
+            unsupported,
+            unsupported_target,
+            original=torch.ones(4, 4),
+            lora_a=torch.ones(2, 4),
+            lora_b=torch.ones(4, 2),
+        )
+        with pytest.raises(
+            CheckpointConversionError,
+            match="Unsupported parametrization",
+        ):
+            merge_lora_checkpoint_state(unsupported, alpha=4.0)
 
 
 def test_raw_lora_merge_matches_project_parametrization() -> None:
-    layer = nn.TransformerEncoderLayer(
-        d_model=4,
-        nhead=2,
-        dim_feedforward=8,
-        batch_first=True,
+    qbyt = build_qbyt(
+        _config()["stage2"],
+        input_dim=3,
+        vocab_size=VOCAB_SIZE,
     )
-    qbyt = nn.Module()
-    qbyt.phone_matchor = nn.TransformerEncoder(layer, num_layers=1)
-    inject_qbyt_lora(qbyt, rank=2, alpha=4.0)
+    inject_qbyt_lora(
+        qbyt,
+        rank=2,
+        alpha=4.0,
+        targets=[
+            "audio_projection.weight",
+            "audio_key.weight",
+            "text_query.weight",
+        ],
+    )
     with torch.no_grad():
         for name, parameter in qbyt.named_parameters():
             if name.endswith(".lora_A"):

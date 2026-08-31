@@ -15,6 +15,18 @@ from dma_kws.stage1.candidates import KeywordCandidate
 import scripts.eval_two_stage_musan_fa as eval_two_stage_musan_fa
 
 
+def _qbyt_alignment() -> dict:
+    return {
+        "topology": "bounded_segmental_v1",
+        "min_phone_duration_frames": 1,
+        "max_phone_duration_frames": 8,
+        "max_inter_phone_gap_frames": 2,
+        "max_keyword_span_frames": 30,
+        "temperature": 0.2,
+        "local_context_kernel": 5,
+    }
+
+
 def _fake_phonemes(text: str) -> list[str]:
     phones = {"hey eva": ["HH", "EY1", "IY1", "V", "AH0"]}
     return phones.get(text.lower(), text.upper().split())
@@ -133,11 +145,10 @@ def _common_eval_patches(monkeypatch, audio_paths: list[Path], duration_sec: flo
         eval_two_stage_musan_fa,
         "build_score_provenance",
         lambda *_args, **_kwargs: {
-            "qbyt_readout": {"mode": "eps_softmin", "temperature": 1.0},
+            "qbyt_alignment": _qbyt_alignment(),
             "sequence_objective": {
                 "target_mode": "ordered_contiguous_prefix",
                 "progress_weight": 0.5,
-                "completion_weight": 0.5,
                 "normalization": "sample",
             },
         },
@@ -169,14 +180,12 @@ def test_two_stage_wakeup_record_preserves_span_and_stage1_score():
         },
         candidate_index=2,
         threshold=0.5,
-        qbyt_readout={"mode": "eps_softmin", "temperature": 0.5},
     )
     assert record["qbyt_score"] == pytest.approx(0.91)
     assert record["detected"] is True
     assert record["label"] == 0
     assert record["clip_span_sec"] == {"start_sec": 1.5, "end_sec": 2.25}
     assert record["stage1_score"] == pytest.approx(0.8)
-    assert record["qbyt_readout_mode"] == "eps_softmin"
     assert record["manifest_meta"] == {
         "subset": "noise",
         "duration_sec": 12.0,
@@ -355,7 +364,7 @@ def test_merge_rejects_mixed_eval_protocol():
         "hop_sec": 3.0,
         "musan_root": "/musan",
         "stream": {"mode": "test"},
-        "provenance": {"qbyt_readout": {"mode": "eps_mean"}},
+        "provenance": {"qbyt_alignment": _qbyt_alignment()},
         "amp": "off",
         "fbank_windows": "independent",
         "batch_size": 64,
@@ -383,7 +392,7 @@ def test_merge_two_stage_wakeups_pools_hours_and_false_accepts():
         "stage2_ckpt": "stage2.pt",
         "musan_root": "/musan",
         "stream": {"mode": "test"},
-        "provenance": {"qbyt_readout": {"mode": "eps_softmin", "temperature": 1.0}},
+        "provenance": {"qbyt_alignment": _qbyt_alignment()},
         "amp": "off",
         "num_shards": 2,
     }

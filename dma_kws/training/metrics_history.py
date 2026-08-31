@@ -50,14 +50,6 @@ _MIN_METRIC_HINTS = (
 #: ambiguous and duplicate the same scalar under several names.
 _ALIAS_METRICS = frozenset(
     {
-        "train/loss",
-        "train/utt_loss",
-        "train/seq_loss",
-        "train/seq_progress_loss",
-        "train/seq_completion_loss",
-        "train/ctc_loss",
-        "train/lr",
-        "train/grad_norm",
         "val_auc",
         "val_target_auc",
         "val_lph_auc",
@@ -252,30 +244,29 @@ def collect_hparams(
     if effective_max_steps is not None:
         hparams["max_steps"] = int(effective_max_steps)
     if section in {"stage2", "adapt"}:
-        from dma_kws.stage2.readout import resolve_qbyt_readout
+        from dma_kws.stage2.readout import resolve_qbyt_alignment
 
         sequence_loss = stage2.get("sequence_loss", {}) or {}
         validation = stage2.get("validation", {}) or {}
-        readout = resolve_qbyt_readout(stage2)
+        alignment = resolve_qbyt_alignment(stage2)
         hparams.update(
             {
-                "qbyt_readout_mode": readout.mode,
-                "qbyt_readout_temperature": readout.temperature,
+                "qbyt_alignment_topology": alignment.topology,
+                "qbyt_alignment_temperature": alignment.temperature,
+                "qbyt_min_phone_duration_frames": alignment.min_phone_duration_frames,
+                "qbyt_max_phone_duration_frames": alignment.max_phone_duration_frames,
+                "qbyt_max_inter_phone_gap_frames": alignment.max_inter_phone_gap_frames,
+                "qbyt_max_keyword_span_frames": alignment.max_keyword_span_frames,
+                "qbyt_local_context_kernel": alignment.local_context_kernel,
                 "qbyt_deployment_threshold": float(
                     ((config.get("demo") or {}).get("qbyt_threshold", 0.5))
                 ),
                 "score_ece_num_bins": int(validation.get("ece_num_bins", 15)),
-                "seq_diagnostic_threshold": float(
-                    validation.get("seq_diagnostic_threshold", 0.5)
-                ),
                 "seq_target_mode": str(
                     sequence_loss.get("target_mode", "ordered_contiguous_prefix")
                 ),
                 "seq_progress_weight": float(
-                    sequence_loss.get("progress_weight", 0.5)
-                ),
-                "seq_completion_weight": float(
-                    sequence_loss.get("completion_weight", 0.5)
+                    sequence_loss.get("progress_weight", 0.3)
                 ),
                 "seq_normalization": str(
                     sequence_loss.get("normalization", "sample")

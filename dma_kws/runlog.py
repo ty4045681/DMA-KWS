@@ -1,7 +1,7 @@
 """Training-run logging helpers (loss/metrics records on disk).
 
-Mirrors the paper's PyTorch Lightning TensorBoard setup (qbyt/train.py uses
-``TensorBoardLogger(save_dir, name=run_name)``) and additionally attaches a
+Uses the Stage II PyTorch Lightning
+``TensorBoardLogger(save_dir, name=run_name)`` and additionally attaches a
 dependency-free ``CSVLogger`` so loss/metrics are always recorded to a plain
 ``metrics.csv`` even when the ``tensorboard`` package is absent.
 

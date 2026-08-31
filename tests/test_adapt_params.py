@@ -33,6 +33,20 @@ STAGE2_SECTION = {
     "num_workers": 8,
     "accumulate_grad_batches": 1,
     "precision": "bf16-mixed",
+    "qbyt_alignment": {
+        "topology": "bounded_segmental_v1",
+        "min_phone_duration_frames": 1,
+        "max_phone_duration_frames": 8,
+        "max_inter_phone_gap_frames": 2,
+        "max_keyword_span_frames": 30,
+        "temperature": 0.2,
+        "local_context_kernel": 5,
+    },
+    "sequence_loss": {
+        "target_mode": "ordered_contiguous_prefix",
+        "progress_weight": 0.3,
+        "normalization": "sample",
+    },
 }
 
 
@@ -167,7 +181,7 @@ def test_adapt_summary_rows_flag_lr_alias_source():
     assert rows["phase"] == "tts"
 
 
-def test_stage2_summary_rows_unchanged():
+def test_stage2_summary_rows_report_alignment_and_progress_objective():
     config = {"stage2": dict(STAGE2_SECTION), "training": {"recipe": "paper"}}
     rows = _rows_to_dict(
         build_run_summary_rows(
@@ -183,11 +197,16 @@ def test_stage2_summary_rows_unchanged():
     assert rows["warmup_steps"] == "2500"
     assert rows["max_steps"] == "50000"
     assert rows["batch_size_per_gpu"] == "64"
-    assert rows["qbyt_readout_mode"] == "gru_last"
-    assert rows["qbyt_readout_temperature"] == "1.0"
+    assert rows["qbyt_alignment_topology"] == "bounded_segmental_v1"
+    assert rows["qbyt_alignment_temperature"] == "0.2"
+    assert rows["qbyt_max_phone_duration_frames"] == "8"
+    assert rows["qbyt_max_inter_phone_gap_frames"] == "2"
+    assert rows["qbyt_max_keyword_span_frames"] == "30"
     assert rows["qbyt_deployment_threshold"] == "0.5"
     assert rows["score_ece_num_bins"] == "15"
-    assert rows["seq_diagnostic_threshold"] == "0.5"
+    assert rows["sequence_objective"] == (
+        "target=ordered_contiguous_prefix progress=0.3 normalization=sample"
+    )
 
 
 def test_summary_can_report_effective_logging_backends():

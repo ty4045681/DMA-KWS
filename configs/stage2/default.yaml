@@ -1,12 +1,17 @@
 encoder_output_dim: 144
 qbyt_embed_dim: 128
 qbyt_layers: 2
-# Final deployed QbyT score. Keep gru_last for existing v2 checkpoints; use
-# eps_mean or eps_softmin for a shared position scorer. Temperature affects
-# eps_softmin only: smaller values put more weight on the weakest position.
-qbyt_readout:
-  mode: gru_last
-  temperature: 1.0
+# The deployed QbyT score is the normalized probability of completing one
+# monotonic, temporally compact path through every anchor phoneme.  Frame counts
+# are measured after encoder subsampling (25 Hz for the default encoders).
+qbyt_alignment:
+  topology: bounded_segmental_v1
+  min_phone_duration_frames: 1
+  max_phone_duration_frames: 8
+  max_inter_phone_gap_frames: 2
+  max_keyword_span_frames: 30
+  temperature: 0.2
+  local_context_kernel: 5
 negative_ratio: 1
 learning_rate: 0.0005
 warmup_steps: 2500
@@ -40,21 +45,11 @@ noise_augmentation:
   snr_db_min: 10.0
   snr_db_max: 20.0
 
-# Load QbyT weights trained before the pooled readout was fixed. Their parameter
-# shapes still match, so nothing else would notice, but they were trained to read
-# a different frame. Only the encoder/adapter weights survive a warm start this
-# way, and no score from such a checkpoint is comparable with its original run.
-allow_legacy_qbyt_readout: false
-
-# The released code used unordered phoneme set-membership labels. The corrected
-# target is cumulative ordered/contiguous progress (111...000), plus an explicit
-# full-keyword completion term. For a strict legacy ablation use:
-# target_mode=membership, progress_weight=1, completion_weight=0,
-# normalization=token.
+# Prefix targets supervise partial progress; the final full-keyword path is
+# supervised only by the utterance objective.
 sequence_loss:
   target_mode: ordered_contiguous_prefix
-  progress_weight: 0.5
-  completion_weight: 0.5
+  progress_weight: 0.3
   normalization: sample
 
 # Phoneme-CTC trunk between the frozen encoder and QbyT (see configs/phoneme_adapter).
@@ -108,9 +103,6 @@ validation:
   val_check_interval: 1000
   # Fixed-width bins for validation score calibration diagnostics.
   ece_num_bins: 15
-  # The sequence endpoint is diagnostic-only and is not calibrated on the
-  # deployed utterance-head threshold.
-  seq_diagnostic_threshold: 0.5
 
 eval:
   fbank:

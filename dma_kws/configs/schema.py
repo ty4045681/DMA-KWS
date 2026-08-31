@@ -253,7 +253,6 @@ class Stage2ValidationConfig:
     batch_size: int = 256
     val_check_interval: int = 1000
     ece_num_bins: int = 15
-    seq_diagnostic_threshold: float = 0.5
 
 
 @dataclass
@@ -375,28 +374,25 @@ class Stage2PhonemeAdapterConfig:
 class Stage2SequenceLossConfig:
     """Ordered phoneme-progress supervision for the QbyT sequence head."""
 
-    #: ``membership`` is retained only for reproducing the released objective.
     target_mode: str = "ordered_contiguous_prefix"
-    #: Per-anchor-position progress BCE contribution.
-    progress_weight: float = 0.5
-    #: Extra weight on the last valid position (full keyword completion).
-    completion_weight: float = 0.5
+    #: Non-final prefix BCE contribution; utterance BCE owns full completion.
+    progress_weight: float = 0.3
     #: ``sample`` gives every pair equal weight; ``token`` reproduces the old
     #: valid-token mean, under which long anchors count more.
     normalization: str = "sample"
 
 
 @dataclass
-class Stage2QbyTReadoutConfig:
-    """Final utterance-score readout applied after the QbyT matcher."""
+class Stage2QbyTAlignmentConfig:
+    """Only supported QbyT score topology: bounded segmental alignment."""
 
-    #: ``gru_last`` reproduces readout v2. ``eps_mean`` applies one shared
-    #: position scorer to valid anchor states and averages its raw logits;
-    #: ``eps_softmin`` emphasizes the weakest valid position.
-    mode: str = "gru_last"
-    #: Positive soft-min temperature. Smaller values approach a hard minimum;
-    #: larger values approach mean pooling.
-    temperature: float = 1.0
+    topology: str = "bounded_segmental_v1"
+    min_phone_duration_frames: int = 1
+    max_phone_duration_frames: int = 8
+    max_inter_phone_gap_frames: int = 2
+    max_keyword_span_frames: int = 30
+    temperature: float = 0.2
+    local_context_kernel: int = 5
 
 
 @dataclass
@@ -439,11 +435,6 @@ class Stage2Config:
     log_interval: int = 10
     val_check_interval: int = 1000
     freeze_encoder: bool = False
-    #: Accept QbyT weights trained against the pre-fix pooled readout. Only the
-    #: encoder/adapter weights of such a checkpoint are meaningful, so this is a
-    #: warm-start escape hatch, not a compatibility mode: scores produced from it
-    #: are not comparable with the run it came from.
-    allow_legacy_qbyt_readout: bool = False
     checkpoint_dir: str = ""
     log_dir: str = ""
     run_name: str = "stage2_qbyt"
@@ -459,8 +450,8 @@ class Stage2Config:
     sequence_loss: Stage2SequenceLossConfig = field(
         default_factory=Stage2SequenceLossConfig
     )
-    qbyt_readout: Stage2QbyTReadoutConfig = field(
-        default_factory=Stage2QbyTReadoutConfig
+    qbyt_alignment: Stage2QbyTAlignmentConfig = field(
+        default_factory=Stage2QbyTAlignmentConfig
     )
     noise_augmentation: Stage2NoiseAugmentationConfig = field(
         default_factory=Stage2NoiseAugmentationConfig
@@ -585,7 +576,9 @@ class AdaptConfig:
     params_file: str = ""
     checkpoint_monitor: str = "val_target_auc"
     checkpoint_filename: str = "step_{step:06d}_target_auc_{val_target_auc:.6f}"
-    lora_targets: list[str] = field(default_factory=lambda: ["in_proj_weight", "out_proj.weight"])
+    lora_targets: list[str] = field(
+        default_factory=lambda: ["audio_key.weight", "text_query.weight"]
+    )
     validation: AdaptValidationConfig = field(default_factory=AdaptValidationConfig)
     sweep: AdaptSweepConfig = field(default_factory=AdaptSweepConfig)
     console: Stage2ConsoleConfig = field(default_factory=Stage2ConsoleConfig)

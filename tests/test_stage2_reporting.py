@@ -5,6 +5,30 @@ import pytest
 from dma_kws.inference.stage2_reporting import build_result_record
 
 
+def test_result_record_exports_only_the_deployed_qbyt_score():
+    record = build_result_record(
+        {"audio_path": "clip.wav", "keyword": "hey eva", "label": 1},
+        {
+            "keyword_phonemes": ["HH", "EY1", "IY1", "V", "AH0"],
+            "qbyt_score": 0.75,
+            "detected": True,
+            "threshold": 0.5,
+            "skipped": False,
+        },
+    )
+
+    assert record == {
+        "audio_path": "clip.wav",
+        "keyword": "hey eva",
+        "keyword_phonemes": ["HH", "EY1", "IY1", "V", "AH0"],
+        "qbyt_score": pytest.approx(0.75),
+        "detected": True,
+        "threshold": pytest.approx(0.5),
+        "skipped": False,
+        "label": 1,
+    }
+
+
 def test_result_record_preserves_augmented_model_input_duration():
     record = build_result_record(
         {"audio_path": "clip.wav", "keyword": "hello"},

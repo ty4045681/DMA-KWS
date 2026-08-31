@@ -53,7 +53,6 @@ def test_distributed_trial_launches_fixed_request_under_torchrun(monkeypatch, tm
                     "tts": {
                         "adapter": str(tmp_path / "adapter.pt"),
                         "merged": str(tmp_path / "stage2_adapted.pt"),
-                        "final_adapter": str(tmp_path / "final_adapter.pt"),
                     },
                     "real": None,
                     "merged_checkpoint": str(tmp_path / "stage2_adapted.pt"),

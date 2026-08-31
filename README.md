@@ -1399,7 +1399,7 @@ Defaults live in `configs/adapt/default.yaml`. Override on the CLI with `adapt.<
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `adapt.rank` | `16` | LoRA rank on QbyT matcher attention |
+| `adapt.rank` | `16` | LoRA rank on QbyT matching projections |
 | `adapt.alpha` | `32` | LoRA scaling (`alpha/rank` applied to `B@A`) |
 | `adapt.learning_rate` | `4e-4` | Adam learning rate (LoRA params only); canonical key |
 | `adapt.lr` | unset | Alias for `adapt.learning_rate`; wins when explicitly set |
@@ -1407,7 +1407,7 @@ Defaults live in `configs/adapt/default.yaml`. Override on the CLI with `adapt.<
 | `adapt.weight_decay` | `0` | Weight decay (AdamW only) |
 | `adapt.warmup_steps` | `100` | Cosine schedule warmup |
 | `adapt.max_steps` | `3000` | Training steps per phase |
-| `adapt.lora_targets` | `in_proj_weight`, `out_proj` | Attention matrices to inject LoRA |
+| `adapt.lora_targets` | `audio_key.weight`, `text_query.weight` | Projections that build the phone/frame emission lattice |
 
 **Data mixing and loading**
 
@@ -1905,8 +1905,8 @@ Each run writes `results.jsonl` and `summary.json`. With
   `fa_per_hour`, `fa_per_24_hours`, `fa_per_1000_hours`)
 
 `summary.json` reports overall and per-subset (`music`/`noise`/`speech`)
-FA/hour. Each result row keeps the keyword phonemes and Stage-II position
-diagnostics.
+FA/hour. Each result row keeps the keyword phonemes and the single deployed
+Stage-II score.
 
 Single keyword, single checkpoint:
 
@@ -1945,8 +1945,6 @@ python3 scripts/eval_two_stage_musan_fa.py \
   locator.decoder=/path/decoder.onnx \
   locator.joiner=/path/joiner.onnx \
   locator.keywords_file=/path/keywords.txt \
-  stage2.qbyt_readout.mode=eps_softmin \
-  stage2.qbyt_readout.temperature=1.0 \
   prep.keyword="hey eva" \
   'prep.keyword_phonemes=HH EY1 IY1 V AH0' \
   prep.musan_root=/path/to/musan \
@@ -1976,8 +1974,7 @@ bash scripts/batch_eval_two_stage_musan_fa.sh \
   locator.encoder=/path/encoder.onnx \
   locator.decoder=/path/decoder.onnx \
   locator.joiner=/path/joiner.onnx \
-  locator.keywords_file=/path/keywords.txt \
-  stage2.qbyt_readout.mode=eps_softmin
+  locator.keywords_file=/path/keywords.txt
 
 bash scripts/eval_two_stage_musan_fa_shards.sh \
   +experiment=icefall_zipformer_stage2 \

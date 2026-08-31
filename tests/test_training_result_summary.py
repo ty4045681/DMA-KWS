@@ -41,7 +41,7 @@ def test_result_rows_expose_identity_progress_freshness_and_outputs(tmp_path):
                 "val/eer_threshold": 0.97,
                 "val/score_neg_mean": 0.4,
                 "val/score_neg_p95": 0.99,
-                "val/completion_auc": 0.91,
+                "val/eer": 0.09,
             },
             artifact_paths={
                 "final_checkpoint": tmp_path / "final.pt",
@@ -64,7 +64,7 @@ def test_result_rows_expose_identity_progress_freshness_and_outputs(tmp_path):
     assert rows["metric/val/auc"] == "0.94"
     assert rows["metric/val/eer_threshold"] == "0.97"
     assert rows["metric/val/score_neg_p95"] == "0.99"
-    assert rows["metric/val/completion_auc"] == "0.91"
+    assert rows["metric/val/eer"] == "0.09"
     assert "metric/val/score_neg_mean" not in rows
     assert "metric/train/microbatch/loss_total" not in rows
     assert rows["artifact/final_checkpoint"].endswith("final.pt")

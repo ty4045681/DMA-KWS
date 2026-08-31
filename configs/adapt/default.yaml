@@ -42,12 +42,9 @@ adapt:
   # Alternatives: val_lph_auc, or a future logged composite score.
   checkpoint_monitor: val_target_auc
   checkpoint_filename: step_{step:06d}_target_auc_{val_target_auc:.6f}
-  # Old adapter-only files do not identify the frozen Stage II base they were
-  # trained against. Keep unsafe loading opt-in.
-  allow_legacy_adapter: false
   lora_targets:
-    - in_proj_weight
-    - out_proj.weight
+    - audio_key.weight
+    - text_query.weight
   validation:
     # Counted in training-batch iterations per rank. With gradient accumulation
     # k, this is approximately val_check_interval/k optimizer steps. The counter

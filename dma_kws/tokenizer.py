@@ -168,15 +168,9 @@ def tokenize_phoneme_string(tokenizer, g2p_text: str) -> list[int]:
     return token_ids
 
 
-SEQ_LABEL_MEMBERSHIP = "membership"
 SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX = "ordered_contiguous_prefix"
 DEFAULT_SEQ_LABEL_MODE = SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
-SEQ_LABEL_MODES = frozenset(
-    {
-        SEQ_LABEL_MEMBERSHIP,
-        SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX,
-    }
-)
+SEQ_LABEL_MODES = frozenset({SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX})
 
 
 def normalize_seq_label_mode(mode: str) -> str:
@@ -224,15 +218,10 @@ def build_seq_label(
     context is allowed, but insertions, reordering and reusing one occurrence of
     a repeated phoneme cannot advance the target.
 
-    ``membership`` retains the released DMA/PhonMatchNet heuristic for explicit
-    legacy ablations. Ids remain stress-marked, so e.g. ``AH0`` and ``AH1`` are
-    distinct in both modes.
+    Ids remain stress-marked, so e.g. ``AH0`` and ``AH1`` are distinct.
     """
     mode = normalize_seq_label_mode(mode)
     if not anchor_ids:
         raise ValueError("anchor_ids must contain at least one phoneme")
-    if mode == SEQ_LABEL_MEMBERSHIP:
-        return [1 if anchor_id in query_ids else 0 for anchor_id in anchor_ids]
-
     matched = _longest_contiguous_anchor_prefix(anchor_ids, query_ids)
     return [1] * matched + [0] * (len(anchor_ids) - matched)

@@ -18,14 +18,10 @@ from dma_kws.training.lora import (
 
 
 def _build_qbyt() -> nn.Module:
-    layer = nn.TransformerEncoderLayer(
-        d_model=128,
-        nhead=4,
-        dim_feedforward=512,
-        batch_first=True,
-    )
     qbyt = nn.Module()
-    qbyt.phone_matchor = nn.TransformerEncoder(layer, num_layers=2)
+    qbyt.audio_projection = nn.Linear(144, 128)
+    qbyt.audio_key = nn.Linear(128, 96)
+    qbyt.text_query = nn.Linear(128, 96)
     return qbyt
 
 
@@ -43,11 +39,19 @@ def test_lora_rejects_non_positive_or_non_finite_alpha(alpha):
 
 
 def test_lora_targets_reject_empty_and_misspelled_entries():
+    assert normalize_lora_targets(None) == (
+        "audio_key.weight",
+        "text_query.weight",
+    )
+    assert normalize_lora_targets(
+        ["audio_projection.weight", "audio_key.weight", "audio_key.weight"]
+    ) == ("audio_projection.weight", "audio_key.weight")
     with pytest.raises(ValueError, match="At least one"):
         normalize_lora_targets([])
     with pytest.raises(ValueError, match="Unsupported"):
-        normalize_lora_targets(["in_proj_weight", "out_project.weight"])
-    assert normalize_lora_targets(["out_proj"]) == ("out_proj.weight",)
+        normalize_lora_targets(["in_proj_weight", "out_proj.weight"])
+    with pytest.raises(ValueError, match="Unsupported"):
+        normalize_lora_targets(["out_proj"])
 
 
 def test_lora_runtime_rejects_base_mutating_ema_and_true_half_precision():
@@ -67,7 +71,7 @@ def test_lora_runtime_rejects_base_mutating_ema_and_true_half_precision():
 def test_inject_qbyt_lora_only_lora_trainable():
     qbyt = _build_qbyt()
     injected = inject_qbyt_lora(qbyt, rank=4, alpha=8.0)
-    assert injected
+    assert injected == ["audio_key.weight", "text_query.weight"]
     counts = count_lora_params(qbyt)
     assert counts["trainable"] == counts["lora_trainable"]
     assert counts["trainable"] > 0
@@ -77,6 +81,22 @@ def test_inject_qbyt_lora_only_lora_trainable():
             assert param.requires_grad
         else:
             assert not param.requires_grad
+
+
+def test_inject_qbyt_lora_can_target_audio_projection_only():
+    qbyt = _build_qbyt()
+
+    injected = inject_qbyt_lora(
+        qbyt,
+        rank=4,
+        alpha=8.0,
+        targets=["audio_projection.weight"],
+    )
+
+    assert injected == ["audio_projection.weight"]
+    state = lora_state_dict(qbyt)
+    assert state
+    assert all(name.startswith("audio_projection.parametrizations.weight") for name in state)
 
 
 def test_merge_lora_removes_parametrizations():
@@ -123,7 +143,7 @@ def _adapter_payload(**overrides):
         "keyword": "hey eva",
         "rank": 4,
         "alpha": 8.0,
-        "lora_targets": ["in_proj_weight", "out_proj.weight"],
+        "lora_targets": ["audio_key.weight", "text_query.weight"],
         "lora_state_dict": {"layer.lora_A": torch.ones(4, 8)},
     }
     payload.update(overrides)
@@ -138,7 +158,7 @@ def test_adapter_resume_metadata_must_match_exactly():
         "keyword": "hey eva",
         "rank": 4,
         "alpha": 8.0,
-        "targets": ("in_proj_weight", "out_proj.weight"),
+        "targets": ("audio_key.weight", "text_query.weight"),
     }
     state = _validate_adapter_checkpoint(_adapter_payload(), **expected)
     assert state
@@ -160,7 +180,7 @@ def test_adapter_resume_metadata_must_match_exactly():
         _validate_adapter_checkpoint(_adapter_payload(alpha=16.0), **expected)
     with pytest.raises(SystemExit, match="lora_targets"):
         _validate_adapter_checkpoint(
-            _adapter_payload(lora_targets=["in_proj_weight"]),
+            _adapter_payload(lora_targets=["audio_key.weight"]),
             **expected,
         )
 
@@ -173,7 +193,7 @@ def test_adapter_resume_requires_metadata_and_nonempty_state():
         "keyword": "hey eva",
         "rank": 4,
         "alpha": 8.0,
-        "targets": ("in_proj_weight", "out_proj.weight"),
+        "targets": ("audio_key.weight", "text_query.weight"),
     }
     with pytest.raises(SystemExit, match="required metadata"):
         _validate_adapter_checkpoint({"lora_state_dict": {"x": torch.ones(1)}}, **expected)
@@ -189,7 +209,7 @@ def test_adapter_resume_rejects_conflicting_nested_metadata_and_wrong_kind():
         "keyword": "hey eva",
         "rank": 4,
         "alpha": 8.0,
-        "targets": ("in_proj_weight", "out_proj.weight"),
+        "targets": ("audio_key.weight", "text_query.weight"),
     }
     conflicting = _adapter_payload(
         config={"adapt": {"keyword": "hey eva", "rank": 4, "alpha": 16.0}}
@@ -204,7 +224,7 @@ def test_adapter_resume_rejects_conflicting_nested_metadata_and_wrong_kind():
         )
 
 
-def test_adapter_resume_checks_base_fingerprint_and_requires_legacy_opt_in():
+def test_adapter_resume_requires_exact_base_fingerprint():
     from dma_kws.stage2.adapt import _validate_adapter_checkpoint
 
     expected = {
@@ -212,7 +232,7 @@ def test_adapter_resume_checks_base_fingerprint_and_requires_legacy_opt_in():
         "keyword": "hey eva",
         "rank": 4,
         "alpha": 8.0,
-        "targets": ("in_proj_weight", "out_proj.weight"),
+        "targets": ("audio_key.weight", "text_query.weight"),
         "base_model_sha256": "a" * 64,
     }
     with pytest.raises(SystemExit, match="base_model_sha256"):
@@ -220,14 +240,60 @@ def test_adapter_resume_checks_base_fingerprint_and_requires_legacy_opt_in():
             _adapter_payload(base_model_sha256="b" * 64),
             **expected,
         )
-    with pytest.raises(SystemExit, match="allow_legacy_adapter"):
+    with pytest.raises(SystemExit, match="base_model_sha256"):
         _validate_adapter_checkpoint(_adapter_payload(), **expected)
-    with pytest.warns(UserWarning, match="explicitly enabled"):
-        _validate_adapter_checkpoint(
-            _adapter_payload(),
-            **expected,
-            allow_legacy_adapter=True,
-        )
+
+
+def test_full_lora_checkpoint_restore_validates_embedded_base(monkeypatch):
+    from dma_kws.stage2.adapt import Stage2LoraAdaptationModule
+    from dma_kws.stage2.module import Stage2LightningModule
+    from dma_kws.stage2.readout import QbyTAlignmentSpec
+    from dma_kws.training.checkpoint_io import (
+        STAGE2_BASE_FINGERPRINT_KEY,
+        fingerprint_stage2_base,
+        stamp_qbyt_readout_version,
+    )
+
+    monkeypatch.setattr(
+        Stage2LightningModule,
+        "on_load_checkpoint",
+        lambda self, checkpoint: None,
+    )
+    module = Stage2LoraAdaptationModule.__new__(Stage2LoraAdaptationModule)
+    nn.Module.__init__(module)
+    module.qbyt_alignment = QbyTAlignmentSpec()
+    module._checkpoint_config = {
+        "adapt": {"keyword": "hey eva", "phase": "tts"}
+    }
+    module._lora_rank = 4
+    module._lora_alpha = 8.0
+    module._lora_targets = ("audio_key.weight", "text_query.weight")
+
+    state = {
+        "encoder.weight": torch.arange(4, dtype=torch.float32),
+        "qbyt.audio_key.parametrizations.weight.original": torch.arange(
+            6, dtype=torch.float32
+        ),
+        "qbyt.audio_key.parametrizations.weight.0.lora_A": torch.ones(1),
+    }
+    fingerprint = fingerprint_stage2_base(state)
+    checkpoint = stamp_qbyt_readout_version(
+        {
+            "checkpoint_kind": "stage2_lora",
+            "keyword": "hey eva",
+            "phase": "tts",
+            "rank": 4,
+            "alpha": 8.0,
+            "lora_targets": list(module._lora_targets),
+            STAGE2_BASE_FINGERPRINT_KEY: fingerprint,
+            "state_dict": state,
+        },
+        alignment=module.qbyt_alignment,
+    )
+
+    module.on_load_checkpoint(checkpoint)
+
+    assert module._base_model_sha256 == fingerprint
 
 
 def test_adapter_resume_is_explicit_except_for_tts_to_real_handoff(tmp_path):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 import pytest
@@ -69,35 +68,6 @@ class FakeBatchVerifier:
         scores = self._scores[: len(feats)]
         self._scores = self._scores[len(feats) :]
         return scores
-
-    def score_clip_feats_detailed(
-        self,
-        feats,
-        keyword_ids_batch,
-        *,
-        include_eps_positions=False,
-        include_seq_positions=False,
-    ):
-        scores = self.score_clip_feats(feats, keyword_ids_batch)
-        records = []
-        for score, keyword_ids in zip(scores, keyword_ids_batch):
-            qbyt_logit = math.log(score / (1.0 - score))
-            completion_logit = math.log(1.0 / 3.0)
-            record = {
-                "qbyt_score": score,
-                "qbyt_logit": qbyt_logit,
-                "completion_score": 0.25,
-                "completion_logit": completion_logit,
-            }
-            if include_eps_positions:
-                record["eps_position_logits"] = [qbyt_logit] * len(keyword_ids)
-            if include_seq_positions:
-                record["seq_position_logits"] = (
-                    [0.5] * (len(keyword_ids) - 1) + [completion_logit]
-                )
-            records.append(record)
-        return records
-
 
 def _build_runner(threshold: float, verifier, monkeypatch) -> Stage2ClipRunner:
     monkeypatch.setattr("dma_kws.inference.stage2_clip.make_g2p", _fake_g2p)
@@ -168,9 +138,6 @@ def test_run_file_windows_counts_and_spans(monkeypatch):
         window_sec=1.0,
         hop_sec=0.5,
         keyword_phonemes=keyword_phonemes,
-        include_score_details=True,
-        include_eps_positions=True,
-        include_seq_positions=True,
     )
 
     assert len(results) == num_windows
@@ -182,9 +149,6 @@ def test_run_file_windows_counts_and_spans(monkeypatch):
         window_sec=1.0,
         hop_sec=0.5,
         keyword_phonemes=keyword_phonemes,
-        include_score_details=True,
-        include_eps_positions=True,
-        include_seq_positions=True,
         batch_size=4,
     )
     assert [result["qbyt_score"] for result in chunked] == [
@@ -209,8 +173,6 @@ def test_run_file_windows_counts_and_spans(monkeypatch):
         [expected_ids] * 4,
         [expected_ids] * 1,
     ]
-    assert len(results[0]["eps_position_logits"]) == len(keyword_phonemes)
-    assert len(results[0]["seq_position_logits"]) == len(keyword_phonemes)
     assert results[4]["detected"] is True  # score 0.5 >= threshold 0.5
     assert results[3]["detected"] is False  # score 0.4 < threshold
 
@@ -275,8 +237,6 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
         def score_prepared_windows(self, prepared, **kwargs):
             captured["score"] = kwargs
             phones = list(prepared["keyword_phonemes"])
-            qbyt_logit = math.log(3.0)
-            completion_logit = 0.0
             return [
                 {
                     "audio": prepared["audio"],
@@ -285,12 +245,6 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
                     "clip_span_sec": {"start_sec": 0.0, "end_sec": 3.0},
                     "window_index": 0,
                     "qbyt_score": 0.75,
-                    "qbyt_logit": qbyt_logit,
-                    "completion_score": 0.5,
-                    "completion_logit": completion_logit,
-                    "eps_position_logits": [qbyt_logit] * len(phones),
-                    "seq_position_logits": [0.25] * (len(phones) - 1)
-                    + [completion_logit],
                     "detected": True,
                     "threshold": 0.5,
                     "skipped": False,
@@ -305,11 +259,18 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
             return runner
 
     provenance = {
-        "qbyt_readout": {"mode": "eps_mean", "temperature": 1.0},
+        "qbyt_alignment": {
+            "topology": "bounded_segmental_v1",
+            "min_phone_duration_frames": 1,
+            "max_phone_duration_frames": 8,
+            "max_inter_phone_gap_frames": 2,
+            "max_keyword_span_frames": 30,
+            "temperature": 0.2,
+            "local_context_kernel": 5,
+        },
         "sequence_objective": {
             "target_mode": "ordered_contiguous_prefix",
             "progress_weight": 0.5,
-            "completion_weight": 0.5,
             "normalization": "sample",
         },
     }
@@ -391,12 +352,8 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
         "keyword_phonemes": run_keyword_phonemes,
         "fbank_windows": "independent",
     }
-    assert captured["score"] == {
-        "include_score_details": True,
-        "include_eps_positions": True,
-        "include_seq_positions": True,
-        "batch_size": 64,
-    }
+    assert captured["score"] == {"batch_size": 64}
+    assert summary["provenance"] == provenance
     assert summary["batch_size"] == 64
     assert summary["amp"] == "off"
     assert summary["fbank_windows"] == "independent"
@@ -406,12 +363,8 @@ def test_eval_musan_writes_rich_json_and_fa_plot_outputs(
         (output_dir / "results.jsonl").read_text(encoding="utf-8").strip()
     )
     assert result["keyword_phonemes"] == expected_phonemes
-    assert result["qbyt_logit"] == pytest.approx(math.log(3.0))
-    assert result["completion_score"] == pytest.approx(0.5)
-    assert len(result["eps_position_logits"]) == len(expected_phonemes)
-    assert len(result["seq_position_scores"]) == len(expected_phonemes)
-    assert result["expected_prefix_length"] is not None
-    assert result["seq_position_targets"] is None
+    assert result["qbyt_score"] == pytest.approx(0.75)
+    assert result["detected"] is True
     assert result["manifest_meta"] == {
         "subset": "speech",
         "start_sec": 0.0,
@@ -597,7 +550,17 @@ def test_merge_musan_summaries_pools_hours_and_false_accepts():
         "hop_sec": 3.0,
         "musan_root": "/musan",
         "stream": {"mode": "test"},
-        "provenance": {"qbyt_readout": {"mode": "eps_mean"}},
+        "provenance": {
+            "qbyt_alignment": {
+                "topology": "bounded_segmental_v1",
+                "min_phone_duration_frames": 1,
+                "max_phone_duration_frames": 8,
+                "max_inter_phone_gap_frames": 2,
+                "max_keyword_span_frames": 30,
+                "temperature": 0.2,
+                "local_context_kernel": 5,
+            }
+        },
         "amp": "off",
         "fbank_windows": "independent",
         "batch_size": 64,

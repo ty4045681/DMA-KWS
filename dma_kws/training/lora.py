@@ -1,4 +1,4 @@
-"""LoRA parametrization for QbyT phoneme matcher attention layers."""
+"""LoRA parametrization for QbyT alignment projection layers."""
 
 from __future__ import annotations
 
@@ -38,24 +38,25 @@ class LoRAParametrization(nn.Module):
         return weight + self.scaling * delta
 
 
-_DEFAULT_LORA_TARGETS = ("in_proj_weight", "out_proj.weight")
-_SUPPORTED_LORA_TARGETS = frozenset(_DEFAULT_LORA_TARGETS)
+_DEFAULT_LORA_TARGETS = ("audio_key.weight", "text_query.weight")
+_SUPPORTED_LORA_TARGETS = frozenset(
+    {
+        "audio_projection.weight",
+        "audio_key.weight",
+        "text_query.weight",
+    }
+)
 
 
 def normalize_lora_targets(targets: Iterable[str] | None) -> tuple[str, ...]:
-    """Normalize aliases and reject empty or misspelled LoRA target lists."""
+    """Normalize and validate QbyT alignment-projection target paths."""
     if targets is None:
         source = _DEFAULT_LORA_TARGETS
     elif isinstance(targets, str):
         source = (targets,)
     else:
         source = tuple(str(target) for target in targets)
-    normalized = tuple(
-        dict.fromkeys(
-            "out_proj.weight" if target == "out_proj" else target
-            for target in source
-        )
-    )
+    normalized = tuple(dict.fromkeys(source))
     if not normalized:
         raise ValueError("At least one LoRA target is required")
     unsupported = sorted(set(normalized) - _SUPPORTED_LORA_TARGETS)
@@ -67,10 +68,18 @@ def normalize_lora_targets(targets: Iterable[str] | None) -> tuple[str, ...]:
     return normalized
 
 
-def _iter_phone_matchor_attn_layers(qbyt: nn.Module) -> Iterable[nn.Module]:
-    phone_matchor = qbyt.phone_matchor
-    for layer in phone_matchor.layers:
-        yield layer.self_attn
+def _resolve_target_module(qbyt: nn.Module, target: str) -> tuple[nn.Module, str]:
+    module_path, parameter_name = target.rsplit(".", 1)
+    module = qbyt.get_submodule(module_path)
+    if not isinstance(module, nn.Linear):
+        raise TypeError(
+            f"LoRA target {target!r} must resolve to nn.Linear, "
+            f"got {type(module).__name__}"
+        )
+    parameter = getattr(module, parameter_name, None)
+    if not isinstance(parameter, nn.Parameter) or parameter.ndim != 2:
+        raise TypeError(f"LoRA target {target!r} must resolve to a rank-2 parameter")
+    return module, parameter_name
 
 
 def inject_qbyt_lora(
@@ -80,40 +89,29 @@ def inject_qbyt_lora(
     alpha: float,
     targets: Iterable[str] | None = None,
 ) -> list[str]:
-    """Freeze QbyT base weights and inject LoRA on matcher self-attention matrices."""
-    target_set = set(normalize_lora_targets(targets))
+    """Freeze QbyT and inject LoRA directly on alignment projection weights."""
+    normalized_targets = normalize_lora_targets(targets)
+    resolved_targets = [
+        (target, *_resolve_target_module(qbyt, target))
+        for target in normalized_targets
+    ]
     qbyt.requires_grad_(False)
     injected: list[str] = []
 
-    for layer_idx, attn in enumerate(_iter_phone_matchor_attn_layers(qbyt)):
-        embed_dim = int(attn.embed_dim)
-        prefix = f"phone_matchor.layers.{layer_idx}.self_attn"
-
-        if "in_proj_weight" in target_set:
-            parametrize.register_parametrization(
-                attn,
-                "in_proj_weight",
-                LoRAParametrization(
-                    embed_dim,
-                    3 * embed_dim,
-                    rank=rank,
-                    alpha=alpha,
-                ),
-            )
-            injected.append(f"{prefix}.in_proj_weight")
-
-        if "out_proj.weight" in target_set:
-            parametrize.register_parametrization(
-                attn.out_proj,
-                "weight",
-                LoRAParametrization(
-                    embed_dim,
-                    embed_dim,
-                    rank=rank,
-                    alpha=alpha,
-                ),
-            )
-            injected.append(f"{prefix}.out_proj.weight")
+    for target, module, parameter_name in resolved_targets:
+        parameter = getattr(module, parameter_name)
+        features_out, features_in = parameter.shape
+        parametrize.register_parametrization(
+            module,
+            parameter_name,
+            LoRAParametrization(
+                int(features_in),
+                int(features_out),
+                rank=rank,
+                alpha=alpha,
+            ),
+        )
+        injected.append(target)
 
     for name, param in qbyt.named_parameters():
         param.requires_grad = ".parametrizations." in name and _is_lora_parameter_name(name)

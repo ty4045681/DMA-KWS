@@ -6,7 +6,6 @@ the QbyT query-by-text model, returning per-candidate detection scores.
 
 from __future__ import annotations
 
-import math
 from contextlib import contextmanager
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -43,11 +42,9 @@ from dma_kws.config import (
 from dma_kws.inference.audio_utils import has_min_fbank_frames
 from dma_kws.nn import (
     build_encoder,
-    encoder_output_frames,
     min_input_frames_for_encoder,
     run_encoder,
 )
-from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage1.candidates import KeywordCandidate
 from dma_kws.stage2.fbank import FbankExtractor
 from dma_kws.stage2.features import waveform_to_fbank
@@ -59,9 +56,7 @@ def _load_model_state(
     load_fn,
     *,
     stream_policy=None,
-    allow_legacy_qbyt_readout: bool = False,
-    expected_qbyt_readout_mode: str | None = None,
-    expected_qbyt_readout_temperature: float | None = None,
+    expected_qbyt_alignment=None,
 ):
     ckpt = load_fn(ckpt_path, map_location="cpu")
     if stream_policy is not None:
@@ -73,9 +68,7 @@ def _load_model_state(
     assert_qbyt_readout_version(
         ckpt,
         source=ckpt_path,
-        allow_legacy=allow_legacy_qbyt_readout,
-        expected_mode=expected_qbyt_readout_mode,
-        expected_temperature=expected_qbyt_readout_temperature,
+        expected_alignment=expected_qbyt_alignment,
     )
     state = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state, strict=True)
@@ -104,8 +97,6 @@ class Stage2Verifier:
                 "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
             ) from exc
 
-        QbyT = load_qbyt_class()
-
         self._torch = torch
         self._demo_cfg = dict(demo_cfg)
         self._device = device
@@ -117,13 +108,10 @@ class Stage2Verifier:
         self._stream_policy = stream_policy
         adapter_cfg = stage2_cfg.get("phoneme_adapter", {}) or {}
         adapter_enabled = bool(adapter_cfg.get("enabled", False))
-        from dma_kws.stage2.readout import resolve_qbyt_readout
+        from dma_kws.stage2.readout import resolve_qbyt_alignment
 
-        qbyt_readout = resolve_qbyt_readout(stage2_cfg)
-        qbyt_readout_mode = qbyt_readout.mode
-        qbyt_readout_temperature = qbyt_readout.temperature
-        self.qbyt_readout_mode = qbyt_readout_mode
-        self.qbyt_readout_temperature = qbyt_readout_temperature
+        qbyt_alignment = resolve_qbyt_alignment(stage2_cfg)
+        self.qbyt_alignment = qbyt_alignment
 
         class Stage2Model(torch.nn.Module):
             def __init__(self):
@@ -145,13 +133,12 @@ class Stage2Verifier:
                 else:
                     self.adapter = None
                     qbyt_input_dim = stage2_encoder_dim
-                self.qbyt = QbyT(
-                    encoder_output_size=qbyt_input_dim,
-                    num_embeds=vocab_size,
-                    embed_dim=int(stage2_cfg.get("qbyt_embed_dim", 128)),
-                    post_num_layers=int(stage2_cfg.get("qbyt_layers", 2)),
-                    readout_mode=qbyt_readout_mode,
-                    readout_temperature=qbyt_readout_temperature,
+                from dma_kws.stage2.model_factory import build_qbyt
+
+                self.qbyt = build_qbyt(
+                    stage2_cfg,
+                    input_dim=qbyt_input_dim,
+                    vocab_size=vocab_size,
                 )
 
             def _encode_and_score(
@@ -160,23 +147,7 @@ class Stage2Verifier:
                 feat_lengths,
                 anchors,
                 anchor_lengths,
-                *,
-                include_readout_details=False,
             ):
-                padded_fbank_frames = int(feats.size(1))
-                projected_encoder_frames = encoder_output_frames(
-                    self.encoder, padded_fbank_frames
-                )
-                qbyt_capacity = int(self.qbyt.pos_enc.pe.size(1))
-                if projected_encoder_frames > qbyt_capacity:
-                    raise ValueError(
-                        "Stage II candidate exceeds QbyT positional capacity: "
-                        f"padded_fbank_frames={padded_fbank_frames}, "
-                        f"projected_encoder_frames={projected_encoder_frames}, "
-                        f"qbyt_capacity={qbyt_capacity}. "
-                        "Check the Stage I locator/window boundaries; automatic "
-                        "truncation is disabled because it could remove the wake word."
-                    )
                 # Inference always runs at the deployment operating point.
                 encoder_out, encoder_mask = run_encoder(
                     self.encoder,
@@ -193,75 +164,11 @@ class Stage2Verifier:
                     speech, _ = self.adapter(
                         encoder_out, encoder_mask, with_log_probs=False
                     )
-                score_fn = (
-                    self.qbyt.forward_with_readout_details
-                    if include_readout_details
-                    else self.qbyt
-                )
-                return score_fn(
+                return self.qbyt(
                     speech,
                     anchors,
                     speech_lengths=encoder_lens,
                     text_lengths=anchor_lengths,
-                )
-
-            def forward_logits(self, feats, feat_lengths, anchors, anchor_lengths):
-                """Return unsquashed utterance/completion logits for analysis."""
-                from dma_kws.stage2.scoring import gather_completion_logits
-
-                logits, seq_logits = self._encode_and_score(
-                    feats,
-                    feat_lengths,
-                    anchors,
-                    anchor_lengths,
-                )
-                completion_logits, completion_valid = gather_completion_logits(
-                    seq_logits,
-                    anchor_lengths,
-                )
-                return logits, completion_logits, completion_valid
-
-            def forward_logits_with_readout_details(
-                self, feats, feat_lengths, anchors, anchor_lengths
-            ):
-                """Return scalar heads plus analysis-only QbyT readout tensors."""
-                (
-                    logits,
-                    completion_logits,
-                    completion_valid,
-                    _seq_logits,
-                    readout_details,
-                ) = self.forward_logits_with_position_details(
-                    feats,
-                    feat_lengths,
-                    anchors,
-                    anchor_lengths,
-                )
-                return logits, completion_logits, completion_valid, readout_details
-
-            def forward_logits_with_position_details(
-                self, feats, feat_lengths, anchors, anchor_lengths
-            ):
-                """Return scalar heads plus both analysis-only position tensors."""
-                from dma_kws.stage2.scoring import gather_completion_logits
-
-                logits, seq_logits, readout_details = self._encode_and_score(
-                    feats,
-                    feat_lengths,
-                    anchors,
-                    anchor_lengths,
-                    include_readout_details=True,
-                )
-                completion_logits, completion_valid = gather_completion_logits(
-                    seq_logits,
-                    anchor_lengths,
-                )
-                return (
-                    logits,
-                    completion_logits,
-                    completion_valid,
-                    seq_logits,
-                    readout_details,
                 )
 
             def forward(self, feats, feat_lengths, anchors, anchor_lengths):
@@ -280,11 +187,8 @@ class Stage2Verifier:
                 stage2_ckpt,
                 torch.load,
                 stream_policy=stream_policy,
-                # Inference must never score a random or semantically stale
-                # readout. The legacy flag is reserved for training warm starts.
-                allow_legacy_qbyt_readout=False,
-                expected_qbyt_readout_mode=qbyt_readout_mode,
-                expected_qbyt_readout_temperature=qbyt_readout_temperature,
+                # Inference must never score a semantically stale alignment.
+                expected_qbyt_alignment=qbyt_alignment,
             )
         except RuntimeError as exc:
             raise SystemExit(
@@ -380,6 +284,10 @@ class Stage2Verifier:
         torch = self._torch
         if not feats:
             return []
+        if len(feats) != len(keyword_ids_batch):
+            raise ValueError("feats and keyword_ids_batch must have the same length")
+        if any(not ids for ids in keyword_ids_batch):
+            raise ValueError("keyword ids must be non-empty")
         from torch.nn.utils.rnn import pad_sequence
 
         padded_feats = pad_sequence(list(feats), batch_first=True, padding_value=0)
@@ -400,209 +308,6 @@ class Stage2Verifier:
                 anchor_lengths.to(self._device),
             )
         return [float(value) for value in scores.reshape(-1).cpu()]
-
-    def score_clip_feats_detailed(
-        self,
-        feats: Sequence,
-        keyword_ids_batch: Sequence[Sequence[int]],
-        *,
-        include_eps_positions: bool = False,
-        include_seq_positions: bool = False,
-    ) -> list[dict[str, Any]]:
-        """Return raw and probability scores for both Stage II heads.
-
-        This analysis-only API deliberately leaves :meth:`score_clip_feats`
-        unchanged, so enabling diagnostics cannot alter deployed decisions.
-        Empty anchors have no completion score and are represented by ``None``.
-        When ``include_eps_positions`` is true, ``eps_position_logits`` contains
-        one raw shared-scorer logit per valid anchor token. It is ``None`` for a
-        ``gru_last`` readout and an empty list for an empty EPS anchor.
-        When ``include_seq_positions`` is true, ``seq_position_logits`` contains
-        the progress/completion head output for every valid anchor token. The
-        final value is required to agree with the separately exported completion
-        scalar. Probability- and target-based diagnostics are derived by the
-        evaluation script rather than mixed into this inference API.
-        """
-
-        torch = self._torch
-        qbyt_readout_mode = getattr(self, "qbyt_readout_mode", "eps_mean")
-        qbyt_readout_temperature = float(
-            getattr(self, "qbyt_readout_temperature", 1.0)
-        )
-        if not feats:
-            return []
-        if len(feats) != len(keyword_ids_batch):
-            raise ValueError("feats and keyword_ids_batch must have the same length")
-
-        from torch.nn.utils.rnn import pad_sequence
-
-        padded_feats = pad_sequence(list(feats), batch_first=True, padding_value=0)
-        feat_lengths = torch.tensor([f.size(0) for f in feats], dtype=torch.long)
-        anchors = pad_sequence(
-            [torch.tensor(list(ids), dtype=torch.long) for ids in keyword_ids_batch],
-            batch_first=True,
-            padding_value=0,
-        )
-        anchor_lengths = torch.tensor(
-            [len(ids) for ids in keyword_ids_batch], dtype=torch.long
-        )
-        with torch.no_grad(), self._inference_amp():
-            model_args = (
-                padded_feats.to(self._device),
-                feat_lengths.to(self._device),
-                anchors.to(self._device),
-                anchor_lengths.to(self._device),
-            )
-            if include_seq_positions:
-                (
-                    utt_logits,
-                    completion_logits,
-                    completion_valid,
-                    seq_logits,
-                    readout_details,
-                ) = self._model.forward_logits_with_position_details(*model_args)
-            elif include_eps_positions:
-                (
-                    utt_logits,
-                    completion_logits,
-                    completion_valid,
-                    readout_details,
-                ) = self._model.forward_logits_with_readout_details(*model_args)
-                seq_logits = None
-            else:
-                utt_logits, completion_logits, completion_valid = (
-                    self._model.forward_logits(*model_args)
-                )
-                seq_logits = None
-                readout_details = None
-            utt_scores = torch.sigmoid(utt_logits)
-            completion_scores = torch.sigmoid(completion_logits)
-
-        utt_logits = utt_logits.reshape(-1).detach().cpu()
-        utt_scores = utt_scores.reshape(-1).detach().cpu()
-        completion_logits = completion_logits.reshape(-1).detach().cpu()
-        completion_scores = completion_scores.reshape(-1).detach().cpu()
-        completion_valid = completion_valid.reshape(-1).detach().cpu()
-        if seq_logits is not None:
-            seq_logits = seq_logits.detach().cpu()
-
-        position_logits = None
-        position_mask = None
-        if readout_details is not None:
-            position_mask = readout_details.position_mask.detach().cpu()
-            if readout_details.position_logits is not None:
-                position_logits = readout_details.position_logits.detach().cpu()
-
-        records = []
-        for index, (
-            utt_logit,
-            utt_score,
-            completion_logit,
-            completion_score,
-            is_valid,
-        ) in enumerate(
-            zip(
-                utt_logits,
-                utt_scores,
-                completion_logits,
-                completion_scores,
-                completion_valid,
-            )
-        ):
-            record = {
-                "qbyt_logit": float(utt_logit),
-                "qbyt_score": float(utt_score),
-                "completion_logit": (
-                    float(completion_logit) if bool(is_valid) else None
-                ),
-                "completion_score": (
-                    float(completion_score) if bool(is_valid) else None
-                ),
-            }
-            if include_seq_positions:
-                expected_length = int(anchor_lengths[index])
-                sample_seq_logits = seq_logits[index, :expected_length]
-                if sample_seq_logits.numel() != expected_length:
-                    raise RuntimeError(
-                        "Sequence-position width does not match the anchor: "
-                        f"sample={index}, logits={sample_seq_logits.numel()}, "
-                        f"anchor={expected_length}"
-                    )
-                if not bool(torch.isfinite(sample_seq_logits).all()):
-                    raise RuntimeError(
-                        f"Sequence position logits contain non-finite values for sample {index}"
-                    )
-                if bool(is_valid) != bool(expected_length):
-                    raise RuntimeError(
-                        "Completion validity disagrees with the anchor length: "
-                        f"sample={index}, valid={bool(is_valid)}, "
-                        f"anchor={expected_length}"
-                    )
-                if bool(is_valid) and not bool(
-                    torch.isclose(
-                        sample_seq_logits[-1],
-                        completion_logit,
-                        rtol=1e-5,
-                        atol=1e-6,
-                    )
-                ):
-                    raise RuntimeError(
-                        "Final sequence-position logit disagrees with completion: "
-                        f"sample={index}, final={float(sample_seq_logits[-1])}, "
-                        f"completion={float(completion_logit)}"
-                    )
-                record["seq_position_logits"] = [
-                    float(value) for value in sample_seq_logits
-                ]
-            if include_eps_positions:
-                if position_logits is None:
-                    record["eps_position_logits"] = None
-                else:
-                    sample_mask = position_mask[index]
-                    sample_logits = position_logits[index][sample_mask]
-                    expected_length = int(anchor_lengths[index])
-                    if sample_logits.numel() != expected_length:
-                        raise RuntimeError(
-                            "EPS position mask length does not match the anchor: "
-                            f"sample={index}, mask={sample_logits.numel()}, "
-                            f"anchor={expected_length}"
-                        )
-                    if not bool(torch.isfinite(sample_logits).all()):
-                        raise RuntimeError(
-                            f"EPS position logits contain non-finite values for sample {index}"
-                        )
-                    if not sample_logits.numel():
-                        expected_logit = torch.zeros_like(utt_logit)
-                    elif qbyt_readout_mode == "eps_mean":
-                        expected_logit = sample_logits.mean()
-                    elif qbyt_readout_mode == "eps_softmin":
-                        values = sample_logits.float()
-                        expected_logit = -qbyt_readout_temperature * (
-                            torch.logsumexp(
-                                -values / qbyt_readout_temperature,
-                                dim=0,
-                            )
-                            - math.log(values.numel())
-                        )
-                    else:
-                        raise RuntimeError(
-                            "EPS position logits were exported for a non-EPS "
-                            f"readout: {qbyt_readout_mode!r}"
-                        )
-                    if not bool(
-                        torch.isclose(expected_logit, utt_logit, rtol=1e-5, atol=1e-6)
-                    ):
-                        raise RuntimeError(
-                            "EPS position-logit aggregation disagrees with the utterance "
-                            f"logit: sample={index}, mode={qbyt_readout_mode}, "
-                            f"expected={float(expected_logit)}, "
-                            f"utterance={float(utt_logit)}"
-                        )
-                    record["eps_position_logits"] = [
-                        float(value) for value in sample_logits
-                    ]
-            records.append(record)
-        return records
 
     def decode_phoneme_feats(self, feats: Sequence) -> list[list[int]]:
         """Greedily decode phoneme ids from full-clip fbank features.

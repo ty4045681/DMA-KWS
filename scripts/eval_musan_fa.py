@@ -191,8 +191,6 @@ def run_eval(cfg: DictConfig) -> dict:
         left_padding_ms=0,
         right_padding_ms=0,
     )
-    sequence_objective = provenance["sequence_objective"]
-
     audio_files = iter_audio_files(musan_root_path)
     if not audio_files:
         raise SystemExit(f"No audio files found under {musan_root}")
@@ -242,9 +240,6 @@ def run_eval(cfg: DictConfig) -> dict:
 
             window_results = runner.score_prepared_windows(
                 prepared,
-                include_score_details=True,
-                include_eps_positions=True,
-                include_seq_positions=True,
                 batch_size=batch_size,
             )
             for window_result in window_results:
@@ -254,8 +249,6 @@ def run_eval(cfg: DictConfig) -> dict:
                     subset,
                     window_result,
                     window_index=int(window_result["window_index"]),
-                    sequence_objective=sequence_objective,
-                    qbyt_readout=provenance["qbyt_readout"],
                 )
                 all_results.append(record)
                 subset_results[subset].append(record)

@@ -427,7 +427,8 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
                         "step": artifact_step,
                         "tokenizer_dict_path": str(dict_path),
                         "vocab_size": vocab_size,
-                    }
+                    },
+                    alignment=model.qbyt_alignment,
                 ),
                 run_context,
             ),

@@ -28,9 +28,7 @@ def _load_model(config: dict, checkpoint_path: Path, vocab_size: int) -> Stage2L
     assert_qbyt_readout_version(
         checkpoint,
         source=checkpoint_path,
-        allow_legacy=False,
-        expected_mode=model.qbyt_readout_mode,
-        expected_temperature=model.qbyt_readout_temperature,
+        expected_alignment=model.qbyt_alignment,
     )
 
     if checkpoint_path.suffix == ".pt":
@@ -40,14 +38,13 @@ def _load_model(config: dict, checkpoint_path: Path, vocab_size: int) -> Stage2L
 
     missing, unexpected = model.load_state_dict(state, strict=False)
     assert_adapter_weights_loaded(model, missing)
-    readout_roots = ("qbyt.gru.", "qbyt.fc.", "qbyt.final_pos_fc.")
-    readout_mismatch = [
-        key for key in (*missing, *unexpected) if key.startswith(readout_roots)
+    qbyt_mismatch = [
+        key for key in (*missing, *unexpected) if key.startswith("qbyt.")
     ]
-    if readout_mismatch:
+    if qbyt_mismatch:
         raise SystemExit(
-            f"Checkpoint {checkpoint_path} does not carry the configured "
-            f"{model.qbyt_readout_mode!r} QbyT readout weights: {readout_mismatch}"
+            f"Checkpoint {checkpoint_path} does not carry the complete QbyT v5 "
+            f"weights: {qbyt_mismatch}"
         )
     if missing:
         print(f"Warning: missing keys when loading checkpoint: {len(missing)}")

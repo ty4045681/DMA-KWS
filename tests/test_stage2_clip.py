@@ -841,35 +841,6 @@ class FakeBatchVerifier:
         self._scores = self._scores[len(feats):]
         return scores
 
-    def score_clip_feats_detailed(
-        self,
-        feats,
-        keyword_ids_batch,
-        *,
-        include_eps_positions=False,
-        include_seq_positions=False,
-    ):
-        scores = self.score_clip_feats(feats, keyword_ids_batch)
-        records = []
-        for score, keyword_ids in zip(scores, keyword_ids_batch):
-            qbyt_logit = math.log(score / (1.0 - score))
-            record = {
-                "qbyt_score": score,
-                "qbyt_logit": qbyt_logit,
-                "completion_score": 0.25,
-                "completion_logit": math.log(0.25 / 0.75),
-            }
-            if include_eps_positions:
-                record["eps_position_logits"] = [qbyt_logit] * len(keyword_ids)
-            if include_seq_positions:
-                record["seq_position_logits"] = (
-                    [0.5] * (len(keyword_ids) - 1) + [record["completion_logit"]]
-                    if keyword_ids
-                    else []
-                )
-            records.append(record)
-        return records
-
 
 def test_clip_runner_run_batch(monkeypatch):
     torch = pytest.importorskip("torch")
@@ -903,11 +874,7 @@ def test_clip_runner_run_batch(monkeypatch):
 
     rows = [
         {"audio_path": "/tmp/a.wav", "keyword": "hello"},
-        {
-            "audio_path": "/tmp/short.wav",
-            "keyword": "hello",
-            "text_variant": "hey eva",
-        },
+        {"audio_path": "/tmp/short.wav", "keyword": "hello"},
         {"audio_path": "/tmp/b.wav", "keyword": "hello"},
     ]
     observed_indices = []
@@ -925,16 +892,9 @@ def test_clip_runner_run_batch(monkeypatch):
     assert results[0]["detected"] is True
     assert results[1]["qbyt_score"] == 0.0
     assert results[1]["detected"] is False
-    assert results[1]["text_variant_phonemes"] == [
-        "HH",
-        "EY1",
-        "IY1",
-        "V",
-        "AH0",
-    ]
     assert results[2]["qbyt_score"] == 0.2
     assert results[2]["detected"] is False
-    assert g2p_calls == ["hello", "hey eva"]
+    assert g2p_calls == ["hello"]
     assert verifier.batches == [2]
     assert observed_indices == [0, 1, 2]
     assert set(results[0]) == {
@@ -1002,7 +962,6 @@ def test_clip_runner_run_batch_uses_per_row_keyword_phoneme_overrides(monkeypatc
     g2p_calls: list[str] = []
     ee_vah = ["HH", "EY1", "IY1", "V", "AH0"]
     ay_vah = ["HH", "EY1", "EY1", "V", "AH0"]
-    hey_eve = ["HH", "EY1", "IY1", "V"]
 
     def fake_text_to_phonemes(_g2p, text):
         g2p_calls.append(text)
@@ -1026,8 +985,6 @@ def test_clip_runner_run_batch_uses_per_row_keyword_phoneme_overrides(monkeypatc
             "audio_path": "/tmp/ee-vah.wav",
             "keyword": "hey eva",
             "keyword_phonemes": "HH EY1 IY1 V AH0",
-            "text_variant": "hey eva",
-            "text_variant_phonemes": "HH EY1 IY1 V",
         },
         {
             "audio_path": "/tmp/ay-vah.wav",
@@ -1044,9 +1001,6 @@ def test_clip_runner_run_batch_uses_per_row_keyword_phoneme_overrides(monkeypatc
         ay_vah,
         ay_vah,
     ]
-    assert results[0]["text_variant_phonemes"] == hey_eve
-    assert "text_variant_phonemes" not in results[1]
-    assert "text_variant_phonemes" not in results[2]
     assert g2p_calls == ["hey eva"]
     assert verifier.keyword_ids_batches == [
         [
@@ -1078,72 +1032,6 @@ def test_clip_runner_rejects_invalid_keyword_phoneme_override(monkeypatch, overr
                 }
             ]
         )
-
-
-def test_clip_runner_run_batch_can_include_score_details(monkeypatch):
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("torchaudio")
-
-    def loader(path: str, *, sample_rate: int):
-        if path.endswith("short.wav"):
-            return torch.zeros(1, 10), sample_rate
-        return torch.zeros(1, sample_rate * 2), sample_rate
-
-    monkeypatch.setattr("dma_kws.inference.stage2_clip.load_audio", loader)
-    monkeypatch.setattr("dma_kws.inference.stage2_clip.make_g2p", _fake_g2p)
-    monkeypatch.setattr(
-        "dma_kws.inference.stage2_clip.text_to_phonemes",
-        lambda _g2p, text: _fake_phonemes(text),
-    )
-    verifier = FakeBatchVerifier(scores=[0.9])
-    tokenizer = load_char_tokenizer("data/dict/lang_char.txt", split_with_space=" ")
-    runner = Stage2ClipRunner(
-        verifier=verifier,
-        tokenizer=tokenizer,
-        demo_cfg={"qbyt_threshold": 0.5},
-        sample_rate=16000,
-    )
-
-    results = runner.run_batch(
-        [
-            {"audio_path": "/tmp/a.wav", "keyword": "hello"},
-            {"audio_path": "/tmp/short.wav", "keyword": "hello"},
-        ],
-        batch_size=8,
-        num_workers=0,
-        include_score_details=True,
-        include_eps_positions=True,
-        include_seq_positions=True,
-    )
-
-    assert results[0]["qbyt_logit"] == pytest.approx(math.log(9.0))
-    assert results[0]["completion_score"] == pytest.approx(0.25)
-    assert results[0]["completion_logit"] == pytest.approx(
-        math.log(1.0 / 3.0)
-    )
-    assert results[0]["keyword_phonemes"] == ["HELLO"]
-    assert results[0]["eps_position_logits"] == pytest.approx([math.log(9.0)])
-    assert results[0]["seq_position_logits"] == pytest.approx(
-        [math.log(1.0 / 3.0)]
-    )
-    assert results[1]["qbyt_logit"] is None
-    assert results[1]["completion_score"] is None
-    assert results[1]["completion_logit"] is None
-    assert results[1]["eps_position_logits"] is None
-    assert results[1]["seq_position_logits"] is None
-
-
-def test_clip_runner_eps_positions_require_score_details(monkeypatch):
-    runner = _build_runner(
-        threshold=0.5,
-        verifier=FakeVerifier(scores=[0.7]),
-        monkeypatch=monkeypatch,
-    )
-
-    with pytest.raises(ValueError, match="requires include_score_details"):
-        runner.run_batch([], include_eps_positions=True)
-    with pytest.raises(ValueError, match="requires include_score_details"):
-        runner.run_batch([], include_seq_positions=True)
 
 
 def test_clip_runner_result_record_shape(monkeypatch):

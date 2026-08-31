@@ -17,7 +17,7 @@
 #   -h, --help              Show this help
 #
 # Remaining arguments are forwarded to eval_two_stage_musan_fa.py, e.g.
-#   +locator=sherpa_zipformer_kws locator.encoder=... stage2.qbyt_readout.mode=eps_softmin
+#   +locator=sherpa_zipformer_kws locator.encoder=... stage2.qbyt_alignment.max_keyword_span_frames=30
 #
 # FA/hour = two-stage wake-ups / total audio hours. Multiple Stage I spans that
 # pass QbyT in one file all count. This is not comparable to the official
@@ -39,7 +39,7 @@
 #     locator.encoder=/path/encoder.onnx \
 #     locator.decoder=/path/decoder.onnx \
 #     locator.joiner=/path/joiner.onnx \
-#     stage2.qbyt_readout.mode=eps_softmin
+#     stage2.qbyt_alignment.max_keyword_span_frames=30
 #
 # Output layout:
 #   With --pt PT:OUT and one keyword, output lands in OUT.

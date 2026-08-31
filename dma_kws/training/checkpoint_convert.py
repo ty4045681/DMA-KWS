@@ -25,6 +25,7 @@ from dma_kws.pathing import resolve_dict_path
 from dma_kws.stage2.adapt_paths import slugify
 from dma_kws.tokenizer import validate_lang_char_dict
 from dma_kws.training.checkpoint_io import (
+    QBYT_ALIGNMENT_SPEC_KEY,
     QBYT_READOUT_VERSION,
     QBYT_READOUT_VERSION_KEY,
     STAGE2_BASE_FINGERPRINT_KEY,
@@ -39,8 +40,7 @@ _PARAMETRIZED_ORIGINAL_RE = re.compile(
     r"^(?P<module>.+)\.parametrizations\.(?P<parameter>[^.]+)\.original$"
 )
 _PROJECT_LORA_TARGET_RE = re.compile(
-    r"^qbyt\.phone_matchor\.layers\.\d+\.self_attn\."
-    r"(?:in_proj_weight|out_proj\.weight)$"
+    r"^qbyt\.(?:audio_projection|audio_key|text_query)\.weight$"
 )
 _LORA_PARAMETER_SUFFIXES = (".lora_A", ".lora_B")
 
@@ -182,7 +182,7 @@ def _resolved_config(
             warnings.warn(
                 "The checkpoint already embeds its resolved training config, so the "
                 "supplied config fallback (--config/--experiment/--adapt-params) is "
-                "ignored. Config arguments are only needed for historical checkpoints "
+                "ignored. Config arguments are only needed for early v5 checkpoints "
                 "without embedded config.",
                 UserWarning,
                 stacklevel=3,
@@ -194,8 +194,8 @@ def _resolved_config(
         return copy.deepcopy(supplied_config)
     raise CheckpointConversionError(
         "Checkpoint does not embed its resolved training config. Supply the exact "
-        "training config with --experiment/--override or --config. Historical "
-        "checkpoints cannot reconstruct this metadata from their weights."
+        "v5 training config with --experiment/--override or --config. Pre-v5 "
+        "QbyT checkpoints are intentionally not convertible."
     )
 
 
@@ -203,58 +203,25 @@ def _require_compatible_readout(
     checkpoint: Mapping[str, Any],
     config: Mapping[str, Any],
 ) -> int:
-    """Return the saved version when this build can reproduce its readout.
+    """Require exact v5 alignment metadata; older score heads are not convertible."""
 
-    Version 2 GRU-last and version 3 GRU-last/EPS-mean remain reproducible, so
-    historical models can be evaluated and converted safely. Preserve their
-    original version in the output; relabeling old weights as version 4 would
-    falsify their provenance.
-    """
+    from dma_kws.stage2.readout import resolve_qbyt_alignment
+    from dma_kws.training.checkpoint_io import assert_qbyt_readout_version
 
-    from dma_kws.stage2.readout import (
-        EPS_MEAN_READOUT,
-        EPS_SOFTMIN_READOUT,
-        GRU_LAST_READOUT,
-        resolve_qbyt_readout,
-    )
-
-    raw_saved = checkpoint.get(QBYT_READOUT_VERSION_KEY)
-    if raw_saved is None:
-        raise CheckpointConversionError(
-            f"Checkpoint QbyT readout version is missing; this build requires "
-            f"{QBYT_READOUT_VERSION}. Refusing to stamp current metadata onto weights "
-            "trained against a different or unknown readout."
-        )
-    saved = _equal_int_metadata(
-        "QbyT readout version",
-        [(f"checkpoint.{QBYT_READOUT_VERSION_KEY}", raw_saved)],
-    )
     stage2 = config.get("stage2")
     if not isinstance(stage2, Mapping):
         raise CheckpointConversionError("Resolved config has no stage2 mapping")
-    readout = resolve_qbyt_readout(stage2)
-    if saved == QBYT_READOUT_VERSION:
-        if readout.mode == EPS_SOFTMIN_READOUT:
-            raw = stage2.get("qbyt_readout")
-            if not isinstance(raw, Mapping) or "temperature" not in raw:
-                raise CheckpointConversionError(
-                    "EPS soft-min checkpoints must explicitly record "
-                    "stage2.qbyt_readout.temperature"
-                )
-        return saved
-    if saved == 3 and readout.mode in (GRU_LAST_READOUT, EPS_MEAN_READOUT):
-        return saved
-    if saved == 2 and readout.mode == GRU_LAST_READOUT:
-        return saved
-    if saved != QBYT_READOUT_VERSION:
-        raise CheckpointConversionError(
-            f"Checkpoint QbyT readout version is {saved!r}, while its resolved mode is "
-            f"{readout.mode!r}; this build supports version {QBYT_READOUT_VERSION}, "
-            "version 3 only with modes 'gru_last'/'eps_mean', plus version 2 only "
-            "with mode 'gru_last'. Refusing to stamp incompatible metadata onto weights "
-            "trained against a different or unknown readout."
+    try:
+        assert_qbyt_readout_version(
+            checkpoint,
+            source="checkpoint conversion input",
+            expected_alignment=resolve_qbyt_alignment(stage2),
         )
-    return saved
+    except (SystemExit, ValueError) as exc:
+        raise CheckpointConversionError(
+            f"Checkpoint is not a complete QbyT v5 bounded-segmental model: {exc}"
+        ) from exc
+    return QBYT_READOUT_VERSION
 
 
 def _equal_int_metadata(
@@ -457,18 +424,12 @@ def _validate_deployable_model_state(
             ) from exc
 
     try:
-        from dma_kws.pathing import load_qbyt_class
-        from dma_kws.stage2.readout import resolve_qbyt_readout
+        from dma_kws.stage2.model_factory import build_qbyt
 
-        QbyT = load_qbyt_class()
-        readout = resolve_qbyt_readout(stage2)
-        qbyt = QbyT(
-            encoder_output_size=qbyt_input_dim,
-            num_embeds=vocab_size,
-            embed_dim=int(stage2.get("qbyt_embed_dim", 128)),
-            post_num_layers=int(stage2.get("qbyt_layers", 2)),
-            readout_mode=readout.mode,
-            readout_temperature=readout.temperature,
+        qbyt = build_qbyt(
+            stage2,
+            input_dim=qbyt_input_dim,
+            vocab_size=vocab_size,
         )
         qbyt.load_state_dict(_submodule_state(state, "qbyt"), strict=True)
     except (ImportError, RuntimeError, SystemExit, TypeError, ValueError) as exc:
@@ -503,6 +464,9 @@ def _base_model_metadata(
         "tokenizer_dict_path": tokenizer_dict_path,
         "vocab_size": vocab_size,
         QBYT_READOUT_VERSION_KEY: _require_compatible_readout(checkpoint, config),
+        QBYT_ALIGNMENT_SPEC_KEY: copy.deepcopy(
+            checkpoint.get(QBYT_ALIGNMENT_SPEC_KEY)
+        ),
     }
 
 
@@ -585,7 +549,8 @@ def _lora_groups(
         target_key = f"{match.group('module')}.{match.group('parameter')}"
         if _PROJECT_LORA_TARGET_RE.fullmatch(target_key) is None:
             raise CheckpointConversionError(
-                f"Unsupported parametrization outside QbyT matcher attention: {target_key}"
+                "Unsupported parametrization outside the QbyT v5 projection set "
+                f"(audio_projection/audio_key/text_query weights): {target_key}"
             )
         groups.append((target_key, original_key, a_key, b_key))
 
@@ -699,14 +664,16 @@ def _lora_hyperparameters(
 
     inferred_targets: set[str] = set()
     for target_key, *_ in groups:
-        if target_key.endswith(".in_proj_weight"):
-            inferred_targets.add("in_proj_weight")
-        elif target_key.endswith(".out_proj.weight"):
-            inferred_targets.add("out_proj.weight")
-        else:
+        target = target_key.removeprefix("qbyt.")
+        if target not in {
+            "audio_projection.weight",
+            "audio_key.weight",
+            "text_query.weight",
+        }:
             raise CheckpointConversionError(
                 f"Unsupported LoRA target in checkpoint: {target_key}"
             )
+        inferred_targets.add(target)
 
     for source, configured_targets in (
         ("checkpoint.lora_targets", checkpoint.get("lora_targets")),
@@ -723,10 +690,6 @@ def _lora_hyperparameters(
                 raise CheckpointConversionError(
                     "LoRA targets metadata must be a sequence of target names"
                 ) from exc
-        configured = {
-            "out_proj.weight" if target == "out_proj" else target
-            for target in configured
-        }
         if configured != inferred_targets:
             raise CheckpointConversionError(
                 f"LoRA targets disagree: {source}={sorted(configured)} "
@@ -855,6 +818,7 @@ def convert_checkpoint(
     _validate_checkpoint_kind_metadata(checkpoint, kind)
     config = _resolved_config(checkpoint, fallback_config)
     readout_version = _require_compatible_readout(checkpoint, config)
+    alignment_spec = copy.deepcopy(checkpoint[QBYT_ALIGNMENT_SPEC_KEY])
 
     if kind == "stage2":
         if lora_output == "adapter":
@@ -971,6 +935,7 @@ def convert_checkpoint(
             "lora_targets": targets,
             STAGE2_BASE_FINGERPRINT_KEY: base_model_sha256,
             QBYT_READOUT_VERSION_KEY: readout_version,
+            QBYT_ALIGNMENT_SPEC_KEY: alignment_spec,
         }
         outputs.append(
             _write_payload(

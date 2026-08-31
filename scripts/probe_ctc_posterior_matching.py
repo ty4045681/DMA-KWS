@@ -63,7 +63,7 @@ def main(cfg: DictConfig) -> None:
     from dma_kws.nn import run_encoder
     from dma_kws.phoneme_adapter.module import ctc_min_input_lengths
     from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
-    from dma_kws.stage2.readout import assert_qbyt_readout_state_loaded
+    from dma_kws.stage2.readout import assert_qbyt_alignment_state_loaded
     from dma_kws.training.checkpoint_io import assert_qbyt_readout_version, extract_state_dict
 
     config = resolved_config(cfg)
@@ -97,9 +97,7 @@ def main(cfg: DictConfig) -> None:
     assert_qbyt_readout_version(
         checkpoint,
         source=checkpoint_path,
-        allow_legacy=False,
-        expected_mode=model.qbyt_readout_mode,
-        expected_temperature=model.qbyt_readout_temperature,
+        expected_alignment=model.qbyt_alignment,
     )
     state = (
         extract_state_dict(checkpoint)
@@ -108,11 +106,11 @@ def main(cfg: DictConfig) -> None:
     )
     missing, unexpected = model.load_state_dict(state, strict=False)
     assert_adapter_weights_loaded(model, missing)
-    assert_qbyt_readout_state_loaded(
+    assert_qbyt_alignment_state_loaded(
         missing,
         unexpected,
         source=checkpoint_path,
-        expected_mode=model.qbyt_readout_mode,
+        expected_topology=model.qbyt_alignment.topology,
     )
     if missing:
         print(f"Warning: {len(missing)} missing keys when loading checkpoint")

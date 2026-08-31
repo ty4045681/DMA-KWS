@@ -128,7 +128,6 @@ def run_eval(cfg: DictConfig) -> dict:
         left_padding_ms=0,
         right_padding_ms=0,
     )
-    sequence_objective = provenance["sequence_objective"]
     locator_type = _locator_type(config)
 
     audio_files = iter_audio_files(musan_root_path)
@@ -188,8 +187,6 @@ def run_eval(cfg: DictConfig) -> dict:
                     scored,
                     candidate_index=candidate_index,
                     threshold=threshold,
-                    sequence_objective=sequence_objective,
-                    qbyt_readout=provenance["qbyt_readout"],
                 )
                 all_results.append(record)
                 subset_results[subset].append(record)

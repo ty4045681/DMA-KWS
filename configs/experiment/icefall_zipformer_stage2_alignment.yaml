@@ -1,0 +1,22 @@
+# @package _global_
+# Frozen Zipformer Stage II with the monotonic QbyT alignment scorer.
+#
+# Usage:
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_alignment \
+#     stage2.freeze_encoder=true
+
+defaults:
+  - icefall_zipformer_stage2
+  - _self_
+
+training:
+  recipe: icefall-zipformer-frozen-alignment
+
+stage2:
+  # Alignment topology is defined once in configs/stage2/default.yaml.
+  phoneme_adapter:
+    enabled: false
+    ctc_weight: 0.0
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-alignment
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-alignment
+  run_name: icefall-zipformer-frozen-alignment

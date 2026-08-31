@@ -3,11 +3,8 @@
 
 Manifest rows may provide ``keyword_phonemes`` as a space-separated ARPAbet
 string (or a string array in JSONL) to override keyword G2P for that row. Rows
-without the field retain automatic G2P. ``text_variant_phonemes`` supports the
-same override for the query reference; otherwise ``text_variant`` is converted
-automatically. When a query reference is available, the JSONL also records
-position-level sequence targets and raw per-sample diagnostic losses using the
-sequence objective saved in the checkpoint.
+without the field retain automatic G2P. Every JSONL row records the single
+deployed bounded-alignment QbyT score.
 
 Each clip receives 160 ms of zero-valued waveform context on both sides by
 default. Override with ``+prep.left_padding_ms=...`` and
@@ -194,8 +191,6 @@ def run_eval(cfg: DictConfig) -> dict:
         left_padding_ms=left_padding_ms,
         right_padding_ms=right_padding_ms,
     )
-    sequence_objective = provenance["sequence_objective"]
-
     runner_results = runner.run_batch(
         rows,
         batch_size=batch_size,
@@ -206,9 +201,6 @@ def run_eval(cfg: DictConfig) -> dict:
             waveform_augmentation if waveform_augmentation.enabled else None
         ),
         waveform_observer=audio_exporter if audio_exporter.enabled else None,
-        include_score_details=True,
-        include_eps_positions=True,
-        include_seq_positions=True,
     )
     try:
         audio_export_summary = audio_exporter.finalize()
@@ -216,12 +208,7 @@ def run_eval(cfg: DictConfig) -> dict:
         raise SystemExit(f"Failed to finalize transformed WAV exports: {exc}") from exc
     results = []
     for index, (row, runner_result) in enumerate(zip(rows, runner_results)):
-        record = _result_record(
-            row,
-            runner_result,
-            sequence_objective=sequence_objective,
-            qbyt_readout=provenance["qbyt_readout"],
-        )
+        record = _result_record(row, runner_result)
         if waveform_augmentation.enabled:
             record.update(waveform_augmentation.recipe_metadata(index))
         exported_audio_path = audio_exporter.result_path(index)
@@ -253,13 +240,9 @@ def run_eval(cfg: DictConfig) -> dict:
     scored_results = [record for record in results if not record.get("skipped", False)]
     deployment_threshold = float(runner._demo_cfg.get("qbyt_threshold", 0.5))
     validation_cfg = (config.get("stage2", {}) or {}).get("validation", {}) or {}
-    completion_threshold = float(
-        validation_cfg.get("seq_diagnostic_threshold", 0.5)
-    )
     ece_num_bins = int(validation_cfg.get("ece_num_bins", 15))
     summary["score_diagnostic_config"] = {
-        "utterance_threshold": deployment_threshold,
-        "completion_threshold": completion_threshold,
+        "threshold": deployment_threshold,
         "ece_num_bins": ece_num_bins,
     }
     labeled_summary = summarize_labeled_results(
@@ -268,20 +251,12 @@ def run_eval(cfg: DictConfig) -> dict:
     )
     if labeled_summary:
         summary["metrics"] = labeled_summary
-        summary["score_heads"] = {
-            "utterance": _score_head_diagnostics(
-                results,
-                score_field="qbyt_score",
-                threshold=deployment_threshold,
-                ece_num_bins=ece_num_bins,
-            ),
-            "completion": _score_head_diagnostics(
-                results,
-                score_field="completion_score",
-                threshold=completion_threshold,
-                ece_num_bins=ece_num_bins,
-            ),
-        }
+        summary["score_diagnostics"] = _score_head_diagnostics(
+            results,
+            score_field="qbyt_score",
+            threshold=deployment_threshold,
+            ece_num_bins=ece_num_bins,
+        )
         if bool(prep.get("plot_curves", True)):
             summary["plots"] = _write_detection_plots(
                 results,

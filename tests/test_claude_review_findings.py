@@ -10,30 +10,28 @@ from dma_kws.inference.stage2_verifier import _load_model_state as load_model_st
 from scripts import prepare_stage1_librispeech as prepare_stage1
 
 
-def test_qbyt_forward_accepts_lengths_and_masks_padded_frames():
+def test_qbyt_forward_routes_lengths_through_structural_alignment():
     source = Path("qbyt/model.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     qbyt_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "QbyT")
     forward = next(node for node in qbyt_class.body if isinstance(node, ast.FunctionDef) and node.name == "forward")
-    implementation = next(
-        node
-        for node in qbyt_class.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_forward_impl"
-    )
     arg_names = [arg.arg for arg in forward.args.args]
 
     assert "speech_lengths" in arg_names
     assert any(
         isinstance(node, ast.Call)
-        and any(keyword.arg == "src_key_padding_mask" for keyword in node.keywords)
-        for node in ast.walk(implementation)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "aligner"
+        and len(node.args) == 3
+        for node in ast.walk(forward)
     )
     assert any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "gather"
-        for node in ast.walk(implementation)
+        for node in ast.walk(forward)
     )
+    assert "MultiheadAttention" not in source
 
 
 def test_demo_load_model_state_requires_exact_checkpoint_keys():

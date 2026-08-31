@@ -19,13 +19,21 @@ def _score_provenance(
     checkpoint_sha256: str = "a" * 64,
 ) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "checkpoint": {
             "path": checkpoint_path,
             "size_bytes": 123,
             "sha256": checkpoint_sha256,
         },
-        "qbyt_readout_mode": "gru_last",
+        "qbyt_alignment": {
+            "topology": "bounded_segmental_v1",
+            "min_phone_duration_frames": 1,
+            "max_phone_duration_frames": 8,
+            "max_inter_phone_gap_frames": 2,
+            "max_keyword_span_frames": 30,
+            "temperature": 0.2,
+            "local_context_kernel": 5,
+        },
         "stream": "backend=zipformer chunking=off",
         "audio_padding_ms": {"left": 160, "right": 160},
         "fbank": {"num_mel_bins": 80, "dither": 0.0},
@@ -37,8 +45,7 @@ def _score_provenance(
         },
         "sequence_objective": {
             "target_mode": "ordered_contiguous_prefix",
-            "progress_weight": 0.5,
-            "completion_weight": 0.5,
+            "progress_weight": 0.3,
             "normalization": "sample",
         },
     }
@@ -91,24 +98,29 @@ def test_comparable_results_reject_content_or_score_semantics_mismatch(tmp_path)
     different_fbank["fbank"]["dither"] = 1.0
     different_tokenizer = deepcopy(baseline)
     different_tokenizer["tokenizer"]["sha256"] = "d" * 64
+    different_alignment = deepcopy(baseline)
+    different_alignment["qbyt_alignment"]["max_inter_phone_gap_frames"] = 1
 
     first = _results_with_summary(tmp_path, "first", baseline)
     second = _results_with_summary(tmp_path, "second", different_hash)
     third = _results_with_summary(tmp_path, "third", different_fbank)
     fourth = _results_with_summary(tmp_path, "fourth", different_tokenizer)
+    fifth = _results_with_summary(tmp_path, "fifth", different_alignment)
 
-    with pytest.raises(ValueError, match="different checkpoint/readout"):
+    with pytest.raises(ValueError, match="Cannot mix hard-negative scores"):
         _validate_comparable_results([first, second])
-    with pytest.raises(ValueError, match="different checkpoint/readout"):
+    with pytest.raises(ValueError, match="Cannot mix hard-negative scores"):
         _validate_comparable_results([first, third])
-    with pytest.raises(ValueError, match="different checkpoint/readout"):
+    with pytest.raises(ValueError, match="Cannot mix hard-negative scores"):
         _validate_comparable_results([first, fourth])
+    with pytest.raises(ValueError, match="Cannot mix hard-negative scores"):
+        _validate_comparable_results([first, fifth])
 
 
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda value: value.update(schema_version=2), "unsupported score provenance"),
+        (lambda value: value.update(schema_version=3), "unsupported score provenance"),
         (lambda value: value.pop("schema_version"), "missing fields"),
         (lambda value: value["checkpoint"].pop("sha256"), "checkpoint.*missing"),
     ],

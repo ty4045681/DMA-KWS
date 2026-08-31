@@ -24,6 +24,18 @@ from scripts.eval_two_stage_kws import _result_record as two_stage_result_record
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
+def _qbyt_alignment() -> dict:
+    return {
+        "topology": "bounded_segmental_v1",
+        "min_phone_duration_frames": 1,
+        "max_phone_duration_frames": 8,
+        "max_inter_phone_gap_frames": 2,
+        "max_keyword_span_frames": 30,
+        "temperature": 0.2,
+        "local_context_kernel": 5,
+    }
+
+
 def test_stage2_clip_audio_padding_defaults_to_160ms_per_side():
     assert _resolve_audio_padding_ms({}) == (160, 160)
 
@@ -351,10 +363,10 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
         {
             "config": {
                 "stage2": {
+                    "qbyt_alignment": _qbyt_alignment(),
                     "sequence_loss": {
                         "target_mode": "ordered_contiguous_prefix",
                         "progress_weight": 0.5,
-                        "completion_weight": 0.5,
                         "normalization": "sample",
                     }
                 }
@@ -390,13 +402,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
             return [
                 {
                     "qbyt_score": 0.75,
-                    "qbyt_logit": 1.0986122886681098,
-                    "completion_logit": 0.0,
-                    "completion_score": 0.5,
                     "keyword_phonemes": ["HH"],
-                    "text_variant_phonemes": ["HH", "AH0", "L", "OW1"],
-                    "eps_position_logits": [1.0986122886681098],
-                    "seq_position_logits": [0.0],
                     "detected": True,
                     "threshold": 0.5,
                     "skipped": False,
@@ -418,14 +424,14 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
             "paths": {},
             "stage1": {},
             "stage2": {
-                "qbyt_readout": {"mode": "eps_mean"},
+                "qbyt_alignment": _qbyt_alignment(),
                 "sequence_loss": {
                     "target_mode": "ordered_contiguous_prefix",
-                    "completion_weight": 0.5,
+                    "progress_weight": 0.5,
+                    "normalization": "sample",
                 },
                 "validation": {
                     "ece_num_bins": 9,
-                    "seq_diagnostic_threshold": 0.4,
                 },
             },
             "demo": {},
@@ -472,9 +478,6 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert captured["kwargs"]["left_padding_ms"] == 160
     assert captured["kwargs"]["right_padding_ms"] == 160
     assert captured["kwargs"]["waveform_transform"] is None
-    assert captured["kwargs"]["include_score_details"] is True
-    assert captured["kwargs"]["include_eps_positions"] is True
-    assert captured["kwargs"]["include_seq_positions"] is True
     assert captured["plot_options"]["min_recall"] == pytest.approx(0.8)
     assert captured["plot_options"]["max_fpr"] is None
     assert summary["audio_padding_ms"] == {"left": 160, "right": 160}
@@ -489,13 +492,9 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert summary["provenance"]["sequence_objective"]["target_mode"] == (
         "ordered_contiguous_prefix"
     )
-    assert summary["provenance"]["qbyt_readout"] == {
-        "mode": "eps_mean",
-        "temperature": 1.0,
-    }
+    assert summary["provenance"]["qbyt_alignment"] == _qbyt_alignment()
     assert summary["score_diagnostic_config"] == {
-        "utterance_threshold": 0.5,
-        "completion_threshold": 0.4,
+        "threshold": 0.5,
         "ece_num_bins": 9,
     }
     assert summary["plots"]["status"] == "skipped"
@@ -509,25 +508,9 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
         (tmp_path / "results.jsonl").read_text(encoding="utf-8").strip()
     )
     assert saved_result["keyword_phonemes"] == ["HH"]
-    assert saved_result["text_variant_phonemes"] == ["HH", "AH0", "L", "OW1"]
     assert saved_result["manifest_meta"] == {"text_variant": "hullo"}
-    assert saved_result["eps_position_logits"] == pytest.approx(
-        [1.0986122886681098]
-    )
-    assert saved_result["qbyt_readout_mode"] == "eps_mean"
-    assert saved_result["qbyt_readout_temperature"] == 1.0
+    assert saved_result["qbyt_score"] == pytest.approx(0.75)
     assert saved_result["augmented_duration_sec"] == pytest.approx(1.25)
-    assert saved_result["seq_position_logits"] == pytest.approx([0.0])
-    assert saved_result["seq_position_scores"] == pytest.approx([0.5])
-    assert saved_result["expected_prefix_length"] == pytest.approx(0.5)
-    assert saved_result["target_prefix_length"] == 1
-    assert saved_result["seq_position_targets"] == [1]
-    assert saved_result["seq_progress_loss_sample"] == pytest.approx(
-        np.log(2.0)
-    )
-    assert saved_result["seq_completion_loss_sample"] == pytest.approx(
-        np.log(2.0)
-    )
 
 
 def test_stage2_clip_eval_records_enabled_waveform_augmentations(
@@ -760,11 +743,10 @@ def test_stage2_clip_eval_records_enabled_waveform_augmentations(
         eval_stage2_clips,
         "_score_provenance",
         lambda *_args, **_kwargs: {
-            "qbyt_readout": {"mode": "gru_last", "temperature": 1.0},
+            "qbyt_alignment": _qbyt_alignment(),
             "sequence_objective": {
                 "target_mode": "ordered_contiguous_prefix",
                 "progress_weight": 0.5,
-                "completion_weight": 0.5,
                 "normalization": "sample",
             },
         },
@@ -1083,15 +1065,28 @@ def test_stage2_clip_eval_reports_invalid_musan_mix_context(tmp_path, monkeypatc
         eval_stage2_clips.run_eval(cfg)
 
 
-def test_score_provenance_classifies_missing_checkpoint_config_as_legacy(tmp_path):
+def test_score_provenance_records_alignment_and_checkpoint_objective(tmp_path):
     torch = pytest.importorskip("torch")
-    checkpoint_path = tmp_path / "legacy.pt"
-    torch.save({"state_dict": {}}, checkpoint_path)
+    checkpoint_path = tmp_path / "stage2.pt"
+    torch.save(
+        {
+            "config": {
+                "stage2": {
+                    "sequence_loss": {
+                        "target_mode": "ordered_contiguous_prefix",
+                        "progress_weight": 0.5,
+                        "normalization": "sample",
+                    }
+                }
+            }
+        },
+        checkpoint_path,
+    )
     tokenizer_path = tmp_path / "lang_char.txt"
     tokenizer_path.write_text("<blank> 0\nHH 1\n", encoding="utf-8")
     config = {
         "stage1": {},
-        "stage2": {"qbyt_readout": {"mode": "gru_last"}},
+        "stage2": {"qbyt_alignment": _qbyt_alignment()},
         "fbank": {},
         "tokenizer": {
             "dict_path": str(tokenizer_path),
@@ -1108,11 +1103,11 @@ def test_score_provenance_classifies_missing_checkpoint_config_as_legacy(tmp_pat
     )
 
     assert provenance["sequence_objective"] == {
-        "target_mode": "membership",
-        "progress_weight": 1.0,
-        "completion_weight": 0.0,
-        "normalization": "token",
+        "target_mode": "ordered_contiguous_prefix",
+        "progress_weight": 0.5,
+        "normalization": "sample",
     }
+    assert provenance["qbyt_alignment"] == _qbyt_alignment()
     assert provenance["tokenizer"]["sha256"] == hashlib.sha256(
         tokenizer_path.read_bytes()
     ).hexdigest()
@@ -1284,7 +1279,6 @@ def test_stage2_clip_result_record_includes_manifest_meta_for_extra_columns():
         "threshold": 0.5,
         "skipped": False,
         "keyword_phonemes": ["HH", "AH0", "L", "OW1"],
-        "text_variant_phonemes": ["HH", "AH0", "L", "OW1"],
     }
 
     record = stage2_clip_result_record(manifest_row, runner_result)
@@ -1293,7 +1287,6 @@ def test_stage2_clip_result_record_includes_manifest_meta_for_extra_columns():
     assert record["keyword"] == "hello"
     assert record["label"] == 0
     assert record["keyword_phonemes"] == ["HH", "AH0", "L", "OW1"]
-    assert record["text_variant_phonemes"] == ["HH", "AH0", "L", "OW1"]
     assert record["manifest_meta"] == {
         "text_variant": "hullo",
         "speaker_id": "spk-002",
@@ -1301,240 +1294,43 @@ def test_stage2_clip_result_record_includes_manifest_meta_for_extra_columns():
     }
 
 
-def test_stage2_clip_result_record_preserves_raw_head_logits():
+def test_stage2_clip_result_record_exports_only_the_deployed_score():
     record = stage2_clip_result_record(
         {"audio_path": "/tmp/audio.wav", "keyword": "hello", "label": 0},
         {
             "qbyt_score": 0.9,
-            "qbyt_logit": 2.1972246,
             "keyword_phonemes": ["HH", "AH0"],
-            "eps_position_logits": [1.1972246, 3.1972246],
-            "completion_score": 0.25,
-            "completion_logit": -1.0986123,
             "detected": True,
             "threshold": 0.5,
             "skipped": False,
         },
     )
 
-    assert record["qbyt_logit"] == pytest.approx(2.1972246)
-    assert record["keyword_phonemes"] == ["HH", "AH0"]
-    assert record["eps_position_logits"] == pytest.approx(
-        [1.1972246, 3.1972246]
-    )
-    assert record["completion_score"] == pytest.approx(0.25)
-    assert record["completion_logit"] == pytest.approx(-1.0986123)
+    assert record == {
+        "audio_path": "/tmp/audio.wav",
+        "keyword": "hello",
+        "keyword_phonemes": ["HH", "AH0"],
+        "qbyt_score": pytest.approx(0.9),
+        "detected": True,
+        "threshold": pytest.approx(0.5),
+        "skipped": False,
+        "label": 0,
+    }
 
 
-def test_stage2_clip_result_record_validates_softmin_readout():
-    temperature = 0.5
-    position_logits = [1.0, 3.0]
-    expected_logit = 1.0 - temperature * np.log(
-        (1.0 + np.exp(-2.0 / temperature)) / 2.0
-    )
-    record = stage2_clip_result_record(
-        {"audio_path": "/tmp/audio.wav", "keyword": "hello", "label": 0},
-        {
-            "qbyt_score": 0.8,
-            "qbyt_logit": expected_logit,
-            "keyword_phonemes": ["HH", "AH0"],
-            "eps_position_logits": position_logits,
-            "detected": True,
-            "threshold": 0.5,
-            "skipped": False,
-        },
-        qbyt_readout={"mode": "eps_softmin", "temperature": temperature},
-    )
+@pytest.mark.parametrize("field", ["qbyt_score", "threshold"])
+def test_stage2_clip_result_record_rejects_non_finite_deployed_score(field):
+    runner_result = {
+        "qbyt_score": 0.9,
+        "keyword_phonemes": ["HH"],
+        "detected": True,
+        "threshold": 0.5,
+        "skipped": False,
+    }
+    runner_result[field] = float("nan")
 
-    assert record["qbyt_readout_mode"] == "eps_softmin"
-    assert record["qbyt_readout_temperature"] == temperature
-    assert record["qbyt_logit"] == pytest.approx(expected_logit)
-
-
-def test_stage2_clip_result_record_derives_ordered_sequence_diagnostics():
-    logits = [2.0, 2.0, -1.0, -2.0, -3.0]
-    completion_score = 1.0 / (1.0 + np.exp(3.0))
-    record = stage2_clip_result_record(
-        {
-            "audio_path": "/tmp/hey-eve.wav",
-            "keyword": "Hey Eva",
-            "label": 0,
-            "text_variant": "Hey Eve",
-        },
-        {
-            "qbyt_score": 0.9,
-            "qbyt_logit": 2.1972246,
-            "keyword_phonemes": ["HH", "EY1", "EY1", "V", "AH0"],
-            "text_variant_phonemes": ["HH", "EY1", "IY1", "V"],
-            "seq_position_logits": logits,
-            "completion_logit": -3.0,
-            "completion_score": completion_score,
-            "detected": True,
-            "threshold": 0.5,
-            "skipped": False,
-        },
-        sequence_objective={
-            "target_mode": "ordered_contiguous_prefix",
-            "progress_weight": 0.5,
-            "completion_weight": 0.5,
-            "normalization": "sample",
-        },
-    )
-
-    scores = [1.0 / (1.0 + np.exp(-value)) for value in logits]
-    losses = [
-        np.log1p(np.exp(-2.0)),
-        np.log1p(np.exp(-2.0)),
-        np.log1p(np.exp(-1.0)),
-        np.log1p(np.exp(-2.0)),
-        np.log1p(np.exp(-3.0)),
-    ]
-    assert record["seq_target_mode"] == "ordered_contiguous_prefix"
-    assert record["seq_target_source"] == "text_variant_g2p"
-    assert record["seq_position_scores"] == pytest.approx(scores)
-    assert record["expected_prefix_length"] == pytest.approx(sum(scores))
-    assert record["target_prefix_length"] == 2
-    assert record["seq_position_targets"] == [1, 1, 0, 0, 0]
-    assert record["seq_progress_loss_sample"] == pytest.approx(np.mean(losses))
-    assert record["seq_completion_loss_sample"] == pytest.approx(losses[-1])
-
-
-def test_stage2_clip_result_record_does_not_invent_sequence_targets_from_label():
-    record = stage2_clip_result_record(
-        {"audio_path": "/tmp/audio.wav", "keyword": "Hey Eva", "label": 0},
-        {
-            "qbyt_score": 0.4,
-            "keyword_phonemes": ["HH", "EY1"],
-            "seq_position_logits": [1.0, -1.0],
-            "completion_logit": -1.0,
-            "completion_score": 1.0 / (1.0 + np.exp(1.0)),
-            "detected": False,
-            "threshold": 0.5,
-            "skipped": False,
-        },
-        sequence_objective={"target_mode": "ordered_contiguous_prefix"},
-    )
-
-    assert record["seq_position_scores"] == pytest.approx(
-        [1.0 / (1.0 + np.exp(-1.0)), 1.0 / (1.0 + np.exp(1.0))]
-    )
-    assert record["expected_prefix_length"] is not None
-    assert record["seq_target_source"] is None
-    assert record["target_prefix_length"] is None
-    assert record["seq_position_targets"] is None
-    assert record["seq_progress_loss_sample"] is None
-    assert record["seq_completion_loss_sample"] is None
-
-
-def test_stage2_clip_result_record_respects_legacy_membership_objective():
-    record = stage2_clip_result_record(
-        {
-            "audio_path": "/tmp/audio.wav",
-            "keyword": "legacy",
-            "text_variant": "query",
-        },
-        {
-            "qbyt_score": 0.4,
-            "keyword_phonemes": ["HH", "EY1", "HH"],
-            "text_variant_phonemes": ["HH"],
-            "seq_position_logits": [1.0, -1.0, 0.0],
-            "completion_logit": 0.0,
-            "completion_score": 0.5,
-            "detected": False,
-            "threshold": 0.5,
-            "skipped": False,
-        },
-        sequence_objective={"target_mode": "membership"},
-    )
-
-    assert record["seq_target_mode"] == "membership"
-    assert record["seq_position_targets"] == [1, 0, 1]
-    assert record["expected_prefix_length"] is None
-    assert record["target_prefix_length"] is None
-    assert record["seq_progress_loss_sample"] is not None
-    assert record["seq_completion_loss_sample"] is None
-
-
-def test_stage2_clip_result_record_rejects_non_finite_scores():
-    with pytest.raises(ValueError, match="qbyt_logit must be finite"):
+    with pytest.raises(ValueError, match=rf"{field} must be finite"):
         stage2_clip_result_record(
             {"audio_path": "/tmp/audio.wav", "keyword": "hello", "label": 0},
-            {
-                "qbyt_score": 0.9,
-                "qbyt_logit": float("nan"),
-                "completion_score": 0.25,
-                "completion_logit": -1.0,
-                "detected": True,
-                "threshold": 0.5,
-                "skipped": False,
-            },
-        )
-
-
-def test_stage2_clip_result_record_rejects_invalid_eps_position_details():
-    base_result = {
-        "qbyt_score": 0.5,
-        "qbyt_logit": 0.0,
-        "keyword_phonemes": ["HH", "EY1"],
-        "eps_position_logits": [-1.0, 1.0],
-        "detected": True,
-        "threshold": 0.5,
-        "skipped": False,
-    }
-    manifest_row = {
-        "audio_path": "/tmp/audio.wav",
-        "keyword": "hey",
-        "label": 0,
-    }
-
-    bad_length = dict(base_result, eps_position_logits=[0.0])
-    with pytest.raises(ValueError, match="one value per keyword phoneme"):
-        stage2_clip_result_record(manifest_row, bad_length)
-
-    bad_mean = dict(base_result, eps_position_logits=[1.0, 1.0])
-    with pytest.raises(ValueError, match="EPS position-logit aggregation"):
-        stage2_clip_result_record(manifest_row, bad_mean)
-
-    bad_finite = dict(base_result, eps_position_logits=[float("nan"), 0.0])
-    with pytest.raises(ValueError, match=r"eps_position_logits\[0\] must be finite"):
-        stage2_clip_result_record(manifest_row, bad_finite)
-
-
-def test_stage2_clip_result_record_rejects_invalid_sequence_position_details():
-    manifest_row = {
-        "audio_path": "/tmp/audio.wav",
-        "keyword": "hey",
-        "text_variant": "hay",
-        "label": 0,
-    }
-    base_result = {
-        "qbyt_score": 0.5,
-        "keyword_phonemes": ["HH", "EY1"],
-        "text_variant_phonemes": ["HH", "EY1"],
-        "seq_position_logits": [1.0, -1.0],
-        "completion_logit": -1.0,
-        "completion_score": 1.0 / (1.0 + np.exp(1.0)),
-        "detected": True,
-        "threshold": 0.5,
-        "skipped": False,
-    }
-    objective = {"target_mode": "ordered_contiguous_prefix"}
-
-    with pytest.raises(ValueError, match="one value per keyword phoneme"):
-        stage2_clip_result_record(
-            manifest_row,
-            dict(base_result, seq_position_logits=[-1.0]),
-            sequence_objective=objective,
-        )
-    with pytest.raises(ValueError, match=r"seq_position_logits\[0\] must be finite"):
-        stage2_clip_result_record(
-            manifest_row,
-            dict(base_result, seq_position_logits=[float("nan"), -1.0]),
-            sequence_objective=objective,
-        )
-    with pytest.raises(ValueError, match=r"seq_position_logits\[-1\]"):
-        stage2_clip_result_record(
-            manifest_row,
-            dict(base_result, completion_logit=-2.0),
-            sequence_objective=objective,
+            runner_result,
         )

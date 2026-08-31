@@ -2,12 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from dma_kws.tokenizer import (
-    SEQ_LABEL_MEMBERSHIP,
-    build_seq_label,
-    load_char_tokenizer,
-    tokenize_phoneme_string,
-)
+from dma_kws.tokenizer import build_seq_label, load_char_tokenizer, tokenize_phoneme_string
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DICT_PATH = REPO_ROOT / "data" / "dict" / "lang_char.txt"
@@ -60,14 +55,6 @@ def test_build_seq_label_respects_repeated_phone_count_and_position():
 
 def test_build_seq_label_uses_best_contiguous_query_start():
     assert build_seq_label([10, 11, 12], [10, 99, 10, 11, 88]) == [1, 1, 0]
-
-
-def test_build_seq_label_retains_explicit_membership_ablation():
-    assert build_seq_label(
-        [10, 11, 12],
-        [11, 99],
-        mode=SEQ_LABEL_MEMBERSHIP,
-    ) == [0, 1, 0]
 
 
 def test_build_seq_label_rejects_unknown_mode():

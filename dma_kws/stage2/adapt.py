@@ -6,13 +6,11 @@ import copy
 import json
 import math
 import os
-import warnings
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 
@@ -104,7 +102,6 @@ def _resolve_adapt_paths(config: dict[str, Any]) -> dict[str, Path]:
         "phase": Path(phase),  # type: ignore[dict-item]
         "phase_str": phase,
         "phase_dir": exp_root / phase,
-        "adapter_path": exp_root / f"adapter_{slug}.pt",
         "merged_path": exp_root / "stage2_adapted.pt",
         "train_manifest": phase_manifest(data_root, phase, split="train"),
         "eval_manifest": phase_manifest(data_root, phase, split="eval"),
@@ -268,8 +265,6 @@ def _validate_base_fingerprint(
     *,
     source: str | Path,
     expected: str,
-    allow_missing: bool = False,
-    warn_if_missing: bool = False,
 ) -> None:
     candidates = _metadata_candidates(checkpoint, STAGE2_BASE_FINGERPRINT_KEY)
     if not candidates:
@@ -277,19 +272,7 @@ def _validate_base_fingerprint(
             f"LoRA checkpoint {source} has no {STAGE2_BASE_FINGERPRINT_KEY}; "
             "its frozen Stage II base identity cannot be verified."
         )
-        if not allow_missing:
-            raise SystemExit(
-                f"{message} Set adapt.allow_legacy_adapter=true only if the "
-                "adapter's original base checkpoint is known to match."
-            )
-        if warn_if_missing:
-            warnings.warn(
-                f"{message} Proceeding because legacy adapter loading was "
-                "explicitly enabled.",
-                UserWarning,
-                stacklevel=3,
-            )
-        return
+        raise SystemExit(message)
     _validate_lora_metadata(
         checkpoint,
         source=source,
@@ -307,7 +290,6 @@ def _validate_adapter_checkpoint(
     alpha: float,
     targets: tuple[str, ...],
     base_model_sha256: str | None = None,
-    allow_legacy_adapter: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Reject adapters trained for a different keyword or LoRA parametrization."""
     source_label = str(source)
@@ -333,8 +315,6 @@ def _validate_adapter_checkpoint(
             checkpoint,
             source=source,
             expected=base_model_sha256,
-            allow_missing=allow_legacy_adapter,
-            warn_if_missing=allow_legacy_adapter,
         )
 
     adapter_state = checkpoint.get("lora_state_dict")
@@ -400,17 +380,11 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             state = torch.load(adapter_checkpoint, map_location="cpu")
             # LoRA weights are tuned against a specific encoder operating point.
             assert_stream_policy_matches(state, self.stream_policy, source=adapter_checkpoint)
-            # ...and against a specific QbyT readout: LoRA only moves the matcher
-            # attention, so a stale adapter would be re-pointed at a frame the
-            # base weights never learned to read.
+            # LoRA is meaningful only on the exact same bounded path topology.
             assert_qbyt_readout_version(
                 state,
                 source=adapter_checkpoint,
-                expected_mode=self.qbyt_readout_mode,
-                expected_temperature=self.qbyt_readout_temperature,
-                # The base QbyT is frozen; unlike a full warm start, a legacy
-                # adapter cannot relearn the corrected pooled readout.
-                allow_legacy=False,
+                expected_alignment=self.qbyt_alignment,
             )
             adapter_state = _validate_adapter_checkpoint(
                 state,
@@ -420,9 +394,6 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
                 alpha=self._lora_alpha,
                 targets=self._lora_targets,
                 base_model_sha256=self._base_model_sha256,
-                allow_legacy_adapter=bool(
-                    checkpoint_adapt.get("allow_legacy_adapter", False)
-                ),
             )
             load_lora_state_dict(self.qbyt, adapter_state, strict=True)
 
@@ -430,11 +401,6 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         self._adapt_cfg = _adapt_section(config)
         self.target_score_diagnostics = BinaryScoreDiagnostics(
             deployment_threshold=self.deployment_threshold,
-            ece_num_bins=self.ece_num_bins,
-            sync_on_compute=True,
-        )
-        self.target_completion_score_diagnostics = BinaryScoreDiagnostics(
-            deployment_threshold=self.sequence_diagnostic_threshold,
             ece_num_bins=self.ece_num_bins,
             sync_on_compute=True,
         )
@@ -462,9 +428,7 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         assert_qbyt_readout_version(
             checkpoint,
             source="the LoRA checkpoint being restored",
-            expected_mode=self.qbyt_readout_mode,
-            expected_temperature=self.qbyt_readout_temperature,
-            allow_legacy=False,
+            expected_alignment=self.qbyt_alignment,
         )
         super().on_load_checkpoint(checkpoint)
         adapt = _adapt_section(self._checkpoint_config)
@@ -500,10 +464,6 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             checkpoint,
             source="the LoRA checkpoint being restored",
             expected=actual_base_sha256,
-            # A full Lightning checkpoint embeds the base tensors themselves, so
-            # its identity can be derived even when an older payload lacks the
-            # redundant fingerprint field.
-            allow_missing=True,
         )
         self._base_model_sha256 = actual_base_sha256
 
@@ -617,7 +577,7 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
-        logits, seq_logits = self(
+        logits, _ = self(
             batch["feat"], batch["feat_lengths"], batch["anchor"]
         )
         labels = batch["label"].int()
@@ -625,20 +585,14 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         if dataloader_idx == 0:
             self._update_score_diagnostics(
                 self.target_score_diagnostics,
-                self.target_completion_score_diagnostics,
                 logits=logits,
-                seq_logits=seq_logits,
-                anchor=batch["anchor"],
                 labels=labels,
                 sample_ids=batch.get("sample_id"),
             )
         else:
             self._update_score_diagnostics(
                 self.score_diagnostics,
-                self.completion_score_diagnostics,
                 logits=logits,
-                seq_logits=seq_logits,
-                anchor=batch["anchor"],
                 labels=labels,
                 sample_ids=batch.get("sample_id"),
             )
@@ -655,11 +609,6 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             prog_bar=True,
             sync_dist=True,
         )
-        self._log_score_diagnostics(
-            self.target_completion_score_diagnostics,
-            namespace=f"val/target_{self.sequence_diagnostic_namespace}",
-            deployment_metric=False,
-        )
         lph_metrics = self._log_score_diagnostics(
             self.score_diagnostics,
             namespace="val/lph_",
@@ -671,25 +620,16 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             prog_bar=True,
             sync_dist=True,
         )
-        self._log_score_diagnostics(
-            self.completion_score_diagnostics,
-            namespace=f"val/lph_{self.sequence_diagnostic_namespace}",
-            deployment_metric=False,
-        )
         # Filename/monitor aliases are kept out of CSV/TensorBoard because a
         # slash cannot be used safely in a checkpoint format field.
         self.log(
             "val_target_auc", target_metrics["auc"], sync_dist=True, logger=False
         )
         self.log("val_lph_auc", lph_metrics["auc"], sync_dist=True, logger=False)
-        # Legacy alias: old adaptation checkpoints monitored LPh via val_auc.
-        self.log("val_auc", lph_metrics["auc"], sync_dist=True, logger=False)
         self._log_train_window_metrics()
 
         self.target_score_diagnostics.reset()
-        self.target_completion_score_diagnostics.reset()
         self.score_diagnostics.reset()
-        self.completion_score_diagnostics.reset()
 
 
 def _resolve_init_checkpoint(config: dict[str, Any], adapt_paths: dict[str, Any], args: Stage2AdaptArgs) -> str:
@@ -967,7 +907,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     lora_rank = int(adapt.get("rank", 16))
     lora_alpha = float(adapt.get("alpha", 32))
     lora_targets = normalize_lora_targets(
-        adapt.get("lora_targets", ("in_proj_weight", "out_proj.weight"))
+        adapt.get("lora_targets", ("audio_key.weight", "text_query.weight"))
     )
     adapt["rank"] = lora_rank
     adapt["alpha"] = lora_alpha
@@ -1129,16 +1069,13 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     global_step = int(trainer.global_step)
     adapter_out = checkpoint_dir / f"adapter_{adapt_paths['slug_str']}.pt"
     merged_out = checkpoint_dir / "stage2_adapted.pt"
-    final_adapter = adapter_out
     artifacts = {
         "adapter": adapter_out,
         "merged": merged_out,
-        "final_adapter": final_adapter,
     }
-    compatibility_aliases = {
+    published_outputs = {
         "phase_adapter": adapt_paths["phase_dir"]
         / f"adapter_{adapt_paths['slug_str']}.pt",
-        "final_adapter": adapt_paths["adapter_path"],
         "merged": adapt_paths["merged_path"],
     }
 
@@ -1168,7 +1105,8 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     "alpha": lora_alpha,
                     "lora_targets": list(lora_targets),
                     STAGE2_BASE_FINGERPRINT_KEY: base_model_sha256,
-                }
+                },
+                alignment=model.qbyt_alignment,
             ),
             run_context,
         )
@@ -1186,19 +1124,18 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     "phase": phase,
                     "tokenizer_dict_path": str(dict_path),
                     "vocab_size": vocab_size,
-                }
+                },
+                alignment=model.qbyt_alignment,
             ),
             run_context,
         )
         _atomic_torch_save(merged_payload, merged_out)
 
-        # These aliases preserve the existing standalone TTS -> real handoff and
-        # evaluation CLI contract. They are last-writer compatibility pointers,
-        # not authoritative run artifacts; atomic replacement prevents concurrent
-        # publishers from exposing a partially written checkpoint.
-        _atomic_torch_save(adapter_payload, compatibility_aliases["phase_adapter"])
-        _atomic_torch_save(adapter_payload, compatibility_aliases["final_adapter"])
-        _atomic_torch_save(merged_payload, compatibility_aliases["merged"])
+        # Stable outputs are required by the standalone TTS -> real handoff and
+        # orchestration CLI. Atomic replacement prevents concurrent publishers
+        # from exposing a partially written checkpoint.
+        _atomic_torch_save(adapter_payload, published_outputs["phase_adapter"])
+        _atomic_torch_save(merged_payload, published_outputs["merged"])
 
         final_metrics = numeric_callback_metrics(dict(trainer.callback_metrics))
         runs_csv = Path(paths["exp_root"]) / "stage2_adapt" / "runs.csv"
@@ -1219,10 +1156,10 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     "primary_artifact_source": artifact_source,
                     "primary_artifact_step": artifact_step,
                     "primary_artifact_path": str(merged_out),
-                    "compatibility_alias": json.dumps(
+                    "published_output": json.dumps(
                         {
                             name: str(path)
-                            for name, path in compatibility_aliases.items()
+                            for name, path in published_outputs.items()
                         },
                         sort_keys=True,
                     ),
@@ -1254,17 +1191,16 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 **artifacts,
                 **log_files,
                 **{
-                    f"compatibility_alias/{name}": path
-                    for name, path in compatibility_aliases.items()
+                    f"published_output/{name}": path
+                    for name, path in published_outputs.items()
                 },
             },
             artifact_sources={
                 "adapter": artifact_source,
                 "merged": artifact_source,
-                "final_adapter": artifact_source,
                 **{
-                    f"compatibility_alias/{name}": "compatibility_alias (atomic last-writer pointer)"
-                    for name in compatibility_aliases
+                    f"published_output/{name}": "stable output (atomic last-writer pointer)"
+                    for name in published_outputs
                 },
             },
             title=f"Stage II LoRA Adaptation Result · {phase}",
@@ -1280,9 +1216,9 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     "step": global_step,
                     "metrics": metrics,
                     "artifacts": {name: str(path) for name, path in artifacts.items()},
-                    "compatibility_aliases": {
+                    "published_outputs": {
                         name: str(path)
-                        for name, path in compatibility_aliases.items()
+                        for name, path in published_outputs.items()
                     },
                     "logs": {name: str(path) for name, path in log_files.items()},
                 }

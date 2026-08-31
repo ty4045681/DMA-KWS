@@ -6,12 +6,12 @@ from copy import deepcopy
 from typing import Any, Mapping
 
 
-PROVENANCE_SCHEMA_VERSION = 1
+PROVENANCE_SCHEMA_VERSION = 2
 
 _REQUIRED_FIELDS = {
     "schema_version",
     "checkpoint",
-    "qbyt_readout_mode",
+    "qbyt_alignment",
     "stream",
     "audio_padding_ms",
     "fbank",

@@ -87,14 +87,14 @@ def test_run_record_contains_actual_primary_artifact_path(
     assert "primary_artifact_path" in string_literals
 
 
-def test_adapt_compatibility_aliases_are_atomic_and_not_returned_as_primary() -> None:
+def test_adapt_stable_outputs_are_atomic_and_not_returned_as_primary() -> None:
     source = Path("dma_kws/stage2/adapt.py").read_text(encoding="utf-8")
 
-    assert '_atomic_torch_save(adapter_payload, compatibility_aliases["phase_adapter"])' in source
-    assert '_atomic_torch_save(merged_payload, compatibility_aliases["merged"])' in source
+    assert '_atomic_torch_save(adapter_payload, published_outputs["phase_adapter"])' in source
+    assert '_atomic_torch_save(merged_payload, published_outputs["merged"])' in source
     assert '"adapter": adapter_out' in source
     assert '"merged": merged_out' in source
-    assert '"compatibility_alias": json.dumps(' in source
+    assert '"published_output": json.dumps(' in source
 
 
 def test_atomic_torch_save_publishes_one_complete_concurrent_payload(

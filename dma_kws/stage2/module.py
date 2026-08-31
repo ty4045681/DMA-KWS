@@ -1,4 +1,4 @@
-"""Stage II QbyT Lightning module aligned with main ``qbyt/train.py`` Wrapper."""
+"""Canonical Stage II QbyT Lightning module."""
 
 from __future__ import annotations
 
@@ -9,16 +9,14 @@ from typing import Any
 
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 import torchmetrics
 
 from dma_kws.config import resolve_stream_policy
 from dma_kws.nn import build_encoder, run_encoder
-from dma_kws.pathing import load_qbyt_class
 from dma_kws.stage2.losses import compute_stage2_losses
+from dma_kws.stage2.model_factory import build_qbyt
 from dma_kws.stage2.objective import resolve_sequence_objective
-from dma_kws.stage2.readout import resolve_qbyt_readout
-from dma_kws.stage2.scoring import gather_completion_logits
+from dma_kws.stage2.readout import resolve_qbyt_alignment
 from dma_kws.training.checkpoint_io import (
     assert_qbyt_readout_version,
     assert_stream_policy_matches,
@@ -31,17 +29,12 @@ from dma_kws.training.scheduler import build_cosine_warmup_optimizer
 from dma_kws.training.score_diagnostics import BinaryScoreDiagnostics
 
 
-def _load_qbyt():
-    return load_qbyt_class()
-
-
 def assert_adapter_weights_loaded(model, missing_keys) -> None:
     """Fail when an enabled phoneme adapter got no weights from a checkpoint.
 
-    Evaluation loads Stage II weights with ``strict=False`` so older checkpoints
-    keep working. That tolerance is dangerous here: a randomly initialized trunk
-    still produces scores, just meaningless ones, and the only symptom is a
-    "missing keys" line in the log.
+    Some warm-start loaders accept missing encoder-side keys. That tolerance is
+    dangerous for an enabled adapter: a randomly initialized trunk still
+    produces scores, and the only symptom would otherwise be a missing-key log.
     """
     if getattr(model, "adapter", None) is None:
         return
@@ -99,12 +92,8 @@ class Stage2LightningModule(pl.LightningModule):
         encoder_dim = int(stage2.get("encoder_output_dim", stage1.get("encoder_output_dim", 144)))
 
         sequence_objective = resolve_sequence_objective(stage2)
-        qbyt_readout = resolve_qbyt_readout(stage2)
-        self.qbyt_readout_mode = qbyt_readout.mode
-        self.qbyt_readout_temperature = qbyt_readout.temperature
-        self.seq_label_mode = sequence_objective.target_mode
+        self.qbyt_alignment = resolve_qbyt_alignment(stage2)
         self.seq_progress_weight = sequence_objective.progress_weight
-        self.seq_completion_weight = sequence_objective.completion_weight
         self.seq_normalization = sequence_objective.normalization
         # Minimal hand-written configs may omit this section. Stamp the resolved
         # objective into all new checkpoints so two same-shape QbyT models do not
@@ -113,8 +102,8 @@ class Stage2LightningModule(pl.LightningModule):
             "sequence_loss"
         ] = sequence_objective.as_dict()
         self._checkpoint_config["stage2"][
-            "qbyt_readout"
-        ] = qbyt_readout.as_dict()
+            "qbyt_alignment"
+        ] = self.qbyt_alignment.as_dict()
 
         self.stream_policy = resolve_stream_policy(stage1)
         self.encoder = build_encoder(stage1, output_dim=encoder_dim)
@@ -151,20 +140,15 @@ class Stage2LightningModule(pl.LightningModule):
             self.adapter = None
             qbyt_input_dim = encoder_dim
 
-        QbyT = _load_qbyt()
-        self.qbyt = QbyT(
-            encoder_output_size=qbyt_input_dim,
-            num_embeds=vocab_size,
-            embed_dim=int(stage2.get("qbyt_embed_dim", 128)),
-            post_num_layers=int(stage2.get("qbyt_layers", 2)),
-            readout_mode=self.qbyt_readout_mode,
-            readout_temperature=self.qbyt_readout_temperature,
+        self.qbyt = build_qbyt(
+            stage2,
+            input_dim=qbyt_input_dim,
+            vocab_size=vocab_size,
         )
 
         self._stage2_cfg = stage2
         self._adapter_cfg = adapter_cfg
         self.freeze_encoder = freeze_encoder
-        self._allow_legacy_qbyt_readout = bool(stage2.get("allow_legacy_qbyt_readout", False))
         self._log_grad_norm = bool((stage2.get("logging", {}) or {}).get("grad_norm", True))
         gradient_diagnostics = stage2.get("gradient_diagnostics", {}) or {}
         self._gradient_diagnostics_enabled = bool(gradient_diagnostics.get("enabled", False))
@@ -215,21 +199,8 @@ class Stage2LightningModule(pl.LightningModule):
         )
         validation_cfg = stage2.get("validation", {}) or {}
         self.ece_num_bins = int(validation_cfg.get("ece_num_bins", 15))
-        self.sequence_diagnostic_threshold = float(
-            validation_cfg.get("seq_diagnostic_threshold", 0.5)
-        )
-        self.sequence_diagnostic_namespace = (
-            "completion_"
-            if self.seq_label_mode == "ordered_contiguous_prefix"
-            else "last_token_"
-        )
         self.score_diagnostics = BinaryScoreDiagnostics(
             deployment_threshold=self.deployment_threshold,
-            ece_num_bins=self.ece_num_bins,
-            sync_on_compute=True,
-        )
-        self.completion_score_diagnostics = BinaryScoreDiagnostics(
-            deployment_threshold=self.sequence_diagnostic_threshold,
             ece_num_bins=self.ece_num_bins,
             sync_on_compute=True,
         )
@@ -242,8 +213,6 @@ class Stage2LightningModule(pl.LightningModule):
                     "loss_seq_weighted",
                     "loss_seq_progress_raw",
                     "loss_seq_progress_weighted",
-                    "loss_seq_completion_raw",
-                    "loss_seq_completion_weighted",
                     "loss_ctc_raw",
                     "loss_ctc_weighted",
                 )
@@ -262,11 +231,7 @@ class Stage2LightningModule(pl.LightningModule):
         assert_qbyt_readout_version(
             checkpoint,
             source=checkpoint_path,
-            expected_mode=self.qbyt_readout_mode,
-            expected_temperature=self.qbyt_readout_temperature,
-            # A legacy readout is only useful as a warm start when QbyT will be
-            # retrained. LoRA freezes QbyT, so its strict base path must reject it.
-            allow_legacy=self._allow_legacy_qbyt_readout and not require_full_qbyt,
+            expected_alignment=self.qbyt_alignment,
         )
         
         # Check if this is an icefall checkpoint (has "model" key)
@@ -366,14 +331,8 @@ class Stage2LightningModule(pl.LightningModule):
                         stacklevel=2,
                     )
             if qbyt_state:
-                missing, unexpected = self.qbyt.load_state_dict(
-                    qbyt_state,
-                    strict=require_full_qbyt,
-                )
-                rank_zero_print(
-                    f"Loaded QbyT weights from {checkpoint_path}: "
-                    f"missing={len(missing)} unexpected={len(unexpected)}"
-                )
+                self.qbyt.load_state_dict(qbyt_state, strict=True)
+                rank_zero_print(f"Loaded QbyT v5 weights from {checkpoint_path}")
 
     def _load_adapter_checkpoint(self, checkpoint_path: Path) -> None:
         """Load a Step A adapter export produced by ``scripts/train_ctc_adapter.py``.
@@ -407,7 +366,7 @@ class Stage2LightningModule(pl.LightningModule):
         Checkpoint averaging keeps the first payload as its template and only
         replaces the state dict, so averaged checkpoints inherit these fields.
         """
-        stamp_qbyt_readout_version(checkpoint)
+        stamp_qbyt_readout_version(checkpoint, alignment=self.qbyt_alignment)
         checkpoint["checkpoint_kind"] = "stage2"
         checkpoint["config"] = copy.deepcopy(self._checkpoint_config)
         checkpoint["vocab_size"] = self._checkpoint_vocab_size
@@ -429,13 +388,7 @@ class Stage2LightningModule(pl.LightningModule):
         assert_qbyt_readout_version(
             checkpoint,
             source="the Stage II checkpoint being restored",
-            expected_mode=self.qbyt_readout_mode,
-            expected_temperature=self.qbyt_readout_temperature,
-            # Full Lightning restore also restores optimizer/scheduler state.
-            # The legacy escape hatch is weights-only and belongs exclusively
-            # to _load_init_checkpoint; a v2 gru_last checkpoint is accepted by
-            # the explicit compatibility rule without this flag.
-            allow_legacy=False,
+            expected_alignment=self.qbyt_alignment,
         )
 
     def forward(
@@ -605,7 +558,6 @@ class Stage2LightningModule(pl.LightningModule):
             seq_labels=batch["seq_label"],
             seq_label_mask=batch["seq_label_mask"],
             seq_progress_weight=self.seq_progress_weight,
-            seq_completion_weight=self.seq_completion_weight,
             seq_normalization=self.seq_normalization,
             ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
             ctc_weight=self.ctc_weight,
@@ -620,10 +572,6 @@ class Stage2LightningModule(pl.LightningModule):
             "loss_seq_progress_raw": losses["seq_progress_loss"],
             "loss_seq_progress_weighted": losses[
                 "seq_progress_weighted_loss"
-            ],
-            "loss_seq_completion_raw": losses["seq_completion_loss"],
-            "loss_seq_completion_weighted": losses[
-                "seq_completion_weighted_loss"
             ],
         }
         if "ctc_loss" in losses:
@@ -646,53 +594,9 @@ class Stage2LightningModule(pl.LightningModule):
             self._train_window_metrics[name].update(value.detach())
         self._train_window_updates += 1
 
-        # Keep the released top-level names for one compatibility cycle. They
-        # are hidden from the progress bar; new dashboards should consume the
-        # explicit microbatch/window hierarchy above.
-        self.log(
-            "train/loss", total_loss, on_step=True, prog_bar=False, logger=False
-        )
-        self.log(
-            "train/utt_loss",
-            losses["utt_loss"],
-            on_step=True,
-            prog_bar=False,
-            logger=False,
-        )
-        self.log(
-            "train/seq_loss",
-            losses["seq_loss"],
-            on_step=True,
-            prog_bar=False,
-            logger=False,
-        )
-        if self.seq_progress_weight:
-            self.log(
-                "train/seq_progress_loss",
-                losses["seq_progress_loss"],
-                on_step=True,
-                logger=False,
-            )
-        if self.seq_completion_weight:
-            self.log(
-                "train/seq_completion_loss",
-                losses["seq_completion_loss"],
-                on_step=True,
-                logger=False,
-            )
-        if "ctc_loss" in losses:
-            self.log(
-                "train/ctc_loss",
-                losses["ctc_loss"],
-                on_step=True,
-                prog_bar=False,
-                logger=False,
-            )
-
         optimizer = self.optimizers()
         lr = optimizer.param_groups[0]["lr"]
         self.log("train/optimizer/lr", lr, on_step=True, prog_bar=True)
-        self.log("train/lr", lr, on_step=True, prog_bar=False, logger=False)
 
     def _consume_train_window_metrics(self) -> dict[str, torch.Tensor]:
         if self._train_window_updates <= 0:
@@ -741,7 +645,6 @@ class Stage2LightningModule(pl.LightningModule):
         total = norms.get("grad_2.0_norm_total")
         if total is not None:
             self.log("train/optimizer/grad_norm_pre_clip", total, on_step=True)
-            self.log("train/grad_norm", total, on_step=True, logger=False)
 
     def _parameters_without_gradients(self) -> tuple[str, ...]:
         return tuple(
@@ -773,41 +676,15 @@ class Stage2LightningModule(pl.LightningModule):
         else:
             self.print(f"Gradient diagnostics at step {step}: all trainable parameters have gradients.")
 
-    @staticmethod
-    def _completion_probabilities(
-        seq_logits: torch.Tensor,
-        anchor: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the final valid anchor-position score and matching labels."""
-        anchor_lengths = anchor.ne(0).sum(dim=1)
-        completion_logits, valid = gather_completion_logits(seq_logits, anchor_lengths)
-        return torch.sigmoid(completion_logits[valid]), labels[valid], valid
-
     def _update_score_diagnostics(
         self,
         score_metric: BinaryScoreDiagnostics,
-        completion_metric: BinaryScoreDiagnostics,
         *,
         logits: torch.Tensor,
-        seq_logits: torch.Tensor,
-        anchor: torch.Tensor,
         labels: torch.Tensor,
         sample_ids: torch.Tensor | None = None,
     ) -> None:
         score_metric.update(torch.sigmoid(logits), labels, sample_ids)
-        completion_scores, completion_labels, completion_valid = (
-            self._completion_probabilities(
-                seq_logits,
-                anchor,
-                labels,
-            )
-        )
-        completion_metric.update(
-            completion_scores,
-            completion_labels,
-            sample_ids[completion_valid] if sample_ids is not None else None,
-        )
 
     def _log_score_diagnostics(
         self,
@@ -815,7 +692,6 @@ class Stage2LightningModule(pl.LightningModule):
         *,
         namespace: str,
         progress_bar: bool = False,
-        deployment_metric: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Log one already-DDP-global diagnostic dictionary."""
         diagnostics = metric.compute()
@@ -825,9 +701,6 @@ class Stage2LightningModule(pl.LightningModule):
                 # Callers give the utterance loss a dataset-specific canonical
                 # name (val/utt_loss, val/target_utt_loss, ...).
                 continue
-            output_name = name
-            if not deployment_metric and name.startswith("deploy_"):
-                output_name = f"diagnostic_{name.removeprefix('deploy_')}"
             # Lightning reduces every tensor passed to ``self.log`` and warns
             # when integer/bool values need an implicit float conversion. Keep
             # the public diagnostics dictionary strongly typed, but make the
@@ -838,7 +711,7 @@ class Stage2LightningModule(pl.LightningModule):
                 else value.to(dtype=torch.float32)
             )
             self.log(
-                f"{namespace}{output_name}",
+                f"{namespace}{name}",
                 logged_value,
                 prog_bar=progress_bar and name in progress_names,
                 # BinaryScoreDiagnostics synchronized the raw sample state, so
@@ -850,16 +723,13 @@ class Stage2LightningModule(pl.LightningModule):
         return diagnostics
 
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> None:
-        logits, seq_logits = self(
+        logits, _ = self(
             batch["feat"], batch["feat_lengths"], batch["anchor"]
         )
         labels = batch["label"].int()
         self._update_score_diagnostics(
             self.score_diagnostics,
-            self.completion_score_diagnostics,
             logits=logits,
-            seq_logits=seq_logits,
-            anchor=batch["anchor"],
             labels=labels,
             sample_ids=batch.get("sample_id"),
         )
@@ -876,29 +746,20 @@ class Stage2LightningModule(pl.LightningModule):
             prog_bar=True,
             sync_dist=True,
         )
-        self._log_score_diagnostics(
-            self.completion_score_diagnostics,
-            namespace=f"val/{self.sequence_diagnostic_namespace}",
-            deployment_metric=False,
-        )
         # Checkpoint-filename alias of val/auc; kept out of CSV/TensorBoard.
         self.log("val_auc", score_metrics["auc"], sync_dist=True, logger=False)
         self._log_train_window_metrics()
 
         self.score_diagnostics.reset()
-        self.completion_score_diagnostics.reset()
 
     def test_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> None:
-        logits, seq_logits = self(
+        logits, _ = self(
             batch["feat"], batch["feat_lengths"], batch["anchor"]
         )
         labels = batch["label"].int()
         self._update_score_diagnostics(
             self.score_diagnostics,
-            self.completion_score_diagnostics,
             logits=logits,
-            seq_logits=seq_logits,
-            anchor=batch["anchor"],
             labels=labels,
             sample_ids=batch.get("sample_id"),
         )
@@ -909,13 +770,7 @@ class Stage2LightningModule(pl.LightningModule):
             namespace="test/",
             progress_bar=True,
         )
-        self._log_score_diagnostics(
-            self.completion_score_diagnostics,
-            namespace=f"test/{self.sequence_diagnostic_namespace}",
-            deployment_metric=False,
-        )
         self.score_diagnostics.reset()
-        self.completion_score_diagnostics.reset()
 
     def trainable_module(self) -> torch.nn.Module:
         """Return the module whose parameters the optimizer should own.

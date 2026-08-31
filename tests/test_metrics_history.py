@@ -25,6 +25,20 @@ CONFIG = {
         "max_steps": 50000,
         "batch_size_per_gpu": 64,
         "accumulate_grad_batches": 2,
+        "qbyt_alignment": {
+            "topology": "bounded_segmental_v1",
+            "min_phone_duration_frames": 1,
+            "max_phone_duration_frames": 8,
+            "max_inter_phone_gap_frames": 2,
+            "max_keyword_span_frames": 30,
+            "temperature": 0.2,
+            "local_context_kernel": 5,
+        },
+        "sequence_loss": {
+            "target_mode": "ordered_contiguous_prefix",
+            "progress_weight": 0.3,
+            "normalization": "sample",
+        },
         "validation": {"val_check_interval": 1000},
     },
     "adapt": {
@@ -227,12 +241,16 @@ def test_numeric_callback_metrics_drops_alias_and_non_numeric():
             "val_auc": 0.9,
             "val_target_auc": 0.91,
             "val_per": 0.2,
-            "train/seq_loss": 0.3,
+            "train/microbatch/loss_seq_weighted": 0.3,
             "note": "text",
             "val/eer": "0.1",
         }
     )
-    assert metrics == {"val/auc": 0.9, "val/eer": 0.1}
+    assert metrics == {
+        "train/microbatch/loss_seq_weighted": 0.3,
+        "val/auc": 0.9,
+        "val/eer": 0.1,
+    }
 
 
 def test_collect_hparams_stage2_section():
@@ -245,28 +263,40 @@ def test_collect_hparams_stage2_section():
     assert hparams["val_check_interval_optimizer_steps_approx"] == 500
     assert hparams["seed"] == 7
     assert hparams["seq_target_mode"] == "ordered_contiguous_prefix"
-    assert hparams["seq_progress_weight"] == 0.5
-    assert hparams["seq_completion_weight"] == 0.5
+    assert hparams["seq_progress_weight"] == 0.3
     assert hparams["seq_normalization"] == "sample"
-    assert hparams["qbyt_readout_mode"] == "gru_last"
-    assert hparams["qbyt_readout_temperature"] == 1.0
+    assert hparams["qbyt_alignment_topology"] == "bounded_segmental_v1"
+    assert hparams["qbyt_alignment_temperature"] == 0.2
+    assert hparams["qbyt_max_phone_duration_frames"] == 8
+    assert hparams["qbyt_max_inter_phone_gap_frames"] == 2
+    assert hparams["qbyt_max_keyword_span_frames"] == 30
     assert hparams["qbyt_deployment_threshold"] == 0.5
     assert hparams["score_ece_num_bins"] == 15
-    assert hparams["seq_diagnostic_threshold"] == 0.5
     assert "rank" not in hparams
 
 
-def test_collect_hparams_records_softmin_readout():
+def test_collect_hparams_records_alignment_overrides():
     config = dict(CONFIG)
     config["stage2"] = dict(
         CONFIG["stage2"],
-        qbyt_readout={"mode": "eps_softmin", "temperature": 0.5},
+        qbyt_alignment={
+            "topology": "bounded_segmental_v1",
+            "min_phone_duration_frames": 2,
+            "max_phone_duration_frames": 6,
+            "max_inter_phone_gap_frames": 1,
+            "max_keyword_span_frames": 24,
+            "temperature": 0.5,
+            "local_context_kernel": 3,
+        },
     )
 
     hparams = collect_hparams(config)
 
-    assert hparams["qbyt_readout_mode"] == "eps_softmin"
-    assert hparams["qbyt_readout_temperature"] == 0.5
+    assert hparams["qbyt_alignment_topology"] == "bounded_segmental_v1"
+    assert hparams["qbyt_alignment_temperature"] == 0.5
+    assert hparams["qbyt_max_phone_duration_frames"] == 6
+    assert hparams["qbyt_max_inter_phone_gap_frames"] == 1
+    assert hparams["qbyt_max_keyword_span_frames"] == 24
 
 
 def test_collect_hparams_adapt_section():
@@ -341,7 +371,7 @@ def test_build_run_record_layout():
     record = build_run_record(
         run_name="adapt_hey-eva_tts",
         hparams={"learning_rate": 4e-4, "rank": 8},
-        final_metrics={"val/auc": 0.91, "train/loss": 0.2},
+        final_metrics={"val/auc": 0.91, "train/window/loss_total": 0.2},
         best_metrics={"val/auc": 0.93},
         global_step=3000,
         duration_seconds=125.67,

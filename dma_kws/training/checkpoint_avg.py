@@ -1,4 +1,4 @@
-"""Checkpoint averaging utilities aligned with ``qbyt/test.py``."""
+"""Checkpoint averaging utilities for canonical Stage II checkpoints."""
 
 from __future__ import annotations
 
@@ -119,7 +119,7 @@ def average_lightning_checkpoints(paths: list[Path], output_path: Path) -> Path:
             ]
         except ValueError as exc:
             raise ValueError(
-                f"Cannot verify the QbyT readout of every checkpoint: {exc}"
+                f"Cannot verify the QbyT alignment of every checkpoint: {exc}"
             ) from exc
         if any(
             not qbyt_readout_specs_equal(spec, readout_specs[0])
@@ -127,7 +127,7 @@ def average_lightning_checkpoints(paths: list[Path], output_path: Path) -> Path:
         ):
             described = [spec.as_dict() for spec in readout_specs]
             raise ValueError(
-                "Cannot average checkpoints with different QbyT readouts: "
+                "Cannot average checkpoints with different QbyT alignments: "
                 f"{described}"
             )
     reference_keys = set(state_dicts[0])

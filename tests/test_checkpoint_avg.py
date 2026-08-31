@@ -3,13 +3,29 @@ from pathlib import Path
 import pytest
 import torch
 
+from dma_kws.stage2.readout import QbyTAlignmentSpec
 from dma_kws.training.checkpoint_avg import average_lightning_checkpoints
 from dma_kws.training.checkpoint_io import (
+    QBYT_ALIGNMENT_SPEC_KEY,
     QBYT_READOUT_VERSION,
     QBYT_READOUT_VERSION_KEY,
     STAGE2_BASE_FINGERPRINT_KEY,
     fingerprint_stage2_base,
 )
+
+
+def _alignment(**overrides) -> dict:
+    spec = QbyTAlignmentSpec().as_dict()
+    spec.update(overrides)
+    return QbyTAlignmentSpec(**spec).as_dict()
+
+
+def _objective(*, progress_weight: float = 0.3) -> dict:
+    return {
+        "target_mode": "ordered_contiguous_prefix",
+        "progress_weight": progress_weight,
+        "normalization": "sample",
+    }
 
 
 def _write_lightning_ckpt(path: Path, weight: float) -> None:
@@ -55,115 +71,120 @@ def test_average_lightning_checkpoints_supports_legacy_model_state_dict(tmp_path
 
 
 def test_average_rejects_different_stage2_sequence_objectives(tmp_path: Path) -> None:
-    legacy = tmp_path / "legacy.ckpt"
+    first = tmp_path / "first.ckpt"
     current = tmp_path / "current.ckpt"
     state = {"qbyt.weight": torch.tensor([1.0])}
-    torch.save({"state_dict": state, "config": {"stage2": {}}}, legacy)
     torch.save(
         {
             "state_dict": state,
             "config": {
                 "stage2": {
-                    "sequence_loss": {
-                        "target_mode": "ordered_contiguous_prefix",
-                        "progress_weight": 0.5,
-                        "completion_weight": 0.5,
-                        "normalization": "sample",
-                    }
+                    "qbyt_alignment": _alignment(),
+                    "sequence_loss": _objective(progress_weight=0.3),
                 }
             },
+            QBYT_READOUT_VERSION_KEY: QBYT_READOUT_VERSION,
+            QBYT_ALIGNMENT_SPEC_KEY: _alignment(),
+        },
+        first,
+    )
+    torch.save(
+        {
+            "state_dict": state,
+            "config": {
+                "stage2": {
+                    "qbyt_alignment": _alignment(),
+                    "sequence_loss": _objective(progress_weight=0.5),
+                }
+            },
+            QBYT_READOUT_VERSION_KEY: QBYT_READOUT_VERSION,
+            QBYT_ALIGNMENT_SPEC_KEY: _alignment(),
         },
         current,
     )
 
     with pytest.raises(ValueError, match="different Stage II sequence objectives"):
-        average_lightning_checkpoints([legacy, current], tmp_path / "bad.ckpt")
+        average_lightning_checkpoints([first, current], tmp_path / "bad.ckpt")
 
 
-def _write_qbyt_readout_ckpt(
+def _write_qbyt_alignment_ckpt(
     path: Path,
     *,
-    mode: str,
-    temperature: float = 1.0,
+    alignment: dict | None = None,
     version: int = QBYT_READOUT_VERSION,
     weight: float = 1.0,
 ) -> None:
+    alignment = _alignment() if alignment is None else alignment
     torch.save(
         {
             "state_dict": {"qbyt.weight": torch.tensor([weight])},
             "config": {
                 "stage2": {
-                    "qbyt_readout": {
-                        "mode": mode,
-                        "temperature": temperature,
-                    }
+                    "qbyt_alignment": alignment,
+                    "sequence_loss": _objective(),
                 }
             },
             QBYT_READOUT_VERSION_KEY: version,
+            QBYT_ALIGNMENT_SPEC_KEY: alignment,
         },
         path,
     )
 
 
-def test_average_rejects_different_qbyt_readout_modes_or_temperatures(
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"min_phone_duration_frames": 2},
+        {"max_phone_duration_frames": 9},
+        {"max_inter_phone_gap_frames": 1},
+        {"max_keyword_span_frames": 40},
+        {"temperature": 0.35},
+        {"local_context_kernel": 7},
+    ],
+)
+def test_average_rejects_any_qbyt_alignment_difference(
     tmp_path: Path,
+    changed: dict,
 ) -> None:
-    mean = tmp_path / "mean.ckpt"
-    mean_other_temperature = tmp_path / "mean_other_temperature.ckpt"
-    softmin_a = tmp_path / "softmin_a.ckpt"
-    softmin_b = tmp_path / "softmin_b.ckpt"
-    _write_qbyt_readout_ckpt(mean, mode="eps_mean")
-    _write_qbyt_readout_ckpt(
-        mean_other_temperature,
-        mode="eps_mean",
-        temperature=0.5,
-    )
-    _write_qbyt_readout_ckpt(
-        softmin_a,
-        mode="eps_softmin",
-        temperature=0.5,
-    )
-    _write_qbyt_readout_ckpt(
-        softmin_b,
-        mode="eps_softmin",
-        temperature=0.75,
-    )
+    baseline = tmp_path / "baseline.ckpt"
+    different = tmp_path / "different.ckpt"
+    _write_qbyt_alignment_ckpt(baseline)
+    _write_qbyt_alignment_ckpt(different, alignment=_alignment(**changed))
 
-    with pytest.raises(ValueError, match="different QbyT readouts"):
+    with pytest.raises(ValueError, match="different QbyT alignments"):
         average_lightning_checkpoints(
-            [mean, softmin_a],
-            tmp_path / "bad_mode.ckpt",
-        )
-    with pytest.raises(ValueError, match="different QbyT readouts"):
-        average_lightning_checkpoints(
-            [softmin_a, softmin_b],
-            tmp_path / "bad_temperature.ckpt",
-        )
-    with pytest.raises(ValueError, match="different QbyT readouts"):
-        average_lightning_checkpoints(
-            [mean, mean_other_temperature],
-            tmp_path / "bad_mean_temperature.ckpt",
+            [baseline, different],
+            tmp_path / "bad_alignment.ckpt",
         )
 
 
-def test_average_accepts_same_readout_across_compatible_versions(
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_average_rejects_pre_v5_qbyt_checkpoint(
     tmp_path: Path,
+    version: int,
 ) -> None:
-    v3 = tmp_path / "v3_mean.ckpt"
-    v4 = tmp_path / "v4_mean.ckpt"
+    legacy = tmp_path / f"v{version}.ckpt"
+    current = tmp_path / "v5.ckpt"
+    _write_qbyt_alignment_ckpt(legacy, version=version)
+    _write_qbyt_alignment_ckpt(current)
+
+    with pytest.raises(ValueError, match=f"unsupported QbyT readout version {version}"):
+        average_lightning_checkpoints([legacy, current], tmp_path / "bad.ckpt")
+
+
+def test_average_accepts_only_same_v5_alignment(tmp_path: Path) -> None:
+    first = tmp_path / "first.ckpt"
+    second = tmp_path / "second.ckpt"
     output = tmp_path / "mean.ckpt"
-    _write_qbyt_readout_ckpt(
-        v3,
-        mode="eps_mean",
-        version=3,
-        weight=1.0,
-    )
-    _write_qbyt_readout_ckpt(v4, mode="eps_mean", weight=3.0)
+    alignment = _alignment(max_keyword_span_frames=40, temperature=0.35)
+    _write_qbyt_alignment_ckpt(first, alignment=alignment, weight=1.0)
+    _write_qbyt_alignment_ckpt(second, alignment=alignment, weight=3.0)
 
-    average_lightning_checkpoints([v3, v4], output)
+    average_lightning_checkpoints([first, second], output)
 
     averaged = torch.load(output, map_location="cpu")
-    assert averaged[QBYT_READOUT_VERSION_KEY] == 3
+    assert averaged[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION
+    assert averaged[QBYT_ALIGNMENT_SPEC_KEY] == alignment
     torch.testing.assert_close(
         averaged["state_dict"]["qbyt.weight"],
         torch.tensor([2.0]),
@@ -182,24 +203,25 @@ def _write_lora_ckpt(
     adapter_value: float,
     alpha: float = 4.0,
     keyword: str = "hey eva",
-    lora_targets: list[str] | tuple[str, ...] | str = ("in_proj_weight",),
-    readout_mode: str = "gru_last",
-    readout_temperature: float = 1.0,
+    lora_targets: list[str] | tuple[str, ...] | str = ("audio_key.weight",),
+    alignment: dict | None = None,
 ) -> None:
+    alignment = _alignment() if alignment is None else alignment
     state = {
         key: value.clone()
         for key, value in base.items()
     }
-    state.update(
-        {
-            "qbyt.layer.parametrizations.weight.0.lora_A": torch.full(
-                (2, 3), adapter_value
-            ),
-            "qbyt.layer.parametrizations.weight.0.lora_B": torch.full(
-                (3, 2), adapter_value
-            ),
-        }
-    )
+    for projection in ("audio_projection", "audio_key", "text_query"):
+        root = f"qbyt.{projection}.parametrizations.weight"
+        original = state.get(f"{root}.original")
+        if original is None:
+            continue
+        state[f"{root}.0.lora_A"] = torch.full(
+            (2, int(original.shape[1])), adapter_value
+        )
+        state[f"{root}.0.lora_B"] = torch.full(
+            (int(original.shape[0]), 2), adapter_value
+        )
     torch.save(
         {
             "checkpoint_kind": "stage2_lora",
@@ -215,10 +237,8 @@ def _write_lora_ckpt(
                     "use_dynamic_chunk": False,
                 },
                 "stage2": {
-                    "qbyt_readout": {
-                        "mode": readout_mode,
-                        "temperature": readout_temperature,
-                    }
+                    "qbyt_alignment": alignment,
+                    "sequence_loss": _objective(),
                 },
                 "adapt": {
                     "keyword": keyword,
@@ -229,6 +249,7 @@ def _write_lora_ckpt(
                 }
             },
             QBYT_READOUT_VERSION_KEY: QBYT_READOUT_VERSION,
+            QBYT_ALIGNMENT_SPEC_KEY: alignment,
             STAGE2_BASE_FINGERPRINT_KEY: fingerprint_stage2_base(state),
         },
         path,
@@ -238,7 +259,7 @@ def _write_lora_ckpt(
 def test_lora_average_only_averages_adapters_and_preserves_base_bits(tmp_path: Path):
     base = {
         "encoder.weight": torch.randn(4, 3),
-        "qbyt.layer.parametrizations.weight.original": torch.randn(3, 3),
+        "qbyt.audio_key.parametrizations.weight.original": torch.randn(3, 3),
         "qbyt.bias": torch.randn(3),
     }
     first = tmp_path / "lora_a.ckpt"
@@ -253,11 +274,11 @@ def test_lora_average_only_averages_adapters_and_preserves_base_bits(tmp_path: P
     state = averaged["state_dict"]
     assert torch.equal(state["encoder.weight"], base["encoder.weight"])
     assert torch.equal(
-        state["qbyt.layer.parametrizations.weight.original"],
-        base["qbyt.layer.parametrizations.weight.original"],
+        state["qbyt.audio_key.parametrizations.weight.original"],
+        base["qbyt.audio_key.parametrizations.weight.original"],
     )
     assert torch.equal(
-        state["qbyt.layer.parametrizations.weight.0.lora_A"],
+        state["qbyt.audio_key.parametrizations.weight.0.lora_A"],
         torch.full((2, 3), 2.0),
     )
     assert averaged[STAGE2_BASE_FINGERPRINT_KEY] == fingerprint_stage2_base(state)
@@ -266,7 +287,7 @@ def test_lora_average_only_averages_adapters_and_preserves_base_bits(tmp_path: P
 def test_lora_average_rejects_different_bases_or_scaling(tmp_path: Path):
     base = {
         "encoder.weight": torch.randn(4, 3),
-        "qbyt.layer.parametrizations.weight.original": torch.randn(3, 3),
+        "qbyt.audio_key.parametrizations.weight.original": torch.randn(3, 3),
     }
     first = tmp_path / "lora_a.ckpt"
     different_base = tmp_path / "lora_other_base.ckpt"
@@ -294,10 +315,10 @@ def test_lora_average_rejects_different_bases_or_scaling(tmp_path: Path):
         )
 
 
-def test_lora_average_rejects_different_softmin_temperatures(tmp_path: Path):
+def test_lora_average_rejects_different_alignment_specs(tmp_path: Path):
     base = {
         "encoder.weight": torch.randn(4, 3),
-        "qbyt.layer.parametrizations.weight.original": torch.randn(3, 3),
+        "qbyt.audio_key.parametrizations.weight.original": torch.randn(3, 3),
     }
     first = tmp_path / "softmin_a.ckpt"
     second = tmp_path / "softmin_b.ckpt"
@@ -305,28 +326,27 @@ def test_lora_average_rejects_different_softmin_temperatures(tmp_path: Path):
         first,
         base=base,
         adapter_value=1.0,
-        readout_mode="eps_softmin",
-        readout_temperature=0.5,
+        alignment=_alignment(temperature=0.3),
     )
     _write_lora_ckpt(
         second,
         base=base,
         adapter_value=3.0,
-        readout_mode="eps_softmin",
-        readout_temperature=0.75,
+        alignment=_alignment(temperature=0.4),
     )
 
-    with pytest.raises(ValueError, match="different QbyT readouts"):
+    with pytest.raises(ValueError, match="different QbyT alignments"):
         average_lightning_checkpoints(
             [first, second],
             tmp_path / "bad_readout.ckpt",
         )
 
 
-def test_lora_average_normalizes_keyword_and_target_aliases(tmp_path: Path):
+def test_lora_average_normalizes_keyword_and_target_order(tmp_path: Path):
     base = {
         "encoder.weight": torch.randn(4, 3),
-        "qbyt.layer.parametrizations.weight.original": torch.randn(3, 3),
+        "qbyt.audio_key.parametrizations.weight.original": torch.randn(3, 3),
+        "qbyt.text_query.parametrizations.weight.original": torch.randn(3, 3),
     }
     first = tmp_path / "canonical.ckpt"
     second = tmp_path / "aliases.ckpt"
@@ -336,7 +356,7 @@ def test_lora_average_normalizes_keyword_and_target_aliases(tmp_path: Path):
         base=base,
         adapter_value=1.0,
         keyword="hey eva",
-        lora_targets=["in_proj_weight", "out_proj.weight"],
+        lora_targets=["audio_key.weight", "text_query.weight"],
     )
     _write_lora_ckpt(
         second,
@@ -344,14 +364,14 @@ def test_lora_average_normalizes_keyword_and_target_aliases(tmp_path: Path):
         adapter_value=3.0,
         alpha=4.000000000001,
         keyword="Hey-Eva!!!",
-        lora_targets=["out_proj", "in_proj_weight", "out_proj.weight"],
+        lora_targets=["text_query.weight", "audio_key.weight"],
     )
     # Exercise normalization across both metadata locations within one file.
     aliased = torch.load(second, map_location="cpu")
     aliased["config"]["adapt"]["keyword"] = "HEY, EVA"
     aliased["config"]["adapt"]["lora_targets"] = [
-        "in_proj_weight",
-        "out_proj.weight",
+        "audio_key.weight",
+        "text_query.weight",
     ]
     torch.save(aliased, second)
 
@@ -359,7 +379,7 @@ def test_lora_average_normalizes_keyword_and_target_aliases(tmp_path: Path):
 
     averaged = torch.load(output, map_location="cpu")
     assert torch.equal(
-        averaged["state_dict"]["qbyt.layer.parametrizations.weight.0.lora_A"],
+        averaged["state_dict"]["qbyt.audio_key.parametrizations.weight.0.lora_A"],
         torch.full((2, 3), 2.0),
     )
 
@@ -367,7 +387,7 @@ def test_lora_average_normalizes_keyword_and_target_aliases(tmp_path: Path):
 def test_lora_average_rejects_unknown_targets(tmp_path: Path):
     base = {
         "encoder.weight": torch.randn(4, 3),
-        "qbyt.layer.parametrizations.weight.original": torch.randn(3, 3),
+        "qbyt.audio_key.parametrizations.weight.original": torch.randn(3, 3),
     }
     first = tmp_path / "unknown_a.ckpt"
     second = tmp_path / "unknown_b.ckpt"
@@ -375,13 +395,13 @@ def test_lora_average_rejects_unknown_targets(tmp_path: Path):
         first,
         base=base,
         adapter_value=1.0,
-        lora_targets=["in_proj_weigth"],
+        lora_targets=["audio_key.weigth"],
     )
     _write_lora_ckpt(
         second,
         base=base,
         adapter_value=3.0,
-        lora_targets=["in_proj_weigth"],
+        lora_targets=["audio_key.weigth"],
     )
 
     with pytest.raises(ValueError, match="Unsupported LoRA targets"):
