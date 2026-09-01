@@ -148,13 +148,8 @@ class Stage2Verifier:
                     vocab_size=vocab_size,
                 )
 
-            def _encode_and_score(
-                self,
-                feats,
-                feat_lengths,
-                anchors,
-                anchor_lengths,
-            ):
+            def encode_for_qbyt(self, feats, feat_lengths):
+                """Return ``(speech, encoder_lengths)`` exactly as QbyT sees them."""
                 # Inference always runs at the deployment operating point.
                 encoder_out, encoder_mask = run_encoder(
                     self.encoder,
@@ -171,6 +166,16 @@ class Stage2Verifier:
                     speech, _ = self.adapter(
                         encoder_out, encoder_mask, with_log_probs=False
                     )
+                return speech, encoder_lens
+
+            def _encode_and_score(
+                self,
+                feats,
+                feat_lengths,
+                anchors,
+                anchor_lengths,
+            ):
+                speech, encoder_lens = self.encode_for_qbyt(feats, feat_lengths)
                 return self.qbyt(
                     speech,
                     anchors,
@@ -306,16 +311,14 @@ class Stage2Verifier:
             )
         ]
 
-    def score_clip_feats_with_logits(
+    def _pad_clip_batch(
         self,
         feats: Sequence,
         keyword_ids_batch: Sequence[Sequence[int]],
-    ) -> list[tuple[float, float]]:
-        """Return ``(raw_logit, calibrated_probability)`` for every clip."""
+    ):
+        """Pad one clip batch onto the device. Shared so no caller can drift."""
 
         torch = self._torch
-        if not feats:
-            return []
         if len(feats) != len(keyword_ids_batch):
             raise ValueError("feats and keyword_ids_batch must have the same length")
         if any(not ids for ids in keyword_ids_batch):
@@ -332,18 +335,77 @@ class Stage2Verifier:
         anchor_lengths = torch.tensor(
             [len(ids) for ids in keyword_ids_batch], dtype=torch.long
         )
+        return (
+            padded_feats.to(self._device),
+            feat_lengths.to(self._device),
+            anchors.to(self._device),
+            anchor_lengths.to(self._device),
+        )
+
+    def score_clip_feats_with_logits(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+    ) -> list[tuple[float, float]]:
+        """Return ``(raw_logit, calibrated_probability)`` for every clip."""
+
+        torch = self._torch
+        if not feats:
+            return []
+        padded_feats, feat_lengths, anchors, anchor_lengths = self._pad_clip_batch(
+            feats, keyword_ids_batch
+        )
         with torch.no_grad(), self._inference_amp():
             raw_logits = self._model(
-                padded_feats.to(self._device),
-                feat_lengths.to(self._device),
-                anchors.to(self._device),
-                anchor_lengths.to(self._device),
+                padded_feats,
+                feat_lengths,
+                anchors,
+                anchor_lengths,
             )
         raw_values = [float(value) for value in raw_logits.reshape(-1).cpu()]
         return [
             (raw_logit, self._calibrator.predict_one(raw_logit))
             for raw_logit in raw_values
         ]
+
+    def emission_diagnostics(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+        *,
+        ablations=None,
+    ) -> list[dict]:
+        """Per-clip emission statistics and readout ablations for a clip batch.
+
+        Runs the same encoder pass, precision and streaming point as
+        :meth:`score_clip_feats_with_logits`, so the ``deployed`` ablation
+        reproduces ``qbyt_raw_logit`` and every other ablation differs from it
+        only by the readout under test.
+        """
+
+        torch = self._torch
+        if not feats:
+            return []
+        from dma_kws.inference.qbyt_diagnostics import (
+            DEFAULT_ABLATIONS,
+            clip_emission_diagnostics,
+        )
+
+        padded_feats, feat_lengths, anchors, anchor_lengths = self._pad_clip_batch(
+            feats, keyword_ids_batch
+        )
+        with torch.no_grad(), self._inference_amp():
+            speech, encoder_lens = self._model.encode_for_qbyt(
+                padded_feats, feat_lengths
+            )
+            return clip_emission_diagnostics(
+                self._model.qbyt,
+                speech,
+                anchors,
+                encoder_lens.to(dtype=torch.long),
+                anchor_lengths,
+                ablations=DEFAULT_ABLATIONS if ablations is None else ablations,
+            )
 
     def decode_phoneme_feats(self, feats: Sequence) -> list[list[int]]:
         """Greedily decode phoneme ids from full-clip fbank features.

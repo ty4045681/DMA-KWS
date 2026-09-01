@@ -215,6 +215,16 @@ class Stage2ClipRunner:
         """Resolved streaming operating point used for every score."""
         return self._verifier.stream_policy
 
+    @property
+    def verifier(self) -> "Stage2Verifier":
+        """Loaded Stage II verifier backing every score this runner produces."""
+        return self._verifier
+
+    @property
+    def sample_rate(self) -> int:
+        """Sample rate every clip is loaded and resampled to."""
+        return self._sample_rate
+
     def _score_feats_with_logits(
         self,
         feats: Sequence,
@@ -316,6 +326,21 @@ class Stage2ClipRunner:
             return text_to_phonemes(self._g2p, keyword)
         return parse_phoneme_sequence(keyword_phonemes, field_name=field_name)
 
+    def enroll_phonemes(self, phonemes: Sequence[str]) -> list[int]:
+        """Tokenize one enrollment sequence into QbyT anchor ids.
+
+        The single enrollment path: batch scoring and offline diagnostics must
+        not tokenize a keyword through two code paths, or a diagnostic could
+        report on an anchor the deployed score never saw.
+        """
+        keyword_ids = tokenize_phoneme_string(self._tokenizer, " ".join(phonemes))
+        if len(keyword_ids) != len(phonemes):
+            raise RuntimeError(
+                "Enrollment phoneme/token length mismatch: "
+                f"phonemes={len(phonemes)}, token_ids={len(keyword_ids)}"
+            )
+        return keyword_ids
+
     def run_batch(
         self,
         rows: Sequence[Mapping[str, Any]],
@@ -387,16 +412,10 @@ class Stage2ClipRunner:
                     if override is not None
                     else auto_phonemes(keyword)
                 )
-                keyword_ids = tokenize_phoneme_string(
-                    self._tokenizer, " ".join(phonemes)
+                keyword_cache[keyword_key] = (
+                    phonemes,
+                    self.enroll_phonemes(phonemes),
                 )
-                if len(keyword_ids) != len(phonemes):
-                    raise RuntimeError(
-                        "Enrollment phoneme/token length mismatch: "
-                        f"keyword={keyword!r}, phonemes={len(phonemes)}, "
-                        f"token_ids={len(keyword_ids)}"
-                    )
-                keyword_cache[keyword_key] = (phonemes, keyword_ids)
 
         transform_enabled = waveform_transform is not None and bool(
             getattr(waveform_transform, "enabled", True)

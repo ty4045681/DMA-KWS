@@ -161,6 +161,49 @@ class QbyT(nn.Module):
     def _length_mask(lengths: torch.Tensor, width: int) -> torch.Tensor:
         return torch.arange(width, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
 
+    def frame_class_log_probs(
+        self,
+        speech: torch.Tensor,
+        frame_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalized per-frame log posterior over ``[phones..., blank, noise]``.
+
+        This is the whole emission model: every discriminative decision the
+        segmental graph can make is a function of this tensor. It is exposed so
+        offline diagnostics can re-derive alternative filler definitions from the
+        exact posterior the deployed score used, without a second forward pass.
+        Shape ``[B, T, num_embeds + 1]``; column ``num_embeds - 1`` is blank and
+        column ``num_embeds`` is non-speech.
+        """
+        audio_states = self.audio_projection(speech)
+        audio_states = audio_states * frame_mask.unsqueeze(-1).to(audio_states.dtype)
+        for block in self.audio_context:
+            audio_states = block(audio_states, frame_mask)
+
+        audio_keys = F.normalize(self.audio_key(audio_states), dim=-1, eps=1e-6)
+        phone_prototypes = F.normalize(
+            self.text_query(self.text_projection.weight[1:]),
+            dim=-1,
+            eps=1e-6,
+        )
+        match_scale = self.match_log_scale.clamp(
+            min=math.log(1.0e-2), max=math.log(100.0)
+        ).exp()
+        phone_logits = match_scale * torch.einsum(
+            "btd,vd->btv", audio_keys, phone_prototypes
+        ) + self.phone_bias
+        class_logits = torch.cat(
+            (
+                phone_logits,
+                self.blank_head(audio_states),
+                self.noise_head(audio_states),
+            ),
+            dim=-1,
+        )
+        # The graph DP always runs in float32, and its probabilistic contract
+        # begins here with one normalized phone/blank/noise competition.
+        return F.log_softmax(class_logits.float(), dim=-1)
+
     def _encode_lattice(
         self,
         speech: torch.Tensor,
@@ -204,34 +247,7 @@ class QbyT(nn.Module):
         frame_mask = self._length_mask(speech_lengths, frame_width)
         phone_mask = self._length_mask(text_lengths, phone_width)
 
-        audio_states = self.audio_projection(speech)
-        audio_states = audio_states * frame_mask.unsqueeze(-1).to(audio_states.dtype)
-        for block in self.audio_context:
-            audio_states = block(audio_states, frame_mask)
-
-        audio_keys = F.normalize(self.audio_key(audio_states), dim=-1, eps=1e-6)
-        phone_prototypes = F.normalize(
-            self.text_query(self.text_projection.weight[1:]),
-            dim=-1,
-            eps=1e-6,
-        )
-        match_scale = self.match_log_scale.clamp(
-            min=math.log(1.0e-2), max=math.log(100.0)
-        ).exp()
-        phone_logits = match_scale * torch.einsum(
-            "btd,vd->btv", audio_keys, phone_prototypes
-        ) + self.phone_bias
-        class_logits = torch.cat(
-            (
-                phone_logits,
-                self.blank_head(audio_states),
-                self.noise_head(audio_states),
-            ),
-            dim=-1,
-        )
-        # The graph DP always runs in float32, and its probabilistic contract
-        # begins here with one normalized phone/blank/noise competition.
-        class_log_probs = F.log_softmax(class_logits.float(), dim=-1)
+        class_log_probs = self.frame_class_log_probs(speech, frame_mask)
 
         phone_class_count = self.text_projection.num_embeddings - 1
         safe_phone_indices = (text - 1).clamp(min=0, max=phone_class_count - 1)
