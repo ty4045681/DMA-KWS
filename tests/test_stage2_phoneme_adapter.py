@@ -1,15 +1,21 @@
 """Stage II wiring of the phoneme CTC adapter."""
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
+import pandas as pd
 import pytest
 import torch
 import torch.nn as nn
 
 pytest.importorskip("pytorch_lightning")
 
+from dma_kws.stage2.collate import train_collate_fn
+from dma_kws.stage2.dataset import LibriPhraseTrainDataset
 from dma_kws.stage2.losses import compute_stage2_losses
 from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
+from dma_kws.tokenizer import CANONICAL_DICT_PATH, load_char_tokenizer
 from dma_kws.training.checkpoint_io import stamp_qbyt_readout_version
 
 ENCODER_DIM = 144
@@ -220,6 +226,111 @@ def test_auxiliary_ctc_skip_metrics_use_global_counts(monkeypatch):
     assert values["train/microbatch/ctc_skipped"] == 4
     assert values["train/microbatch/ctc_skip_rate"] == pytest.approx(4 / 6)
     assert values["train/epoch/ctc_skip_rate"] == pytest.approx(4 / 6)
+
+
+def _background_negative_dataset(monkeypatch, *, speech_frames: int, background_frames: int):
+    """A LibriPhrase dataset whose every negative draw is pure background."""
+    clips = {
+        "clips-2-a.npy": np.array(
+            [{"audio_path": "LP-460/hello/a.wav"}, {"audio_path": "LP-460/hello/b.wav"}],
+            dtype=object,
+        ),
+        "clips-2-b.npy": np.array(
+            [{"audio_path": "LP-460/world/c.wav"}, {"audio_path": "LP-460/world/d.wav"}],
+            dtype=object,
+        ),
+    }
+
+    def fake_load(path, allow_pickle=False):
+        name = Path(path).name
+        if name in clips:
+            return clips[name]
+        if "fbank" in str(path):
+            return np.ones((speech_frames, 80), dtype=np.float32)
+        raise FileNotFoundError(path)
+
+    class _FakeBackgroundSampler:
+        def __init__(self, **_kwargs):
+            pass
+
+        def extract(self, *, rng):
+            return torch.full((background_frames, 80), 9.0)
+
+    monkeypatch.setattr("dma_kws.stage2.dataset.np.load", fake_load)
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.TrainingBackgroundSampler",
+        _FakeBackgroundSampler,
+    )
+    return LibriPhraseTrainDataset(
+        wav_dir="/data/segments",
+        tokenizer=load_char_tokenizer(CANONICAL_DICT_PATH),
+        df=pd.DataFrame(
+            {
+                "ngram": ["hello", "world"],
+                "ngram_g2p": ["HH AH0 L OW1", "W ER1 L D"],
+                "clips_file": ["clips-2-a.npy", "clips-2-b.npy"],
+                "distances_file": ["dist-0-a.npy", "dist-2-b.npy"],
+            }
+        ),
+        sample_lens=8,
+        seed=1,
+        background_negative={
+            "enabled": True,
+            "probability": 1.0,
+            "audio_list_path": "/background/musan.list",
+        },
+    )
+
+
+def test_background_negative_is_skipped_by_the_auxiliary_ctc_loss_end_to_end(monkeypatch):
+    """Dataset -> collate -> module -> adapter for a pure-background negative.
+
+    Each link is covered on its own elsewhere. What none of those tests can see
+    is the contract *between* them: the dataset emits ``query_seq=[]`` for
+    music/noise, the collate turns that into ``query_lengths == 0``, and the
+    adapter drops the row from the CTC mean and reports it as skipped. Any link
+    that started inventing a target instead (padding to length one, falling
+    back to the anchor) would quietly teach the trunk phonemes for noise.
+    """
+    speech_frames, background_frames = 12, 7
+    dataset = _background_negative_dataset(
+        monkeypatch, speech_frames=speech_frames, background_frames=background_frames
+    )
+    samples = [dataset[index] for index in range(len(dataset))]
+    speech = [sample for sample in samples if sample["query_seq"].numel() > 0][:2]
+    background = [sample for sample in samples if sample["query_seq"].numel() == 0][:1]
+    assert len(speech) == 2 and len(background) == 1, "seed no longer yields both kinds"
+    assert background[0]["label"].item() == 0
+    assert torch.all(background[0]["seq_label"] == 0)
+
+    batch = train_collate_fn(speech + background)
+    assert batch["query_lengths"].tolist().count(0) == 1
+    assert batch["feat_lengths"].tolist() == [speech_frames, speech_frames, background_frames]
+
+    module = _build(monkeypatch, _config(ctc_weight=0.3))
+    module.log = MagicMock()
+    _logits, _seq_logits, (ctc_log_probs, encoder_mask) = module.forward_with_encoder(
+        batch["feat"], batch["feat_lengths"], batch["anchor"], mode="train"
+    )
+    loss = module._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask)
+
+    assert isinstance(loss, torch.Tensor)
+    assert torch.isfinite(loss)
+    logged = {call.args[0]: float(call.args[1]) for call in module.log.call_args_list}
+    assert logged["train/microbatch/ctc_skipped"] == 1
+    assert logged["train/microbatch/ctc_valid"] == 2
+
+    # The mean must be over the two speech rows alone; the background row is not
+    # a zero-loss contributor but absent entirely.
+    speech_rows = batch["query_lengths"] > 0
+    reference, reference_skipped = module.adapter.ctc_loss(
+        ctc_log_probs[speech_rows],
+        encoder_mask[speech_rows],
+        batch["query_seq"][speech_rows],
+        batch["query_lengths"][speech_rows],
+    )
+    assert reference_skipped == 0
+    torch.testing.assert_close(loss, reference)
 
 
 def test_auxiliary_ctc_loss_is_off_by_default(monkeypatch):

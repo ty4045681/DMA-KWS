@@ -22,11 +22,13 @@ from dma_kws.tokenizer import (
     load_char_tokenizer,
     normalize_seq_label_mode,
     tokenize_phoneme_string,
+    unsupported_phones,
 )
 from dma_kws.training.ddp import process_rank
 
 _PARQUET_COLUMNS = ["ngram", "ngram_g2p", "clips_file", "distances_file"]
 _MAX_CONTAINING_NEGATIVE_DRAWS = 16
+_G2P_VALIDATION_SAMPLE = 200
 
 _EVAL_COLUMNS = [
     "anchor_text",
@@ -110,6 +112,43 @@ def stage2_worker_init_fn(worker_id: int) -> None:
     _reseed_rng_holders(info.dataset, rank_seed, set())
 
 
+def validate_ngram_g2p(
+    df: pd.DataFrame,
+    *,
+    source: Path | str,
+    sample_size: int = _G2P_VALIDATION_SAMPLE,
+) -> None:
+    """Reject training anchors whose ``ngram_g2p`` is outside the vocabulary.
+
+    A parquet written before the stress-marked vocabulary carries stress-stripped
+    phonemes (``AH`` instead of ``AH0``), and ``CharTokenizer`` maps every one of
+    them to ``<unk>``. In Stage II that id becomes both a QbyT phone row and a
+    CTC target for the phoneme adapter, so training would quietly proceed on
+    transcripts without vowels. An empty string is rejected here as well: it
+    would only surface later as ``build_seq_label`` refusing an empty anchor,
+    without naming the parquet or the n-gram. Checking a bounded sample is
+    enough because the column is generated in one pass.
+    """
+    fix = (
+        "regenerate ngram_g2p with scripts/prepare_stage2_paper.py "
+        "(prep.force_g2p_recompute=true)."
+    )
+    sample = df.head(sample_size)
+    for ngram, g2p in zip(sample["ngram"].tolist(), sample["ngram_g2p"].tolist()):
+        phones = g2p.split() if isinstance(g2p, str) else []
+        if not phones:
+            raise ValueError(
+                f"{source}: anchor {ngram!r} has an empty ngram_g2p; {fix}"
+            )
+        unsupported = unsupported_phones(phones)
+        if unsupported:
+            raise ValueError(
+                f"{source}: anchor {ngram!r} has phonemes outside the vocabulary: "
+                f"{', '.join(unsupported)} (ngram_g2p: {g2p!r}). Parquets predating "
+                f"the stress-marked vocabulary tokenize every vowel to <unk>; {fix}"
+            )
+
+
 class LibriPhraseTrainDataset(Dataset):
     """LibriPhrase Stage II dataset with speech and optional pure backgrounds.
 
@@ -147,10 +186,13 @@ class LibriPhraseTrainDataset(Dataset):
 
         if df is not None:
             self.df = df.reset_index(drop=True)
+            g2p_source = "in-memory dataframe"
         else:
             if parquet_file is None:
                 raise ValueError("Either df or parquet_file must be provided")
             self.df = pd.read_parquet(parquet_file, columns=_PARQUET_COLUMNS)
+            g2p_source = parquet_file
+        validate_ngram_g2p(self.df, source=g2p_source)
 
         self.anchor_lists = self.df["ngram"].tolist()
         self.anchor2idx = {anchor: idx for idx, anchor in enumerate(self.anchor_lists)}

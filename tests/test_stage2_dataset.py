@@ -137,6 +137,58 @@ def test_dataset_rejects_unknown_seq_label_mode(mock_npy_loader):
         )
 
 
+def test_dataset_rejects_stress_stripped_ngram_g2p(mock_npy_loader):
+    """A parquet predating the stress-marked vocabulary tokenizes every vowel to
+    ``<unk>``, which would then be both a QbyT phone row and a CTC target. The
+    tokenizer cannot tell, so the dataset has to refuse it at load time."""
+    df = _mock_dataframe()
+    df.loc[0, "ngram_g2p"] = "HH AH L OW1"
+
+    with pytest.raises(ValueError, match=r"outside the vocabulary: AH\b") as excinfo:
+        LibriPhraseTrainDataset(
+            wav_dir="/data/segments",
+            tokenizer=_FakeTokenizer(),
+            df=df,
+            sample_lens=1,
+        )
+
+    message = str(excinfo.value)
+    assert "in-memory dataframe" in message
+    assert "'hello'" in message
+    assert "force_g2p_recompute" in message
+
+
+@pytest.mark.parametrize("ngram_g2p", ["", "   "])
+def test_dataset_rejects_empty_ngram_g2p(mock_npy_loader, ngram_g2p):
+    df = _mock_dataframe()
+    df.loc[1, "ngram_g2p"] = ngram_g2p
+
+    with pytest.raises(ValueError, match="'world' has an empty ngram_g2p"):
+        LibriPhraseTrainDataset(
+            wav_dir="/data/segments",
+            tokenizer=_FakeTokenizer(),
+            df=df,
+            sample_lens=1,
+        )
+
+
+def test_dataset_names_the_parquet_when_rejecting_ngram_g2p(tmp_path):
+    df = _mock_dataframe()
+    df.loc[0, "ngram_g2p"] = "HH AH L OW"
+    parquet_file = tmp_path / "legacy.parquet"
+    df.to_parquet(parquet_file, index=False)
+
+    with pytest.raises(ValueError, match="legacy.parquet") as excinfo:
+        LibriPhraseTrainDataset(
+            wav_dir="/data/segments",
+            tokenizer=_FakeTokenizer(),
+            parquet_file=parquet_file,
+            sample_lens=1,
+        )
+
+    assert "AH, OW" in str(excinfo.value)
+
+
 def test_containing_ngram_is_never_returned_as_a_negative(mock_npy_loader):
     df = pd.DataFrame(
         {
