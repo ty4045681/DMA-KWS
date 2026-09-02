@@ -38,13 +38,22 @@ Usage (same arguments as eval_stage2_clips.py):
     prep.stage2_ckpt=.../step_step_006500.pt \
     prep.batch_size=128 prep.num_workers=8 run.device=cuda \
     prep.output_dir=.../hey_eva_and_its_variants \
-    +prep.group_field=variant +prep.limit=0
+    +prep.group_field=variant prep.limit=0
+
+Long recordings (MUSAN background) cannot be scored as one clip: the encoder's
+self-attention is quadratic in the input length and a multi-minute file exhausts
+GPU memory. Add ``+prep.windowed=true`` to slice every file on the same
+``prep.window_sec`` / ``prep.hop_sec`` / ``prep.fbank_windows`` grid that
+``eval_musan_fa.py`` uses, so per-window ``deployed`` logits are comparable with
+that script's per-window scores. Windowed mode applies no zero padding, again
+matching ``eval_musan_fa.py``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import hydra
@@ -87,6 +96,148 @@ def _group_of(row: dict, group_field: str) -> str:
     if "label" in row:
         return f"label={int(row['label'])}"
     return "all"
+
+
+def _base_record(row: dict, group_field: str, diagnostics: dict) -> dict:
+    record = {
+        "audio_path": row["audio_path"],
+        "keyword": row["keyword"],
+        "group": _group_of(row, group_field),
+        **diagnostics,
+    }
+    if "label" in row:
+        record["label"] = int(row["label"])
+    return record
+
+
+def _probe_clips(
+    rows: list[dict],
+    *,
+    runner,
+    group_field: str,
+    batch_size: int,
+    num_workers: int,
+    left_padding_ms: int,
+    right_padding_ms: int,
+) -> tuple[list[dict], int]:
+    """Score every manifest row as one padded clip, like eval_stage2_clips.py."""
+
+    from torch.utils.data import DataLoader
+
+    verifier = runner.verifier
+    # Enrollment goes through the runner so the probed anchors are byte-identical
+    # to the ones eval_stage2_clips.py scored.
+    anchors: list[list[int]] = []
+    for row_index, row in enumerate(rows, start=1):
+        phonemes = runner.resolve_keyword_phonemes(
+            str(row["keyword"]),
+            row.get("keyword_phonemes"),
+            field_name=f"Manifest row {row_index} keyword_phonemes",
+        )
+        anchors.append(runner.enroll_phonemes(phonemes))
+
+    dataset = ClipFeatureDataset(
+        audio_paths=[row["audio_path"] for row in rows],
+        sample_rate=runner.sample_rate,
+        fbank_extractor=verifier.fbank_extractor,
+        fbank_kwargs=verifier.fbank_kwargs,
+        min_fbank_frames=verifier.min_fbank_frames,
+        left_padding_ms=left_padding_ms,
+        right_padding_ms=right_padding_ms,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=max(1, batch_size),
+        shuffle=False,
+        num_workers=max(0, num_workers),
+        collate_fn=collate_clip_feature_batch,
+    )
+
+    records: list[dict] = []
+    num_skipped = 0
+    for batch in loader:
+        feats, ids_batch, indices = [], [], []
+        for index, feat, _end_sec in batch:
+            if feat is None:
+                num_skipped += 1
+                continue
+            feats.append(feat)
+            ids_batch.append(anchors[index])
+            indices.append(index)
+        if not feats:
+            continue
+        for index, diagnostics in zip(
+            indices, verifier.emission_diagnostics(feats, ids_batch)
+        ):
+            records.append(_base_record(rows[index], group_field, diagnostics))
+    return records, num_skipped
+
+
+def _probe_windows(
+    rows: list[dict],
+    *,
+    runner,
+    group_field: str,
+    batch_size: int,
+    num_workers: int,
+    window_sec: float,
+    hop_sec: float,
+    fbank_windows: str,
+) -> tuple[list[dict], int]:
+    """Slice every file on the eval_musan_fa.py hop grid and score each window.
+
+    Returns one record per window; ``num_skipped`` counts files that produced
+    no scoreable window (shorter than one window).
+    """
+
+    verifier = runner.verifier
+
+    def prepare(row: dict):
+        return runner.prepare_file_windows(
+            row["audio_path"],
+            str(row["keyword"]),
+            window_sec=window_sec,
+            hop_sec=hop_sec,
+            keyword_phonemes=row.get("keyword_phonemes"),
+            fbank_windows=fbank_windows,
+        )
+
+    def prepared_in_order():
+        # Same bounded prefetch as eval_musan_fa.py: audio decoding is the
+        # bottleneck, and files must stay in manifest order.
+        if num_workers <= 1:
+            for row in rows:
+                yield row, prepare(row)
+            return
+        pending = []
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            for row in rows:
+                pending.append((row, pool.submit(prepare, row)))
+                if len(pending) >= num_workers:
+                    ready_row, future = pending.pop(0)
+                    yield ready_row, future.result()
+            for ready_row, future in pending:
+                yield ready_row, future.result()
+
+    records: list[dict] = []
+    num_skipped = 0
+    for row, prepared in prepared_in_order():
+        if not prepared.feats:
+            num_skipped += 1
+            continue
+        for start in range(0, len(prepared.feats), max(1, batch_size)):
+            feats = prepared.feats[start : start + batch_size]
+            spans = prepared.spans[start : start + batch_size]
+            ids_batch = [list(prepared.keyword_ids)] * len(feats)
+            for (window_index, start_sec, end_sec), diagnostics in zip(
+                spans, verifier.emission_diagnostics(feats, ids_batch)
+            ):
+                record = _base_record(row, group_field, diagnostics)
+                record["window_index"] = int(window_index)
+                record["start_sec"] = float(start_sec)
+                record["end_sec"] = float(end_sec)
+                records.append(record)
+    return records, num_skipped
 
 
 def run_probe(cfg: DictConfig) -> dict:
@@ -135,65 +286,55 @@ def run_probe(cfg: DictConfig) -> dict:
     runner = Stage2ClipRunner.from_config(config, prep, device)
     verifier = runner.verifier
 
-    # Enrollment goes through the runner so the probed anchors are byte-identical
-    # to the ones eval_stage2_clips.py scored.
-    anchors: list[list[int]] = []
-    for row_index, row in enumerate(rows, start=1):
-        phonemes = runner.resolve_keyword_phonemes(
-            str(row["keyword"]),
-            row.get("keyword_phonemes"),
-            field_name=f"Manifest row {row_index} keyword_phonemes",
-        )
-        anchors.append(runner.enroll_phonemes(phonemes))
-
     batch_size = int(prep.get("batch_size", 0) or 0) or 64
     num_workers = int(prep.get("num_workers", 0) or 0)
     if num_workers <= 0:
         num_workers = min(8, os.cpu_count() or 1)
 
-    dataset = ClipFeatureDataset(
-        audio_paths=[row["audio_path"] for row in rows],
-        sample_rate=runner.sample_rate,
-        fbank_extractor=verifier.fbank_extractor,
-        fbank_kwargs=verifier.fbank_kwargs,
-        min_fbank_frames=verifier.min_fbank_frames,
-        left_padding_ms=left_padding_ms,
-        right_padding_ms=right_padding_ms,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=max(1, batch_size),
-        shuffle=False,
-        num_workers=max(0, num_workers),
-        collate_fn=collate_clip_feature_batch,
-    )
-
-    records: list[dict] = []
-    num_skipped = 0
-    for batch in loader:
-        feats, ids_batch, indices = [], [], []
-        for index, feat, _end_sec in batch:
-            if feat is None:
-                num_skipped += 1
-                continue
-            feats.append(feat)
-            ids_batch.append(anchors[index])
-            indices.append(index)
-        if not feats:
-            continue
-        for index, diagnostics in zip(
-            indices, verifier.emission_diagnostics(feats, ids_batch)
-        ):
-            row = rows[index]
-            record = {
-                "audio_path": row["audio_path"],
-                "keyword": row["keyword"],
-                "group": _group_of(row, group_field),
-                **diagnostics,
-            }
-            if "label" in row:
-                record["label"] = int(row["label"])
-            records.append(record)
+    windowed = bool(prep.get("windowed", False))
+    if windowed:
+        window_sec = float(prep.get("window_sec", 0.0) or 3.0)
+        hop_sec = float(prep.get("hop_sec", 0.0) or 3.0)
+        if window_sec <= 0 or hop_sec <= 0:
+            raise SystemExit("prep.window_sec and prep.hop_sec must be positive")
+        fbank_windows = str(prep.get("fbank_windows") or "independent").strip().lower()
+        if fbank_windows not in {"independent", "file"}:
+            raise SystemExit(
+                "prep.fbank_windows must be 'independent' or 'file', "
+                f"got {prep.get('fbank_windows')!r}"
+            )
+        records, num_skipped = _probe_windows(
+            rows,
+            runner=runner,
+            group_field=group_field,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            window_sec=window_sec,
+            hop_sec=hop_sec,
+            fbank_windows=fbank_windows,
+        )
+        mode_summary = {
+            "mode": "windows",
+            "window_sec": window_sec,
+            "hop_sec": hop_sec,
+            "fbank_windows": fbank_windows,
+            "num_files": len(rows),
+            "num_files_without_windows": num_skipped,
+        }
+    else:
+        records, num_skipped = _probe_clips(
+            rows,
+            runner=runner,
+            group_field=group_field,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            left_padding_ms=left_padding_ms,
+            right_padding_ms=right_padding_ms,
+        )
+        mode_summary = {
+            "mode": "clips",
+            "audio_padding_ms": {"left": left_padding_ms, "right": right_padding_ms},
+        }
 
     records_path = output_dir / "emission_diagnostics.jsonl"
     with records_path.open("w", encoding="utf-8") as handle:
@@ -208,7 +349,7 @@ def run_probe(cfg: DictConfig) -> dict:
         "group_field": group_field or None,
         "qbyt_alignment": verifier.qbyt_alignment.as_dict(),
         "stream": verifier.stream_policy.describe(),
-        "audio_padding_ms": {"left": left_padding_ms, "right": right_padding_ms},
+        **mode_summary,
         "ablations": [
             {
                 "name": spec.name,

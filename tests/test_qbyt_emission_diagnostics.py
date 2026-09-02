@@ -451,6 +451,127 @@ def test_probe_writes_one_record_per_clip_grouped_by_manifest_field(
     assert written[0]["masked_query_mass_mean"] == pytest.approx(0.4)
 
 
+def test_probe_windowed_mode_scores_every_hop_window_and_records_its_span(
+    tmp_path, monkeypatch
+):
+    """Long files must go through the eval_musan_fa.py window grid, not one clip."""
+    from dma_kws.inference.stage2_clip import PreparedFileWindows
+
+    manifest_path = tmp_path / "manifest.csv"
+    manifest_path.write_text("audio_path,keyword\n", encoding="utf-8")
+    rows = [
+        {"audio_path": "music-fma-0001.wav", "keyword": "hey eva", "label": 0},
+        {"audio_path": "speech-tiny.wav", "keyword": "hey eva", "label": 0},
+        {"audio_path": "noise-free-0002.wav", "keyword": "hey eva", "label": 0},
+    ]
+    calls: list[dict] = []
+
+    class FakeVerifier:
+        class _Alignment:
+            @staticmethod
+            def as_dict():
+                return {"topology": "keyword_filler_segmental_crf_v1"}
+
+        class _Stream:
+            @staticmethod
+            def describe():
+                return "chunked"
+
+        qbyt_alignment = _Alignment()
+        stream_policy = _Stream()
+
+        def emission_diagnostics(self, feats, keyword_ids_batch):
+            assert len(feats) == len(keyword_ids_batch)
+            assert all(ids == [1, 2] for ids in keyword_ids_batch)
+            calls.append({"batch": len(feats)})
+            return [
+                {
+                    "encoder_frames": 25,
+                    "phone_count": 2,
+                    "masked_query_mass_mean": 0.1,
+                    "masked_query_mass_max": 0.2,
+                    "deployed": {"logit": -6.0, "has_legal_path": True},
+                }
+                for _ in feats
+            ]
+
+    class FakeRunner:
+        verifier = FakeVerifier()
+        sample_rate = 16000
+
+        @staticmethod
+        def prepare_file_windows(audio_path, keyword, *, window_sec, hop_sec,
+                                 keyword_phonemes=None, fbank_windows="independent"):
+            assert window_sec == 1.0 and hop_sec == 1.0
+            assert fbank_windows == "independent"
+            count = {"music-fma-0001.wav": 5, "speech-tiny.wav": 0,
+                     "noise-free-0002.wav": 2}[audio_path]
+            return PreparedFileWindows(
+                audio_path=audio_path,
+                keyword=keyword,
+                keyword_phonemes=["HH", "EY1"],
+                keyword_ids=[1, 2],
+                feats=[torch.zeros(100, 80) for _ in range(count)],
+                spans=[(i, float(i), float(i + 1)) for i in range(count)],
+            )
+
+        @staticmethod
+        def from_config(_config, _prep, _device):
+            return FakeRunner()
+
+    monkeypatch.setattr(
+        probe_qbyt_emissions,
+        "resolved_config",
+        lambda _cfg: {"paths": {}, "stage1": {}, "stage2": {}, "demo": {}, "tokenizer": {}},
+    )
+    monkeypatch.setattr(probe_qbyt_emissions, "load_manifest", lambda _path: rows)
+    monkeypatch.setattr(
+        probe_qbyt_emissions, "resolve_accelerator", lambda _device: ("cpu", 1)
+    )
+    monkeypatch.setattr(probe_qbyt_emissions, "Stage2ClipRunner", FakeRunner)
+
+    cfg = OmegaConf.create(
+        {
+            "prep": {
+                "manifest": str(manifest_path),
+                "stage2_ckpt": str(manifest_path),
+                "output_dir": str(tmp_path / "out"),
+                "windowed": True,
+                "window_sec": 1.0,
+                "hop_sec": 1.0,
+                "fbank_windows": "independent",
+                # Two windows per scoring batch, and a thread pool, so both the
+                # batching and the prefetch path are exercised.
+                "batch_size": 2,
+                "num_workers": 2,
+            },
+            "run": {"device": "cpu"},
+        }
+    )
+
+    summary = probe_qbyt_emissions.run_probe(cfg)
+
+    assert summary["mode"] == "windows"
+    assert summary["window_sec"] == 1.0 and summary["hop_sec"] == 1.0
+    assert summary["num_clips"] == 7          # 5 + 0 + 2 windows
+    assert summary["num_files"] == 3
+    assert summary["num_files_without_windows"] == 1
+    assert "audio_padding_ms" not in summary  # windowed mode never pads
+    # 5 windows in batches of 2 -> 3 calls; 2 windows -> 1 call.
+    assert [c["batch"] for c in calls] == [2, 2, 1, 2]
+
+    written = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "emission_diagnostics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [r["audio_path"] for r in written][:5] == ["music-fma-0001.wav"] * 5
+    assert [r["window_index"] for r in written] == [0, 1, 2, 3, 4, 0, 1]
+    assert written[3]["start_sec"] == 3.0 and written[3]["end_sec"] == 4.0
+    assert all(r["label"] == 0 for r in written)
+
+
 def test_probe_rejects_a_group_field_that_is_not_a_manifest_column():
     rows = [{"audio_path": "a.wav", "keyword": "hey eva", "variant": "hey_ava"}]
     assert probe_qbyt_emissions._resolve_group_field(rows, "variant") == "variant"
