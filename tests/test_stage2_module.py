@@ -273,7 +273,7 @@ def test_saved_checkpoint_stamps_complete_alignment(module):
 
     checkpoint = {"state_dict": module.state_dict()}
     module.on_save_checkpoint(checkpoint)
-    assert checkpoint[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION == 6
+    assert checkpoint[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION == 7
     assert checkpoint[QBYT_ALIGNMENT_SPEC_KEY] == module.qbyt_alignment.as_dict()
     module.on_load_checkpoint(checkpoint)
 

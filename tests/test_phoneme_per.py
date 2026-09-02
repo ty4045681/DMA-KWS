@@ -296,7 +296,7 @@ def test_phoneme_per_runner_rejects_invalid_reference_phoneme_override(
 @pytest.mark.parametrize(
     "padding_overrides,expected_padding",
     [
-        ({}, (160, 160)),
+        ({}, (0, 0)),
         ({"left_padding_ms": 0, "right_padding_ms": 240}, (0, 240)),
     ],
 )

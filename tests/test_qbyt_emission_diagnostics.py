@@ -17,6 +17,7 @@ from omegaconf import OmegaConf
 pytest.importorskip("torch")
 
 from dma_kws.inference.qbyt_diagnostics import (
+    DEFAULT_ABLATIONS,
     AblationSpec,
     _target_llr,
     clip_emission_diagnostics,
@@ -105,6 +106,23 @@ def test_deployed_ablation_reproduces_the_forward_utterance_logit():
         assert record["deployed"]["logit"] == pytest.approx(
             float(expected[index]), abs=1e-4
         )
+
+
+def test_default_ablation_is_the_deployed_one_vs_rest_readout():
+    # A bare spec must mean "what ships", otherwise ``deployed`` silently drifts
+    # from ``QbyT.forward`` the moment the shipped filler definition changes.
+    assert AblationSpec("x").filler == "one_vs_rest"
+    deployed = DEFAULT_ABLATIONS[0]
+    assert deployed.name == "deployed"
+    assert deployed.filler == "one_vs_rest"
+    assert deployed.max_inter_phone_gap_frames is None
+    assert deployed.max_keyword_span_frames is None
+    assert [spec.name for spec in DEFAULT_ABLATIONS] == [
+        "deployed",
+        "query_relative_filler",
+        "gap_1",
+        "legacy_v6_readout",
+    ]
 
 
 def test_frame_class_log_probs_is_a_normalized_posterior():
@@ -250,7 +268,7 @@ def test_relaxed_bounds_ablation_recovers_a_keyword_longer_than_the_span_cap():
     assert relaxed["logit"] > deployed["logit"]
 
 
-def test_masked_query_mass_matches_the_deployed_filler_mask():
+def test_masked_query_mass_matches_the_query_relative_filler_mask():
     model = _model()
     speech, anchors, speech_lengths, anchor_lengths = _batch(model, [4], [18])
     frame_mask = model._length_mask(speech_lengths, speech.size(1))
@@ -267,7 +285,7 @@ def test_masked_query_mass_matches_the_deployed_filler_mask():
 
 
 def test_masked_query_mass_counts_a_repeated_phone_once():
-    """``filler_class_mask`` removes a phone set, not a multiset.
+    """The query-relative filler removes a phone set, not a multiset.
 
     A keyword like "hey google" uses ``G`` twice; summing per position would
     report a discount larger than the probability the filler actually loses, and
@@ -430,13 +448,13 @@ def test_probe_writes_one_record_per_clip_grouped_by_manifest_field(
 
     assert summary["num_clips"] == 2
     assert summary["num_skipped"] == 1
-    assert summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    assert summary["audio_padding_ms"] == {"left": 0, "right": 0}
     assert set(summary["by_group"]) == {"hey_eva", "hey_ava"}
     assert [spec["name"] for spec in summary["ablations"]] == [
         "deployed",
-        "one_vs_rest_filler",
-        "relaxed_bounds",
-        "one_vs_rest_and_relaxed",
+        "query_relative_filler",
+        "gap_1",
+        "legacy_v6_readout",
     ]
 
     written = [

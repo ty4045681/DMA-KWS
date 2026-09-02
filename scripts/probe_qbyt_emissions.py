@@ -13,21 +13,22 @@ This probe reuses the exact features, padding, streaming point, precision and
 checkpoint of ``eval_stage2_clips.py``, then re-scores the *same* frame
 posteriors under alternative readouts:
 
-  deployed                 the shipped score (reproduces ``qbyt_raw_logit``)
-  one_vs_rest_filler       the competing phone stays in the denominator
-  relaxed_bounds           gap 1->3 frames, keyword span 30->50 frames
-  one_vs_rest_and_relaxed  both
+  deployed               the shipped score (reproduces ``qbyt_raw_logit``)
+  query_relative_filler  the legacy (readout-version-6) filler: blank, noise
+                         and every phone the query does not use
+  gap_1                  the legacy inter-phone gap bound of 1 frame (40 ms)
+  legacy_v6_readout      both, i.e. the complete readout-version-6 score
 
 Reading the report:
 
   ``phone_top_frames_llr_mean`` near or below 0 for positives  -> cause A: the
       frame classifier is the bottleneck; the filler and bound ablations cannot
       help much and frame-level supervision is the prerequisite.
-  ``relaxed_bounds`` logit far above ``deployed`` for positives -> cause B: the
-      bounds are clipping true keywords.
-  ``masked_query_mass_mean`` large, and ``one_vs_rest_filler`` well below
-      ``deployed`` on near-miss negatives -> the query-relative filler is
-      discounting substitutions onto phones the keyword already contains.
+  ``gap_1`` logit far below ``deployed`` for positives -> cause B: the legacy
+      gap bound was clipping true keywords with natural inter-word pauses.
+  ``masked_query_mass_mean`` large, and ``query_relative_filler`` well above
+      ``deployed`` on near-miss negatives -> the legacy filler was discounting
+      substitutions onto phones the keyword already contains.
   ``best_frame_span`` above ``max_keyword_span_frames`` -> that clip's keyword
       cannot be covered by any legal path.
 
@@ -69,7 +70,7 @@ from dma_kws.inference.stage2_clip import (
 )
 from dma_kws.training.device import resolve_accelerator
 
-DEFAULT_PADDING_MS = 160
+DEFAULT_PADDING_MS = 0
 
 
 def _resolve_group_field(rows: list[dict], group_field: str) -> str:
@@ -120,7 +121,7 @@ def _probe_clips(
     left_padding_ms: int,
     right_padding_ms: int,
 ) -> tuple[list[dict], int]:
-    """Score every manifest row as one padded clip, like eval_stage2_clips.py."""
+    """Score every manifest row as one clip, like eval_stage2_clips.py."""
 
     from torch.utils.data import DataLoader
 

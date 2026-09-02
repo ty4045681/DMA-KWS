@@ -52,13 +52,13 @@ def _payload(
 
 
 def test_v6_alignment_defaults_are_the_only_topology() -> None:
-    assert QBYT_READOUT_VERSION == 6
+    assert QBYT_READOUT_VERSION == 7
     assert normalize_qbyt_alignment_topology(None) == QBYT_ALIGNMENT_TOPOLOGY
     assert resolve_qbyt_alignment({}).as_dict() == {
         "topology": "keyword_filler_segmental_crf_v1",
         "min_phone_duration_frames": 1,
         "max_phone_duration_frames": 8,
-        "max_inter_phone_gap_frames": 1,
+        "max_inter_phone_gap_frames": 3,
         "max_keyword_span_frames": 30,
         "local_context_kernel": 5,
         "weakest_phone_temperature": 0.2,
@@ -165,7 +165,7 @@ def test_stamp_records_version_and_complete_actual_alignment() -> None:
         },
         alignment=configured,
     )
-    assert payload[QBYT_READOUT_VERSION_KEY] == 6
+    assert payload[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION
     assert payload[QBYT_ALIGNMENT_SPEC_KEY] == configured
     assert checkpoint_qbyt_readout_spec(payload).as_dict() == configured
 

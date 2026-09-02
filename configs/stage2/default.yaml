@@ -3,13 +3,15 @@ qbyt_embed_dim: 128
 qbyt_layers: 2
 # QbyT v6 scores a compact monotonic keyword graph against a filler/noise and
 # one-phone-deletion alternative graph. Frame counts are measured after encoder
-# subsampling (25 Hz for the default encoders). The weakest aligned phone can
-# only veto a detection; it cannot create a route around the graph.
+# subsampling (25 Hz for the default encoders). The gap bound is 3 frames =
+# 120 ms so natural inter-word pauses ("hey" ... "eva") can be skipped instead
+# of being charged to a neighbouring phone. The weakest aligned phone can only
+# veto a detection; it cannot create a route around the graph.
 qbyt_alignment:
   topology: keyword_filler_segmental_crf_v1
   min_phone_duration_frames: 1
   max_phone_duration_frames: 8
-  max_inter_phone_gap_frames: 1
+  max_inter_phone_gap_frames: 3
   max_keyword_span_frames: 30
   local_context_kernel: 5
   weakest_phone_temperature: 0.2

@@ -398,7 +398,7 @@ class Stage2QbyTAlignmentConfig:
     topology: str = "keyword_filler_segmental_crf_v1"
     min_phone_duration_frames: int = 1
     max_phone_duration_frames: int = 8
-    max_inter_phone_gap_frames: int = 1
+    max_inter_phone_gap_frames: int = 3
     max_keyword_span_frames: int = 30
     local_context_kernel: int = 5
     weakest_phone_temperature: float = 0.2

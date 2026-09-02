@@ -96,12 +96,12 @@ stage2:
 
   # Must exactly match the v6 base checkpoint. These bounds are in post-encoder
   # frames (25 Hz): phones are 40--320 ms, adjacent phones may be separated by
-  # at most 40 ms, and the whole wake phrase must fit within 1.2 s.
+  # at most 120 ms, and the whole wake phrase must fit within 1.2 s.
   qbyt_alignment:
     topology: keyword_filler_segmental_crf_v1
     min_phone_duration_frames: 1
     max_phone_duration_frames: 8
-    max_inter_phone_gap_frames: 1
+    max_inter_phone_gap_frames: 3
     max_keyword_span_frames: 30
     local_context_kernel: 5
     weakest_phone_temperature: 0.2

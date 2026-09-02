@@ -37,14 +37,15 @@ class AblationSpec:
 
     ``filler`` selects how the per-frame denominator is formed:
 
-    ``query_relative``
-        The shipped definition: blank, non-speech and every inventory phone the
-        query does not use. Phones that *are* in the query are removed from the
-        denominator, so a substitution onto another query phone is charged
-        against an artificially small filler.
     ``one_vs_rest``
-        ``log p(phone) - log(1 - p(phone))``. The competing phone always stays
-        in the denominator.
+        The deployed definition: ``log p(phone) - log(1 - p(phone))``. The
+        competing phone always stays in the denominator.
+    ``query_relative``
+        The legacy (readout-version-6) definition, kept for comparison: blank,
+        non-speech and every inventory phone the query does not use. Phones
+        that *are* in the query are removed from the denominator, so a
+        substitution onto another query phone is charged against an
+        artificially small filler.
 
     ``max_inter_phone_gap_frames`` and ``max_keyword_span_frames`` of ``None``
     keep the deployed bound. ``max_phone_duration_frames`` is deliberately not
@@ -53,7 +54,7 @@ class AblationSpec:
     """
 
     name: str
-    filler: str = "query_relative"
+    filler: str = "one_vs_rest"
     max_inter_phone_gap_frames: int | None = None
     max_keyword_span_frames: int | None = None
 
@@ -65,20 +66,16 @@ class AblationSpec:
             )
 
 
-#: Deployed readout first, then the two independent hypotheses for a low score.
+#: Deployed readout first, then each readout-version-6 rule reinstated on its
+#: own, then both together, so a score shift can be attributed to one of them.
 DEFAULT_ABLATIONS: tuple[AblationSpec, ...] = (
     AblationSpec("deployed"),
-    AblationSpec("one_vs_rest_filler", filler="one_vs_rest"),
+    AblationSpec("query_relative_filler", filler="query_relative"),
+    AblationSpec("gap_1", max_inter_phone_gap_frames=1),
     AblationSpec(
-        "relaxed_bounds",
-        max_inter_phone_gap_frames=3,
-        max_keyword_span_frames=50,
-    ),
-    AblationSpec(
-        "one_vs_rest_and_relaxed",
-        filler="one_vs_rest",
-        max_inter_phone_gap_frames=3,
-        max_keyword_span_frames=50,
+        "legacy_v6_readout",
+        filler="query_relative",
+        max_inter_phone_gap_frames=1,
     ),
 )
 
@@ -232,13 +229,14 @@ def clip_emission_diagnostics(
     class_log_probs = qbyt.frame_class_log_probs(speech, frame_mask).float()
     duration = _duration_potentials(qbyt, anchors, phone_mask)
 
-    # Probability mass the shipped filler removes from its denominator, per
-    # frame. ``filler_masked = 1 - this`` while ``filler_one_vs_rest = 1 - p_i``,
-    # so this is precisely the size of the discount the one-vs-rest ablation
-    # removes, and it bounds how much that fix can buy.
+    # Probability mass the legacy query-relative filler removes from its
+    # denominator, per frame. ``filler_masked = 1 - this`` while the deployed
+    # ``filler_one_vs_rest = 1 - p_i``, so this is precisely the size of the
+    # discount the query-relative ablation reinstates.
     #
-    # Counted over the *set* of query phones, exactly like ``filler_class_mask``:
-    # a phone the query uses twice is still removed from the denominator once.
+    # Counted over the *set* of query phones, exactly like that ablation's class
+    # mask: a phone the query uses twice is still removed from the denominator
+    # once.
     safe_indices = (anchors - 1).clamp(min=0, max=phone_class_count - 1)
     counts = torch.zeros(
         anchors.size(0), phone_class_count, device=anchors.device, dtype=torch.long

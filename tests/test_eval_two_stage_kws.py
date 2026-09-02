@@ -37,8 +37,8 @@ def _qbyt_alignment() -> dict:
     }
 
 
-def test_stage2_clip_audio_padding_defaults_to_160ms_per_side():
-    assert _resolve_audio_padding_ms({}) == (160, 160)
+def test_stage2_clip_audio_padding_defaults_to_unpadded():
+    assert _resolve_audio_padding_ms({}) == (0, 0)
 
 
 def test_stage2_clip_audio_padding_can_be_overridden_per_side():
@@ -476,12 +476,12 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     summary = eval_stage2_clips.run_eval(cfg)
 
     assert captured["rows"] == rows
-    assert captured["kwargs"]["left_padding_ms"] == 160
-    assert captured["kwargs"]["right_padding_ms"] == 160
+    assert captured["kwargs"]["left_padding_ms"] == 0
+    assert captured["kwargs"]["right_padding_ms"] == 0
     assert captured["kwargs"]["waveform_transform"] is None
     assert captured["plot_options"]["min_recall"] == pytest.approx(0.8)
     assert captured["plot_options"]["max_fpr"] is None
-    assert summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    assert summary["audio_padding_ms"] == {"left": 0, "right": 0}
     assert summary["audio_aug"]["enabled"] is False
     assert summary["musan_mix"]["enabled"] is False
     assert summary["provenance"]["checkpoint"]["path"] == str(
@@ -501,7 +501,7 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert summary["plots"]["status"] == "skipped"
     assert "positive and negative" in summary["plots"]["reason"]
     saved_summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
-    assert saved_summary["audio_padding_ms"] == {"left": 160, "right": 160}
+    assert saved_summary["audio_padding_ms"] == {"left": 0, "right": 0}
     assert saved_summary["audio_aug"]["enabled"] is False
     assert saved_summary["musan_mix"]["enabled"] is False
     assert saved_summary["plots"] == summary["plots"]

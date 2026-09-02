@@ -26,8 +26,11 @@ from dma_kws.training.checkpoint_avg import average_lightning_checkpoints
 #: historical GRU/EPS mode with a target-only bounded segmental path average.
 #: Version 6 replaces that one-sided score with a normalized phone/filler
 #: competition, keyword-vs-near-miss segmental log-likelihood ratio, and an
-#: aligned weakest-phone veto.
-QBYT_READOUT_VERSION = 6
+#: aligned weakest-phone veto. Version 7 keeps the v6 keyword/filler segmental
+#: graph but scores each phone's frames by its one-vs-rest log-odds instead of
+#: against a query-relative filler; checkpoints trained under 6 score
+#: differently on the same weights and must be retrained.
+QBYT_READOUT_VERSION = 7
 
 QBYT_READOUT_VERSION_KEY = "qbyt_readout_version"
 QBYT_ALIGNMENT_SPEC_KEY = "qbyt_alignment_spec"
@@ -268,7 +271,7 @@ def checkpoint_qbyt_readout_spec(
 ) -> Any:
     """Resolve the complete segmental-CRF score carried by a v6 checkpoint.
 
-    Versions 5 and earlier are intentionally not inferred or upgraded. Their
+    Earlier versions are intentionally not inferred or upgraded. Their
     weights were optimized for a different score, so tensor shapes cannot
     establish semantic compatibility.
     """
@@ -384,7 +387,7 @@ def assert_qbyt_readout_version(
         f"{source} carries QbyT weights at readout {described}{mode_detail}, but this build "
         f"uses version {QBYT_READOUT_VERSION}{expected_detail}. Readout semantics differ, "
         "so loading these weights would silently change the meaning of the deployed score."
-        " Re-train Stage II with the v6 keyword-vs-filler segmental CRF."
+        f" Re-train Stage II at readout version {QBYT_READOUT_VERSION}."
     )
 
 

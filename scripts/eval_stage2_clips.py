@@ -6,10 +6,11 @@ string (or a string array in JSONL) to override keyword G2P for that row. Rows
 without the field retain automatic G2P. Every JSONL row records the single
 deployed bounded-alignment QbyT score.
 
-Each clip receives 160 ms of zero-valued waveform context on both sides by
-default. Override with ``+prep.left_padding_ms=...`` and
-``+prep.right_padding_ms=...``; use zero to disable either side.
-Padding is part of the scored model input and counts toward its minimum length.
+Clips are scored unpadded by default, matching the training features, MUSAN
+evaluation and the deployed two-stage path. ``+prep.left_padding_ms=...`` and
+``+prep.right_padding_ms=...`` add zero-valued waveform context on either side;
+that padding is part of the scored model input and counts toward its minimum
+length.
 When valid positive and negative labels are present, the output directory also
 receives ``roc_curve.png``, ``det_curve.png``, and ``roc_curve.csv`` for the
 utterance QbyT score. The CSV lists every empirical ROC point as
@@ -55,7 +56,7 @@ from dma_kws.training.device import resolve_accelerator
 from dma_kws.training.score_diagnostics import binary_score_diagnostics
 
 
-DEFAULT_PADDING_MS = 160
+DEFAULT_PADDING_MS = 0
 
 
 def _metrics_record(record: dict) -> dict:

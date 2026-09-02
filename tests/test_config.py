@@ -68,7 +68,7 @@ def test_demo_config_loads_with_tokenizer_and_training_seed():
     assert stage2["qbyt_alignment"] == {
         "min_phone_duration_frames": 1,
         "max_phone_duration_frames": 8,
-        "max_inter_phone_gap_frames": 1,
+        "max_inter_phone_gap_frames": 3,
         "max_keyword_span_frames": 30,
         "local_context_kernel": 5,
         "weakest_phone_temperature": 0.2,
@@ -88,7 +88,7 @@ def test_alignment_experiment_inherits_the_single_stage2_alignment_config():
     assert config["stage2"]["qbyt_alignment"] == {
         "min_phone_duration_frames": 1,
         "max_phone_duration_frames": 8,
-        "max_inter_phone_gap_frames": 1,
+        "max_inter_phone_gap_frames": 3,
         "max_keyword_span_frames": 30,
         "local_context_kernel": 5,
         "weakest_phone_temperature": 0.2,

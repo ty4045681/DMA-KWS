@@ -39,6 +39,11 @@ stamped by `Stage2LightningModule.on_save_checkpoint` and the explicit
 loaders check it via `assert_qbyt_readout_version`. Test fixtures that simulate a
 current-build checkpoint must call `stamp_qbyt_readout_version`.
 
+Version 7 replaced the query-relative filler with one-vs-rest per-phone emission
+log-odds (`target_llr = log p_u - log(1 - p_u)`). Parameter shapes are identical
+to version 6, but 6-era checkpoints score differently on the same weights and
+are refused by the guard; they must be retrained.
+
 ## QbyT batch invariance
 
 `QbyT.forward` concatenates padded text and padded audio, so anything expressed in

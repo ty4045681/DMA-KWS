@@ -8,10 +8,11 @@ the reference for legacy manifests, with ``keyword_phonemes`` as its optional
 per-row override. CSV overrides are space-separated ARPAbet strings; JSONL also
 accepts arrays of strings.
 
-Each clip receives 160 ms of zero-valued waveform context on both sides by
-default. Override with ``+prep.left_padding_ms=...`` and
-``+prep.right_padding_ms=...``; use zero to disable either side. Padding is part
-of the decoded model input and counts toward its minimum length.
+Clips are decoded unpadded by default, matching the training features, MUSAN
+evaluation and the deployed two-stage path. ``+prep.left_padding_ms=...`` and
+``+prep.right_padding_ms=...`` add zero-valued waveform context on either side;
+that padding is part of the decoded model input and counts toward its minimum
+length.
 
 Example for a manifest containing ``audio_path,keyword,label,text_variant``::
 
@@ -50,7 +51,7 @@ from dma_kws.inference.phoneme_per import (
 from dma_kws.training.device import resolve_accelerator
 
 
-DEFAULT_PADDING_MS = 160
+DEFAULT_PADDING_MS = 0
 
 
 def _optional_int(value) -> int | None:

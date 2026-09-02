@@ -1,9 +1,10 @@
 """Query-by-text verifier with a keyword-vs-filler segmental readout.
 
 The adapter-free v6 scorer learns one normalized inventory of phone, blank and
-noise evidence directly on top of the encoder.  A bounded segmental graph is the
-only route from that frame lattice to the deployed score; global audio/text
-pooling cannot bypass the ordered keyword path.
+noise evidence directly on top of the encoder.  Each query phone's frame
+evidence is its one-vs-rest log-odds within that inventory.  A bounded
+segmental graph is the only route from that frame lattice to the deployed
+score; global audio/text pooling cannot bypass the ordered keyword path.
 """
 
 from __future__ import annotations
@@ -257,35 +258,19 @@ class QbyT(nn.Module):
             safe_phone_indices.unsqueeze(-1).expand(-1, -1, frame_width),
         )
 
-        # Filler is query-relative: blank, noise, and every inventory phone not
-        # used by this query. A one-phone deletion graph can consequently explain
-        # a substitution as filler while the exact graph must explain every phone.
-        query_phone_counts = torch.zeros(
-            batch_size,
-            phone_class_count,
-            device=text.device,
-            dtype=torch.long,
+        # One-vs-rest: each query phone competes against everything else in the
+        # same normalized frame posterior, including the other query phones. The
+        # previous query-relative filler removed every query phone from the
+        # denominator, so a substitution onto a phone the keyword already used
+        # (query IY1 landing on an EY1 frame in "hey ava" vs "hey eva") was
+        # charged against an artificially small competitor set.
+        rest_log_probs = torch.log1p(
+            -target_log_probs.exp().clamp(max=1.0 - 1e-6)
         )
-        query_phone_counts.scatter_add_(
-            1,
-            safe_phone_indices,
-            phone_mask.to(dtype=torch.long),
-        )
-        filler_class_mask = torch.cat(
-            (
-                query_phone_counts.eq(0),
-                torch.ones(batch_size, 2, device=text.device, dtype=torch.bool),
-            ),
-            dim=1,
-        )
-        filler_log_probs = torch.logsumexp(
-            class_log_probs.masked_fill(
-                ~filler_class_mask.unsqueeze(1),
-                -torch.inf,
-            ),
-            dim=-1,
-        )
-        target_llr = target_log_probs - filler_log_probs.unsqueeze(1)
+        target_llr = target_log_probs - rest_log_probs
+        # There is no longer one shared per-frame filler score; the aligner only
+        # uses this as a baseline that cancels inside the reported LLR.
+        filler_log_probs = torch.zeros_like(class_log_probs[:, :, 0])
 
         valid_lattice = phone_mask.unsqueeze(2) & frame_mask.unsqueeze(1)
         target_llr = torch.where(

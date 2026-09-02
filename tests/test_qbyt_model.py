@@ -1,5 +1,7 @@
 """Structural and padding invariants of the QbyT v6 segmental-CRF scorer."""
 
+import math
+
 import pytest
 import torch
 
@@ -11,12 +13,12 @@ EMBED_DIM = 32
 ENCODER_DIM = 24
 
 
-def _model(seed: int = 0, *, layers: int = 2, kernel: int = 5):
+def _model(seed: int = 0, *, layers: int = 2, kernel: int = 5, num_embeds: int = 73):
     torch.manual_seed(seed)
     QbyT = load_qbyt_class()
     return QbyT(
         encoder_output_size=ENCODER_DIM,
-        num_embeds=73,
+        num_embeds=num_embeds,
         embed_dim=EMBED_DIM,
         post_num_layers=layers,
         local_context_kernel=kernel,
@@ -178,24 +180,64 @@ def test_deployment_loss_reaches_competitive_emission_and_duration_parameters():
         assert torch.isfinite(parameter.grad).all()
 
 
-def test_lattice_is_normalized_and_filler_is_query_relative():
+def test_encode_lattice_uses_one_vs_rest_log_odds():
+    model = _model(layers=1)
+    queries = torch.tensor([[3, 4, 5, 0], [6, 7, 0, 0]])
+    speech = torch.randn(2, 18, ENCODER_DIM)
+    speech_lengths = torch.tensor([18, 12])
+    text_lengths = torch.tensor([3, 2])
+    with torch.no_grad():
+        class_log_probs = model.frame_class_log_probs(
+            speech, model._length_mask(speech_lengths, 18)
+        )
+        target_llr, filler, *_ = model._encode_lattice(
+            speech, queries, speech_lengths, text_lengths
+        )
+
+    torch.testing.assert_close(filler, torch.zeros_like(filler))
+    for b in range(2):
+        for u in range(4):
+            for t in range(18):
+                if u < int(text_lengths[b]) and t < int(speech_lengths[b]):
+                    log_p = class_log_probs[b, t, int(queries[b, u]) - 1]
+                    expected = log_p - torch.log1p(-log_p.exp().clamp(max=1.0 - 1e-6))
+                    torch.testing.assert_close(
+                        target_llr[b, u, t], expected, atol=1e-5, rtol=1e-5
+                    )
+                else:
+                    assert target_llr[b, u, t].item() == 0.0
+
+
+def test_in_query_substitution_is_charged_against_the_competing_phone(monkeypatch):
+    # Five phone classes plus blank and noise. The frame is acoustically phone 2
+    # and the query contains both phone 1 and phone 2, so the legacy
+    # query-relative filler would drop phone 2's 0.60 from phone 1's denominator.
+    model = _model(layers=0, num_embeds=6)
+    probs = torch.tensor([[[0.15, 0.60, 0.10, 0.05, 0.03, 0.04, 0.03]]])
+    monkeypatch.setattr(
+        model, "frame_class_log_probs", lambda speech, frame_mask: probs.log()
+    )
+    query = torch.tensor([[1, 2]])
+    with torch.no_grad():
+        target_llr, *_ = model._encode_lattice(
+            torch.zeros(1, 1, ENCODER_DIM), query, torch.tensor([1]), torch.tensor([2])
+        )
+
+    one_vs_rest = math.log(0.15 / 0.85)
+    query_relative = math.log(0.15 / (1.0 - 0.15 - 0.60))
+    assert target_llr[0, 0, 0].item() == pytest.approx(one_vs_rest, abs=1e-5)
+    assert abs(target_llr[0, 0, 0].item() - query_relative) > 1.0
+    assert target_llr[0, 1, 0].item() == pytest.approx(math.log(0.60 / 0.40), abs=1e-5)
+
+
+def test_zero_initialized_duration_potentials_are_centered_uniform():
     model = _model(layers=0)
     speech = torch.randn(1, 16, ENCODER_DIM)
     query = torch.tensor([[3, 4]])
-    extended_query = torch.tensor([[3, 4, 5]])
-    lengths = torch.tensor([16])
     with torch.no_grad():
-        target_llr, filler, duration, *_ = model._encode_lattice(
-            speech, query, lengths, torch.tensor([2])
+        _, _, duration, *_ = model._encode_lattice(
+            speech, query, torch.tensor([16]), torch.tensor([2])
         )
-        _, extended_filler, _, *_ = model._encode_lattice(
-            speech, extended_query, lengths, torch.tensor([3])
-        )
-
-    target_log_probs = target_llr + filler.unsqueeze(1)
-    assert torch.all(filler <= 0.0)
-    assert torch.all(target_log_probs <= 0.0)
-    assert not torch.allclose(filler, extended_filler)
     # Zero initialization is a centered uniform duration potential, so it adds
     # no arbitrary per-phone offset to the graph score.
     torch.testing.assert_close(duration, torch.zeros_like(duration))
