@@ -50,7 +50,12 @@ def resolve_sequence_objective(
         return CURRENT_SEQUENCE_OBJECTIVE
     if not isinstance(raw, Mapping):
         raise ValueError("stage2.sequence_loss must be a mapping")
-    supported = {"target_mode", "progress_weight", "normalization"}
+    supported = {
+        "target_mode",
+        "progress_weight",
+        "normalization",
+        "completion_weight",
+    }
     unknown = sorted(set(raw) - supported)
     if unknown:
         raise ValueError(f"stage2.sequence_loss has unknown fields: {unknown}")

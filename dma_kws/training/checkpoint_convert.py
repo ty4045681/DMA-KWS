@@ -205,23 +205,28 @@ def _require_compatible_readout(
 ) -> int:
     """Require exact v6 alignment metadata; older score heads are not convertible."""
 
-    from dma_kws.stage2.readout import resolve_qbyt_alignment
-    from dma_kws.training.checkpoint_io import assert_qbyt_readout_version
+    from dma_kws.stage2.readout import resolve_qbyt_score_spec
+    from dma_kws.training.checkpoint_io import (
+        QBYT_READOUT_VERSION_KEY,
+        assert_qbyt_readout_version,
+    )
 
     stage2 = config.get("stage2")
     if not isinstance(stage2, Mapping):
         raise CheckpointConversionError("Resolved config has no stage2 mapping")
     try:
+        expected = resolve_qbyt_score_spec(stage2)
         assert_qbyt_readout_version(
             checkpoint,
             source="checkpoint conversion input",
-            expected_alignment=resolve_qbyt_alignment(stage2),
+            expected_alignment=expected,
         )
     except (SystemExit, ValueError) as exc:
         raise CheckpointConversionError(
-            f"Checkpoint is not a complete QbyT v6 segmental-CRF model: {exc}"
+            f"Checkpoint QbyT readout is not compatible with the resolved config: {exc}"
         ) from exc
-    return QBYT_READOUT_VERSION
+    saved = checkpoint.get(QBYT_READOUT_VERSION_KEY)
+    return int(saved) if saved is not None else expected.version
 
 
 def _equal_int_metadata(

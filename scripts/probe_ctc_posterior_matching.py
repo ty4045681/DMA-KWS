@@ -97,7 +97,7 @@ def main(cfg: DictConfig) -> None:
     assert_qbyt_readout_version(
         checkpoint,
         source=checkpoint_path,
-        expected_alignment=model.qbyt_alignment,
+        expected_alignment=model.qbyt_score,
     )
     state = (
         extract_state_dict(checkpoint)
@@ -106,12 +106,13 @@ def main(cfg: DictConfig) -> None:
     )
     missing, unexpected = model.load_state_dict(state, strict=False)
     assert_adapter_weights_loaded(model, missing)
-    assert_qbyt_alignment_state_loaded(
-        missing,
-        unexpected,
-        source=checkpoint_path,
-        expected_topology=model.qbyt_alignment.topology,
-    )
+    if model.qbyt_alignment is not None:
+        assert_qbyt_alignment_state_loaded(
+            missing,
+            unexpected,
+            source=checkpoint_path,
+            expected_topology=model.qbyt_alignment.topology,
+        )
     if missing:
         print(f"Warning: {len(missing)} missing keys when loading checkpoint")
     if unexpected:

@@ -48,6 +48,7 @@ from dma_kws.training.lora import (
     inject_qbyt_lora,
     load_lora_state_dict,
     lora_state_dict,
+    lora_targets_for_qbyt_family,
     merge_lora,
     normalize_lora_targets,
 )
@@ -209,7 +210,12 @@ def _normalize_lora_metadata(key: str, value: Any) -> Any:
         return parsed
     if key == "lora_targets":
         values = [value] if isinstance(value, str) else value
-        return frozenset(normalize_lora_targets(values))
+        try:
+            return frozenset(
+                normalize_lora_targets(values, family="keyword_filler")
+            )
+        except ValueError:
+            return frozenset(normalize_lora_targets(values, family="pooling"))
     return value
 
 
@@ -362,7 +368,9 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         self.ctc_weight = 0.0
 
         self._base_model_sha256 = fingerprint_stage2_base(self.state_dict())
-        normalized_targets = normalize_lora_targets(lora_targets)
+        normalized_targets = lora_targets_for_qbyt_family(
+            lora_targets, family=self.qbyt_score.family
+        )
         self.lora_injected = inject_qbyt_lora(
             self.qbyt,
             rank=lora_rank,
@@ -384,7 +392,7 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             assert_qbyt_readout_version(
                 state,
                 source=adapter_checkpoint,
-                expected_alignment=self.qbyt_alignment,
+                expected_alignment=self.qbyt_score,
             )
             adapter_state = _validate_adapter_checkpoint(
                 state,
@@ -428,7 +436,7 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         assert_qbyt_readout_version(
             checkpoint,
             source="the LoRA checkpoint being restored",
-            expected_alignment=self.qbyt_alignment,
+            expected_alignment=self.qbyt_score,
         )
         super().on_load_checkpoint(checkpoint)
         adapt = _adapt_section(self._checkpoint_config)
@@ -921,8 +929,12 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
 
     lora_rank = int(adapt.get("rank", 16))
     lora_alpha = float(adapt.get("alpha", 32))
-    lora_targets = normalize_lora_targets(
-        adapt.get("lora_targets", ("audio_key.weight", "text_query.weight"))
+    from dma_kws.stage2.readout import resolve_qbyt_score_spec
+
+    score = resolve_qbyt_score_spec(config.get("stage2", {}))
+    lora_targets = lora_targets_for_qbyt_family(
+        adapt.get("lora_targets"),
+        family=score.family,
     )
     adapt["rank"] = lora_rank
     adapt["alpha"] = lora_alpha
@@ -1121,7 +1133,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     "lora_targets": list(lora_targets),
                     STAGE2_BASE_FINGERPRINT_KEY: base_model_sha256,
                 },
-                alignment=model.qbyt_alignment,
+                alignment=model.qbyt_score,
             ),
             run_context,
         )
@@ -1140,7 +1152,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     "tokenizer_dict_path": str(dict_path),
                     "vocab_size": vocab_size,
                 },
-                alignment=model.qbyt_alignment,
+                alignment=model.qbyt_score,
             ),
             run_context,
         )

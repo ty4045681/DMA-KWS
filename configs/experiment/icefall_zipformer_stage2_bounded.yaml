@@ -1,0 +1,32 @@
+# @package _global_
+# Frozen Zipformer Stage II with the v5 target-only bounded segmental readout.
+#
+# Usage:
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_bounded \
+#     stage2.freeze_encoder=true
+
+defaults:
+  - icefall_zipformer_stage2
+  - _self_
+
+training:
+  recipe: icefall-zipformer-frozen-bounded-segmental-v5
+
+stage2:
+  qbyt_readout_version: 5
+  qbyt_alignment:
+    topology: bounded_segmental_v1
+    min_phone_duration_frames: 1
+    max_phone_duration_frames: 8
+    max_inter_phone_gap_frames: 2
+    max_keyword_span_frames: 30
+    local_context_kernel: 5
+    temperature: 0.2
+  phoneme_adapter:
+    enabled: false
+    ctc_weight: 0.0
+  negative_tail_loss:
+    enabled: false
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-bounded-segmental-v5
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-bounded-segmental-v5
+  run_name: icefall-zipformer-frozen-bounded-segmental-v5

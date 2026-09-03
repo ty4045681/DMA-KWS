@@ -244,21 +244,35 @@ def collect_hparams(
     if effective_max_steps is not None:
         hparams["max_steps"] = int(effective_max_steps)
     if section in {"stage2", "adapt"}:
-        from dma_kws.stage2.readout import resolve_qbyt_alignment
+        from dma_kws.stage2.readout import resolve_qbyt_score_spec
 
         sequence_loss = stage2.get("sequence_loss", {}) or {}
         validation = stage2.get("validation", {}) or {}
-        alignment = resolve_qbyt_alignment(stage2)
+        score = resolve_qbyt_score_spec(stage2)
+        hparams["qbyt_readout_version"] = int(score.version)
+        if score.family == "pooling":
+            hparams["qbyt_readout_mode"] = score.value.mode
+            hparams["qbyt_readout_temperature"] = float(score.value.temperature)
+        else:
+            alignment = score.value
+            hparams.update(
+                {
+                    "qbyt_alignment_topology": alignment.topology,
+                    "qbyt_weakest_phone_temperature": getattr(
+                        alignment, "weakest_phone_temperature", None
+                    ),
+                    "qbyt_weakest_phone_weight": getattr(
+                        alignment, "weakest_phone_weight", None
+                    ),
+                    "qbyt_min_phone_duration_frames": alignment.min_phone_duration_frames,
+                    "qbyt_max_phone_duration_frames": alignment.max_phone_duration_frames,
+                    "qbyt_max_inter_phone_gap_frames": alignment.max_inter_phone_gap_frames,
+                    "qbyt_max_keyword_span_frames": alignment.max_keyword_span_frames,
+                    "qbyt_local_context_kernel": alignment.local_context_kernel,
+                }
+            )
         hparams.update(
             {
-                "qbyt_alignment_topology": alignment.topology,
-                "qbyt_weakest_phone_temperature": alignment.weakest_phone_temperature,
-                "qbyt_weakest_phone_weight": alignment.weakest_phone_weight,
-                "qbyt_min_phone_duration_frames": alignment.min_phone_duration_frames,
-                "qbyt_max_phone_duration_frames": alignment.max_phone_duration_frames,
-                "qbyt_max_inter_phone_gap_frames": alignment.max_inter_phone_gap_frames,
-                "qbyt_max_keyword_span_frames": alignment.max_keyword_span_frames,
-                "qbyt_local_context_kernel": alignment.local_context_kernel,
                 "qbyt_deployment_threshold": float(
                     ((config.get("demo") or {}).get("qbyt_threshold", 0.5))
                 ),

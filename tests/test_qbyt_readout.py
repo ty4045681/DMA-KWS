@@ -7,11 +7,14 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from dma_kws.stage2.readout import (
+    CURRENT_QBYT_READOUT_VERSION,
     QBYT_ALIGNMENT_TOPOLOGY,
     QbyTAlignmentSpec,
+    SUPPORTED_QBYT_READOUT_VERSIONS,
     assert_qbyt_alignment_state_loaded,
     normalize_qbyt_alignment_topology,
     resolve_qbyt_alignment,
+    resolve_qbyt_score_spec,
 )
 from dma_kws.training.checkpoint_io import (
     QBYT_ALIGNMENT_SPEC_KEY,
@@ -52,7 +55,8 @@ def _payload(
 
 
 def test_v6_alignment_defaults_are_the_only_topology() -> None:
-    assert QBYT_READOUT_VERSION == 7
+    assert QBYT_READOUT_VERSION == CURRENT_QBYT_READOUT_VERSION == 7
+    assert SUPPORTED_QBYT_READOUT_VERSIONS == frozenset({2, 3, 4, 5, 6, 7})
     assert normalize_qbyt_alignment_topology(None) == QBYT_ALIGNMENT_TOPOLOGY
     assert resolve_qbyt_alignment({}).as_dict() == {
         "topology": "keyword_filler_segmental_crf_v1",
@@ -94,18 +98,66 @@ def test_alignment_config_canonicalizes_numeric_strings() -> None:
 
 
 @pytest.mark.parametrize("mode", ["gru_last", "eps_mean", "eps_softmin"])
-def test_historical_readout_modes_are_not_configuration_options(mode: str) -> None:
+def test_historical_readout_modes_are_not_v7_alignment_topologies(mode: str) -> None:
     with pytest.raises(ValueError, match="legacy GRU/EPS switch"):
         resolve_qbyt_alignment({"qbyt_readout": {"mode": mode}})
     with pytest.raises(ValueError, match="Historical GRU/EPS"):
         resolve_qbyt_alignment({"qbyt_alignment": {"topology": mode}})
 
 
-def test_target_only_bounded_segmental_topology_is_rejected() -> None:
+@pytest.mark.parametrize("mode", ["gru_last", "eps_mean", "eps_softmin"])
+def test_pooling_score_spec_accepts_historical_modes(mode: str) -> None:
+    spec = resolve_qbyt_score_spec(
+        {"qbyt_readout_version": 4, "qbyt_readout": {"mode": mode, "temperature": 0.5}}
+    )
+    assert spec.version == 4
+    assert spec.family == "pooling"
+    assert spec.value.mode == mode
+    assert spec.value.temperature == 0.5
+
+
+def test_version_3_cannot_claim_softmin() -> None:
+    with pytest.raises(ValueError, match="version 3 cannot carry mode"):
+        resolve_qbyt_score_spec(
+            {
+                "qbyt_readout_version": 3,
+                "qbyt_readout": {"mode": "eps_softmin", "temperature": 0.5},
+            }
+        )
+
+
+def test_bounded_score_spec_accepts_v5_topology() -> None:
+    spec = resolve_qbyt_score_spec(
+        {
+            "qbyt_readout_version": 5,
+            "qbyt_alignment": {
+                "topology": "bounded_segmental_v1",
+                "temperature": 0.2,
+                "weakest_phone_weight": 1.0,
+            },
+        }
+    )
+    assert spec.version == 5
+    assert spec.family == "bounded"
+    assert spec.value.topology == "bounded_segmental_v1"
+    assert spec.value.temperature == 0.2
+
+
+def test_target_only_bounded_segmental_topology_is_rejected_as_v7() -> None:
     with pytest.raises(ValueError, match="target-only bounded-segmental"):
         resolve_qbyt_alignment(
             {"qbyt_alignment": {"topology": "bounded_segmental_v1"}}
         )
+
+
+def test_keyword_filler_version_6_and_7_share_alignment_fields() -> None:
+    raw = {"qbyt_alignment": _spec()}
+    v6 = resolve_qbyt_score_spec({**raw, "qbyt_readout_version": 6})
+    v7 = resolve_qbyt_score_spec({**raw, "qbyt_readout_version": 7})
+    assert v6.value == v7.value
+    assert v6.emission == "query_relative"
+    assert v7.emission == "one_vs_rest"
+    assert v6 != v7
 
 
 @pytest.mark.parametrize(
@@ -167,7 +219,9 @@ def test_stamp_records_version_and_complete_actual_alignment() -> None:
     )
     assert payload[QBYT_READOUT_VERSION_KEY] == QBYT_READOUT_VERSION
     assert payload[QBYT_ALIGNMENT_SPEC_KEY] == configured
-    assert checkpoint_qbyt_readout_spec(payload).as_dict() == configured
+    decoded = checkpoint_qbyt_readout_spec(payload)
+    assert decoded.version == QBYT_READOUT_VERSION
+    assert decoded.value.as_dict() == configured
 
 
 def test_stamp_requires_and_accepts_explicit_spec() -> None:
@@ -210,8 +264,8 @@ def test_current_checkpoint_requires_exact_stamped_and_configured_spec() -> None
         )
 
 
-@pytest.mark.parametrize("version", [None, 1, 2, 3, 4, 5])
-def test_pre_v6_qbyt_weights_are_always_rejected(version: int | None) -> None:
+@pytest.mark.parametrize("version", [None, 1])
+def test_unversioned_and_v1_qbyt_weights_are_rejected(version: int | None) -> None:
     payload = _payload(
         version=version,
         stamped_spec=None,
@@ -221,6 +275,32 @@ def test_pre_v6_qbyt_weights_are_always_rejected(version: int | None) -> None:
         assert_qbyt_readout_version(
             payload,
             source="legacy.pt",
+        )
+
+
+@pytest.mark.parametrize("version", [2, 3, 4])
+def test_pooling_checkpoints_load_when_the_run_asks_for_pooling(version: int) -> None:
+    from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
+
+    payload = _payload(
+        version=version,
+        stamped_spec=None,
+        config_spec=None,
+    )
+    payload["config"] = {
+        "stage2": {"qbyt_readout_version": version, "qbyt_readout": {"mode": "gru_last"}}
+    }
+    assert_qbyt_readout_version(payload, source="pooling.pt")
+    assert_qbyt_readout_version(
+        payload,
+        source="pooling.pt",
+        expected_alignment=QbyTReadoutConfig(mode="gru_last"),
+    )
+    with pytest.raises(SystemExit, match="uses version 7"):
+        assert_qbyt_readout_version(
+            payload,
+            source="pooling.pt",
+            expected_alignment=QbyTAlignmentSpec(),
         )
 
 
@@ -267,8 +347,35 @@ def test_lora_adapter_payload_is_also_version_and_spec_checked() -> None:
         "lora_state_dict": {"phone_matchor.lora_A": torch.zeros(1)},
         QBYT_READOUT_VERSION_KEY: 4,
     }
+    assert_qbyt_readout_version(payload, source="legacy-adapter.pt")
     with pytest.raises(SystemExit, match="version 4"):
-        assert_qbyt_readout_version(payload, source="legacy-adapter.pt")
+        assert_qbyt_readout_version(
+            payload,
+            source="legacy-adapter.pt",
+            expected_alignment=QbyTAlignmentSpec(),
+        )
+
+
+def test_stamp_pooling_writes_version_without_alignment_spec() -> None:
+    from dma_kws.stage2.readout import resolve_qbyt_score_spec
+
+    spec = resolve_qbyt_score_spec(
+        {"qbyt_readout_version": 4, "qbyt_readout": {"mode": "eps_mean"}}
+    )
+    payload = stamp_qbyt_readout_version(
+        {
+            "model_state_dict": {"qbyt.final_pos_fc.weight": torch.zeros(1)},
+            "config": {
+                "stage2": {
+                    "qbyt_readout_version": 4,
+                    "qbyt_readout": {"mode": "eps_mean"},
+                }
+            },
+        },
+        alignment=spec,
+    )
+    assert payload[QBYT_READOUT_VERSION_KEY] == 4
+    assert QBYT_ALIGNMENT_SPEC_KEY not in payload
 
 
 def test_non_strict_load_rejects_any_qbyt_state_mismatch() -> None:

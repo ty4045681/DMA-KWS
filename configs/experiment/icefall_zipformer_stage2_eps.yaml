@@ -1,0 +1,30 @@
+# @package _global_
+# Frozen Zipformer Stage II with the v4 EPS mean pooling readout.
+#
+# Usage:
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_eps \
+#     stage2.freeze_encoder=true
+#
+# Set mode=eps_softmin (or use icefall_zipformer_stage2_eps_softmin) for
+# weakest-position-aware pooling.
+
+defaults:
+  - icefall_zipformer_stage2
+  - _self_
+
+training:
+  recipe: icefall-zipformer-frozen-eps
+
+stage2:
+  qbyt_readout_version: 4
+  qbyt_readout:
+    mode: eps_mean
+    temperature: 1.0
+  phoneme_adapter:
+    enabled: false
+    ctc_weight: 0.0
+  negative_tail_loss:
+    enabled: false
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-eps
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-eps
+  run_name: icefall-zipformer-frozen-eps

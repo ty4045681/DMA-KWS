@@ -17,7 +17,7 @@ from dma_kws.nn import build_encoder, run_encoder
 from dma_kws.stage2.losses import compute_stage2_losses
 from dma_kws.stage2.model_factory import build_qbyt
 from dma_kws.stage2.objective import resolve_sequence_objective
-from dma_kws.stage2.readout import resolve_qbyt_alignment
+from dma_kws.stage2.readout import resolve_qbyt_score_spec
 from dma_kws.training.checkpoint_io import (
     assert_qbyt_readout_version,
     assert_stream_policy_matches,
@@ -93,15 +93,42 @@ class Stage2LightningModule(pl.LightningModule):
         encoder_dim = int(stage2.get("encoder_output_dim", stage1.get("encoder_output_dim", 144)))
 
         sequence_objective = resolve_sequence_objective(stage2)
-        self.qbyt_alignment = resolve_qbyt_alignment(stage2)
+        self.qbyt_score = resolve_qbyt_score_spec(stage2)
+        self.qbyt_alignment = (
+            self.qbyt_score.value
+            if self.qbyt_score.family != "pooling"
+            else None
+        )
         self.seq_progress_weight = sequence_objective.progress_weight
         self.seq_normalization = sequence_objective.normalization
+        raw_sequence = stage2.get("sequence_loss") or {}
+        self.seq_completion_weight = (
+            float(raw_sequence.get("completion_weight", 0.5))
+            if self.qbyt_score.family == "pooling"
+            else 0.0
+        )
         negative_tail_cfg = stage2.get("negative_tail_loss", {}) or {}
         if not isinstance(negative_tail_cfg, dict):
             raise ValueError("stage2.negative_tail_loss must be a mapping")
+        negative_tail_enabled = bool(negative_tail_cfg.get("enabled", False))
+        if negative_tail_enabled and self.qbyt_score.family != "keyword_filler":
+            raise ValueError(
+                "stage2.negative_tail_loss is only supported for keyword-filler "
+                f"QbyT (v6/v7); this run is {self.qbyt_score.family} v{self.qbyt_score.version}"
+            )
+        background_cfg = stage2.get("background_negative", {}) or {}
+        if (
+            isinstance(background_cfg, dict)
+            and bool(background_cfg.get("enabled", False))
+            and self.qbyt_score.family != "keyword_filler"
+        ):
+            raise ValueError(
+                "stage2.background_negative is only supported for keyword-filler "
+                f"QbyT (v6/v7); this run is {self.qbyt_score.family} v{self.qbyt_score.version}"
+            )
         self.negative_tail_weight = (
             float(negative_tail_cfg.get("weight", 0.5))
-            if bool(negative_tail_cfg.get("enabled", False))
+            if negative_tail_enabled
             else 0.0
         )
         self.negative_tail_fraction = float(
@@ -114,8 +141,16 @@ class Stage2LightningModule(pl.LightningModule):
             "sequence_loss"
         ] = sequence_objective.as_dict()
         self._checkpoint_config["stage2"][
-            "qbyt_alignment"
-        ] = self.qbyt_alignment.as_dict()
+            "qbyt_readout_version"
+        ] = self.qbyt_score.version
+        if self.qbyt_score.family == "pooling":
+            self._checkpoint_config["stage2"]["qbyt_readout"] = (
+                self.qbyt_score.value.as_dict()
+            )
+        else:
+            self._checkpoint_config["stage2"][
+                "qbyt_alignment"
+            ] = self.qbyt_score.value.as_dict()
 
         self.stream_policy = resolve_stream_policy(stage1)
         self.encoder = build_encoder(stage1, output_dim=encoder_dim)
@@ -259,7 +294,7 @@ class Stage2LightningModule(pl.LightningModule):
         assert_qbyt_readout_version(
             checkpoint,
             source=checkpoint_path,
-            expected_alignment=self.qbyt_alignment,
+            expected_alignment=self.qbyt_score,
         )
         
         # Check if this is an icefall checkpoint (has "model" key)
@@ -394,7 +429,7 @@ class Stage2LightningModule(pl.LightningModule):
         Checkpoint averaging keeps the first payload as its template and only
         replaces the state dict, so averaged checkpoints inherit these fields.
         """
-        stamp_qbyt_readout_version(checkpoint, alignment=self.qbyt_alignment)
+        stamp_qbyt_readout_version(checkpoint, alignment=self.qbyt_score)
         checkpoint["checkpoint_kind"] = "stage2"
         checkpoint["config"] = copy.deepcopy(self._checkpoint_config)
         checkpoint["vocab_size"] = self._checkpoint_vocab_size
@@ -416,7 +451,7 @@ class Stage2LightningModule(pl.LightningModule):
         assert_qbyt_readout_version(
             checkpoint,
             source="the Stage II checkpoint being restored",
-            expected_alignment=self.qbyt_alignment,
+            expected_alignment=self.qbyt_score,
         )
 
     def forward(
@@ -581,14 +616,35 @@ class Stage2LightningModule(pl.LightningModule):
         )
         encoder_lengths = encoder_mask.squeeze(1).sum(dim=1).to(dtype=torch.long)
         anchor_lengths = batch["anchor"].ne(0).sum(dim=1).to(dtype=torch.long)
-        minimum_path_frames = (
-            anchor_lengths * self.qbyt_alignment.min_phone_duration_frames
-        )
-        valid_path_mask = (
-            anchor_lengths.gt(0)
-            & minimum_path_frames.le(encoder_lengths)
-            & minimum_path_frames.le(self.qbyt_alignment.max_keyword_span_frames)
-        )
+        if self.qbyt_score.family == "pooling":
+            from dma_kws.stage2.losses_pooling import (
+                compute_stage2_losses as compute_pooling_losses,
+            )
+
+            total_loss, losses = compute_pooling_losses(
+                logits=logits,
+                seq_logits=seq_logits,
+                labels=batch["label"],
+                seq_labels=batch["seq_label"],
+                seq_label_mask=batch["seq_label_mask"],
+                seq_progress_weight=self.seq_progress_weight,
+                seq_completion_weight=self.seq_completion_weight,
+                seq_normalization=self.seq_normalization,
+                ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
+                ctc_weight=self.ctc_weight,
+            )
+            return total_loss, losses, logits
+
+        valid_path_mask = None
+        if self.qbyt_score.family == "keyword_filler":
+            minimum_path_frames = (
+                anchor_lengths * self.qbyt_alignment.min_phone_duration_frames
+            )
+            valid_path_mask = (
+                anchor_lengths.gt(0)
+                & minimum_path_frames.le(encoder_lengths)
+                & minimum_path_frames.le(self.qbyt_alignment.max_keyword_span_frames)
+            )
         total_loss, losses = compute_stage2_losses(
             logits=logits,
             seq_logits=seq_logits,
@@ -603,8 +659,9 @@ class Stage2LightningModule(pl.LightningModule):
             ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
             ctc_weight=self.ctc_weight,
         )
-        losses["valid_path_mask"] = valid_path_mask
-        losses["illegal_path_rate"] = (~valid_path_mask).float().mean()
+        if valid_path_mask is not None:
+            losses["valid_path_mask"] = valid_path_mask
+            losses["illegal_path_rate"] = (~valid_path_mask).float().mean()
         return total_loss, losses, logits
 
     def _log_train_losses(self, total_loss: torch.Tensor, losses: dict[str, torch.Tensor]) -> None:

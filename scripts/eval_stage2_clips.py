@@ -106,9 +106,15 @@ def _score_head_diagnostics(
     return result
 
 
-def _resolve_audio_padding_ms(prep: dict) -> tuple[int, int]:
-    left_padding_ms = int(prep.get("left_padding_ms", DEFAULT_PADDING_MS))
-    right_padding_ms = int(prep.get("right_padding_ms", DEFAULT_PADDING_MS))
+def _resolve_audio_padding_ms(
+    prep: dict,
+    stage2: dict | None = None,
+) -> tuple[int, int]:
+    from dma_kws.stage2.readout import default_clip_padding_ms
+
+    default = default_clip_padding_ms(stage2 or {})
+    left_padding_ms = int(prep.get("left_padding_ms", default))
+    right_padding_ms = int(prep.get("right_padding_ms", default))
     if left_padding_ms < 0 or right_padding_ms < 0:
         raise SystemExit("prep.left_padding_ms and prep.right_padding_ms must be >= 0")
     return left_padding_ms, right_padding_ms
@@ -138,7 +144,9 @@ def run_eval(cfg: DictConfig) -> dict:
     if not stage2_ckpt:
         raise SystemExit("prep.stage2_ckpt is required")
     stage2_calibration = str(prep.get("stage2_calibration", "")).strip()
-    left_padding_ms, right_padding_ms = _resolve_audio_padding_ms(prep)
+    left_padding_ms, right_padding_ms = _resolve_audio_padding_ms(
+        prep, config.get("stage2") if isinstance(config.get("stage2"), dict) else {}
+    )
     output_dir_override = str(prep.get("output_dir", ""))
     if output_dir_override == "outputs/eval_two_stage_kws":
         output_dir_override = ""

@@ -13,7 +13,14 @@ EMBED_DIM = 32
 ENCODER_DIM = 24
 
 
-def _model(seed: int = 0, *, layers: int = 2, kernel: int = 5, num_embeds: int = 73):
+def _model(
+    seed: int = 0,
+    *,
+    layers: int = 2,
+    kernel: int = 5,
+    num_embeds: int = 73,
+    emission: str = "one_vs_rest",
+):
     torch.manual_seed(seed)
     QbyT = load_qbyt_class()
     return QbyT(
@@ -29,6 +36,7 @@ def _model(seed: int = 0, *, layers: int = 2, kernel: int = 5, num_embeds: int =
         weakest_phone_temperature=0.2,
         weakest_phone_weight=1.0,
         dropout=0.0,
+        emission=emission,
     ).eval()
 
 
@@ -228,6 +236,51 @@ def test_in_query_substitution_is_charged_against_the_competing_phone(monkeypatc
     assert target_llr[0, 0, 0].item() == pytest.approx(one_vs_rest, abs=1e-5)
     assert abs(target_llr[0, 0, 0].item() - query_relative) > 1.0
     assert target_llr[0, 1, 0].item() == pytest.approx(math.log(0.60 / 0.40), abs=1e-5)
+
+
+def test_query_relative_emission_reproduces_legacy_filler(monkeypatch):
+    model = _model(layers=0, num_embeds=6, emission="query_relative")
+    probs = torch.tensor([[[0.15, 0.60, 0.10, 0.05, 0.03, 0.04, 0.03]]])
+    monkeypatch.setattr(
+        model, "frame_class_log_probs", lambda speech, frame_mask: probs.log()
+    )
+    query = torch.tensor([[1, 2]])
+    with torch.no_grad():
+        target_llr, filler, *_ = model._encode_lattice(
+            torch.zeros(1, 1, ENCODER_DIM), query, torch.tensor([1]), torch.tensor([2])
+        )
+
+    expected_filler = math.log(1.0 - 0.15 - 0.60)
+    assert filler[0, 0].item() == pytest.approx(expected_filler, abs=1e-5)
+    assert target_llr[0, 0, 0].item() == pytest.approx(
+        math.log(0.15) - expected_filler, abs=1e-5
+    )
+
+
+def test_query_relative_and_one_vs_rest_disagree_on_identical_weights():
+    one_vs_rest = _model(seed=3, layers=1, emission="one_vs_rest")
+    query_relative = _model(seed=3, layers=1, emission="query_relative")
+    query_relative.load_state_dict(one_vs_rest.state_dict())
+    query, speech = _sample(4, 20, 11)
+    with torch.no_grad():
+        rest_logit, _ = one_vs_rest(
+            speech.unsqueeze(0),
+            query.unsqueeze(0),
+            speech_lengths=torch.tensor([speech.size(0)]),
+            text_lengths=torch.tensor([query.size(0)]),
+        )
+        relative_logit, _ = query_relative(
+            speech.unsqueeze(0),
+            query.unsqueeze(0),
+            speech_lengths=torch.tensor([speech.size(0)]),
+            text_lengths=torch.tensor([query.size(0)]),
+        )
+    assert not torch.allclose(rest_logit, relative_logit, atol=1e-5, rtol=1e-5)
+
+
+def test_unknown_emission_is_rejected():
+    with pytest.raises(ValueError, match="Unsupported QbyT emission"):
+        _model(emission="softmax_pool")
 
 
 def test_zero_initialized_duration_potentials_are_centered_uniform():

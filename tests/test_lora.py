@@ -38,6 +38,33 @@ def test_lora_rejects_non_positive_or_non_finite_alpha(alpha):
         LoRAParametrization(128, 384, rank=8, alpha=alpha)
 
 
+def test_pooling_lora_targets_are_phone_matchor_attention_weights():
+    from qbyt.pooling import QbyT
+    from dma_kws.training.lora import lora_targets_for_qbyt_family
+
+    assert normalize_lora_targets(None, family="pooling") == (
+        "in_proj_weight",
+        "out_proj.weight",
+    )
+    assert lora_targets_for_qbyt_family(
+        ["audio_key.weight", "text_query.weight"],
+        family="pooling",
+    ) == ("in_proj_weight", "out_proj.weight")
+    assert lora_targets_for_qbyt_family(
+        None, family="keyword_filler"
+    ) == ("audio_key.weight", "text_query.weight")
+    qbyt = QbyT(
+        encoder_output_size=24,
+        num_embeds=16,
+        embed_dim=32,
+        post_num_layers=1,
+        readout_mode="gru_last",
+    )
+    injected = inject_qbyt_lora(qbyt, rank=2, alpha=4.0)
+    assert injected
+    assert all("phone_matchor" in name for name in injected)
+
+
 def test_lora_targets_reject_empty_and_misspelled_entries():
     assert normalize_lora_targets(None) == (
         "audio_key.weight",
@@ -49,9 +76,11 @@ def test_lora_targets_reject_empty_and_misspelled_entries():
     with pytest.raises(ValueError, match="At least one"):
         normalize_lora_targets([])
     with pytest.raises(ValueError, match="Unsupported"):
-        normalize_lora_targets(["in_proj_weight", "out_proj.weight"])
+        normalize_lora_targets(
+            ["in_proj_weight", "out_proj.weight"], family="keyword_filler"
+        )
     with pytest.raises(ValueError, match="Unsupported"):
-        normalize_lora_targets(["out_proj"])
+        normalize_lora_targets(["out_proj"], family="keyword_filler")
 
 
 def test_lora_runtime_rejects_base_mutating_ema_and_true_half_precision():
@@ -247,7 +276,7 @@ def test_adapter_resume_requires_exact_base_fingerprint():
 def test_full_lora_checkpoint_restore_validates_embedded_base(monkeypatch):
     from dma_kws.stage2.adapt import Stage2LoraAdaptationModule
     from dma_kws.stage2.module import Stage2LightningModule
-    from dma_kws.stage2.readout import QbyTAlignmentSpec
+    from dma_kws.stage2.readout import QbyTAlignmentSpec, QbyTScoreSpec
     from dma_kws.training.checkpoint_io import (
         STAGE2_BASE_FINGERPRINT_KEY,
         fingerprint_stage2_base,
@@ -262,6 +291,7 @@ def test_full_lora_checkpoint_restore_validates_embedded_base(monkeypatch):
     module = Stage2LoraAdaptationModule.__new__(Stage2LoraAdaptationModule)
     nn.Module.__init__(module)
     module.qbyt_alignment = QbyTAlignmentSpec()
+    module.qbyt_score = QbyTScoreSpec(version=7, value=module.qbyt_alignment)
     module._checkpoint_config = {
         "adapt": {"keyword": "hey eva", "phase": "tts"}
     }

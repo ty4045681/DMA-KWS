@@ -214,6 +214,12 @@ def clip_emission_diagnostics(
 ) -> list[dict[str, Any]]:
     """Per-clip emission statistics and readout ablations for one batch."""
 
+    if not hasattr(qbyt, "frame_class_log_probs"):
+        raise TypeError(
+            "QbyT emission diagnostics require a keyword-filler QbyT with "
+            "frame_class_log_probs; pooling and bounded v5 models are unsupported"
+        )
+
     if anchors.size(1) == 0 or int(anchor_lengths.min()) <= 0:
         # QbyT.forward returns the invalid sentinel for an empty query instead of
         # indexing the graph. Rather than reproduce that branch and risk the two

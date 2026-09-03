@@ -115,10 +115,13 @@ class Stage2Verifier:
         self._stream_policy = stream_policy
         adapter_cfg = stage2_cfg.get("phoneme_adapter", {}) or {}
         adapter_enabled = bool(adapter_cfg.get("enabled", False))
-        from dma_kws.stage2.readout import resolve_qbyt_alignment
+        from dma_kws.stage2.readout import resolve_qbyt_score_spec
 
-        qbyt_alignment = resolve_qbyt_alignment(stage2_cfg)
-        self.qbyt_alignment = qbyt_alignment
+        qbyt_score = resolve_qbyt_score_spec(stage2_cfg)
+        self.qbyt_score = qbyt_score
+        self.qbyt_alignment = (
+            qbyt_score.value if qbyt_score.family != "pooling" else None
+        )
 
         class Stage2Model(torch.nn.Module):
             def __init__(self):
@@ -200,7 +203,7 @@ class Stage2Verifier:
                 torch.load,
                 stream_policy=stream_policy,
                 # Inference must never score a semantically stale alignment.
-                expected_qbyt_alignment=qbyt_alignment,
+                expected_qbyt_alignment=qbyt_score,
             )
         except RuntimeError as exc:
             raise SystemExit(

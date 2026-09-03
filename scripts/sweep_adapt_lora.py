@@ -82,17 +82,18 @@ def _eval_lph_auc(
     assert_qbyt_readout_version(
         ckpt,
         source=checkpoint,
-        expected_alignment=model.qbyt_alignment,
+        expected_alignment=model.qbyt_score,
     )
     state = extract_state_dict(ckpt)
     missing, unexpected = model.load_state_dict(state, strict=False)
     assert_adapter_weights_loaded(model, missing)
-    assert_qbyt_alignment_state_loaded(
-        missing,
-        unexpected,
-        source=checkpoint,
-        expected_topology=model.qbyt_alignment.topology,
-    )
+    if model.qbyt_alignment is not None:
+        assert_qbyt_alignment_state_loaded(
+            missing,
+            unexpected,
+            source=checkpoint,
+            expected_topology=model.qbyt_alignment.topology,
+        )
     trainer = pl.Trainer(
         accelerator=accelerator, devices=1, logger=False, enable_checkpointing=False
     )
@@ -118,7 +119,7 @@ def _eval_target_auc(
     from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
     from dma_kws.stage2.readout import (
         assert_qbyt_alignment_state_loaded,
-        resolve_qbyt_alignment,
+        resolve_qbyt_score_spec,
     )
     from dma_kws.stage2.sweep_eval import (
         resolve_target_eval_output_dir,
@@ -156,7 +157,7 @@ def _eval_target_auc(
     )
 
     ckpt = torch.load(checkpoint, map_location="cpu")
-    expected_alignment = resolve_qbyt_alignment(config.get("stage2", {}))
+    expected_alignment = resolve_qbyt_score_spec(config.get("stage2", {}))
     assert_qbyt_readout_version(
         ckpt,
         source=checkpoint,
@@ -197,12 +198,13 @@ def _eval_target_auc(
     model = _TargetValModule(config, vocab_size=vocab_size)
     missing, unexpected = model.load_state_dict(state, strict=False)
     assert_adapter_weights_loaded(model, missing)
-    assert_qbyt_alignment_state_loaded(
-        missing,
-        unexpected,
-        source=checkpoint,
-        expected_topology=model.qbyt_alignment.topology,
-    )
+    if model.qbyt_alignment is not None:
+        assert_qbyt_alignment_state_loaded(
+            missing,
+            unexpected,
+            source=checkpoint,
+            expected_topology=model.qbyt_alignment.topology,
+        )
 
     trainer = pl.Trainer(
         accelerator=accelerator, devices=1, logger=False, enable_checkpointing=False

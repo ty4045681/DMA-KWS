@@ -28,7 +28,7 @@ def _load_model(config: dict, checkpoint_path: Path, vocab_size: int) -> Stage2L
     assert_qbyt_readout_version(
         checkpoint,
         source=checkpoint_path,
-        expected_alignment=model.qbyt_alignment,
+        expected_alignment=model.qbyt_score,
     )
 
     if checkpoint_path.suffix == ".pt":

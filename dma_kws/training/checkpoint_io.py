@@ -200,25 +200,83 @@ def assert_stream_policy_matches(
         )
 
 
-def _resolve_qbyt_alignment_value(value: Any) -> Any:
-    """Resolve a spec object, direct spec mapping, or Stage-II config mapping."""
+def _stage2_with_default_version(
+    stage2: Mapping[str, Any],
+    default_version: int | None,
+) -> Mapping[str, Any]:
+    """Pin a missing ``qbyt_readout_version`` to ``default_version``.
 
-    from dma_kws.stage2.readout import QbyTAlignmentSpec, resolve_qbyt_alignment
+    Historical v6 files record the era on the payload stamp and the alignment
+    fields under ``config.stage2``, but not ``config.stage2.qbyt_readout_version``.
+    Inferring the current default (7) from that keyword-filler block would
+    disagree with the stamp.
+    """
 
-    if isinstance(value, QbyTAlignmentSpec):
+    if default_version is None or stage2.get("qbyt_readout_version") is not None:
+        return stage2
+    pinned = dict(stage2)
+    pinned["qbyt_readout_version"] = int(default_version)
+    return pinned
+
+
+def _resolve_qbyt_score_value(
+    value: Any,
+    *,
+    default_version: int | None = None,
+) -> Any:
+    """Resolve a score spec, inner spec object, or Stage-II config mapping."""
+
+    from dma_kws.stage2.readout import (
+        QbyTAlignmentSpec,
+        QbyTScoreSpec,
+        resolve_qbyt_score_spec,
+    )
+    from dma_kws.stage2.readout_bounded import (
+        QbyTAlignmentSpec as BoundedAlignmentSpec,
+    )
+    from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
+
+    if isinstance(value, QbyTScoreSpec):
         return value
+    if isinstance(value, QbyTAlignmentSpec):
+        version = default_version if default_version in (6, 7) else 7
+        return QbyTScoreSpec(version=version, value=value)
+    if isinstance(value, BoundedAlignmentSpec):
+        return QbyTScoreSpec(version=5, value=value)
+    if isinstance(value, QbyTReadoutConfig):
+        version = default_version if default_version in (2, 3, 4) else 4
+        return QbyTScoreSpec(version=version, value=value)
     if value is None:
-        return resolve_qbyt_alignment({})
+        return resolve_qbyt_score_spec({})
     if not isinstance(value, Mapping):
-        raise ValueError("QbyT alignment spec must be a mapping")
+        raise ValueError("QbyT score spec must be a mapping")
     if "stage2" in value:
         stage2 = value.get("stage2")
         if not isinstance(stage2, Mapping):
             raise ValueError("config.stage2 must be a mapping")
-        return resolve_qbyt_alignment(stage2)
-    if "qbyt_alignment" in value or "qbyt_readout" in value:
-        return resolve_qbyt_alignment(value)
-    return resolve_qbyt_alignment({"qbyt_alignment": value})
+        return resolve_qbyt_score_spec(
+            _stage2_with_default_version(stage2, default_version)
+        )
+    if (
+        "qbyt_alignment" in value
+        or "qbyt_readout" in value
+        or "qbyt_readout_version" in value
+    ):
+        return resolve_qbyt_score_spec(
+            _stage2_with_default_version(value, default_version)
+        )
+    return resolve_qbyt_score_spec(
+        _stage2_with_default_version(
+            {"qbyt_alignment": value},
+            default_version,
+        )
+    )
+
+
+def _resolve_qbyt_alignment_value(value: Any) -> Any:
+    """Resolve to the inner spec object for current keyword-filler callers."""
+
+    return _resolve_qbyt_score_value(value).value
 
 
 def stamp_qbyt_readout_version(
@@ -226,7 +284,7 @@ def stamp_qbyt_readout_version(
     *,
     alignment: Any,
 ) -> dict[str, Any]:
-    """Record the complete QbyT v6 score semantics in ``payload``, in place.
+    """Record the QbyT score semantics that produced ``payload``, in place.
 
     ``alignment`` is mandatory so a writer cannot silently stamp default
     semantics that differ from the model which produced the weights.
@@ -234,64 +292,126 @@ def stamp_qbyt_readout_version(
 
     config = payload.get("config")
     stage2 = config.get("stage2") if isinstance(config, Mapping) else None
-    spec = _resolve_qbyt_alignment_value(alignment)
+    default_version = None
+    if isinstance(stage2, Mapping) and stage2.get("qbyt_readout_version") is not None:
+        default_version = int(stage2["qbyt_readout_version"])
+    spec = _resolve_qbyt_score_value(alignment, default_version=default_version)
 
     if isinstance(stage2, Mapping):
-        configured = _resolve_qbyt_alignment_value(stage2)
+        configured = _resolve_qbyt_score_value(
+            stage2, default_version=spec.version
+        )
         if not qbyt_readout_specs_equal(configured, spec):
             raise ValueError(
-                "Explicit QbyT alignment spec disagrees with config.stage2.qbyt_alignment: "
+                "Explicit QbyT alignment spec disagrees with config.stage2: "
                 f"explicit={_describe_readout_spec(spec)}, "
                 f"config={_describe_readout_spec(configured)}"
             )
 
-    payload[QBYT_READOUT_VERSION_KEY] = QBYT_READOUT_VERSION
-    payload[QBYT_ALIGNMENT_SPEC_KEY] = spec.as_dict()
+    payload[QBYT_READOUT_VERSION_KEY] = spec.version
+    if spec.version >= 5:
+        payload[QBYT_ALIGNMENT_SPEC_KEY] = spec.value.as_dict()
+    else:
+        payload.pop(QBYT_ALIGNMENT_SPEC_KEY, None)
     return payload
 
 
 def qbyt_readout_specs_equal(left: Any, right: Any) -> bool:
-    """Whether two resolved alignment specs produce the same deployed score."""
+    """Whether two resolved scores produce the same deployed score."""
 
+    from dma_kws.stage2.readout import QbyTScoreSpec
+
+    if isinstance(left, QbyTScoreSpec) and isinstance(right, QbyTScoreSpec):
+        if left.family == "pooling" and right.family == "pooling":
+            return left.value == right.value
+        return left.version == right.version and left.value == right.value
     return left == right
 
 
 def _describe_readout_spec(spec: Any) -> str:
+    from dma_kws.stage2.readout import QbyTScoreSpec
+
     if spec is None:
         return "unknown"
+    if isinstance(spec, QbyTScoreSpec):
+        return f"v{spec.version}:{_describe_readout_spec(spec.value)}"
+    if not hasattr(spec, "as_dict"):
+        return repr(spec)
     values = spec.as_dict()
     fields = ", ".join(f"{key}={value!r}" for key, value in values.items())
-    return f"{spec.topology}({fields})"
+    name = getattr(spec, "topology", getattr(spec, "mode", type(spec).__name__))
+    return f"{name}({fields})"
 
 
-def checkpoint_qbyt_readout_spec(
+def _decode_pooling_checkpoint(
     checkpoint: Mapping[str, Any],
-    *,
-    saved_version: Any | None = None,
+    saved: int,
 ) -> Any:
-    """Resolve the complete segmental-CRF score carried by a v6 checkpoint.
-
-    Earlier versions are intentionally not inferred or upgraded. Their
-    weights were optimized for a different score, so tensor shapes cannot
-    establish semantic compatibility.
-    """
-
-    from dma_kws.stage2.readout import QbyTAlignmentSpec
-
-    saved = (
-        checkpoint.get(QBYT_READOUT_VERSION_KEY)
-        if saved_version is None
-        else saved_version
+    from dma_kws.stage2.readout_pooling import (
+        EPS_MEAN_READOUT,
+        EPS_SOFTMIN_READOUT,
+        GRU_LAST_READOUT,
+        resolve_qbyt_readout,
     )
-    if saved != QBYT_READOUT_VERSION:
-        raise ValueError(f"unsupported QbyT readout version {saved!r}")
 
+    config = checkpoint.get("config")
+    if isinstance(config, Mapping):
+        stage2 = config.get("stage2")
+        if isinstance(stage2, Mapping):
+            spec = resolve_qbyt_readout(stage2)
+            if saved == 3 and spec.mode not in (GRU_LAST_READOUT, EPS_MEAN_READOUT):
+                raise ValueError(
+                    f"QbyT readout version 3 cannot carry mode {spec.mode!r}"
+                )
+            if spec.mode == EPS_SOFTMIN_READOUT:
+                raw = stage2.get("qbyt_readout")
+                if not isinstance(raw, Mapping) or "temperature" not in raw:
+                    raise ValueError(
+                        "EPS soft-min checkpoints must explicitly record "
+                        "stage2.qbyt_readout.temperature"
+                    )
+            return spec
+
+    state = extract_state_dict(dict(checkpoint))
+    if isinstance(state, Mapping):
+        if any(
+            isinstance(key, str) and key.startswith("qbyt.final_pos_fc.")
+            for key in state
+        ):
+            if saved == 3:
+                return resolve_qbyt_readout(
+                    {"qbyt_readout": {"mode": EPS_MEAN_READOUT}}
+                )
+            raise ValueError(
+                "QbyT readout version 4 uses a final_pos_fc head but does not "
+                "explicitly identify EPS mean versus soft-min in its config"
+            )
+        if any(
+            isinstance(key, str) and key.startswith(("qbyt.gru.", "qbyt.fc."))
+            for key in state
+        ):
+            return resolve_qbyt_readout(
+                {"qbyt_readout": {"mode": GRU_LAST_READOUT}}
+            )
+    return resolve_qbyt_readout({"qbyt_readout": {"mode": GRU_LAST_READOUT}})
+
+
+def _decode_alignment_checkpoint(
+    checkpoint: Mapping[str, Any],
+    saved: int,
+) -> Any:
+    from dma_kws.stage2.readout import QbyTAlignmentSpec, QbyTScoreSpec
+    from dma_kws.stage2.readout_bounded import (
+        QbyTAlignmentSpec as BoundedAlignmentSpec,
+    )
+
+    spec_cls = BoundedAlignmentSpec if saved == 5 else QbyTAlignmentSpec
     raw = checkpoint.get(QBYT_ALIGNMENT_SPEC_KEY)
     if not isinstance(raw, Mapping):
         raise ValueError(
-            f"QbyT v6 checkpoint must explicitly record {QBYT_ALIGNMENT_SPEC_KEY}"
+            f"QbyT v{saved} checkpoint must explicitly record {QBYT_ALIGNMENT_SPEC_KEY}"
         )
-    required = set(QbyTAlignmentSpec.__dataclass_fields__)
+    required = set(spec_cls.__dataclass_fields__)
     missing = sorted(required - set(raw))
     unknown = sorted(set(raw) - required)
     if missing or unknown:
@@ -303,17 +423,53 @@ def checkpoint_qbyt_readout_spec(
         raise ValueError(
             f"invalid {QBYT_ALIGNMENT_SPEC_KEY}: " + ", ".join(details)
         )
-    spec = _resolve_qbyt_alignment_value(raw)
+    if saved == 5:
+        spec = spec_cls(**dict(raw))
+    else:
+        spec = _resolve_qbyt_score_value(
+            {"qbyt_readout_version": saved, "qbyt_alignment": raw}
+        ).value
+    return QbyTScoreSpec(version=saved, value=spec)
+
+
+def checkpoint_qbyt_readout_spec(
+    checkpoint: Mapping[str, Any],
+    *,
+    saved_version: Any | None = None,
+) -> Any:
+    """Resolve the score semantics carried by a supported QbyT checkpoint."""
+
+    from dma_kws.stage2.readout import (
+        QbyTScoreSpec,
+        SUPPORTED_QBYT_READOUT_VERSIONS,
+    )
+
+    saved = (
+        checkpoint.get(QBYT_READOUT_VERSION_KEY)
+        if saved_version is None
+        else saved_version
+    )
+    if saved not in SUPPORTED_QBYT_READOUT_VERSIONS:
+        raise ValueError(f"unsupported QbyT readout version {saved!r}")
+
+    if saved in (2, 3, 4):
+        spec = QbyTScoreSpec(
+            version=int(saved),
+            value=_decode_pooling_checkpoint(checkpoint, int(saved)),
+        )
+    else:
+        spec = _decode_alignment_checkpoint(checkpoint, int(saved))
 
     config = checkpoint.get("config")
     if isinstance(config, Mapping):
         stage2 = config.get("stage2")
         if isinstance(stage2, Mapping):
-            configured = _resolve_qbyt_alignment_value(stage2)
+            configured = _resolve_qbyt_score_value(
+                stage2, default_version=int(saved)
+            )
             if not qbyt_readout_specs_equal(spec, configured):
                 raise ValueError(
-                    f"{QBYT_ALIGNMENT_SPEC_KEY} disagrees with "
-                    "config.stage2.qbyt_alignment"
+                    "stamped QbyT score disagrees with config.stage2"
                 )
     return spec
 
@@ -341,20 +497,24 @@ def assert_qbyt_readout_version(
     source: Any,
     expected_alignment: Any | None = None,
 ) -> None:
-    """Fail unless QbyT weights carry the exact v6 segmental score semantics.
+    """Fail unless QbyT weights match the expected score semantics.
 
     Encoder-only checkpoints return before version validation and remain valid
-    warm starts. Pre-v6 QbyT weights are never loadable.
+    warm starts. Unversioned and v1 QbyT weights are never loadable. When
+    ``expected_alignment`` is omitted, any supported v2-v7 checkpoint that
+    decodes is accepted. When it is provided, pooling v2/v3/v4 may match on
+    mode/temperature; v5/v6/v7 require an equal version and spec.
     """
 
     if not _carries_qbyt_weights(checkpoint):
         return
 
     saved = checkpoint.get(QBYT_READOUT_VERSION_KEY)
-    if expected_alignment is not None:
-        expected = _resolve_qbyt_alignment_value(expected_alignment)
-    else:
-        expected = None
+    expected = (
+        _resolve_qbyt_score_value(expected_alignment)
+        if expected_alignment is not None
+        else None
+    )
 
     saved_spec = None
     saved_error = None
@@ -366,7 +526,7 @@ def assert_qbyt_readout_version(
     except ValueError as exc:
         saved_error = str(exc)
 
-    compatible = saved == QBYT_READOUT_VERSION and saved_spec is not None and (
+    compatible = saved_spec is not None and (
         expected is None or qbyt_readout_specs_equal(saved_spec, expected)
     )
     if compatible:
@@ -383,11 +543,14 @@ def assert_qbyt_readout_version(
         if expected
         else ""
     )
+    expected_version = (
+        expected.version if expected is not None else QBYT_READOUT_VERSION
+    )
     raise SystemExit(
         f"{source} carries QbyT weights at readout {described}{mode_detail}, but this build "
-        f"uses version {QBYT_READOUT_VERSION}{expected_detail}. Readout semantics differ, "
+        f"uses version {expected_version}{expected_detail}. Readout semantics differ, "
         "so loading these weights would silently change the meaning of the deployed score."
-        f" Re-train Stage II at readout version {QBYT_READOUT_VERSION}."
+        f" Re-train Stage II at readout version {expected_version}."
     )
 
 

@@ -1,0 +1,27 @@
+# @package _global_
+# Frozen Zipformer Stage II with the v4 GRU-last pooling readout.
+#
+# Usage:
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_pooling \
+#     stage2.freeze_encoder=true
+
+defaults:
+  - icefall_zipformer_stage2
+  - _self_
+
+training:
+  recipe: icefall-zipformer-frozen-pooling-gru
+
+stage2:
+  qbyt_readout_version: 4
+  qbyt_readout:
+    mode: gru_last
+    temperature: 1.0
+  phoneme_adapter:
+    enabled: false
+    ctc_weight: 0.0
+  negative_tail_loss:
+    enabled: false
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-pooling-gru
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-pooling-gru
+  run_name: icefall-zipformer-frozen-pooling-gru

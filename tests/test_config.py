@@ -10,6 +10,7 @@ from dma_kws.config import (
     require_sections,
 )
 from dma_kws.configs.schema import AdaptSweepConfig
+from dma_kws.stage2.readout import resolve_qbyt_score_spec
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -65,6 +66,8 @@ def test_demo_config_loads_with_tokenizer_and_training_seed():
         "progress_weight": 0.3,
         "normalization": "sample",
     }
+    assert stage2["qbyt_readout_version"] == 7
+    assert stage2["qbyt_readout"] is None
     assert stage2["qbyt_alignment"] == {
         "min_phone_duration_frames": 1,
         "max_phone_duration_frames": 8,
@@ -74,8 +77,8 @@ def test_demo_config_loads_with_tokenizer_and_training_seed():
         "weakest_phone_temperature": 0.2,
         "weakest_phone_weight": 1.0,
         "topology": "keyword_filler_segmental_crf_v1",
+        "temperature": None,
     }
-    assert "qbyt_readout" not in stage2
     assert "allow_legacy_qbyt_readout" not in stage2
     assert stage2["checkpoint"]["monitor"] == "val_auc"
     assert stage2["checkpoint"]["mode"] == "max"
@@ -85,6 +88,8 @@ def test_alignment_experiment_inherits_the_single_stage2_alignment_config():
     config = config_to_dict(compose_config("icefall_zipformer_stage2_alignment"))
 
     assert config["training"]["recipe"] == "icefall-zipformer-frozen-segmental-crf-v6"
+    assert config["stage2"]["qbyt_readout_version"] == 7
+    assert config["stage2"]["qbyt_readout"] is None
     assert config["stage2"]["qbyt_alignment"] == {
         "min_phone_duration_frames": 1,
         "max_phone_duration_frames": 8,
@@ -94,9 +99,47 @@ def test_alignment_experiment_inherits_the_single_stage2_alignment_config():
         "weakest_phone_temperature": 0.2,
         "weakest_phone_weight": 1.0,
         "topology": "keyword_filler_segmental_crf_v1",
+        "temperature": None,
     }
-    assert "qbyt_readout" not in config["stage2"]
     assert "allow_legacy_qbyt_readout" not in config["stage2"]
+
+
+@pytest.mark.parametrize(
+    ("experiment", "version", "family", "detail"),
+    [
+        ("icefall_zipformer_stage2_pooling", 4, "pooling", "gru_last"),
+        ("icefall_zipformer_stage2_eps", 4, "pooling", "eps_mean"),
+        ("icefall_zipformer_stage2_eps_softmin", 4, "pooling", "eps_softmin"),
+        ("icefall_zipformer_stage2_bounded", 5, "bounded", "bounded_segmental_v1"),
+        (
+            "icefall_zipformer_stage2_v6",
+            6,
+            "keyword_filler",
+            "query_relative",
+        ),
+        (
+            "icefall_zipformer_stage2_alignment",
+            7,
+            "keyword_filler",
+            "one_vs_rest",
+        ),
+    ],
+)
+def test_readout_experiments_select_the_declared_score_family(
+    experiment: str, version: int, family: str, detail: str
+) -> None:
+    config = config_to_dict(compose_config(experiment))
+    score = resolve_qbyt_score_spec(config["stage2"])
+    assert score.version == version
+    assert score.family == family
+    if family == "pooling":
+        assert score.value.mode == detail
+        assert config["stage2"]["negative_tail_loss"]["enabled"] is False
+    elif family == "bounded":
+        assert score.value.topology == detail
+        assert config["stage2"]["negative_tail_loss"]["enabled"] is False
+    else:
+        assert score.emission == detail
 
 
 def test_checkpoint_monitor_and_mode_accept_structured_overrides():

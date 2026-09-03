@@ -441,7 +441,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
                         "tokenizer_dict_path": str(dict_path),
                         "vocab_size": vocab_size,
                     },
-                    alignment=model.qbyt_alignment,
+                    alignment=model.qbyt_score,
                 ),
                 run_context,
             ),

@@ -72,7 +72,7 @@ def test_restore_best_checkpoint_weights_strictly_rejects_incompatible_state(tmp
         )
 
 
-def test_readout_version_6_qbyt_checkpoint_is_refused_despite_a_valid_spec():
+def test_readout_version_6_qbyt_checkpoint_is_refused_by_a_v7_config():
     # Version 6 used the query-relative filler; its weights load shape-for-shape
     # into the one-vs-rest model, so only the version stamp can catch them.
     assert QBYT_READOUT_VERSION == 7
@@ -82,5 +82,37 @@ def test_readout_version_6_qbyt_checkpoint_is_refused_despite_a_valid_spec():
         QBYT_ALIGNMENT_SPEC_KEY: QbyTAlignmentSpec().as_dict(),
     }
 
+    assert_qbyt_readout_version(checkpoint, source="v6.pt")
     with pytest.raises(SystemExit, match="readout version 6.*uses version 7"):
-        assert_qbyt_readout_version(checkpoint, source="v6.pt")
+        assert_qbyt_readout_version(
+            checkpoint,
+            source="v6.pt",
+            expected_alignment=QbyTAlignmentSpec(),
+        )
+
+
+def test_historical_v6_checkpoint_with_unversioned_config_stage2_decodes() -> None:
+    from dma_kws.stage2.readout import QbyTScoreSpec
+    from dma_kws.training.checkpoint_io import checkpoint_qbyt_readout_spec
+
+    alignment = QbyTAlignmentSpec(max_inter_phone_gap_frames=1).as_dict()
+    checkpoint = {
+        "model_state_dict": {"qbyt.phone_bias": torch.zeros(3)},
+        QBYT_READOUT_VERSION_KEY: 6,
+        QBYT_ALIGNMENT_SPEC_KEY: alignment,
+        "config": {"stage2": {"qbyt_alignment": alignment}},
+    }
+    decoded = checkpoint_qbyt_readout_spec(checkpoint)
+    assert decoded.version == 6
+    assert decoded.value.as_dict() == alignment
+    assert_qbyt_readout_version(
+        checkpoint,
+        source="historical-v6.pt",
+        expected_alignment=QbyTScoreSpec(version=6, value=QbyTAlignmentSpec(**alignment)),
+    )
+    with pytest.raises(SystemExit, match="readout version 6.*uses version 7"):
+        assert_qbyt_readout_version(
+            checkpoint,
+            source="historical-v6.pt",
+            expected_alignment=QbyTAlignmentSpec(**alignment),
+        )

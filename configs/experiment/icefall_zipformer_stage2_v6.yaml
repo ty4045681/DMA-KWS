@@ -1,0 +1,32 @@
+# @package _global_
+# Frozen Zipformer Stage II with the v6 keyword-vs-filler readout
+# (query-relative filler, 40 ms inter-phone gap).
+#
+# Usage:
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_v6 \
+#     stage2.freeze_encoder=true
+
+defaults:
+  - icefall_zipformer_stage2
+  - _self_
+
+training:
+  recipe: icefall-zipformer-frozen-segmental-crf-v6-query-relative
+
+stage2:
+  qbyt_readout_version: 6
+  qbyt_alignment:
+    topology: keyword_filler_segmental_crf_v1
+    min_phone_duration_frames: 1
+    max_phone_duration_frames: 8
+    max_inter_phone_gap_frames: 1
+    max_keyword_span_frames: 30
+    local_context_kernel: 5
+    weakest_phone_temperature: 0.2
+    weakest_phone_weight: 1.0
+  phoneme_adapter:
+    enabled: false
+    ctc_weight: 0.0
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-segmental-crf-v6-query-relative
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-segmental-crf-v6-query-relative
+  run_name: icefall-zipformer-frozen-segmental-crf-v6-query-relative

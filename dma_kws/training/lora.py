@@ -46,26 +46,70 @@ _SUPPORTED_LORA_TARGETS = frozenset(
         "text_query.weight",
     }
 )
+_POOLING_DEFAULT_LORA_TARGETS = ("in_proj_weight", "out_proj.weight")
+_POOLING_SUPPORTED_LORA_TARGETS = frozenset(_POOLING_DEFAULT_LORA_TARGETS)
 
 
-def normalize_lora_targets(targets: Iterable[str] | None) -> tuple[str, ...]:
-    """Normalize and validate QbyT alignment-projection target paths."""
+def normalize_lora_targets(
+    targets: Iterable[str] | None,
+    *,
+    family: str | None = None,
+) -> tuple[str, ...]:
+    """Normalize and validate QbyT LoRA target paths for one readout family."""
+    if family == "pooling":
+        default = _POOLING_DEFAULT_LORA_TARGETS
+        supported = _POOLING_SUPPORTED_LORA_TARGETS
+    elif family == "keyword_filler":
+        default = _DEFAULT_LORA_TARGETS
+        supported = _SUPPORTED_LORA_TARGETS
+    else:
+        default = _DEFAULT_LORA_TARGETS
+        supported = _SUPPORTED_LORA_TARGETS
     if targets is None:
-        source = _DEFAULT_LORA_TARGETS
+        source = default
     elif isinstance(targets, str):
         source = (targets,)
     else:
         source = tuple(str(target) for target in targets)
-    normalized = tuple(dict.fromkeys(source))
+    normalized = tuple(
+        dict.fromkeys(
+            "out_proj.weight" if target == "out_proj" else target
+            for target in source
+        )
+    )
     if not normalized:
         raise ValueError("At least one LoRA target is required")
-    unsupported = sorted(set(normalized) - _SUPPORTED_LORA_TARGETS)
+    unsupported = sorted(set(normalized) - supported)
     if unsupported:
         raise ValueError(
             f"Unsupported LoRA targets: {unsupported}; "
-            f"supported={sorted(_SUPPORTED_LORA_TARGETS)}"
+            f"supported={sorted(supported)}"
         )
     return normalized
+
+
+def lora_targets_for_qbyt_family(
+    targets: Iterable[str] | None,
+    *,
+    family: str,
+) -> tuple[str, ...]:
+    """Resolve LoRA targets for a readout family.
+
+    Hydra's AdaptConfig default is the keyword-filler pair. A pooling run that
+    left that default in place should get the phone_matchor targets instead of
+    failing inject.
+    """
+
+    raw: Iterable[str] | None = targets
+    if family == "pooling":
+        if targets is None:
+            raw = None
+        elif isinstance(targets, str):
+            raw = None if targets == _DEFAULT_LORA_TARGETS[0] else (targets,)
+        else:
+            as_tuple = tuple(targets)
+            raw = None if as_tuple == _DEFAULT_LORA_TARGETS else as_tuple
+    return normalize_lora_targets(raw, family=family)
 
 
 def _resolve_target_module(qbyt: nn.Module, target: str) -> tuple[nn.Module, str]:
@@ -82,6 +126,56 @@ def _resolve_target_module(qbyt: nn.Module, target: str) -> tuple[nn.Module, str
     return module, parameter_name
 
 
+def _iter_phone_matchor_attn_layers(qbyt: nn.Module) -> Iterable[nn.Module]:
+    phone_matchor = qbyt.phone_matchor
+    for layer in phone_matchor.layers:
+        yield layer.self_attn
+
+
+def _inject_pooling_lora(
+    qbyt: nn.Module,
+    *,
+    rank: int,
+    alpha: float,
+    targets: Iterable[str] | None,
+) -> list[str]:
+    target_set = set(normalize_lora_targets(targets, family="pooling"))
+    qbyt.requires_grad_(False)
+    injected: list[str] = []
+    for layer_idx, attn in enumerate(_iter_phone_matchor_attn_layers(qbyt)):
+        embed_dim = int(attn.embed_dim)
+        prefix = f"phone_matchor.layers.{layer_idx}.self_attn"
+        if "in_proj_weight" in target_set:
+            parametrize.register_parametrization(
+                attn,
+                "in_proj_weight",
+                LoRAParametrization(
+                    embed_dim,
+                    3 * embed_dim,
+                    rank=rank,
+                    alpha=alpha,
+                ),
+            )
+            injected.append(f"{prefix}.in_proj_weight")
+        if "out_proj.weight" in target_set:
+            parametrize.register_parametrization(
+                attn.out_proj,
+                "weight",
+                LoRAParametrization(
+                    embed_dim,
+                    embed_dim,
+                    rank=rank,
+                    alpha=alpha,
+                ),
+            )
+            injected.append(f"{prefix}.out_proj.weight")
+    for name, param in qbyt.named_parameters():
+        param.requires_grad = ".parametrizations." in name and _is_lora_parameter_name(
+            name
+        )
+    return injected
+
+
 def inject_qbyt_lora(
     qbyt: nn.Module,
     *,
@@ -89,7 +183,10 @@ def inject_qbyt_lora(
     alpha: float,
     targets: Iterable[str] | None = None,
 ) -> list[str]:
-    """Freeze QbyT and inject LoRA directly on alignment projection weights."""
+    """Freeze QbyT and inject LoRA on the active family's projection weights."""
+    if hasattr(qbyt, "phone_matchor"):
+        return _inject_pooling_lora(qbyt, rank=rank, alpha=alpha, targets=targets)
+
     normalized_targets = normalize_lora_targets(targets)
     resolved_targets = [
         (target, *_resolve_target_module(qbyt, target))

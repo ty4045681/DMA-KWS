@@ -1,4 +1,9 @@
-"""Canonical QbyT v6 keyword-vs-filler score configuration."""
+"""QbyT score configuration across readout versions 2-7.
+
+Version 6/7 keyword-filler specs live in this module. Pooling (v2-v4) and
+bounded-segmental (v5) specs are restored from git in sibling modules; the
+functions below dispatch to them.
+"""
 
 from __future__ import annotations
 
@@ -219,26 +224,219 @@ class QbyTAlignmentSpec:
 def resolve_qbyt_alignment(
     stage2_config: Mapping[str, Any],
 ) -> QbyTAlignmentSpec:
-    """Resolve and validate ``stage2.qbyt_alignment``."""
+    """Resolve v6/v7 ``stage2.qbyt_alignment``.
+
+    Historical pooling and bounded configs must go through
+    :func:`resolve_qbyt_score_spec`.
+    """
+
+    score = resolve_qbyt_score_spec(stage2_config)
+    if score.version in (2, 3, 4):
+        raise ValueError(
+            "stage2.qbyt_readout is a legacy GRU/EPS switch and is unsupported "
+            "by QbyT v6; replace it with stage2.qbyt_alignment"
+        )
+    if score.version == 5:
+        raise ValueError(
+            "Unsupported QbyT alignment topology 'bounded_segmental_v1'; expected "
+            f"{QBYT_ALIGNMENT_TOPOLOGY!r}. Historical GRU/EPS and target-only "
+            "bounded-segmental readouts are not loadable by the v6 model."
+        )
+    if not isinstance(score.value, QbyTAlignmentSpec):
+        raise TypeError("keyword-filler spec must be QbyTAlignmentSpec")
+    return score.value
+
+
+_KEYWORD_FILLER_ONLY_ALIGNMENT_FIELDS = frozenset(
+    {"weakest_phone_temperature", "weakest_phone_weight"}
+)
+_BOUNDED_ONLY_ALIGNMENT_FIELDS = frozenset({"temperature"})
+SUPPORTED_QBYT_READOUT_VERSIONS = frozenset({2, 3, 4, 5, 6, 7})
+CURRENT_QBYT_READOUT_VERSION = 7
+
+
+@dataclass(frozen=True)
+class QbyTScoreSpec:
+    """Versioned score semantics carried by a checkpoint or Hydra run."""
+
+    version: int
+    value: Any
+
+    @property
+    def family(self) -> str:
+        if self.version in (2, 3, 4):
+            return "pooling"
+        if self.version == 5:
+            return "bounded"
+        return "keyword_filler"
+
+    @property
+    def emission(self) -> str | None:
+        if self.version == 6:
+            return "query_relative"
+        if self.version == 7:
+            return "one_vs_rest"
+        return None
+
+    def as_dict(self) -> dict[str, Any]:
+        payload = {"version": self.version}
+        if hasattr(self.value, "as_dict"):
+            payload.update(self.value.as_dict())
+        return payload
+
+
+def _plain_mapping(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return {
+            str(key): item
+            for key, item in value.items()
+            if item is not None
+        }
+    raise ValueError("expected a mapping")
+
+
+def _alignment_topology(stage2_config: Mapping[str, Any]) -> str | None:
+    raw = stage2_config.get("qbyt_alignment")
+    if not isinstance(raw, Mapping):
+        return None
+    topology = raw.get("topology", raw.get("mode"))
+    if topology is None:
+        return None
+    return str(topology).strip().lower()
+
+
+def default_clip_padding_ms(stage2_config: Mapping[str, Any] | None) -> int:
+    """Clip-eval zero padding. Version 6 defaulted to 160 ms; others are unpadded."""
+
+    if not isinstance(stage2_config, Mapping):
+        return 0
+    try:
+        version = resolve_qbyt_readout_version(stage2_config)
+    except ValueError:
+        return 0
+    return 160 if version == 6 else 0
+
+
+def resolve_qbyt_readout_version(stage2_config: Mapping[str, Any]) -> int:
+    """Return the readout version declared or inferred from a Stage-II mapping."""
 
     if not isinstance(stage2_config, Mapping):
         raise ValueError("stage2 config must be a mapping")
-    raw = stage2_config.get("qbyt_alignment")
-    if raw is None:
-        if stage2_config.get("qbyt_readout") is not None:
+    raw = stage2_config.get("qbyt_readout_version")
+    if raw is not None:
+        if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+            raise ValueError(
+                f"stage2.qbyt_readout_version must be an integer, got {raw!r}"
+            )
+        try:
+            version = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"stage2.qbyt_readout_version must be an integer, got {raw!r}"
+            ) from exc
+        if str(raw).strip().lstrip("+") != str(version) and not isinstance(raw, int):
+            raise ValueError(
+                f"stage2.qbyt_readout_version must be an integer, got {raw!r}"
+            )
+        if version not in SUPPORTED_QBYT_READOUT_VERSIONS:
+            raise ValueError(
+                f"Unsupported QbyT readout version {version!r}; expected one of "
+                f"{sorted(SUPPORTED_QBYT_READOUT_VERSIONS)}"
+            )
+        return version
+
+    topology = _alignment_topology(stage2_config)
+    has_readout = stage2_config.get("qbyt_readout") is not None
+    if topology == "bounded_segmental_v1":
+        return 5
+    if has_readout and topology not in {
+        QBYT_ALIGNMENT_TOPOLOGY,
+        "bounded_segmental_v1",
+    }:
+        return 4
+    if has_readout and topology == QBYT_ALIGNMENT_TOPOLOGY:
+        raise ValueError(
+            "stage2.qbyt_readout and keyword-filler qbyt_alignment both present; "
+            "set stage2.qbyt_readout_version to choose a family"
+        )
+    if has_readout:
+        return 4
+    return CURRENT_QBYT_READOUT_VERSION
+
+
+def _alignment_fields_for_version(
+    raw: Mapping[str, Any] | None, version: int
+) -> dict[str, Any]:
+    mapping = dict(raw or {})
+    if version == 5:
+        drop = _KEYWORD_FILLER_ONLY_ALIGNMENT_FIELDS
+        mapping = {key: value for key, value in mapping.items() if key not in drop}
+    elif version in (6, 7):
+        drop = _BOUNDED_ONLY_ALIGNMENT_FIELDS
+        mapping = {key: value for key, value in mapping.items() if key not in drop}
+    return mapping
+
+
+def resolve_qbyt_score_spec(stage2_config: Mapping[str, Any]) -> QbyTScoreSpec:
+    """Resolve the complete QbyT score for any supported readout version."""
+
+    if not isinstance(stage2_config, Mapping):
+        raise ValueError("stage2 config must be a mapping")
+    version = resolve_qbyt_readout_version(stage2_config)
+    readout = stage2_config.get("qbyt_readout")
+    alignment = stage2_config.get("qbyt_alignment")
+
+    if version in (2, 3, 4):
+        from dma_kws.stage2.readout_pooling import resolve_qbyt_readout
+
+        if version == 2 and readout is not None:
+            pooling = resolve_qbyt_readout({"qbyt_readout": readout})
+            if pooling.mode != "gru_last":
+                raise ValueError(
+                    f"QbyT readout version 2 cannot carry mode {pooling.mode!r}"
+                )
+            return QbyTScoreSpec(version=version, value=pooling)
+        if version == 3 and readout is not None:
+            pooling = resolve_qbyt_readout({"qbyt_readout": readout})
+            if pooling.mode == "eps_softmin":
+                raise ValueError(
+                    f"QbyT readout version 3 cannot carry mode {pooling.mode!r}"
+                )
+            return QbyTScoreSpec(version=version, value=pooling)
+        return QbyTScoreSpec(
+            version=version,
+            value=resolve_qbyt_readout({"qbyt_readout": readout}),
+        )
+
+    if version == 5:
+        from dma_kws.stage2.readout_bounded import resolve_qbyt_alignment as resolve_bounded
+
+        if readout is not None:
             raise ValueError(
                 "stage2.qbyt_readout is a legacy GRU/EPS switch and is unsupported "
-                "by QbyT v6; replace it with stage2.qbyt_alignment"
+                "by QbyT v5; replace it with stage2.qbyt_alignment"
             )
-        raw = {}
-    if not isinstance(raw, Mapping):
-        raise ValueError("stage2.qbyt_alignment must be a mapping")
+        filtered = _alignment_fields_for_version(_plain_mapping(alignment), 5)
+        return QbyTScoreSpec(
+            version=5,
+            value=resolve_bounded({"qbyt_alignment": filtered}),
+        )
 
+    if readout is not None:
+        raise ValueError(
+            "stage2.qbyt_readout is a legacy GRU/EPS switch and is unsupported "
+            "by QbyT v6; replace it with stage2.qbyt_alignment"
+        )
+    filtered = _alignment_fields_for_version(_plain_mapping(alignment), version)
+    if filtered is None:
+        filtered = {}
     supported = set(QbyTAlignmentSpec.__dataclass_fields__)
-    unknown = sorted(set(raw) - supported)
+    unknown = sorted(set(filtered) - supported)
     if unknown:
         raise ValueError(f"stage2.qbyt_alignment has unknown fields: {unknown}")
-    return QbyTAlignmentSpec(**dict(raw))
+    return QbyTScoreSpec(version=version, value=QbyTAlignmentSpec(**dict(filtered)))
 
 
 def assert_qbyt_alignment_state_loaded(
@@ -264,6 +462,7 @@ def assert_qbyt_alignment_state_loaded(
 
 
 __all__ = [
+    "CURRENT_QBYT_READOUT_VERSION",
     "DEFAULT_LOCAL_CONTEXT_KERNEL",
     "DEFAULT_MAX_INTER_PHONE_GAP_FRAMES",
     "DEFAULT_MAX_KEYWORD_SPAN_FRAMES",
@@ -273,7 +472,12 @@ __all__ = [
     "DEFAULT_WEAKEST_PHONE_WEIGHT",
     "QBYT_ALIGNMENT_TOPOLOGY",
     "QbyTAlignmentSpec",
+    "QbyTScoreSpec",
+    "SUPPORTED_QBYT_READOUT_VERSIONS",
     "assert_qbyt_alignment_state_loaded",
+    "default_clip_padding_ms",
     "normalize_qbyt_alignment_topology",
     "resolve_qbyt_alignment",
+    "resolve_qbyt_readout_version",
+    "resolve_qbyt_score_spec",
 ]

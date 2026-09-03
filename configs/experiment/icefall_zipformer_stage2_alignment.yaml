@@ -1,6 +1,7 @@
 # @package _global_
-# Adapter-free frozen Zipformer Stage II with the v6 keyword-vs-filler
-# segmental-CRF scorer.
+# Adapter-free frozen Zipformer Stage II with the v7 keyword-vs-filler
+# segmental-CRF scorer (one-vs-rest emission, 120 ms inter-phone gap).
+# For the v6 query-relative score use +experiment=icefall_zipformer_stage2_v6.
 #
 # Usage:
 #   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_alignment \
@@ -14,6 +15,7 @@ training:
   recipe: icefall-zipformer-frozen-segmental-crf-v6
 
 stage2:
+  qbyt_readout_version: 7
   # Alignment topology is defined once in configs/stage2/default.yaml.
   phoneme_adapter:
     enabled: false

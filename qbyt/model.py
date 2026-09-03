@@ -17,6 +17,10 @@ import torch.nn.functional as F
 
 from qbyt.monotonic_alignment import BoundedSegmentalAligner
 
+ONE_VS_REST_EMISSION = "one_vs_rest"
+QUERY_RELATIVE_EMISSION = "query_relative"
+_QBYT_EMISSIONS = frozenset({ONE_VS_REST_EMISSION, QUERY_RELATIVE_EMISSION})
+
 
 class _LocalContextBlock(nn.Module):
     """Residual temporal block whose receptive field is explicitly bounded."""
@@ -72,6 +76,7 @@ class QbyT(nn.Module):
         weakest_phone_temperature: float = 0.2,
         weakest_phone_weight: float = 1.0,
         dropout: float = 0.1,
+        emission: str = ONE_VS_REST_EMISSION,
     ) -> None:
         super().__init__()
         if post_num_layers < 0:
@@ -87,6 +92,12 @@ class QbyT(nn.Module):
             raise ValueError("weakest_phone_temperature must be finite and positive")
         if not math.isfinite(weakest_phone_weight) or weakest_phone_weight < 0:
             raise ValueError("weakest_phone_weight must be finite and non-negative")
+        emission_name = str(emission).strip().lower()
+        if emission_name not in _QBYT_EMISSIONS:
+            choices = ", ".join(sorted(_QBYT_EMISSIONS))
+            raise ValueError(
+                f"Unsupported QbyT emission {emission!r}; expected one of: {choices}"
+            )
 
         self.audio_projection = nn.Linear(encoder_output_size, embed_dim)
         self.text_projection = nn.Embedding(
@@ -133,6 +144,7 @@ class QbyT(nn.Module):
             temperature=weakest_phone_temperature,
         )
         self.weakest_phone_weight = float(weakest_phone_weight)
+        self.emission = emission_name
 
     @staticmethod
     def _resolve_lengths(
@@ -258,19 +270,38 @@ class QbyT(nn.Module):
             safe_phone_indices.unsqueeze(-1).expand(-1, -1, frame_width),
         )
 
-        # One-vs-rest: each query phone competes against everything else in the
-        # same normalized frame posterior, including the other query phones. The
-        # previous query-relative filler removed every query phone from the
-        # denominator, so a substitution onto a phone the keyword already used
-        # (query IY1 landing on an EY1 frame in "hey ava" vs "hey eva") was
-        # charged against an artificially small competitor set.
-        rest_log_probs = torch.log1p(
-            -target_log_probs.exp().clamp(max=1.0 - 1e-6)
-        )
-        target_llr = target_log_probs - rest_log_probs
-        # There is no longer one shared per-frame filler score; the aligner only
-        # uses this as a baseline that cancels inside the reported LLR.
-        filler_log_probs = torch.zeros_like(class_log_probs[:, :, 0])
+        if self.emission == QUERY_RELATIVE_EMISSION:
+            # Version 6: blank, non-speech, and inventory phones the query does
+            # not use. Phones that are in the query leave the denominator.
+            counts = torch.zeros(
+                batch_size,
+                phone_class_count,
+                device=text.device,
+                dtype=torch.long,
+            )
+            counts.scatter_add_(
+                1, safe_phone_indices, phone_mask.to(dtype=torch.long)
+            )
+            class_mask = torch.cat(
+                (
+                    counts.eq(0),
+                    torch.ones(batch_size, 2, device=text.device, dtype=torch.bool),
+                ),
+                dim=1,
+            )
+            filler_log_probs = torch.logsumexp(
+                class_log_probs.masked_fill(~class_mask.unsqueeze(1), -torch.inf),
+                dim=-1,
+            )
+            target_llr = target_log_probs - filler_log_probs.unsqueeze(1)
+        else:
+            # Version 7: each query phone competes against everything else in
+            # the same normalized frame posterior, including other query phones.
+            rest_log_probs = torch.log1p(
+                -target_log_probs.exp().clamp(max=1.0 - 1e-6)
+            )
+            target_llr = target_log_probs - rest_log_probs
+            filler_log_probs = torch.zeros_like(class_log_probs[:, :, 0])
 
         valid_lattice = phone_mask.unsqueeze(2) & frame_mask.unsqueeze(1)
         target_llr = torch.where(
@@ -358,4 +389,8 @@ class QbyT(nn.Module):
         return utterance_logits, seq_logits
 
 
-__all__ = ["QbyT"]
+__all__ = [
+    "ONE_VS_REST_EMISSION",
+    "QUERY_RELATIVE_EMISSION",
+    "QbyT",
+]

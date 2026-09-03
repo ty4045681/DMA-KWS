@@ -39,6 +39,8 @@ def _qbyt_alignment() -> dict:
 
 def test_stage2_clip_audio_padding_defaults_to_unpadded():
     assert _resolve_audio_padding_ms({}) == (0, 0)
+    assert _resolve_audio_padding_ms({}, {"qbyt_readout_version": 7}) == (0, 0)
+    assert _resolve_audio_padding_ms({}, {"qbyt_readout_version": 6}) == (160, 160)
 
 
 def test_stage2_clip_audio_padding_can_be_overridden_per_side():

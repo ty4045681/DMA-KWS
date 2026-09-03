@@ -423,25 +423,54 @@ def build_run_summary_rows(
         ]
     )
     if section in {"stage2", "adapt"}:
-        from dma_kws.stage2.readout import resolve_qbyt_alignment
+        from dma_kws.stage2.readout import resolve_qbyt_score_spec
 
         sequence_cfg = stage2.get("sequence_loss", {}) or {}
         adapter_cfg = stage2.get("phoneme_adapter", {}) or {}
         validation_diagnostics_cfg = stage2.get("validation", {}) or {}
-        alignment = resolve_qbyt_alignment(stage2)
+        score = resolve_qbyt_score_spec(stage2)
+        rows.append(("qbyt_readout_version", str(score.version)))
+        if score.family == "pooling":
+            rows.extend(
+                [
+                    ("qbyt_readout_mode", score.value.mode),
+                    ("qbyt_readout_temperature", str(score.value.temperature)),
+                ]
+            )
+        else:
+            alignment = score.value
+            rows.extend(
+                [
+                    ("qbyt_alignment_topology", alignment.topology),
+                    (
+                        "qbyt_weakest_phone_temperature",
+                        str(getattr(alignment, "weakest_phone_temperature", "")),
+                    ),
+                    (
+                        "qbyt_weakest_phone_weight",
+                        str(getattr(alignment, "weakest_phone_weight", "")),
+                    ),
+                    (
+                        "qbyt_min_phone_duration_frames",
+                        str(alignment.min_phone_duration_frames),
+                    ),
+                    (
+                        "qbyt_max_phone_duration_frames",
+                        str(alignment.max_phone_duration_frames),
+                    ),
+                    (
+                        "qbyt_max_inter_phone_gap_frames",
+                        str(alignment.max_inter_phone_gap_frames),
+                    ),
+                    (
+                        "qbyt_max_keyword_span_frames",
+                        str(alignment.max_keyword_span_frames),
+                    ),
+                    ("qbyt_local_context_kernel", str(alignment.local_context_kernel)),
+                ]
+            )
         rows.extend(
             [
-                ("qbyt_alignment_topology", alignment.topology),
-                (
-                    "qbyt_weakest_phone_temperature",
-                    str(alignment.weakest_phone_temperature),
-                ),
-                ("qbyt_weakest_phone_weight", str(alignment.weakest_phone_weight)),
-                ("qbyt_min_phone_duration_frames", str(alignment.min_phone_duration_frames)),
-                ("qbyt_max_phone_duration_frames", str(alignment.max_phone_duration_frames)),
-                ("qbyt_max_inter_phone_gap_frames", str(alignment.max_inter_phone_gap_frames)),
-                ("qbyt_max_keyword_span_frames", str(alignment.max_keyword_span_frames)),
-                ("qbyt_local_context_kernel", str(alignment.local_context_kernel)),
                 (
                     "qbyt_deployment_threshold",
                     str(

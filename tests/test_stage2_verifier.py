@@ -115,6 +115,78 @@ def test_stage2_verifier_scores_at_the_deployment_point(monkeypatch):
     assert verifier.amp is None
 
 
+def test_stage2_verifier_passes_versioned_score_spec_to_checkpoint_guard(monkeypatch):
+    import torch.nn as nn
+
+    from dma_kws.stage2.readout import QbyTAlignmentSpec, QbyTScoreSpec
+
+    captured: dict = {}
+
+    class _StubEncoder(nn.Module):
+        def output_frames(self, num_input_frames):
+            return num_input_frames
+
+        def forward(self, feats, feat_lengths):
+            mask = torch.ones(feats.size(0), 1, feats.size(1), dtype=torch.bool)
+            return torch.zeros(feats.size(0), feats.size(1), 8), mask
+
+    class _StubQbyT(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+
+        def forward(self, speech, text, speech_lengths=None, text_lengths=None):
+            return (
+                torch.zeros(speech.size(0)),
+                torch.zeros(text.size(0), text.size(1)),
+            )
+
+    def _capture_load(model, *_args, **kwargs):
+        captured["expected"] = kwargs.get("expected_qbyt_alignment")
+        return model
+
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_verifier.build_encoder",
+        lambda *_a, **_k: _StubEncoder(),
+    )
+    monkeypatch.setattr(
+        "dma_kws.stage2.model_factory.load_qbyt_class", lambda: _StubQbyT
+    )
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_verifier._load_model_state", _capture_load
+    )
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_verifier.run_encoder",
+        lambda encoder, feat, feat_lengths, *, policy, mode="eval": encoder(
+            feat, feat_lengths
+        ),
+    )
+
+    stage1_cfg = {
+        "encoder_type": "icefall_zipformer",
+        "causal": True,
+        "downsampling_factor": "1,2,4,8,4,2",
+        "cnn_module_kernel": "31,31,15,15,31",
+        "stream": {"chunk_size": 16, "left_context_frames": 64},
+    }
+    Stage2Verifier(
+        stage1_cfg=stage1_cfg,
+        stage2_cfg={
+            "encoder_output_dim": 8,
+            "qbyt_readout_version": 6,
+            "qbyt_alignment": QbyTAlignmentSpec().as_dict(),
+        },
+        demo_cfg={},
+        fbank_cfg=FbankConfig(dither=0.0, window_type="povey"),
+        stage2_ckpt="unused-stage2.pt",
+        device=torch.device("cpu"),
+        vocab_size=73,
+    )
+    expected = captured["expected"]
+    assert isinstance(expected, QbyTScoreSpec)
+    assert expected.version == 6
+    assert expected.emission == "query_relative"
+
+
 def test_stage2_verifier_exposes_raw_logits_and_calibrates_once():
     verifier = Stage2Verifier.__new__(Stage2Verifier)
     verifier._torch = torch

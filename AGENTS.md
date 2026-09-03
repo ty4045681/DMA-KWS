@@ -29,25 +29,29 @@ caused it.
 
 ## QbyT readout version
 
-`QBYT_READOUT_VERSION` in `dma_kws/training/checkpoint_io.py` guards Stage II
-checkpoints whose QbyT weights were trained against a different pooled readout.
-Parameter shapes do not change across such a fix, so nothing else would notice.
+`QBYT_READOUT_VERSION` (`CURRENT_QBYT_READOUT_VERSION`) is 7, the default for
+new Stage II runs. `SUPPORTED_QBYT_READOUT_VERSIONS` is `{2, 3, 4, 5, 6, 7}`.
+Stamp the version that actually produced the weights; do not write 7 onto a
+pooling or v6 checkpoint.
 
-If you change what `QbyT.forward` reads out, bump the constant. Checkpoints are
+Loaders (`assert_qbyt_readout_version`) accept any supported checkpoint that
+decodes. When a run config is supplied, pooling v2/v3/v4 may match on
+mode/temperature; v5/v6/v7 require an equal version and spec. v6 and v7 share
+parameter shapes but not the emission formula (query-relative vs one-vs-rest),
+so a v6 file cannot be scored as v7.
+
+Families live in `qbyt/pooling.py` (v2-v4), `qbyt/bounded.py` (v5), and
+`qbyt/model.py` (v6/v7). `build_qbyt` is the only constructor. Checkpoints are
 stamped by `Stage2LightningModule.on_save_checkpoint` and the explicit
-`torch.save` calls in `dma_kws/stage2/train.py` and `dma_kws/stage2/adapt.py`;
-loaders check it via `assert_qbyt_readout_version`. Test fixtures that simulate a
-current-build checkpoint must call `stamp_qbyt_readout_version`.
-
-Version 7 replaced the query-relative filler with one-vs-rest per-phone emission
-log-odds (`target_llr = log p_u - log(1 - p_u)`). Parameter shapes are identical
-to version 6, but 6-era checkpoints score differently on the same weights and
-are refused by the guard; they must be retrained.
+`torch.save` calls in `dma_kws/stage2/train.py` and `dma_kws/stage2/adapt.py`.
+Test fixtures that simulate a current-build checkpoint must call
+`stamp_qbyt_readout_version`.
 
 ## QbyT batch invariance
 
-`QbyT.forward` concatenates padded text and padded audio, so anything expressed in
-per-sample lengths must account for the batch padding between the two blocks. The
-sequence is re-packed to `[valid text][valid audio][padding]` for exactly this
-reason. `tests/test_qbyt_model.py` locks the invariants down numerically; a
+Pooling `QbyT.forward` concatenates padded text and padded audio, so anything
+expressed in per-sample lengths must account for the batch padding between the
+two blocks. The sequence is re-packed to `[valid text][valid audio][padding]`
+for exactly this reason. `tests/test_qbyt_pooling.py` and
+`tests/test_qbyt_model.py` lock the invariants down numerically; a
 structural/AST assertion cannot catch a wrong index.

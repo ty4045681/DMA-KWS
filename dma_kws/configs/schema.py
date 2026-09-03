@@ -392,8 +392,16 @@ class Stage2NegativeTailLossConfig:
 
 
 @dataclass
+class Stage2QbyTReadoutConfig:
+    """Pooling utterance readout used by QbyT versions 2-4."""
+
+    mode: str = "gru_last"
+    temperature: float = 1.0
+
+
+@dataclass
 class Stage2QbyTAlignmentConfig:
-    """Only supported QbyT score topology: keyword-vs-filler segmental CRF."""
+    """Keyword-vs-filler (v6/v7) or bounded-segmental (v5) alignment fields."""
 
     topology: str = "keyword_filler_segmental_crf_v1"
     min_phone_duration_frames: int = 1
@@ -403,6 +411,8 @@ class Stage2QbyTAlignmentConfig:
     local_context_kernel: int = 5
     weakest_phone_temperature: float = 0.2
     weakest_phone_weight: float = 1.0
+    #: v5 only. Ignored by keyword-filler resolve after being stripped.
+    temperature: float | None = None
 
 
 @dataclass
@@ -475,6 +485,8 @@ class Stage2Config:
     negative_tail_loss: Stage2NegativeTailLossConfig = field(
         default_factory=Stage2NegativeTailLossConfig
     )
+    qbyt_readout_version: int = 7
+    qbyt_readout: Stage2QbyTReadoutConfig | None = None
     qbyt_alignment: Stage2QbyTAlignmentConfig = field(
         default_factory=Stage2QbyTAlignmentConfig
     )

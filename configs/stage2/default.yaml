@@ -7,6 +7,10 @@ qbyt_layers: 2
 # 120 ms so natural inter-word pauses ("hey" ... "eva") can be skipped instead
 # of being charged to a neighbouring phone. The weakest aligned phone can only
 # veto a detection; it cannot create a route around the graph.
+# Versions 2-4 use qbyt_readout (gru_last / eps_mean / eps_softmin). Version 5
+# uses qbyt_alignment.topology=bounded_segmental_v1. Version 6 is the same
+# alignment fields as 7 with query-relative emission and must be set explicitly.
+qbyt_readout_version: 7
 qbyt_alignment:
   topology: keyword_filler_segmental_crf_v1
   min_phone_duration_frames: 1

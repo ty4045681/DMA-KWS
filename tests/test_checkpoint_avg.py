@@ -159,18 +159,39 @@ def test_average_rejects_any_qbyt_alignment_difference(
         )
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
-def test_average_rejects_pre_v6_qbyt_checkpoint(
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6])
+def test_average_rejects_mixed_readout_versions(
     tmp_path: Path,
     version: int,
 ) -> None:
     legacy = tmp_path / f"v{version}.ckpt"
-    current = tmp_path / "v6.ckpt"
+    current = tmp_path / "v7.ckpt"
     _write_qbyt_alignment_ckpt(legacy, version=version)
     _write_qbyt_alignment_ckpt(current)
 
-    with pytest.raises(ValueError, match=f"unsupported QbyT readout version {version}"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"unsupported QbyT readout version {version}"
+            r"|stamped QbyT score disagrees"
+            r"|invalid qbyt_alignment_spec"
+            r"|different QbyT"
+        ),
+    ):
         average_lightning_checkpoints([legacy, current], tmp_path / "bad.ckpt")
+
+
+def test_average_rejects_v6_versus_v7_with_identical_alignment_fields(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "v6.ckpt"
+    second = tmp_path / "v7.ckpt"
+    alignment = _alignment()
+    _write_qbyt_alignment_ckpt(first, alignment=alignment, version=6)
+    _write_qbyt_alignment_ckpt(second, alignment=alignment, version=7)
+
+    with pytest.raises(ValueError, match="different QbyT alignments"):
+        average_lightning_checkpoints([first, second], tmp_path / "mixed.ckpt")
 
 
 def test_average_accepts_only_same_v6_alignment(tmp_path: Path) -> None:

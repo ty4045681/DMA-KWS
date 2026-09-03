@@ -15,7 +15,7 @@ from dma_kws.config import (
 from dma_kws.pathing import resolve_dict_path
 from dma_kws.inference.score_provenance import PROVENANCE_SCHEMA_VERSION
 from dma_kws.stage2.objective import checkpoint_sequence_objective
-from dma_kws.stage2.readout import resolve_qbyt_alignment
+from dma_kws.stage2.readout import resolve_qbyt_score_spec
 
 def _file_identity(path: str | Path, *, kind: str) -> dict[str, str | int]:
     resolved = Path(path).expanduser().resolve()
@@ -69,7 +69,11 @@ def build_score_provenance(
         raise SystemExit(
             f"Stage II checkpoint is missing v6 objective metadata: {exc}"
         ) from exc
-    qbyt_alignment = resolve_qbyt_alignment(stage2)
+    score = resolve_qbyt_score_spec(stage2)
+    if score.family == "pooling":
+        qbyt_alignment = {"topology": "pooling", **score.value.as_dict()}
+    else:
+        qbyt_alignment = score.value.as_dict()
 
     return {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
@@ -79,7 +83,8 @@ def build_score_provenance(
             if calibration_path
             else {"type": "identity_logit_sigmoid"}
         ),
-        "qbyt_alignment": qbyt_alignment.as_dict(),
+        "qbyt_readout_version": score.version,
+        "qbyt_alignment": qbyt_alignment,
         "stream": stream,
         "audio_padding_ms": {
             "left": int(left_padding_ms),
