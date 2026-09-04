@@ -206,3 +206,93 @@ def test_seq_loss_rejects_invalid_configuration():
 
     with pytest.raises(ValueError, match="normalization"):
         compute_stage2_losses(**common, seq_normalization="batch")
+
+
+def test_negative_tail_loss_is_added_with_configured_weight():
+    logits = torch.tensor([1.5, -0.5, 0.25])
+    labels = torch.tensor([0.0, 0.0, 1.0])
+    seq_logits = torch.empty(3, 0)
+    seq_labels = torch.empty(3, 0)
+    seq_mask = torch.empty(3, 0)
+
+    baseline, baseline_losses = compute_stage2_losses(
+        logits,
+        seq_logits,
+        labels,
+        seq_labels,
+        seq_mask,
+    )
+    total, losses = compute_stage2_losses(
+        logits,
+        seq_logits,
+        labels,
+        seq_labels,
+        seq_mask,
+        negative_tail_weight=0.4,
+        negative_tail_fraction=0.5,
+    )
+
+    expected_tail = torch.nn.functional.softplus(torch.tensor(1.5))
+    assert torch.allclose(losses["negative_tail_loss"], expected_tail)
+    assert torch.allclose(
+        losses["negative_tail_weighted_loss"],
+        0.4 * expected_tail,
+    )
+    assert torch.allclose(total, baseline + 0.4 * expected_tail)
+    assert "negative_tail_loss" not in baseline_losses
+    assert "negative_tail_weighted_loss" not in baseline_losses
+
+
+def test_negative_tail_loss_zero_weight_matches_baseline_keys():
+    logits = torch.tensor([1.5, -0.5, 0.25])
+    labels = torch.tensor([0.0, 0.0, 1.0])
+    seq_logits = torch.empty(3, 0)
+    seq_labels = torch.empty(3, 0)
+    seq_mask = torch.empty(3, 0)
+
+    baseline, baseline_losses = compute_stage2_losses(
+        logits,
+        seq_logits,
+        labels,
+        seq_labels,
+        seq_mask,
+    )
+    total, losses = compute_stage2_losses(
+        logits,
+        seq_logits,
+        labels,
+        seq_labels,
+        seq_mask,
+        negative_tail_weight=0.0,
+        negative_tail_fraction=0.5,
+    )
+
+    assert torch.allclose(total, baseline)
+    assert set(losses) == set(baseline_losses)
+    assert "negative_tail_loss" not in losses
+
+
+@pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
+def test_negative_tail_loss_rejects_invalid_weight(weight):
+    with pytest.raises(ValueError, match="negative_tail_weight"):
+        compute_stage2_losses(
+            logits=torch.zeros(1),
+            seq_logits=torch.empty(1, 0),
+            labels=torch.zeros(1),
+            seq_labels=torch.empty(1, 0),
+            seq_label_mask=torch.empty(1, 0),
+            negative_tail_weight=weight,
+        )
+
+
+@pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1, float("nan"), float("inf")])
+def test_negative_tail_loss_rejects_invalid_fraction(fraction):
+    with pytest.raises(ValueError, match="negative_tail_fraction"):
+        compute_stage2_losses(
+            logits=torch.zeros(1),
+            seq_logits=torch.empty(1, 0),
+            labels=torch.zeros(1),
+            seq_labels=torch.empty(1, 0),
+            seq_label_mask=torch.empty(1, 0),
+            negative_tail_fraction=fraction,
+        )

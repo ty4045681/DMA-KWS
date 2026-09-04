@@ -111,20 +111,20 @@ class Stage2LightningModule(pl.LightningModule):
         if not isinstance(negative_tail_cfg, dict):
             raise ValueError("stage2.negative_tail_loss must be a mapping")
         negative_tail_enabled = bool(negative_tail_cfg.get("enabled", False))
-        if negative_tail_enabled and self.qbyt_score.family != "keyword_filler":
+        if negative_tail_enabled and self.qbyt_score.family == "bounded":
             raise ValueError(
-                "stage2.negative_tail_loss is only supported for keyword-filler "
-                f"QbyT (v6/v7); this run is {self.qbyt_score.family} v{self.qbyt_score.version}"
+                "stage2.negative_tail_loss is not supported for bounded "
+                f"QbyT (v5); this run is {self.qbyt_score.family} v{self.qbyt_score.version}"
             )
         background_cfg = stage2.get("background_negative", {}) or {}
         if (
             isinstance(background_cfg, dict)
             and bool(background_cfg.get("enabled", False))
-            and self.qbyt_score.family != "keyword_filler"
+            and self.qbyt_score.family == "bounded"
         ):
             raise ValueError(
-                "stage2.background_negative is only supported for keyword-filler "
-                f"QbyT (v6/v7); this run is {self.qbyt_score.family} v{self.qbyt_score.version}"
+                "stage2.background_negative is not supported for bounded "
+                f"QbyT (v5); this run is {self.qbyt_score.family} v{self.qbyt_score.version}"
             )
         self.negative_tail_weight = (
             float(negative_tail_cfg.get("weight", 0.5))
@@ -630,6 +630,8 @@ class Stage2LightningModule(pl.LightningModule):
                 seq_progress_weight=self.seq_progress_weight,
                 seq_completion_weight=self.seq_completion_weight,
                 seq_normalization=self.seq_normalization,
+                negative_tail_weight=self.negative_tail_weight,
+                negative_tail_fraction=self.negative_tail_fraction,
                 ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
                 ctc_weight=self.ctc_weight,
             )

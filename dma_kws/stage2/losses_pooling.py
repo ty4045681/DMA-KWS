@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn.functional as F
 
+from dma_kws.stage2.losses import negative_tail_cvar_loss, validate_negative_tail_loss
 from dma_kws.stage2.scoring import gather_last_valid_logits
 
 
@@ -114,19 +115,28 @@ def compute_stage2_losses(
     seq_progress_weight: float = 0.5,
     seq_completion_weight: float = 0.5,
     seq_normalization: str = "sample",
+    negative_tail_weight: float = 0.0,
+    negative_tail_fraction: float = 0.1,
     ctc_loss: torch.Tensor | None = None,
     ctc_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute utterance, ordered-progress and completion losses for Stage II.
 
-    ``ctc_loss`` is the optional auxiliary phoneme CTC term computed on the
-    adapter trunk. When ``seq_completion_weight`` is non-zero, ``seq_labels``
-    must be cumulative ordered-prefix targets (``111...000``), making the last
-    valid target the full-keyword label. A progress-only membership target is
-    retained for explicit legacy ablations. ``ctc_weight=0.0`` keeps this loss
-    independent of the phoneme adapter.
+    ``negative_tail_weight`` optionally adds a CVaR/top-k penalty over the
+    highest-scoring negative examples in the current batch. The default zero
+    weight preserves the historical utterance BCE exactly. ``ctc_loss`` is the
+    optional auxiliary phoneme CTC term computed on the adapter trunk. When
+    ``seq_completion_weight`` is non-zero, ``seq_labels`` must be cumulative
+    ordered-prefix targets (``111...000``), making the last valid target the
+    full-keyword label. A progress-only membership target is retained for
+    explicit legacy ablations. ``ctc_weight=0.0`` keeps this loss independent
+    of the phoneme adapter.
     """
     validate_seq_loss_weights(seq_progress_weight, seq_completion_weight)
+    validate_negative_tail_loss(
+        weight=negative_tail_weight,
+        fraction=negative_tail_fraction,
+    )
     seq_normalization = normalize_seq_loss_normalization(seq_normalization)
 
     utt_loss = F.binary_cross_entropy_with_logits(logits, labels.float())
@@ -153,6 +163,17 @@ def compute_stage2_losses(
         "seq_progress_weighted_loss": seq_progress_weighted_loss,
         "seq_completion_weighted_loss": seq_completion_weighted_loss,
     }
+
+    if negative_tail_weight:
+        negative_tail_loss = negative_tail_cvar_loss(
+            logits,
+            labels,
+            fraction=negative_tail_fraction,
+        )
+        negative_tail_weighted_loss = negative_tail_weight * negative_tail_loss
+        total_loss = total_loss + negative_tail_weighted_loss
+        losses["negative_tail_loss"] = negative_tail_loss
+        losses["negative_tail_weighted_loss"] = negative_tail_weighted_loss
 
     if ctc_loss is not None and ctc_weight:
         ctc_weighted_loss = ctc_weight * ctc_loss

@@ -52,6 +52,41 @@ def _config(*, span: int = 30) -> dict:
     }
 
 
+def _pooling_config() -> dict:
+    cfg = _config()
+    stage2 = cfg["stage2"]
+    stage2.pop("qbyt_alignment", None)
+    stage2["qbyt_readout_version"] = 4
+    stage2["qbyt_readout"] = {"mode": "eps_softmin", "temperature": 1.0}
+    stage2["background_negative"] = {
+        "enabled": True,
+        "probability": 0.25,
+        "audio_list_path": "/tmp/x.list",
+    }
+    stage2["negative_tail_loss"] = {
+        "enabled": True,
+        "weight": 0.5,
+        "fraction": 0.1,
+    }
+    return cfg
+
+
+def _bounded_config() -> dict:
+    cfg = _config()
+    stage2 = cfg["stage2"]
+    stage2["qbyt_readout_version"] = 5
+    stage2["qbyt_alignment"] = {
+        "topology": "bounded_segmental_v1",
+        "temperature": 0.2,
+        "min_phone_duration_frames": 1,
+        "max_phone_duration_frames": 4,
+        "max_inter_phone_gap_frames": 1,
+        "max_keyword_span_frames": 30,
+        "local_context_kernel": 5,
+    }
+    return cfg
+
+
 class _Encoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -288,3 +323,58 @@ def test_restore_with_different_alignment_is_rejected(monkeypatch):
     stamp_qbyt_readout_version(checkpoint, alignment=other.qbyt_alignment)
     with pytest.raises(SystemExit, match="current config expects"):
         module.on_load_checkpoint(checkpoint)
+
+
+def test_pooling_allows_background_negative_and_negative_tail(monkeypatch):
+    _patch_model(monkeypatch)
+    module = Stage2LightningModule(_pooling_config(), vocab_size=20)
+    assert module.qbyt_score.family == "pooling"
+    assert module.negative_tail_weight == 0.5
+    assert module.negative_tail_fraction == 0.1
+
+
+def test_keyword_filler_still_allows_background_negative_and_negative_tail(
+    monkeypatch,
+):
+    _patch_model(monkeypatch)
+    cfg = _config()
+    cfg["stage2"]["background_negative"] = {
+        "enabled": True,
+        "probability": 0.25,
+        "audio_list_path": "/tmp/x.list",
+    }
+    cfg["stage2"]["negative_tail_loss"] = {
+        "enabled": True,
+        "weight": 0.5,
+        "fraction": 0.1,
+    }
+    module = Stage2LightningModule(cfg, vocab_size=20)
+    assert module.qbyt_score.family == "keyword_filler"
+    assert module.negative_tail_weight == 0.5
+
+
+@pytest.mark.parametrize(
+    "knob",
+    [
+        {
+            "negative_tail_loss": {
+                "enabled": True,
+                "weight": 0.5,
+                "fraction": 0.1,
+            }
+        },
+        {
+            "background_negative": {
+                "enabled": True,
+                "probability": 0.25,
+                "audio_list_path": "/tmp/x.list",
+            }
+        },
+    ],
+)
+def test_bounded_rejects_background_negative_and_negative_tail(monkeypatch, knob):
+    _patch_model(monkeypatch)
+    cfg = _bounded_config()
+    cfg["stage2"].update(knob)
+    with pytest.raises(ValueError, match="not supported for bounded"):
+        Stage2LightningModule(cfg, vocab_size=20)
