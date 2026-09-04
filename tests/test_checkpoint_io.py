@@ -91,6 +91,38 @@ def test_readout_version_6_qbyt_checkpoint_is_refused_by_a_v7_config():
         )
 
 
+def test_state_only_v41_pooling_checkpoint_sniffs_extension_keys() -> None:
+    from dma_kws.training.checkpoint_io import checkpoint_qbyt_readout_spec
+    from qbyt.pooling import QbyT
+
+    torch.manual_seed(0)
+    model = QbyT(
+        encoder_output_size=8,
+        num_embeds=10,
+        embed_dim=16,
+        post_num_layers=1,
+        sink_token=True,
+        text_position="learned",
+        audio_position="relative_bias",
+        relative_num_buckets=16,
+        relative_max_distance=40,
+    )
+    payload = {
+        "model_state_dict": {
+            f"qbyt.{key}": value for key, value in model.state_dict().items()
+        },
+        QBYT_READOUT_VERSION_KEY: 4,
+    }
+    decoded = checkpoint_qbyt_readout_spec(payload)
+    assert decoded.version == 4
+    assert decoded.value.mode == "gru_last"
+    assert decoded.value.sink_token is True
+    assert decoded.value.text_position == "learned"
+    assert decoded.value.audio_position == "relative_bias"
+    assert decoded.value.relative_num_buckets == 16
+    assert decoded.value.relative_max_distance == 40
+
+
 def test_historical_v6_checkpoint_with_unversioned_config_stage2_decodes() -> None:
     from dma_kws.stage2.readout import QbyTScoreSpec
     from dma_kws.training.checkpoint_io import checkpoint_qbyt_readout_spec

@@ -35,6 +35,11 @@ def build_qbyt(
             post_num_layers=layers,
             readout_mode=score.value.mode,
             readout_temperature=score.value.temperature,
+            sink_token=score.value.sink_token,
+            text_position=score.value.text_position,
+            audio_position=score.value.audio_position,
+            relative_num_buckets=score.value.relative_num_buckets,
+            relative_max_distance=score.value.relative_max_distance,
         )
     if score.family == "bounded":
         from qbyt.bounded import QbyT

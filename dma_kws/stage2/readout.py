@@ -389,26 +389,28 @@ def resolve_qbyt_score_spec(stage2_config: Mapping[str, Any]) -> QbyTScoreSpec:
     alignment = stage2_config.get("qbyt_alignment")
 
     if version in (2, 3, 4):
-        from dma_kws.stage2.readout_pooling import resolve_qbyt_readout
-
-        if version == 2 and readout is not None:
-            pooling = resolve_qbyt_readout({"qbyt_readout": readout})
-            if pooling.mode != "gru_last":
-                raise ValueError(
-                    f"QbyT readout version 2 cannot carry mode {pooling.mode!r}"
-                )
-            return QbyTScoreSpec(version=version, value=pooling)
-        if version == 3 and readout is not None:
-            pooling = resolve_qbyt_readout({"qbyt_readout": readout})
-            if pooling.mode == "eps_softmin":
-                raise ValueError(
-                    f"QbyT readout version 3 cannot carry mode {pooling.mode!r}"
-                )
-            return QbyTScoreSpec(version=version, value=pooling)
-        return QbyTScoreSpec(
-            version=version,
-            value=resolve_qbyt_readout({"qbyt_readout": readout}),
+        from dma_kws.stage2.readout_pooling import (
+            pooling_extension_offenders,
+            resolve_qbyt_readout,
         )
+
+        pooling = resolve_qbyt_readout({"qbyt_readout": readout})
+        if version == 2 and pooling.mode != "gru_last":
+            raise ValueError(
+                f"QbyT readout version 2 cannot carry mode {pooling.mode!r}"
+            )
+        if version == 3 and pooling.mode == "eps_softmin":
+            raise ValueError(
+                f"QbyT readout version 3 cannot carry mode {pooling.mode!r}"
+            )
+        if version in (2, 3):
+            extras = pooling_extension_offenders(pooling)
+            if extras:
+                raise ValueError(
+                    f"QbyT readout version {version} cannot carry "
+                    + ", ".join(extras)
+                )
+        return QbyTScoreSpec(version=version, value=pooling)
 
     if version == 5:
         from dma_kws.stage2.readout_bounded import resolve_qbyt_alignment as resolve_bounded

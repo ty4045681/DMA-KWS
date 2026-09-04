@@ -126,6 +126,104 @@ def test_version_3_cannot_claim_softmin() -> None:
         )
 
 
+@pytest.mark.parametrize("version", [2, 3])
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("sink_token", True),
+        ("text_position", "learned"),
+        ("audio_position", "relative_bias"),
+        ("relative_num_buckets", 16),
+        ("relative_max_distance", 40),
+    ],
+)
+def test_version_2_and_3_reject_v41_extension_fields(
+    version: int, field: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=rf"version {version} cannot carry"):
+        resolve_qbyt_score_spec(
+            {
+                "qbyt_readout_version": version,
+                "qbyt_readout": {"mode": "gru_last", field: value},
+            }
+        )
+
+
+def test_version_4_accepts_v41_fields_and_as_dict_emits_them() -> None:
+    spec = resolve_qbyt_score_spec(
+        {
+            "qbyt_readout_version": 4,
+            "qbyt_readout": {
+                "mode": "eps_softmin",
+                "temperature": 0.5,
+                "sink_token": True,
+                "text_position": "Learned",
+                "audio_position": "relative_bias",
+                "relative_num_buckets": 16,
+                "relative_max_distance": 40,
+            },
+        }
+    )
+    assert spec.version == 4
+    payload = spec.value.as_dict()
+    assert payload["mode"] == "eps_softmin"
+    assert payload["temperature"] == 0.5
+    assert payload["sink_token"] is True
+    assert payload["text_position"] == "learned"
+    assert payload["audio_position"] == "relative_bias"
+    assert payload["relative_num_buckets"] == 16
+    assert payload["relative_max_distance"] == 40
+
+
+def test_legacy_v4_checkpoint_rejects_sink_token_run_config() -> None:
+    from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
+
+    payload = _payload(version=4, stamped_spec=None, config_spec=None)
+    payload["config"] = {
+        "stage2": {
+            "qbyt_readout_version": 4,
+            "qbyt_readout": {"mode": "gru_last", "temperature": 1.0},
+        }
+    }
+    assert_qbyt_readout_version(
+        payload,
+        source="legacy-v4.pt",
+        expected_alignment=QbyTReadoutConfig(mode="gru_last"),
+    )
+    with pytest.raises(SystemExit, match="current config expects"):
+        assert_qbyt_readout_version(
+            payload,
+            source="legacy-v4.pt",
+            expected_alignment=QbyTReadoutConfig(
+                mode="gru_last", sink_token=True
+            ),
+        )
+
+
+def test_default_v4_config_matches_mode_temperature_only_checkpoint() -> None:
+    from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
+
+    payload = _payload(version=4, stamped_spec=None, config_spec=None)
+    payload["config"] = {
+        "stage2": {
+            "qbyt_readout_version": 4,
+            "qbyt_readout": {"mode": "gru_last", "temperature": 1.0},
+        }
+    }
+    assert_qbyt_readout_version(
+        payload,
+        source="legacy-v4.pt",
+        expected_alignment=QbyTReadoutConfig(),
+    )
+    resolved = resolve_qbyt_score_spec(
+        {"qbyt_readout_version": 4, "qbyt_readout": {"mode": "eps_softmin"}}
+    )
+    assert resolved.value == QbyTReadoutConfig(
+        mode="eps_softmin", temperature=1.0
+    )
+    assert "sink_token" in resolved.value.as_dict()
+
+
 def test_bounded_score_spec_accepts_v5_topology() -> None:
     spec = resolve_qbyt_score_spec(
         {

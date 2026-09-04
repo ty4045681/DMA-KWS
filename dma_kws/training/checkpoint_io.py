@@ -343,6 +343,37 @@ def _describe_readout_spec(spec: Any) -> str:
     return f"{name}({fields})"
 
 
+def _sniff_pooling_v41_flags(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Recover v4.1 knobs from pooling weights when config.stage2 is absent."""
+
+    flags: dict[str, Any] = {}
+    has_sink = False
+    has_learned_text = False
+    has_relative_bias = False
+    for key, value in state.items():
+        if not isinstance(key, str):
+            continue
+        if key == "qbyt.sink_token" or key.startswith("qbyt.sink_token"):
+            has_sink = True
+        if key.startswith("qbyt.text_pos_emb."):
+            has_learned_text = True
+        if key.startswith("qbyt.relative_bias."):
+            has_relative_bias = True
+            if key.endswith("relative_bias.audio_buckets") and getattr(
+                value, "ndim", 0
+            ) == 2:
+                flags["relative_num_buckets"] = int(value.shape[0])
+            if key.endswith("relative_bias.max_distance"):
+                flags["relative_max_distance"] = int(value.item())
+    if has_sink:
+        flags["sink_token"] = True
+    if has_learned_text:
+        flags["text_position"] = "learned"
+    if has_relative_bias:
+        flags["audio_position"] = "relative_bias"
+    return flags
+
+
 def _decode_pooling_checkpoint(
     checkpoint: Mapping[str, Any],
     saved: int,
@@ -373,27 +404,26 @@ def _decode_pooling_checkpoint(
             return spec
 
     state = extract_state_dict(dict(checkpoint))
+    readout: dict[str, Any] = {"mode": GRU_LAST_READOUT}
     if isinstance(state, Mapping):
         if any(
             isinstance(key, str) and key.startswith("qbyt.final_pos_fc.")
             for key in state
         ):
             if saved == 3:
-                return resolve_qbyt_readout(
-                    {"qbyt_readout": {"mode": EPS_MEAN_READOUT}}
+                readout = {"mode": EPS_MEAN_READOUT}
+            else:
+                raise ValueError(
+                    "QbyT readout version 4 uses a final_pos_fc head but does not "
+                    "explicitly identify EPS mean versus soft-min in its config"
                 )
-            raise ValueError(
-                "QbyT readout version 4 uses a final_pos_fc head but does not "
-                "explicitly identify EPS mean versus soft-min in its config"
-            )
-        if any(
+        elif any(
             isinstance(key, str) and key.startswith(("qbyt.gru.", "qbyt.fc."))
             for key in state
         ):
-            return resolve_qbyt_readout(
-                {"qbyt_readout": {"mode": GRU_LAST_READOUT}}
-            )
-    return resolve_qbyt_readout({"qbyt_readout": {"mode": GRU_LAST_READOUT}})
+            readout = {"mode": GRU_LAST_READOUT}
+        readout.update(_sniff_pooling_v41_flags(state))
+    return resolve_qbyt_readout({"qbyt_readout": readout})
 
 
 def _decode_alignment_checkpoint(

@@ -14,6 +14,13 @@ EPS_SOFTMIN_READOUT = "eps_softmin"
 _QBYT_READOUT_MODES = frozenset(
     {GRU_LAST_READOUT, EPS_MEAN_READOUT, EPS_SOFTMIN_READOUT}
 )
+_QBYT_NHEAD = 4
+_LEARNED_TEXT_PE_MAX_LEN = 128
+_TEXT_MODALITY = 0
+_AUDIO_MODALITY = 1
+_SINK_MODALITY = 2
+_TEXT_POSITIONS = frozenset({"sinusoidal", "learned"})
+_AUDIO_POSITIONS = frozenset({"sinusoidal", "relative_bias"})
 
 
 class QbyTReadoutDetails(NamedTuple):
@@ -123,6 +130,101 @@ class ModalityEmbedding(nn.Module):
             raise ValueError(f"不支持的模态类型: {modality_type}")
 
 
+def _relative_position_bucket(relative_position, num_buckets, max_distance):
+    """T5 bidirectional buckets. relative_position = k - q."""
+    ret = 0
+    n = -relative_position
+    num_buckets //= 2
+    ret = ret + (n < 0).to(torch.long) * num_buckets
+    n = torch.abs(n)
+    max_exact = num_buckets // 2
+    is_small = n < max_exact
+    val_if_large = max_exact + (
+        torch.log(n.float() / max_exact)
+        / math.log(max_distance / max_exact)
+        * (num_buckets - max_exact)
+    ).to(torch.long)
+    val_if_large = torch.min(
+        val_if_large, torch.full_like(val_if_large, num_buckets - 1)
+    )
+    ret = ret + torch.where(is_small, n, val_if_large)
+    return ret
+
+
+def repacked_modality_and_index(positions, text_lengths, valid, *, sink):
+    """Modality ids and within-modality indices after the packed layout.
+
+    Packed order is ``[valid text][sink?][valid audio][pad]``. ``positions`` is
+    ``[1, L]`` or ``[B, L]``; ``text_lengths`` is ``[B]``; ``valid`` is ``[B, L]``.
+    """
+    batch_size = text_lengths.size(0)
+    pos = positions.expand(batch_size, -1)
+    text_col = text_lengths.unsqueeze(1)
+    is_text = pos < text_col
+    if sink:
+        is_sink = valid & (pos == text_col)
+    else:
+        is_sink = torch.zeros_like(valid)
+    is_audio = valid & ~is_text & ~is_sink
+    modality = torch.zeros(pos.shape, dtype=torch.long, device=pos.device)
+    modality = modality.masked_fill(is_audio, _AUDIO_MODALITY)
+    modality = modality.masked_fill(is_sink, _SINK_MODALITY)
+    sink_offset = 1 if sink else 0
+    index = torch.zeros(pos.shape, dtype=torch.long, device=pos.device)
+    index = torch.where(is_text, pos, index)
+    index = torch.where(
+        is_audio, (pos - text_col - sink_offset).clamp(min=0), index
+    )
+    return modality, index
+
+
+class RelativeAttentionBias(nn.Module):
+    """Shared T5 audio–audio buckets plus a 3-way modality pair table."""
+
+    def __init__(self, nhead, num_buckets, max_distance):
+        super().__init__()
+        nhead = int(nhead)
+        num_buckets = int(num_buckets)
+        max_distance = int(max_distance)
+        if nhead < 1 or num_buckets < 1 or max_distance < 1:
+            raise ValueError(
+                "relative attention bias requires positive nhead, num_buckets, "
+                f"and max_distance; got nhead={nhead}, num_buckets={num_buckets}, "
+                f"max_distance={max_distance}"
+            )
+        self.nhead = nhead
+        self.audio_buckets = nn.Parameter(torch.zeros(num_buckets, nhead))
+        self.pair_table = nn.Parameter(torch.zeros(3, 3, nhead))
+        self.register_buffer(
+            "num_buckets", torch.tensor(num_buckets, dtype=torch.long)
+        )
+        self.register_buffer(
+            "max_distance", torch.tensor(max_distance, dtype=torch.long)
+        )
+
+    def compute(self, modality, index, valid):
+        """Return additive attention bias ``[B, H, L, L]`` in float32."""
+        modality = modality.long()
+        index = index.long()
+        valid = valid.to(dtype=torch.bool)
+        # pair_table[q_mod, k_mod, h]; relative_position = k_index - q_index.
+        pair = self.pair_table[modality.unsqueeze(2), modality.unsqueeze(1)]
+        pair = pair.permute(0, 3, 1, 2).float()
+        relative_position = index.unsqueeze(1) - index.unsqueeze(2)
+        buckets = _relative_position_bucket(
+            relative_position,
+            int(self.audio_buckets.size(0)),
+            int(self.max_distance),
+        )
+        audio = self.audio_buckets[buckets].permute(0, 3, 1, 2).float()
+        both_audio = (modality == _AUDIO_MODALITY).unsqueeze(2) & (
+            modality == _AUDIO_MODALITY
+        ).unsqueeze(1)
+        bias = pair + audio * both_audio.unsqueeze(1).to(dtype=audio.dtype)
+        key_valid = valid.unsqueeze(1).unsqueeze(2)
+        return bias.masked_fill(~key_valid, float("-inf"))
+
+
 class GRUFCModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(GRUFCModel, self).__init__()
@@ -145,17 +247,54 @@ class QbyT(nn.Module):
         post_num_layers=2,
         readout_mode=GRU_LAST_READOUT,
         readout_temperature=1.0,
+        sink_token=False,
+        text_position="sinusoidal",
+        audio_position="sinusoidal",
+        relative_num_buckets=32,
+        relative_max_distance=64,
     ):
         super().__init__()
+        text_position = str(text_position).strip().lower()
+        audio_position = str(audio_position).strip().lower()
+        if text_position not in _TEXT_POSITIONS:
+            raise ValueError(
+                f"Unsupported QbyT text_position {text_position!r}; expected one of: "
+                + ", ".join(sorted(_TEXT_POSITIONS))
+            )
+        if audio_position not in _AUDIO_POSITIONS:
+            raise ValueError(
+                f"Unsupported QbyT audio_position {audio_position!r}; expected one of: "
+                + ", ".join(sorted(_AUDIO_POSITIONS))
+            )
         self.audio_projection = nn.Linear(encoder_output_size, embed_dim)
         self.text_projection = nn.Embedding(num_embeddings=num_embeds, embedding_dim=embed_dim)
         self.pos_enc = PositionalEncoding(embed_dim)
         self.modality_enc = ModalityEmbedding(embed_dim)
+        self.nhead = _QBYT_NHEAD
+        self.text_position = text_position
+        self.audio_position = audio_position
+        self.sink_token = (
+            nn.Parameter(torch.zeros(embed_dim)) if sink_token else None
+        )
+        self.text_pos_emb = (
+            nn.Embedding(_LEARNED_TEXT_PE_MAX_LEN, embed_dim)
+            if text_position == "learned"
+            else None
+        )
+        self.relative_bias = (
+            RelativeAttentionBias(
+                nhead=_QBYT_NHEAD,
+                num_buckets=relative_num_buckets,
+                max_distance=relative_max_distance,
+            )
+            if audio_position == "relative_bias"
+            else None
+        )
 
         self.phone_matchor = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=embed_dim,
-                nhead=4,
+                nhead=_QBYT_NHEAD,
                 dim_feedforward=embed_dim*4,
                 dropout=0.1,
                 batch_first=True
@@ -229,16 +368,26 @@ class QbyT(nn.Module):
     ):
         # 文本处理
         text_emb = self.text_projection(text)
-        text_emb = self.pos_enc(text_emb)
+        if self.text_pos_emb is not None:
+            text_width = text_emb.size(1)
+            if text_width > _LEARNED_TEXT_PE_MAX_LEN:
+                raise ValueError(
+                    "learned text positional embedding supports at most "
+                    f"{_LEARNED_TEXT_PE_MAX_LEN} tokens, got {text_width}"
+                )
+            text_positions = torch.arange(text_width, device=text_emb.device)
+            text_emb = text_emb + self.text_pos_emb(text_positions)
+        else:
+            text_emb = self.pos_enc(text_emb)
         text_emb = self.modality_enc(text_emb, 'text')
 
         # 音频处理
         audio_emb = self.audio_projection(speech)
-        audio_emb = self.pos_enc(audio_emb)
+        if self.relative_bias is None:
+            audio_emb = self.pos_enc(audio_emb)
         audio_emb = self.modality_enc(audio_emb, 'audio')
 
-        combined_feat = torch.cat([text_emb, audio_emb], dim=1)
-        batch_size = combined_feat.size(0)
+        batch_size = text_emb.size(0)
         if speech_lengths is None:
             speech_lengths = torch.full(
                 (batch_size,),
@@ -255,6 +404,13 @@ class QbyT(nn.Module):
         else:
             text_lengths = text_lengths.to(device=speech.device, dtype=torch.long)
         text_lengths = text_lengths.clamp(min=0, max=text.size(1))
+
+        if self.sink_token is not None:
+            sink = self.sink_token.view(1, 1, -1).expand(batch_size, 1, -1)
+            audio_emb = torch.cat([sink, audio_emb], dim=1)
+            speech_lengths = speech_lengths + 1
+
+        combined_feat = torch.cat([text_emb, audio_emb], dim=1)
 
         # Both blocks are padded to their batch maximum, so the naive concat is
         # [valid text][text padding][valid audio][audio padding]. Re-pack each
@@ -280,7 +436,24 @@ class QbyT(nn.Module):
             1, source_indices.unsqueeze(-1).expand(-1, -1, combined_feat.size(-1))
         ) * valid.unsqueeze(-1).to(combined_feat.dtype)
 
-        combined_feat = self.phone_matchor(combined_feat, src_key_padding_mask=~valid)
+        if self.relative_bias is not None:
+            modality, index = repacked_modality_and_index(
+                positions,
+                text_lengths,
+                valid,
+                sink=self.sink_token is not None,
+            )
+            attn_bias = self.relative_bias.compute(modality, index, valid)
+            attn_mask = attn_bias.reshape(
+                batch_size * self.nhead, total_width, total_width
+            )
+            combined_feat = self.phone_matchor(
+                combined_feat, mask=attn_mask, src_key_padding_mask=None
+            )
+        else:
+            combined_feat = self.phone_matchor(
+                combined_feat, src_key_padding_mask=~valid
+            )
         # After re-packing, positions [0, text_lengths) hold this sample's text
         # and [text_lengths, text_width) hold audio frames. That is safe because
         # build_seq_label emits one label per anchor token, so the Stage II

@@ -133,7 +133,12 @@ def test_readout_experiments_select_the_declared_score_family(
     assert score.version == version
     assert score.family == family
     if family == "pooling":
+        from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
+
         assert score.value.mode == detail
+        assert score.value == QbyTReadoutConfig(
+            mode=detail, temperature=score.value.temperature
+        )
         assert config["stage2"]["negative_tail_loss"]["enabled"] is False
     elif family == "bounded":
         assert score.value.topology == detail

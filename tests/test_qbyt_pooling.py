@@ -12,7 +12,7 @@ import torch
 
 pytest.importorskip("torch")
 
-from qbyt.pooling import QbyT
+from qbyt.pooling import QbyT, RelativeAttentionBias, repacked_modality_and_index
 
 EMBED_DIM = 64
 ENCODER_DIM = 48
@@ -24,12 +24,75 @@ AUDIO_LEN = 20
 # pooled GRU state has consumed no audio at all.
 assert SHORT_TEXT_LEN + AUDIO_LEN - 1 < LONG_TEXT_LEN
 
+# Captured from a default-constructed pooling QbyT before v4.1 knobs. Extra
+# sink / text_pos_emb / relative_bias keys must not appear on this path.
+_DEFAULT_QBYT_STATE_KEYS = (
+    "audio_projection.bias",
+    "audio_projection.weight",
+    "fc.bias",
+    "fc.weight",
+    "gru.bias_hh_l0",
+    "gru.bias_ih_l0",
+    "gru.weight_hh_l0",
+    "gru.weight_ih_l0",
+    "modality_enc.audio_emb",
+    "modality_enc.text_emb",
+    "phone_matchor.layers.0.linear1.bias",
+    "phone_matchor.layers.0.linear1.weight",
+    "phone_matchor.layers.0.linear2.bias",
+    "phone_matchor.layers.0.linear2.weight",
+    "phone_matchor.layers.0.norm1.bias",
+    "phone_matchor.layers.0.norm1.weight",
+    "phone_matchor.layers.0.norm2.bias",
+    "phone_matchor.layers.0.norm2.weight",
+    "phone_matchor.layers.0.self_attn.in_proj_bias",
+    "phone_matchor.layers.0.self_attn.in_proj_weight",
+    "phone_matchor.layers.0.self_attn.out_proj.bias",
+    "phone_matchor.layers.0.self_attn.out_proj.weight",
+    "phone_matchor.layers.1.linear1.bias",
+    "phone_matchor.layers.1.linear1.weight",
+    "phone_matchor.layers.1.linear2.bias",
+    "phone_matchor.layers.1.linear2.weight",
+    "phone_matchor.layers.1.norm1.bias",
+    "phone_matchor.layers.1.norm1.weight",
+    "phone_matchor.layers.1.norm2.bias",
+    "phone_matchor.layers.1.norm2.weight",
+    "phone_matchor.layers.1.self_attn.in_proj_bias",
+    "phone_matchor.layers.1.self_attn.in_proj_weight",
+    "phone_matchor.layers.1.self_attn.out_proj.bias",
+    "phone_matchor.layers.1.self_attn.out_proj.weight",
+    "pos_enc.pe",
+    "seq_fc.bias",
+    "seq_fc.weight",
+    "text_projection.weight",
+)
+
+_V41_KNOB_CASES = [
+    pytest.param({}, id="default"),
+    pytest.param({"sink_token": True}, id="sink"),
+    pytest.param({"text_position": "learned"}, id="learned_text"),
+    pytest.param({"audio_position": "relative_bias"}, id="relative_bias"),
+    pytest.param(
+        {
+            "sink_token": True,
+            "text_position": "learned",
+            "audio_position": "relative_bias",
+        },
+        id="all_v41",
+    ),
+]
+
 
 def _model(
     seed: int = 0,
     *,
     readout_mode: str = "gru_last",
     readout_temperature: float = 1.0,
+    sink_token: bool = False,
+    text_position: str = "sinusoidal",
+    audio_position: str = "sinusoidal",
+    relative_num_buckets: int = 32,
+    relative_max_distance: int = 64,
 ):
     torch.manual_seed(seed)
     model = QbyT(
@@ -39,6 +102,11 @@ def _model(
         post_num_layers=2,
         readout_mode=readout_mode,
         readout_temperature=readout_temperature,
+        sink_token=sink_token,
+        text_position=text_position,
+        audio_position=audio_position,
+        relative_num_buckets=relative_num_buckets,
+        relative_max_distance=relative_max_distance,
     )
     return model.eval()
 
@@ -82,7 +150,8 @@ def _score(model, texts, audios, text_lengths, speech_lengths):
     return logits
 
 
-def test_score_is_invariant_to_batch_companions():
+@pytest.mark.parametrize("knobs", _V41_KNOB_CASES)
+def test_score_is_invariant_to_batch_companions(knobs):
     """The same pair must score the same next to a short and a long keyword.
 
     This is the failure that makes training and validation disagree: training
@@ -90,7 +159,7 @@ def test_score_is_invariant_to_batch_companions():
     CSVs are concatenated 1-word first and consumed with shuffle=False, so the
     batch text width is systematically different between the two.
     """
-    model = _model()
+    model = _model(**knobs)
     text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
     short_companion, short_audio = _sample(SHORT_TEXT_LEN + 1, AUDIO_LEN, seed=2)
     long_companion, long_audio = _sample(LONG_TEXT_LEN, AUDIO_LEN, seed=3)
@@ -113,14 +182,15 @@ def test_score_is_invariant_to_batch_companions():
     torch.testing.assert_close(with_short, with_long, atol=1e-5, rtol=1e-4)
 
 
-def test_batched_score_matches_unpadded_single():
+@pytest.mark.parametrize("knobs", _V41_KNOB_CASES)
+def test_batched_score_matches_unpadded_single(knobs):
     """A batch=1 call with no padding at all is the ground truth.
 
     Pinning against it fixes the *meaning* of the readout -- the pooled state
     after consuming exactly [valid text][valid audio] -- rather than only
     checking that two padded batches happen to agree.
     """
-    model = _model()
+    model = _model(**knobs)
     text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
     long_companion, long_audio = _sample(LONG_TEXT_LEN, AUDIO_LEN * 2, seed=3)
 
@@ -136,9 +206,10 @@ def test_batched_score_matches_unpadded_single():
     torch.testing.assert_close(alone, batched, atol=1e-5, rtol=1e-4)
 
 
-def test_audio_padding_does_not_leak():
+@pytest.mark.parametrize("knobs", _V41_KNOB_CASES)
+def test_audio_padding_does_not_leak(knobs):
     """Frames past speech_lengths must not reach the score."""
-    model = _model()
+    model = _model(**knobs)
     text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
     garbage = torch.randn(AUDIO_LEN * 2, ENCODER_DIM, generator=torch.Generator().manual_seed(9))
     padded_audio = torch.cat([audio, garbage], dim=0)
@@ -149,9 +220,10 @@ def test_audio_padding_does_not_leak():
     torch.testing.assert_close(clean, noisy, atol=1e-5, rtol=1e-4)
 
 
-def test_text_padding_does_not_leak():
+@pytest.mark.parametrize("knobs", _V41_KNOB_CASES)
+def test_text_padding_does_not_leak(knobs):
     """Token ids past text_lengths must not reach the score."""
-    model = _model()
+    model = _model(**knobs)
     text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
     garbage = torch.randint(3, 70, (LONG_TEXT_LEN - SHORT_TEXT_LEN,), generator=torch.Generator().manual_seed(9))
     padded_text = torch.cat([text, garbage], dim=0)
@@ -186,9 +258,10 @@ def test_seq_logits_cover_the_padded_anchor_width():
     assert seq_logits.shape == (2, LONG_TEXT_LEN)
 
 
-def test_valid_text_logits_are_invariant_to_batch_companions():
+@pytest.mark.parametrize("knobs", _V41_KNOB_CASES)
+def test_valid_text_logits_are_invariant_to_batch_companions(knobs):
     """The supervised part of seq_logits must not move with the batch either."""
-    model = _model()
+    model = _model(**knobs)
     text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
     long_companion, long_audio = _sample(LONG_TEXT_LEN, AUDIO_LEN, seed=3)
 
@@ -341,8 +414,9 @@ def test_gru_readout_details_do_not_invent_eps_position_logits():
 
 
 @pytest.mark.parametrize("readout_mode", ["eps_mean", "eps_softmin"])
-def test_eps_score_is_invariant_to_batch_companions(readout_mode):
-    model = _model(readout_mode=readout_mode)
+@pytest.mark.parametrize("knobs", _V41_KNOB_CASES)
+def test_eps_score_is_invariant_to_batch_companions(readout_mode, knobs):
+    model = _model(readout_mode=readout_mode, **knobs)
     text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
     short_companion, short_audio = _sample(SHORT_TEXT_LEN + 1, AUDIO_LEN, seed=2)
     long_companion, long_audio = _sample(LONG_TEXT_LEN, AUDIO_LEN, seed=3)
@@ -425,3 +499,175 @@ def test_unknown_readout_mode_is_rejected():
 def test_invalid_readout_temperature_is_rejected(temperature):
     with pytest.raises(ValueError, match="readout_temperature"):
         _model(readout_mode="eps_softmin", readout_temperature=temperature)
+
+
+def _distinctive_relative_bias(nhead=4, num_buckets=32, max_distance=64):
+    module = RelativeAttentionBias(
+        nhead=nhead, num_buckets=num_buckets, max_distance=max_distance
+    )
+    with torch.no_grad():
+        module.audio_buckets.copy_(
+            torch.arange(num_buckets, dtype=torch.float32)
+            .unsqueeze(1)
+            .expand(-1, nhead)
+            .contiguous()
+        )
+        module.pair_table.copy_(
+            torch.arange(3 * 3 * nhead, dtype=torch.float32).view(3, 3, nhead)
+        )
+    return module
+
+
+def _bias_for_layout(module, *, text_len, audio_len, total_width, sink=False):
+    text_lengths = torch.tensor([text_len])
+    speech_lengths = torch.tensor([audio_len + int(sink)])
+    positions = torch.arange(total_width).unsqueeze(0)
+    valid_lengths = (text_lengths + speech_lengths).clamp(min=1, max=total_width)
+    valid = positions < valid_lengths.unsqueeze(1)
+    modality, index = repacked_modality_and_index(
+        positions, text_lengths, valid, sink=sink
+    )
+    return module.compute(modality, index, valid), valid
+
+
+def test_relative_bias_audio_block_is_translation_equivariant():
+    module = _distinctive_relative_bias()
+    audio_len = 6
+    left, _ = _bias_for_layout(
+        module, text_len=3, audio_len=audio_len, total_width=24, sink=False
+    )
+    right, _ = _bias_for_layout(
+        module, text_len=9, audio_len=audio_len, total_width=24, sink=False
+    )
+    left_audio = left[0, :, 3:9, 3:9]
+    right_audio = right[0, :, 9:15, 9:15]
+    torch.testing.assert_close(left_audio, right_audio)
+
+
+def test_relative_bias_cross_modal_has_no_positional_term():
+    module = _distinctive_relative_bias()
+    audio_len = 5
+    nhead = module.nhead
+    for text_len, sink in ((3, False), (8, False), (4, True)):
+        bias, _ = _bias_for_layout(
+            module,
+            text_len=text_len,
+            audio_len=audio_len,
+            total_width=24,
+            sink=sink,
+        )
+        audio_start = text_len + int(sink)
+        audio_end = audio_start + audio_len
+        text_to_audio = bias[0, :, :text_len, audio_start:audio_end]
+        expected_ta = module.pair_table[0, 1].view(nhead, 1, 1).expand_as(
+            text_to_audio
+        )
+        torch.testing.assert_close(text_to_audio, expected_ta)
+        audio_to_text = bias[0, :, audio_start:audio_end, :text_len]
+        expected_at = module.pair_table[1, 0].view(nhead, 1, 1).expand_as(
+            audio_to_text
+        )
+        torch.testing.assert_close(audio_to_text, expected_at)
+        if sink:
+            sink_to_text = bias[0, :, text_len : text_len + 1, :text_len]
+            torch.testing.assert_close(
+                sink_to_text,
+                module.pair_table[2, 0].view(nhead, 1, 1).expand_as(sink_to_text),
+            )
+            text_to_sink = bias[0, :, :text_len, text_len : text_len + 1]
+            torch.testing.assert_close(
+                text_to_sink,
+                module.pair_table[0, 2].view(nhead, 1, 1).expand_as(text_to_sink),
+            )
+            sink_to_audio = bias[0, :, text_len : text_len + 1, audio_start:audio_end]
+            torch.testing.assert_close(
+                sink_to_audio,
+                module.pair_table[2, 1]
+                .view(nhead, 1, 1)
+                .expand_as(sink_to_audio),
+            )
+            audio_to_sink = bias[0, :, audio_start:audio_end, text_len : text_len + 1]
+            torch.testing.assert_close(
+                audio_to_sink,
+                module.pair_table[1, 2]
+                .view(nhead, 1, 1)
+                .expand_as(audio_to_sink),
+            )
+
+
+def test_relative_bias_pads_keys_with_neg_inf_and_keeps_every_query_finite():
+    module = _distinctive_relative_bias()
+    text_lengths = torch.tensor([3, 5])
+    speech_lengths = torch.tensor([4, 2])
+    total_width = 12
+    positions = torch.arange(total_width).unsqueeze(0)
+    valid_lengths = (text_lengths + speech_lengths).clamp(min=1, max=total_width)
+    valid = positions < valid_lengths.unsqueeze(1)
+    modality, index = repacked_modality_and_index(
+        positions, text_lengths, valid, sink=False
+    )
+    bias = module.compute(modality, index, valid)
+    for row in range(text_lengths.size(0)):
+        padded_keys = ~valid[row]
+        assert torch.isneginf(bias[row, :, :, padded_keys]).all()
+        assert not torch.isneginf(bias[row]).all(dim=-1).any()
+
+
+def test_sink_token_receives_gradient_and_preserves_text_logit_width():
+    model = _model(sink_token=True)
+    text, audio = _sample(SHORT_TEXT_LEN, AUDIO_LEN, seed=1)
+    logits, text_logits = model(
+        audio.unsqueeze(0),
+        text.unsqueeze(0),
+        speech_lengths=torch.tensor([AUDIO_LEN]),
+        text_lengths=torch.tensor([SHORT_TEXT_LEN]),
+    )
+    logits.sum().backward()
+    assert model.sink_token is not None
+    assert model.sink_token.grad is not None
+    assert torch.isfinite(model.sink_token.grad).all()
+    assert not torch.equal(
+        model.sink_token.grad, torch.zeros_like(model.sink_token.grad)
+    )
+    assert text_logits.shape == (1, SHORT_TEXT_LEN)
+
+
+def test_default_qbyt_matches_legacy_state_keys_and_seeded_forward():
+    first = _model(seed=0)
+    second = _model(seed=0)
+    first_keys = tuple(sorted(first.state_dict()))
+    assert first_keys == _DEFAULT_QBYT_STATE_KEYS
+    assert first_keys == tuple(sorted(second.state_dict()))
+    assert "sink_token" not in first_keys
+    assert not any(key.startswith("text_pos_emb.") for key in first_keys)
+    assert not any(key.startswith("relative_bias.") for key in first_keys)
+
+    text, audio = _sample(4, 6, seed=5)
+    with torch.no_grad():
+        first_logits, first_text = first(
+            audio.unsqueeze(0),
+            text.unsqueeze(0),
+            speech_lengths=torch.tensor([6]),
+            text_lengths=torch.tensor([4]),
+        )
+        second_logits, second_text = second(
+            audio.unsqueeze(0),
+            text.unsqueeze(0),
+            speech_lengths=torch.tensor([6]),
+            text_lengths=torch.tensor([4]),
+        )
+    assert torch.equal(first_logits, second_logits)
+    assert torch.equal(first_text, second_text)
+
+
+def test_learned_text_position_rejects_width_over_128():
+    model = _model(text_position="learned")
+    text = torch.randint(3, 70, (1, 129))
+    audio = torch.randn(1, 4, ENCODER_DIM)
+    with pytest.raises(ValueError, match="128"):
+        model(
+            audio,
+            text,
+            speech_lengths=torch.tensor([4]),
+            text_lengths=torch.tensor([129]),
+        )

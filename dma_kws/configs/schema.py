@@ -397,6 +397,11 @@ class Stage2QbyTReadoutConfig:
 
     mode: str = "gru_last"
     temperature: float = 1.0
+    sink_token: bool = False
+    text_position: str = "sinusoidal"
+    audio_position: str = "sinusoidal"
+    relative_num_buckets: int = 32
+    relative_max_distance: int = 64
 
 
 @dataclass
