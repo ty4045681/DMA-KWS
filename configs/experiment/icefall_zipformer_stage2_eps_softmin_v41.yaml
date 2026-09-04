@@ -1,0 +1,50 @@
+# @package _global_
+# Frozen Zipformer Stage II with pooling v4.1 (EPS soft-min + sink token,
+# learned text PE, T5-style relative audio bias) and MUSAN music/noise
+# background negatives plus CVaR tail loss.
+#
+# Generate the leakage-safe lists first (speech stays 100% in eval):
+#   python scripts/split_musan.py \
+#     --musan-root /path/to/musan \
+#     --output-dir data/dma-kws/processed/musan_split \
+#     --train-categories music,noise
+#
+# Usage:
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_eps_softmin_v41 \
+#     stage2.freeze_encoder=true \
+#     stage2.background_negative.audio_list_path=data/dma-kws/processed/musan_split/train_background.list
+
+defaults:
+  - icefall_zipformer_stage2
+  - _self_
+
+training:
+  recipe: icefall-zipformer-frozen-eps-softmin-v41
+
+stage2:
+  qbyt_readout_version: 4
+  qbyt_readout:
+    mode: eps_softmin
+    temperature: 1.0
+    sink_token: true
+    text_position: learned
+    audio_position: relative_bias
+  phoneme_adapter:
+    enabled: false
+    ctc_weight: 0.0
+  background_negative:
+    enabled: true
+    probability: 0.25
+    audio_list_path: ${paths.processed_root}/musan_split/train_background.list
+    duration_seconds_min: 1.0
+    duration_seconds_max: 3.0
+  negative_tail_loss:
+    enabled: true
+    weight: 0.5
+    fraction: 0.1
+  # Waveform-domain additive mix is a separate ablation; leave it off here.
+  noise_augmentation:
+    enabled: false
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-eps-softmin-v41
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-eps-softmin-v41
+  run_name: icefall-zipformer-frozen-eps-softmin-v41

@@ -1889,6 +1889,28 @@ Checkpoints run sequentially on one GPU; to use multiple GPUs, split the checkpo
 
 ## 11. MUSAN false-accept evaluation
 
+Hold speech out of training background negatives with a leakage-safe split:
+
+```bash
+python scripts/split_musan.py \
+  --musan-root /path/to/musan \
+  --output-dir /path/to/musan_split \
+  --train-categories music,noise
+```
+
+`--train-categories` defaults to `music,noise,speech` (all three still split).
+Omitting `speech` sends every speech file to eval so Stage II never trains on
+it. The two lists must stay on opposite sides of the train/eval cut:
+
+- `train_background.list` → `stage2.background_negative.audio_list_path`
+- `eval_musan.list` → `prep.musan_audio_list_path` for `eval_musan_fa.py` and
+  `batch_eval_musan_fa.sh --audio-list`
+
+Do not pass `train_background.list` to eval. `split.json` records
+`policy.train_categories` and catalog hashes so the cut is auditable. When
+`prep.musan_audio_list_path` is set, noisy-speech `eval_condition` MUSAN mixing
+also uses only those eval files.
+
 `scripts/eval_musan_fa.py` and `scripts/batch_eval_musan_fa.sh` score Stage II
 only: they slide a fixed window over every MUSAN file and treat every window as
 a negative. The official grid is `prep.window_sec=3.0` / `prep.hop_sec=3.0`.

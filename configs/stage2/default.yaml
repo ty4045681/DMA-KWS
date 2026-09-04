@@ -7,8 +7,16 @@ qbyt_layers: 2
 # 120 ms so natural inter-word pauses ("hey" ... "eva") can be skipped instead
 # of being charged to a neighbouring phone. The weakest aligned phone can only
 # veto a detection; it cannot create a route around the graph.
-# Versions 2-4 use qbyt_readout (gru_last / eps_mean / eps_softmin). Version 5
-# uses qbyt_alignment.topology=bounded_segmental_v1. Version 6 is the same
+# Versions 2-4 use qbyt_readout (gru_last / eps_mean / eps_softmin). Version 4
+# also carries optional v4.1 knobs that default to the legacy embedding path:
+#   sink_token: false
+#   text_position: sinusoidal | learned
+#   audio_position: sinusoidal | relative_bias
+#   relative_num_buckets: 32
+#   relative_max_distance: 64
+# A checkpoint's qbyt_readout mapping is the compatibility key (equality);
+# omitted knobs resolve to those defaults. Version 5 uses
+# qbyt_alignment.topology=bounded_segmental_v1. Version 6 is the same
 # alignment fields as 7 with query-relative emission and must be set explicitly.
 qbyt_readout_version: 7
 qbyt_alignment:
@@ -68,8 +76,9 @@ negative_tail_loss:
   fraction: 0.1
 
 # Pure background is sampled only inside the existing negative branch, so this
-# does not change the 50/50 positive/negative class balance. Populate the list
-# with a training-only mixture of music, noise and ambient/non-target speech.
+# does not change the 50/50 positive/negative class balance. Pooling v2-v4 and
+# keyword-filler v6/v7 may enable it; bounded v5 may not. Point audio_list_path
+# at train_background.list from scripts/split_musan.py (never the eval list).
 background_negative:
   enabled: false
   probability: 0.25

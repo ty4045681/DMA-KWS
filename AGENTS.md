@@ -35,10 +35,16 @@ Stamp the version that actually produced the weights; do not write 7 onto a
 pooling or v6 checkpoint.
 
 Loaders (`assert_qbyt_readout_version`) accept any supported checkpoint that
-decodes. When a run config is supplied, pooling v2/v3/v4 may match on
-mode/temperature; v5/v6/v7 require an equal version and spec. v6 and v7 share
-parameter shapes but not the emission formula (query-relative vs one-vs-rest),
-so a v6 file cannot be scored as v7.
+decodes. When a run config is supplied, pooling v2/v3/v4 match on the full
+`qbyt_readout` spec (mode, temperature, and the v4.1 knobs; omitted knobs
+default to legacy v4). v5/v6/v7 require an equal version and spec. v6 and v7
+share parameter shapes but not the emission formula (query-relative vs
+one-vs-rest), so a v6 file cannot be scored as v7.
+
+The v4 pooling spec now carries the v4.1 fields `sink_token`, `text_position`,
+`audio_position`, `relative_num_buckets`, and `relative_max_distance`. Defaults
+reproduce legacy v4; a checkpoint's `qbyt_readout` mapping is the compatibility
+key. Do not stamp version 8, and do not write 7 onto a pooling checkpoint.
 
 Families live in `qbyt/pooling.py` (v2-v4), `qbyt/bounded.py` (v5), and
 `qbyt/model.py` (v6/v7). `build_qbyt` is the only constructor. Checkpoints are

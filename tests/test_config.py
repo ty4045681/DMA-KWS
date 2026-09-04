@@ -147,6 +147,31 @@ def test_readout_experiments_select_the_declared_score_family(
         assert score.emission == detail
 
 
+def test_eps_softmin_v41_experiment_resolves_extension_knobs_and_tail_loss():
+    from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
+
+    config = config_to_dict(compose_config("icefall_zipformer_stage2_eps_softmin_v41"))
+    score = resolve_qbyt_score_spec(config["stage2"])
+    assert score.version == 4
+    assert score.family == "pooling"
+    assert score.value == QbyTReadoutConfig(
+        mode="eps_softmin",
+        temperature=1.0,
+        sink_token=True,
+        text_position="learned",
+        audio_position="relative_bias",
+    )
+    assert score.value != QbyTReadoutConfig(mode="eps_softmin", temperature=1.0)
+    stage2 = config["stage2"]
+    assert stage2["negative_tail_loss"]["enabled"] is True
+    assert stage2["negative_tail_loss"]["weight"] == 0.5
+    assert stage2["background_negative"]["enabled"] is True
+    assert stage2["noise_augmentation"]["enabled"] is False
+    assert stage2["background_negative"]["audio_list_path"].endswith(
+        "musan_split/train_background.list"
+    )
+
+
 def test_checkpoint_monitor_and_mode_accept_structured_overrides():
     config = config_to_dict(
         compose_config(
