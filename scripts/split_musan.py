@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from dma_kws.data_prep.musan_split import (
     DEFAULT_MUSAN_SPLIT_SEED,
     DEFAULT_MUSAN_TRAIN_RATIO,
+    MUSAN_CATEGORIES,
     build_musan_split,
 )
 
@@ -49,16 +50,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MUSAN_SPLIT_SEED,
         help=f"Deterministic split seed (default: {DEFAULT_MUSAN_SPLIT_SEED})",
     )
+    parser.add_argument(
+        "--train-categories",
+        default=",".join(MUSAN_CATEGORIES),
+        help="Comma-separated MUSAN categories allowed in train (default: music,noise,speech). "
+        "Categories omitted here go entirely to eval.",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> dict:
     args = build_parser().parse_args(argv)
+    train_categories = [
+        part.strip() for part in str(args.train_categories).split(",") if part.strip()
+    ]
     summary = build_musan_split(
         args.musan_root,
         args.output_dir,
         train_ratio=args.train_ratio,
         seed=args.seed,
+        train_categories=train_categories,
     )
     brief_keys = (
         "list",
@@ -73,6 +84,7 @@ def main(argv: Sequence[str] | None = None) -> dict:
             key: summary["splits"]["train"][key] for key in brief_keys
         },
         "eval": {key: summary["splits"]["eval"][key] for key in brief_keys},
+        "train_categories": summary["policy"]["train_categories"],
         "train_ratio_target": summary["train_ratio_target"],
         "train_ratio_actual": summary["train_ratio_actual"],
     }

@@ -247,6 +247,24 @@ def test_enabled_mixer_rejects_missing_or_empty_subset(tmp_path, subset):
         )
 
 
+def test_musan_audio_list_path_filters_discovered_subset(tmp_path):
+    _write_audio_placeholders(tmp_path, "noise", "allowed.wav", "blocked.wav")
+    allowed = (tmp_path / "noise" / "allowed.wav").resolve()
+    allowlist = tmp_path / "eval_musan.list"
+    allowlist.write_text(f"{allowed}\n", encoding="utf-8")
+    prep = _prep(tmp_path, noise=True, seed=11)
+    prep["musan_audio_list_path"] = str(allowlist)
+
+    mixer = MusanWaveformMixer.from_prep(
+        prep,
+        audio_paths=[f"clean-{index}.wav" for index in range(16)],
+    )
+    sources = {
+        mixer.recipe_metadata(index)["noise"]["source"] for index in range(16)
+    }
+    assert sources == {"noise/allowed.wav"}
+
+
 @pytest.mark.parametrize(
     ("mix_config", "message"),
     [

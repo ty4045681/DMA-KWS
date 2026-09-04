@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import wave
 
@@ -225,3 +226,110 @@ def test_discovery_requires_complete_musan_and_rejects_broken_audio(tmp_path):
         path.write_bytes(b"not an audio file")
     with pytest.raises(ValueError, match="Could not read audio metadata"):
         discover_musan_recordings(complete)
+
+
+@pytest.mark.parametrize(
+    "train_categories",
+    [("music", "noise"), ("noise", "music")],
+)
+def test_train_categories_keeps_speech_eval_only(tmp_path, train_categories):
+    musan_root = tmp_path / "musan"
+    paths = _build_complete_musan(musan_root)
+    recordings = discover_musan_recordings(musan_root)
+
+    split = split_musan_recordings(
+        recordings, train_ratio=0.60, seed=20260831, train_categories=train_categories
+    )
+    train_paths = {record.path for record in split.train}
+    eval_paths = {record.path for record in split.eval}
+    speech_paths = set(paths["speech/us-gov"])
+    music_paths = set(paths["music/fma"])
+    noise_paths = set(paths["noise/free-sound"])
+    catalog_paths = {
+        path for stratum_paths in paths.values() for path in stratum_paths
+    }
+
+    assert train_paths.isdisjoint(eval_paths)
+    assert train_paths | eval_paths == catalog_paths
+    assert not any(path in train_paths for path in speech_paths)
+    assert speech_paths <= eval_paths
+    assert train_paths & music_paths and eval_paths & music_paths
+    assert train_paths & noise_paths and eval_paths & noise_paths
+
+    output_dir = tmp_path / "split"
+    summary = build_musan_split(
+        musan_root,
+        output_dir,
+        train_ratio=0.60,
+        seed=20260831,
+        train_categories=train_categories,
+    )
+    payload = json.loads((output_dir / "split.json").read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["policy"]["train_categories"] == ["music", "noise"]
+    assert summary["policy"]["train_categories"] == ["music", "noise"]
+    for stratum, values in payload["balance_by_stratum"].items():
+        if stratum.startswith("speech/"):
+            assert values["target_train_microseconds"] == 0
+            assert values["actual_train_microseconds"] == 0
+
+
+def test_train_categories_rejects_unknown_and_empty():
+    recordings = (_recording("a", 1), _recording("b", 1))
+    with pytest.raises(ValueError, match="train_categories"):
+        split_musan_recordings(recordings, train_categories=("speechh",))
+    with pytest.raises(ValueError, match="train_categories"):
+        split_musan_recordings(recordings, train_categories=())
+
+
+def test_default_train_categories_still_splits_speech(tmp_path):
+    musan_root = tmp_path / "musan"
+    paths = _build_complete_musan(musan_root)
+    recordings = discover_musan_recordings(musan_root)
+
+    split = split_musan_recordings(recordings, train_ratio=0.60, seed=20260831)
+    membership = {record.path: "train" for record in split.train} | {
+        record.path: "eval" for record in split.eval
+    }
+    for stratum_paths in paths.values():
+        assert {membership[path] for path in stratum_paths} == {"train", "eval"}
+
+
+def test_eval_only_category_allows_singleton_stratum():
+    speech = MusanRecording(
+        path=Path("/virtual/speech/us-gov/only.wav"),
+        relative_path="speech/us-gov/only.wav",
+        category="speech",
+        source="us-gov",
+        duration_microseconds=1_000_000,
+        frames=8000,
+        sample_rate=8000,
+        group_id="speech/us-gov/only.wav",
+        group_kind="recording",
+    )
+    music = tuple(
+        MusanRecording(
+            path=Path(f"/virtual/music/fma/music-{index}.wav"),
+            relative_path=f"music/fma/music-{index}.wav",
+            category="music",
+            source="fma",
+            duration_microseconds=1_000_000,
+            frames=8000,
+            sample_rate=8000,
+            group_id=f"music/fma/music-{index}.wav",
+            group_kind="recording",
+        )
+        for index in range(2)
+    )
+
+    split = split_musan_recordings(
+        (speech, *music),
+        train_ratio=0.5,
+        seed=3,
+        train_categories=("music", "noise"),
+    )
+    assert {record.relative_path for record in split.train} <= {
+        record.relative_path for record in music
+    }
+    assert speech.relative_path in {record.relative_path for record in split.eval}
+    assert not any(record.category == "speech" for record in split.train)

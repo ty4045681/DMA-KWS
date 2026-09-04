@@ -18,7 +18,7 @@ MUSAN_CATEGORIES = ("music", "noise", "speech")
 MUSAN_AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a")
 DEFAULT_MUSAN_SPLIT_SEED = 20260831
 DEFAULT_MUSAN_TRAIN_RATIO = 0.60
-MUSAN_SPLIT_SCHEMA_VERSION = 1
+MUSAN_SPLIT_SCHEMA_VERSION = 2
 
 _UNKNOWN_ARTISTS = {"", "-", "n/a", "na", "none", "unknown"}
 
@@ -527,11 +527,29 @@ def _split_stratum(
     return train, evaluation
 
 
+def _canonicalize_train_categories(
+    train_categories: Sequence[str],
+) -> tuple[str, ...]:
+    if not train_categories:
+        raise ValueError("train_categories must be a non-empty sequence of MUSAN categories")
+    unknown = sorted(
+        {str(name) for name in train_categories if name not in MUSAN_CATEGORIES}
+    )
+    if unknown:
+        raise ValueError(
+            "train_categories contains unknown MUSAN categories: "
+            + ", ".join(repr(name) for name in unknown)
+        )
+    selected = set(train_categories)
+    return tuple(category for category in MUSAN_CATEGORIES if category in selected)
+
+
 def split_musan_recordings(
     recordings: Sequence[MusanRecording],
     *,
     train_ratio: float = DEFAULT_MUSAN_TRAIN_RATIO,
     seed: int = DEFAULT_MUSAN_SPLIT_SEED,
+    train_categories: Sequence[str] = MUSAN_CATEGORIES,
 ) -> MusanSplit:
     """Split by category/source, balancing duration without splitting a group."""
     if not 0.0 < train_ratio < 1.0:
@@ -540,6 +558,7 @@ def split_musan_recordings(
         raise ValueError(f"seed must be a non-negative integer, got {seed!r}")
     if not recordings:
         raise ValueError("MUSAN recording catalog is empty")
+    allowed_categories = set(_canonicalize_train_categories(train_categories))
 
     paths = [record.path for record in recordings]
     if len(set(paths)) != len(paths):
@@ -564,6 +583,10 @@ def split_musan_recordings(
     train: list[MusanRecording] = []
     evaluation: list[MusanRecording] = []
     for stratum in sorted(strata):
+        category, _source = stratum
+        if category not in allowed_categories:
+            evaluation.extend(strata[stratum])
+            continue
         stratum_train, stratum_eval = _split_stratum(
             strata[stratum], train_ratio=train_ratio, seed=seed
         )
@@ -630,7 +653,9 @@ def _balance_summary(
     train: Sequence[MusanRecording],
     *,
     train_ratio: float,
+    train_categories: Sequence[str] = MUSAN_CATEGORIES,
 ) -> dict[str, Any]:
+    allowed_categories = set(train_categories)
     train_paths = {record.path for record in train}
     balance: dict[str, Any] = {}
     for stratum in sorted({record.stratum for record in catalog}):
@@ -643,7 +668,10 @@ def _balance_summary(
         train_microseconds = sum(
             record.duration_microseconds for record in stratum_train
         )
-        target_microseconds = round(total_microseconds * train_ratio)
+        if category in allowed_categories:
+            target_microseconds = round(total_microseconds * train_ratio)
+        else:
+            target_microseconds = 0
         group_durations = [
             group.duration_microseconds for group in _group_recordings(stratum_records)
         ]
@@ -686,6 +714,7 @@ def build_musan_split(
     *,
     train_ratio: float = DEFAULT_MUSAN_TRAIN_RATIO,
     seed: int = DEFAULT_MUSAN_SPLIT_SEED,
+    train_categories: Sequence[str] = MUSAN_CATEGORIES,
 ) -> dict[str, Any]:
     """Create two disjoint allowlists and an auditable ``split.json``."""
     root = Path(musan_root).expanduser().resolve()
@@ -700,8 +729,14 @@ def build_musan_split(
             f"Refusing to overwrite an existing MUSAN split directory: {destination}"
         )
 
+    canonical_train_categories = _canonicalize_train_categories(train_categories)
     recordings = discover_musan_recordings(root)
-    split = split_musan_recordings(recordings, train_ratio=train_ratio, seed=seed)
+    split = split_musan_recordings(
+        recordings,
+        train_ratio=train_ratio,
+        seed=seed,
+        train_categories=canonical_train_categories,
+    )
     summary: dict[str, Any] = {
         "schema_version": MUSAN_SPLIT_SCHEMA_VERSION,
         "dataset": "MUSAN",
@@ -720,10 +755,14 @@ def build_musan_split(
                 "noise": "recording",
                 "speech": "recording",
             },
+            "train_categories": list(canonical_train_categories),
         },
         "catalog": _split_summary(recordings),
         "balance_by_stratum": _balance_summary(
-            recordings, split.train, train_ratio=train_ratio
+            recordings,
+            split.train,
+            train_ratio=train_ratio,
+            train_categories=canonical_train_categories,
         ),
         "splits": {
             "train": {"list": artifact_names["train"], **_split_summary(split.train)},

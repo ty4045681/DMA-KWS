@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from dma_kws.audio import load_audio
-from dma_kws.inference.manifest import iter_audio_files
+from dma_kws.inference.manifest import iter_audio_files, load_audio_file_list
 
 
 _RMS_EPSILON = 1.0e-8
@@ -221,13 +221,26 @@ def _derive_event_seed(component_seed: int, event_index: int) -> int:
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 
 
-def _discover_subset(root: Path, subset: str) -> tuple[Path, ...]:
+def _discover_subset(
+    root: Path,
+    subset: str,
+    allowlist: set[Path] | None = None,
+    *,
+    allowlist_path: str | Path | None = None,
+) -> tuple[Path, ...]:
     subset_root = root / subset
     if not subset_root.is_dir():
         raise NotADirectoryError(f"MUSAN {subset} directory not found: {subset_root}")
     files = tuple(iter_audio_files(subset_root))
     if not files:
         raise ValueError(f"No supported audio files found under {subset_root}")
+    if allowlist is not None:
+        files = tuple(path for path in files if path.resolve() in allowlist)
+        if not files:
+            raise ValueError(
+                f"No MUSAN {subset} files remain after filtering with allowlist "
+                f"{allowlist_path}"
+            )
     return files
 
 
@@ -1006,18 +1019,41 @@ class MusanWaveformMixer:
             if not root.is_dir():
                 raise NotADirectoryError(f"MUSAN root not found: {root}")
 
+        allowlist: set[Path] | None = None
+        allowlist_path: str | None = None
+        list_path_raw = prep.get("musan_audio_list_path", "")
+        list_path_text = str(list_path_raw or "").strip()
+        if list_path_text:
+            allowlist_path = list_path_text
+            allowlist = {path.resolve() for path in load_audio_file_list(list_path_text)}
+
         noise_files = (
-            _discover_subset(root, "noise")
+            _discover_subset(
+                root,
+                "noise",
+                allowlist,
+                allowlist_path=allowlist_path,
+            )
             if root is not None and (noise_enabled or burst_noise.enabled)
             else ()
         )
         music_files = (
-            _discover_subset(root, "music")
+            _discover_subset(
+                root,
+                "music",
+                allowlist,
+                allowlist_path=allowlist_path,
+            )
             if root is not None and music_enabled
             else ()
         )
         speech_files = (
-            _discover_subset(root, "speech")
+            _discover_subset(
+                root,
+                "speech",
+                allowlist,
+                allowlist_path=allowlist_path,
+            )
             if root is not None and speech_enabled
             else ()
         )
