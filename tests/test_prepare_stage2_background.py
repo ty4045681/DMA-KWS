@@ -172,6 +172,63 @@ def test_crop_rng_matches_documented_sha256_payload():
     assert crop_rng(SEED, source_id, 0).random() != other.random()
 
 
+def _drive_pool_window(*, n_jobs: int, workers: int, wait_completed) -> tuple[list[int], int]:
+    from dma_kws.data_prep.stage2_background import _iter_ordered_pool_results
+
+    outstanding: list[int] = []
+    max_outstanding = 0
+
+    def submit(index: int) -> int:
+        nonlocal max_outstanding
+        outstanding.append(index)
+        max_outstanding = max(max_outstanding, len(outstanding))
+        return index
+
+    def collect(handle: int, index: int) -> int:
+        assert handle == index
+        return index
+
+    yielded: list[int] = []
+    for value in _iter_ordered_pool_results(
+        n_jobs,
+        workers=workers,
+        submit=submit,
+        collect=collect,
+        wait_completed=wait_completed,
+    ):
+        yielded.append(value)
+        outstanding.remove(value)
+    assert outstanding == []
+    return yielded, max_outstanding
+
+
+def test_ordered_pool_window_cannot_run_ahead_of_yield_by_more_than_workers():
+    def complete_highest_first(in_flight):
+        handle = max(in_flight, key=lambda key: in_flight[key])
+        return (handle,)
+
+    def complete_all(in_flight):
+        return tuple(in_flight)
+
+    n_jobs = 8
+    workers = 2
+    high_first, high_max = _drive_pool_window(
+        n_jobs=n_jobs, workers=workers, wait_completed=complete_highest_first
+    )
+    all_at_once, all_max = _drive_pool_window(
+        n_jobs=n_jobs, workers=workers, wait_completed=complete_all
+    )
+    assert high_first == all_at_once == list(range(n_jobs))
+    assert high_max <= workers
+    assert all_max <= workers
+
+    wider, wider_max = _drive_pool_window(
+        n_jobs=9, workers=3, wait_completed=complete_highest_first
+    )
+    assert wider == list(range(9))
+    assert wider_max <= 3
+
+
 def test_serial_and_workers2_are_bit_identical_and_match_online_extract(tmp_path):
     from dma_kws.data_prep.stage2_background import prepare_stage2_background
 

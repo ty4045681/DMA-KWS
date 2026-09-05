@@ -33,7 +33,7 @@ from pathlib import Path
 import random
 import shutil
 import tempfile
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -471,6 +471,43 @@ def _worker_extract(job: SourceJob) -> SourceCrops:
     return _extract_source_crops(job)
 
 
+def _iter_ordered_pool_results(
+    n_jobs: int,
+    *,
+    workers: int,
+    submit: Callable[[int], Any],
+    collect: Callable[[Any, int], Any],
+    wait_completed: Callable[[Mapping[Any, int]], Iterable[Any]],
+) -> Iterator[Any]:
+    """Yield job results in index order with a bounded submit window.
+
+    At most ``workers`` jobs may be submitted ahead of the next index to
+    yield. Completed-but-unconsumed results therefore cannot grow with N:
+    ``len(in_flight) + len(ready) <= workers``.
+    """
+    next_submit = 0
+    next_yield = 0
+    in_flight: dict[Any, int] = {}
+    ready: dict[int, Any] = {}
+    while next_yield < n_jobs:
+        while next_submit < n_jobs and next_submit < next_yield + workers:
+            handle = submit(next_submit)
+            in_flight[handle] = next_submit
+            next_submit += 1
+        if not in_flight:
+            raise RuntimeError("Background crop workers produced no in-flight jobs")
+        for handle in wait_completed(in_flight):
+            index = in_flight.pop(handle)
+            ready[index] = collect(handle, index)
+        if len(in_flight) + len(ready) > workers:
+            raise RuntimeError(
+                "in-flight background-cache results exceeded the worker window"
+            )
+        while next_yield in ready:
+            yield ready.pop(next_yield)
+            next_yield += 1
+
+
 def _iter_source_results(
     jobs: Sequence[SourceJob],
     *,
@@ -485,35 +522,36 @@ def _iter_source_results(
         return
 
     context = multiprocessing.get_context("spawn")
-    max_in_flight = workers
     with ProcessPoolExecutor(
         max_workers=workers,
         mp_context=context,
         initializer=_init_worker,
         initargs=(dict(fbank_params),),
     ) as executor:
-        next_submit = 0
-        next_yield = 0
-        in_flight: dict[Any, int] = {}
-        ready: dict[int, SourceCrops] = {}
-        while next_yield < len(jobs):
-            while next_submit < len(jobs) and len(in_flight) < max_in_flight:
-                future = executor.submit(_worker_extract, jobs[next_submit])
-                in_flight[future] = next_submit
-                next_submit += 1
+
+        def submit(index: int) -> Any:
+            return executor.submit(_worker_extract, jobs[index])
+
+        def collect(handle: Any, index: int) -> SourceCrops:
+            try:
+                return handle.result()
+            except Exception as exc:
+                job = jobs[index]
+                raise RuntimeError(
+                    f"Failed to extract background crops from {job.path}"
+                ) from exc
+
+        def wait_completed(in_flight: Mapping[Any, int]) -> Iterable[Any]:
             done, _pending = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
-            for future in done:
-                index = in_flight.pop(future)
-                try:
-                    ready[index] = future.result()
-                except Exception as exc:
-                    job = jobs[index]
-                    raise RuntimeError(
-                        f"Failed to extract background crops from {job.path}"
-                    ) from exc
-            while next_yield in ready:
-                yield ready.pop(next_yield)
-                next_yield += 1
+            return done
+
+        yield from _iter_ordered_pool_results(
+            len(jobs),
+            workers=workers,
+            submit=submit,
+            collect=collect,
+            wait_completed=wait_completed,
+        )
 
 
 def _max_frames_per_shard(shard_size_mib: int, feature_dim: int) -> int:
