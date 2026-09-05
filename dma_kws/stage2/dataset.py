@@ -15,6 +15,10 @@ import torch.utils.data
 from torch.utils.data import Dataset
 
 from dma_kws.g2p import make_g2p, text_to_phonemes
+from dma_kws.stage2.metadata_cache import (
+    MetadataLRUCache,
+    resolve_metadata_cache_limits,
+)
 from dma_kws.tokenizer import (
     DEFAULT_SEQ_LABEL_MODE,
     SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX,
@@ -176,6 +180,8 @@ class LibriPhraseTrainDataset(Dataset):
         background_negative: Mapping[str, Any] | None = None,
         fbank_kwargs: Mapping[str, Any] | None = None,
         seq_label_mode: str = DEFAULT_SEQ_LABEL_MODE,
+        # Omitted/None disables the LRU so existing tests keep the uncached path.
+        metadata_cache: Mapping[str, Any] | None = None,
     ) -> None:
         if tokenizer is None:
             if dict_path is None:
@@ -195,6 +201,10 @@ class LibriPhraseTrainDataset(Dataset):
         validate_ngram_g2p(self.df, source=g2p_source)
 
         self.anchor_lists = self.df["ngram"].tolist()
+        self._ngram_g2p = self.df["ngram_g2p"].tolist()
+        self._clips_files = self.df["clips_file"].tolist()
+        self._distances_files = self.df["distances_file"].tolist()
+        self._n_anchors = len(self.anchor_lists)
         self.anchor2idx = {anchor: idx for idx, anchor in enumerate(self.anchor_lists)}
         self.negative_ratio = negative_ratio
         self.hard_negative_ratio = hard_negative_ratio
@@ -315,13 +325,39 @@ class LibriPhraseTrainDataset(Dataset):
             )
             self._background_probability = probability
 
+        max_entries, max_bytes = resolve_metadata_cache_limits(metadata_cache)
+        self._metadata_cache = MetadataLRUCache(
+            max_entries=max_entries,
+            max_bytes=max_bytes,
+        )
+
     def __len__(self) -> int:
         return self.sample_lens
+
+    def _load_metadata_array(self, path: str):
+        key = ("npy", path)
+        cached = self._metadata_cache.get(key)
+        if cached is not None:
+            return cached
+        data = np.load(path, allow_pickle=True)
+        self._metadata_cache.put(key, data)
+        return data
+
+    def _tokenize_phoneme_string(self, g2p_text: str) -> list[int]:
+        if self._metadata_cache.max_entries <= 0:
+            return tokenize_phoneme_string(self.tokenizer, g2p_text)
+        key = ("phn", g2p_text)
+        cached = self._metadata_cache.get(key)
+        if cached is not None:
+            return list(cached)
+        token_ids = tokenize_phoneme_string(self.tokenizer, g2p_text)
+        self._metadata_cache.put(key, tuple(token_ids))
+        return token_ids
 
     def get_random_clips(self, clips_file: str) -> dict:
         number = int(os.path.basename(clips_file).split("-")[-2])
         random_number = self._rng.randint(0, number - 1)
-        clips_data = np.load(clips_file, allow_pickle=True)
+        clips_data = self._load_metadata_array(clips_file)
         return clips_data[random_number]
 
     def get_random_distances(self, distances_file: str) -> dict | None:
@@ -329,28 +365,29 @@ class LibriPhraseTrainDataset(Dataset):
         if number == 0:
             return None
         random_number = self._rng.randint(0, number - 1)
-        distances_data = np.load(distances_file, allow_pickle=True)
+        distances_data = self._load_metadata_array(distances_file)
         return distances_data[random_number]
 
     def get_negative(self, index: int) -> tuple[dict, str, str]:
-        remaining_indices = [i for i in range(len(self.anchor_lists)) if i != index]
-        random_index = self._rng.choice(remaining_indices)
+        n = self._n_anchors
+        if n < 2:
+            raise ValueError(
+                "Cannot sample a regular negative with fewer than 2 anchors; "
+                f"got {n}"
+            )
+        r = self._rng.randrange(n - 1)
+        random_index = r + int(r >= index)
 
         negative = self.anchor_lists[random_index]
-        negative_inform = self.df.iloc[random_index]
-        negative_clips = negative_inform["clips_file"]
-        negative_wav = self.get_random_clips(negative_clips)
-        negative_g2p = negative_inform["ngram_g2p"]
+        negative_wav = self.get_random_clips(self._clips_files[random_index])
+        negative_g2p = self._ngram_g2p[random_index]
         return negative_wav, negative_g2p, negative
 
     def get_hard_negative(self, hard_negative: dict) -> tuple[dict, str, str]:
         hard_ngram = hard_negative["ngram"]
-
         idx = self.anchor2idx[hard_ngram]
-        hard_ngram_inform = self.df.iloc[idx]
-
-        hard_ngram_wav = self.get_random_clips(hard_ngram_inform["clips_file"])
-        hard_ngram_g2p = hard_ngram_inform["ngram_g2p"]
+        hard_ngram_wav = self.get_random_clips(self._clips_files[idx])
+        hard_ngram_g2p = self._ngram_g2p[idx]
         return hard_ngram_wav, hard_ngram_g2p, hard_ngram
 
     def _load_fbank(self, query_wav: str) -> torch.Tensor:
@@ -369,8 +406,8 @@ class LibriPhraseTrainDataset(Dataset):
         feats = torch.from_numpy(np.load(fbank_path))
         return feats
 
-    def _draw_negative(self, index: int, anchor_inform) -> tuple[str, str]:
-        hard_neg = self.get_random_distances(anchor_inform["distances_file"])
+    def _draw_negative(self, index: int) -> tuple[str, str]:
+        hard_neg = self.get_random_distances(self._distances_files[index])
         negative_type = self._rng.choices(
             [1, 2],
             weights=[self.negative_ratio, self.hard_negative_ratio],
@@ -383,17 +420,15 @@ class LibriPhraseTrainDataset(Dataset):
         return negative_wav["audio_path"], negative_g2p
 
     def __getitem__(self, index: int) -> dict:
-        index = index % len(self.anchor_lists)
-        anchor_inform = self.df.iloc[index]
-        anchor_g2p = anchor_inform["ngram_g2p"]
-        anchor_seq = tokenize_phoneme_string(self.tokenizer, anchor_g2p)
+        index = index % self._n_anchors
+        anchor_g2p = self._ngram_g2p[index]
+        anchor_seq = self._tokenize_phoneme_string(anchor_g2p)
         label = 1
         query_wav: str | None = None
         background_feats: torch.Tensor | None = None
 
         if self._rng.random() < 0.5:
-            anchor_clips = anchor_inform["clips_file"]
-            query_wav = self.get_random_clips(anchor_clips)["audio_path"]
+            query_wav = self.get_random_clips(self._clips_files[index])["audio_path"]
             query_seq = list(anchor_seq)
             seq_label = build_seq_label(
                 anchor_seq,
@@ -425,8 +460,8 @@ class LibriPhraseTrainDataset(Dataset):
                 background_feats = self._background_sampler.extract(rng=self._rng)
             else:
                 for _ in range(_MAX_CONTAINING_NEGATIVE_DRAWS):
-                    query_wav, query_g2p = self._draw_negative(index, anchor_inform)
-                    query_seq = tokenize_phoneme_string(self.tokenizer, query_g2p)
+                    query_wav, query_g2p = self._draw_negative(index)
+                    query_seq = self._tokenize_phoneme_string(query_g2p)
                     seq_label = build_seq_label(
                         anchor_seq,
                         query_seq,

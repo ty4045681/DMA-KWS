@@ -839,6 +839,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         background_negative=background_negative,
         fbank_kwargs=fbank_kwargs(get_fbank_config(config)),
         seq_label_mode=seq_label_mode,
+        metadata_cache=stage2.get("metadata_cache", {}) or {},
     )
 
     train_dataset = MixedAdaptationDataset(

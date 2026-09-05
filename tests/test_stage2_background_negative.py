@@ -149,3 +149,4 @@ def test_lora_replay_forwards_background_noise_and_fbank_configuration():
     assert keywords["noise_augmentation"] == "noise_augmentation"
     assert keywords["background_negative"] == "background_negative"
     assert keywords["fbank_kwargs"] == "fbank_kwargs(get_fbank_config(config))"
+    assert keywords["metadata_cache"] == "stage2.get('metadata_cache', {}) or {}"
