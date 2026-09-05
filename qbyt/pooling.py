@@ -1,8 +1,10 @@
+from contextlib import contextmanager
+import math
+from typing import NamedTuple
+
 import torch
 import torch.nn as nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
-import math
-from typing import NamedTuple
 
 # Keep this vendored model importable on its own (for example from ``qbyt/``).
 # These public mode spellings intentionally mirror ``dma_kws.stage2.readout``;
@@ -21,6 +23,45 @@ _AUDIO_MODALITY = 1
 _SINK_MODALITY = 2
 _TEXT_POSITIONS = frozenset({"sinusoidal", "learned"})
 _AUDIO_POSITIONS = frozenset({"sinusoidal", "relative_bias"})
+_MIN_RELATIVE_NUM_BUCKETS = 4
+
+
+@contextmanager
+def _additive_float_mask_encoder():
+    """Run TransformerEncoder without the fused eval kernel.
+
+    PyTorch 2.13 takes ``_transformer_encoder_layer_fwd`` under ``eval()`` +
+    ``no_grad()``. That kernel does not preserve a 3-D float additive mask, so
+    Stage II's default FP32 verifier path scores NaN after the bias tables
+    leave zero init. Training is unaffected because the fused path is already
+    off when ``training=True``.
+    """
+    enabled = torch.backends.mha.get_fastpath_enabled()
+    if enabled:
+        torch.backends.mha.set_fastpath_enabled(False)
+    try:
+        yield
+    finally:
+        if enabled:
+            torch.backends.mha.set_fastpath_enabled(True)
+
+
+def _validate_relative_attention_buckets(num_buckets, max_distance):
+    """Reject T5 bucket sizes that divide by zero or index past the table."""
+    if num_buckets < _MIN_RELATIVE_NUM_BUCKETS:
+        raise ValueError(
+            "relative_num_buckets must be >= "
+            f"{_MIN_RELATIVE_NUM_BUCKETS} so bidirectional T5 buckets have a "
+            f"non-zero exact range; got {num_buckets}"
+        )
+    max_exact = num_buckets // 4
+    if max_distance <= max_exact:
+        raise ValueError(
+            "relative_max_distance must be greater than "
+            f"relative_num_buckets // 4 ({max_exact}); got "
+            f"relative_num_buckets={num_buckets}, "
+            f"relative_max_distance={max_distance}"
+        )
 
 
 class QbyTReadoutDetails(NamedTuple):
@@ -186,12 +227,11 @@ class RelativeAttentionBias(nn.Module):
         nhead = int(nhead)
         num_buckets = int(num_buckets)
         max_distance = int(max_distance)
-        if nhead < 1 or num_buckets < 1 or max_distance < 1:
+        if nhead < 1:
             raise ValueError(
-                "relative attention bias requires positive nhead, num_buckets, "
-                f"and max_distance; got nhead={nhead}, num_buckets={num_buckets}, "
-                f"max_distance={max_distance}"
+                f"relative attention bias requires positive nhead; got {nhead}"
             )
+        _validate_relative_attention_buckets(num_buckets, max_distance)
         self.nhead = nhead
         self.audio_buckets = nn.Parameter(torch.zeros(num_buckets, nhead))
         self.pair_table = nn.Parameter(torch.zeros(3, 3, nhead))
@@ -447,9 +487,10 @@ class QbyT(nn.Module):
             attn_mask = attn_bias.reshape(
                 batch_size * self.nhead, total_width, total_width
             )
-            combined_feat = self.phone_matchor(
-                combined_feat, mask=attn_mask, src_key_padding_mask=None
-            )
+            with _additive_float_mask_encoder():
+                combined_feat = self.phone_matchor(
+                    combined_feat, mask=attn_mask, src_key_padding_mask=None
+                )
         else:
             combined_feat = self.phone_matchor(
                 combined_feat, src_key_padding_mask=~valid

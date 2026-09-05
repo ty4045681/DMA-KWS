@@ -175,6 +175,43 @@ def test_version_4_accepts_v41_fields_and_as_dict_emits_them() -> None:
     assert payload["relative_max_distance"] == 40
 
 
+@pytest.mark.parametrize("num_buckets", [1, 2, 3])
+def test_qbyt_readout_config_rejects_too_few_relative_buckets(num_buckets: int) -> None:
+    from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
+
+    with pytest.raises(ValueError, match="relative_num_buckets"):
+        QbyTReadoutConfig(relative_num_buckets=num_buckets)
+    with pytest.raises(ValueError, match="relative_num_buckets"):
+        resolve_qbyt_score_spec(
+            {
+                "qbyt_readout_version": 4,
+                "qbyt_readout": {
+                    "mode": "eps_softmin",
+                    "relative_num_buckets": num_buckets,
+                },
+            }
+        )
+
+
+def test_qbyt_readout_config_rejects_max_distance_not_greater_than_max_exact() -> None:
+    from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
+
+    with pytest.raises(ValueError, match="relative_max_distance"):
+        QbyTReadoutConfig(relative_num_buckets=32, relative_max_distance=8)
+    with pytest.raises(ValueError, match="relative_max_distance"):
+        resolve_qbyt_score_spec(
+            {
+                "qbyt_readout_version": 4,
+                "qbyt_readout": {
+                    "mode": "eps_softmin",
+                    "audio_position": "relative_bias",
+                    "relative_num_buckets": 32,
+                    "relative_max_distance": 8,
+                },
+            }
+        )
+
+
 def test_legacy_v4_checkpoint_rejects_sink_token_run_config() -> None:
     from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
 

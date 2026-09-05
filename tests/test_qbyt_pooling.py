@@ -671,3 +671,62 @@ def test_learned_text_position_rejects_width_over_128():
             speech_lengths=torch.tensor([4]),
             text_lengths=torch.tensor([129]),
         )
+
+
+def test_relative_bias_eval_after_one_adam_step_is_finite():
+    """Stage II eval is FP32 + no_grad; the fused MHA fast path NaNs a float mask."""
+    assert torch.backends.mha.get_fastpath_enabled()
+    torch.manual_seed(0)
+    model = QbyT(
+        encoder_output_size=ENCODER_DIM,
+        num_embeds=73,
+        embed_dim=EMBED_DIM,
+        post_num_layers=2,
+        readout_mode="eps_softmin",
+        sink_token=True,
+        text_position="learned",
+        audio_position="relative_bias",
+    ).cpu()
+    text = torch.randint(3, 70, (2, 8))
+    audio = torch.randn(2, AUDIO_LEN, ENCODER_DIM)
+    text_lengths = torch.tensor([8, 5])
+    speech_lengths = torch.tensor([AUDIO_LEN, 12])
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model.train()
+    train_logits, _ = model(
+        audio,
+        text,
+        speech_lengths=speech_lengths,
+        text_lengths=text_lengths,
+    )
+    train_logits.square().mean().backward()
+    optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        eval_logits, _ = model(
+            audio,
+            text,
+            speech_lengths=speech_lengths,
+            text_lengths=text_lengths,
+        )
+    assert torch.isfinite(eval_logits).all()
+    assert eval_logits.shape == (2,)
+
+
+@pytest.mark.parametrize("num_buckets", [1, 2, 3])
+def test_relative_bias_rejects_too_few_buckets(num_buckets):
+    with pytest.raises(ValueError, match="relative_num_buckets"):
+        RelativeAttentionBias(nhead=4, num_buckets=num_buckets, max_distance=64)
+    with pytest.raises(ValueError, match="relative_num_buckets"):
+        _model(audio_position="relative_bias", relative_num_buckets=num_buckets)
+
+
+def test_relative_bias_rejects_max_distance_not_greater_than_max_exact():
+    with pytest.raises(ValueError, match="relative_max_distance"):
+        RelativeAttentionBias(nhead=4, num_buckets=32, max_distance=8)
+    with pytest.raises(ValueError, match="relative_max_distance"):
+        _model(
+            audio_position="relative_bias",
+            relative_num_buckets=32,
+            relative_max_distance=8,
+        )

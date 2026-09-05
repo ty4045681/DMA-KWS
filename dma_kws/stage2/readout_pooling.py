@@ -18,6 +18,7 @@ DEFAULT_QBYT_TEXT_POSITION = "sinusoidal"
 DEFAULT_QBYT_AUDIO_POSITION = "sinusoidal"
 DEFAULT_QBYT_RELATIVE_NUM_BUCKETS = 32
 DEFAULT_QBYT_RELATIVE_MAX_DISTANCE = 64
+_MIN_RELATIVE_NUM_BUCKETS = 4
 QBYT_READOUT_MODES = frozenset(
     {GRU_LAST_READOUT, EPS_MEAN_READOUT, EPS_SOFTMIN_READOUT}
 )
@@ -120,6 +121,26 @@ def _normalize_qbyt_positive_int(value: Any, *, field: str) -> int:
     return parsed
 
 
+def _validate_relative_attention_buckets(
+    num_buckets: int, max_distance: int
+) -> None:
+    """Reject T5 bucket sizes that divide by zero or index past the table."""
+    if num_buckets < _MIN_RELATIVE_NUM_BUCKETS:
+        raise ValueError(
+            "QbyT readout relative_num_buckets must be >= "
+            f"{_MIN_RELATIVE_NUM_BUCKETS} so bidirectional T5 buckets have a "
+            f"non-zero exact range; got {num_buckets}"
+        )
+    max_exact = num_buckets // 4
+    if max_distance <= max_exact:
+        raise ValueError(
+            "QbyT readout relative_max_distance must be greater than "
+            f"relative_num_buckets // 4 ({max_exact}); got "
+            f"relative_num_buckets={num_buckets}, "
+            f"relative_max_distance={max_distance}"
+        )
+
+
 @dataclass(frozen=True)
 class QbyTReadoutConfig:
     """Canonical final-score readout configuration.
@@ -179,6 +200,9 @@ class QbyTReadoutConfig:
             _normalize_qbyt_positive_int(
                 self.relative_max_distance, field="relative_max_distance"
             ),
+        )
+        _validate_relative_attention_buckets(
+            self.relative_num_buckets, self.relative_max_distance
         )
 
     def as_dict(self) -> dict[str, str | float | bool | int]:
