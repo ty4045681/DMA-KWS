@@ -193,6 +193,7 @@ def test_eps_softmin_v41_cached_overlay_keeps_readout_and_isolates_run_paths():
     score = resolve_qbyt_score_spec(cached["stage2"])
     background = cached["stage2"]["background_negative"]
 
+    assert background["enabled"] is True
     assert background["mode"] == "fbank_cache"
     assert background["audio_list_path"] == ""
     assert background["cache_manifest"].endswith(

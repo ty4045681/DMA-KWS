@@ -99,6 +99,7 @@ def test_cached_overlay_flips_data_source_and_keeps_v41_readout():
     background = cached_stage2["background_negative"]
     score = resolve_qbyt_score_spec(cached_stage2)
 
+    assert background["enabled"] is True
     assert background["mode"] == "fbank_cache"
     assert background["audio_list_path"] == ""
     assert background["cache_manifest"].endswith(

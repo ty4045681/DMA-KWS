@@ -65,15 +65,24 @@ TIMING_JSON_KEYS = (
 DICT_PATH = PROJECT_ROOT / "data" / "dict" / "lang_char.txt"
 
 
+def _assert_gpu_util(value) -> None:
+    if value == "unavailable":
+        return
+    if isinstance(value, (int, float)):
+        assert 0 <= value <= 100, value
+        return
+    assert isinstance(value, list) and value, value
+    for item in value:
+        assert isinstance(item, (int, float)), item
+        assert 0 <= item <= 100, item
+
+
 def _assert_timing_contract(payload: dict) -> None:
     missing = [key for key in TIMING_JSON_KEYS if key not in payload]
     assert missing == [], missing
     assert payload["status"] == "ok"
     assert "speedup" not in payload
-    assert payload["gpu_util"] != 0
-    assert payload["gpu_util"] == "unavailable" or isinstance(
-        payload["gpu_util"], (int, float)
-    )
+    _assert_gpu_util(payload["gpu_util"])
     for name in (
         "wait_p50_ms",
         "wait_p95_ms",

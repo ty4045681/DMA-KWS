@@ -2,7 +2,8 @@
 # Frozen Zipformer Stage II v4.1 with a precomputed crop-level background
 # fbank cache. Architecture, readout, loss, optimizer, and MUSAN split stay
 # identical to icefall_zipformer_stage2_eps_softmin_v41; only the data source
-# and run paths change. The cache reader is not wired yet.
+# and run paths change. The cache reader is wired: cache_manifest must exist,
+# original audio is not required, and enabled is inherited from v41 (true).
 #
 # Usage:
 #   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_eps_softmin_v41_cached \
