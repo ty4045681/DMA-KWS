@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from dma_kws.pathing import PROJECT_ROOT, resolve_dict_path
+from dma_kws.stage2.train_data import (
+    build_stage2_train_dataloader,
+    build_stage2_train_dataset,
+    resolve_stage2_data_path as _resolve_path,
+)
 from dma_kws.training.device import resolve_accelerator_and_devices
 from dma_kws.training.loaders import build_loader_kwargs
 
@@ -27,13 +32,6 @@ class Stage2TrainArgs:
     device: str = "cuda"
     devices: int = 1
     limit_steps: int = 0
-
-
-def _resolve_path(stage2: dict[str, Any], key: str, default: Path) -> Path:
-    raw = stage2.get(key, "")
-    if raw:
-        return Path(raw)
-    return default
 
 
 def background_negative_run_paths(
@@ -111,26 +109,18 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     try:
         import torch
         import pytorch_lightning as pl
-        from torch.utils.data import DataLoader
     except ImportError as exc:
         raise SystemExit(
             "Missing torch/pytorch-lightning. Install CUDA PyTorch on the training machine first."
         ) from exc
 
     from dma_kws.config import (
-        fbank_kwargs,
-        get_fbank_config,
         get_tokenizer_config,
         require_sections,
     )
     from dma_kws.runlog import build_loggers, logger_backend_names
-    from dma_kws.stage2.collate import train_collate_fn
-    from dma_kws.stage2.dataset import LibriPhraseTrainDataset, stage2_worker_init_fn
     from dma_kws.stage2.module import Stage2LightningModule
-    from dma_kws.stage2.objective import (
-        assert_sequence_objective_matches,
-        resolve_sequence_objective,
-    )
+    from dma_kws.stage2.objective import assert_sequence_objective_matches
     from dma_kws.tokenizer import load_char_tokenizer
     from dma_kws.training.callbacks import (
         build_stage2_callbacks,
@@ -144,7 +134,6 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     from dma_kws.training.ddp import (
         apply_step_based_validation,
         build_trainer_kwargs,
-        process_rank,
         rank_zero_print,
     )
     from dma_kws.training.metrics_history import (
@@ -160,7 +149,6 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
 
     require_sections(config, ["paths", "stage1", "stage2", "tokenizer", "training"])
     paths = config["paths"]
-    stage1 = config["stage1"]
     stage2 = config["stage2"]
     training = config["training"]
     tokenizer_cfg = get_tokenizer_config(config)
@@ -184,8 +172,6 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
 
     seed = int(training.get("seed", 2025))
     pl.seed_everything(seed, workers=True)
-    dataset_seed = seed + 1_000_003 * process_rank()
-    sequence_objective = resolve_sequence_objective(stage2)
     noise_augmentation = stage2.get("noise_augmentation", {}) or {}
     if not isinstance(noise_augmentation, dict):
         raise ValueError("stage2.noise_augmentation must be a mapping")
@@ -193,36 +179,8 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     if not isinstance(background_negative, dict):
         raise ValueError("stage2.background_negative must be a mapping")
 
-    train_dataset = LibriPhraseTrainDataset(
-        parquet_file=parquet_file,
-        wav_dir=wav_dir,
-        tokenizer=tokenizer,
-        negative_ratio=int(stage2.get("negative_ratio", 1)),
-        hard_negative_ratio=int(stage2.get("hard_negative_ratio", 1)),
-        sample_lens=int(stage2.get("sample_lens", 5000)),
-        seed=dataset_seed,
-        noise_augmentation=noise_augmentation,
-        background_negative=background_negative,
-        fbank_kwargs=fbank_kwargs(get_fbank_config(config)),
-        seq_label_mode=sequence_objective.target_mode,
-        metadata_cache=stage2.get("metadata_cache", {}) or {},
-    )
-
-    batch_size = int(stage2.get("batch_size_per_gpu", 64))
-    num_workers = int(stage2.get("num_workers", stage1.get("num_workers", 2)))
-    loader_kwargs = build_loader_kwargs(num_workers, stage2.get("dataloader", {}) or {})
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=train_collate_fn,
-        drop_last=True,
-        # Without this the dataset's RNG is forked in an identical state into every
-        # worker, so all of them draw the same negatives and clips.
-        worker_init_fn=stage2_worker_init_fn,
-        **loader_kwargs,
-    )
+    train_dataset = build_stage2_train_dataset(config, tokenizer)
+    train_dataloader = build_stage2_train_dataloader(config, train_dataset)
 
     val_dataloader = _build_val_dataloader(config, tokenizer)
 
