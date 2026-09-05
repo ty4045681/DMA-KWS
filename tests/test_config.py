@@ -167,8 +167,50 @@ def test_eps_softmin_v41_experiment_resolves_extension_knobs_and_tail_loss():
     assert stage2["negative_tail_loss"]["weight"] == 0.5
     assert stage2["background_negative"]["enabled"] is True
     assert stage2["noise_augmentation"]["enabled"] is False
+    assert stage2["background_negative"]["mode"] == "online"
     assert stage2["background_negative"]["audio_list_path"].endswith(
         "musan_split/train_background.list"
+    )
+
+
+def test_default_compose_exposes_background_cache_and_metadata_cache_fields():
+    stage2 = config_to_dict(compose_config())["stage2"]
+
+    assert stage2["background_negative"]["mode"] == "online"
+    assert stage2["background_negative"]["cache_manifest"] == ""
+    assert stage2["background_negative"]["max_open_shards"] == 8
+    assert stage2["metadata_cache"]["max_entries"] == 128
+    assert stage2["metadata_cache"]["max_bytes"] == 33554432
+
+
+def test_eps_softmin_v41_cached_overlay_keeps_readout_and_isolates_run_paths():
+    from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
+
+    v41 = config_to_dict(compose_config("icefall_zipformer_stage2_eps_softmin_v41"))
+    cached = config_to_dict(
+        compose_config("icefall_zipformer_stage2_eps_softmin_v41_cached")
+    )
+    score = resolve_qbyt_score_spec(cached["stage2"])
+    background = cached["stage2"]["background_negative"]
+
+    assert background["mode"] == "fbank_cache"
+    assert background["audio_list_path"] == ""
+    assert background["cache_manifest"].endswith(
+        "stage2_background_cache/manifest.json"
+    )
+    assert score.version == 4
+    assert score.value == QbyTReadoutConfig(
+        mode="eps_softmin",
+        temperature=1.0,
+        sink_token=True,
+        text_position="learned",
+        audio_position="relative_bias",
+    )
+    assert cached["stage2"]["run_name"] != v41["stage2"]["run_name"]
+    assert cached["stage2"]["log_dir"] != v41["stage2"]["log_dir"]
+    assert cached["stage2"]["checkpoint_dir"] != v41["stage2"]["checkpoint_dir"]
+    assert cached["stage2"]["run_name"] == (
+        "icefall-zipformer-frozen-eps-softmin-v41-cached"
     )
 
 

@@ -432,6 +432,26 @@ class Stage2NoiseAugmentationConfig:
     snr_db_max: float = 20.0
 
 
+def _require_int(value: object, *, field: str, minimum: int) -> int:
+    """Reject ``bool`` (a subclass of ``int``) and values below ``minimum``."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{field} must be an int >= {minimum}, got {value!r}")
+    return value
+
+
+def _normalize_background_negative_mode(value: object) -> str:
+    if value is None:
+        mode = "online"
+    else:
+        mode = str(value).strip()
+    if mode not in {"online", "fbank_cache"}:
+        raise ValueError(
+            "stage2.background_negative.mode must be 'online' or "
+            f"'fbank_cache', got {value!r}"
+        )
+    return mode
+
+
 @dataclass
 class Stage2BackgroundNegativeConfig:
     """Optional pure music/noise/ambient negatives for Stage-II training."""
@@ -442,6 +462,38 @@ class Stage2BackgroundNegativeConfig:
     audio_list_path: str = ""
     duration_seconds_min: float = 1.0
     duration_seconds_max: float = 3.0
+    #: ``online`` draws from ``audio_list_path``; ``fbank_cache`` reads a crop library.
+    mode: str = "online"
+    cache_manifest: str = ""
+    max_open_shards: int = 8
+
+    def __post_init__(self) -> None:
+        self.mode = _normalize_background_negative_mode(self.mode)
+        self.max_open_shards = _require_int(
+            self.max_open_shards,
+            field="stage2.background_negative.max_open_shards",
+            minimum=1,
+        )
+
+
+@dataclass
+class Stage2MetadataCacheConfig:
+    """Per-worker LRU for Stage-II clips/distances metadata files."""
+
+    max_entries: int = 128
+    max_bytes: int = 33554432
+
+    def __post_init__(self) -> None:
+        self.max_entries = _require_int(
+            self.max_entries,
+            field="stage2.metadata_cache.max_entries",
+            minimum=0,
+        )
+        self.max_bytes = _require_int(
+            self.max_bytes,
+            field="stage2.metadata_cache.max_bytes",
+            minimum=1,
+        )
 
 
 @dataclass
@@ -500,6 +552,9 @@ class Stage2Config:
     )
     background_negative: Stage2BackgroundNegativeConfig = field(
         default_factory=Stage2BackgroundNegativeConfig
+    )
+    metadata_cache: Stage2MetadataCacheConfig = field(
+        default_factory=Stage2MetadataCacheConfig
     )
     phoneme_adapter: Stage2PhonemeAdapterConfig = field(
         default_factory=Stage2PhonemeAdapterConfig

@@ -278,6 +278,9 @@ class LibriPhraseTrainDataset(Dataset):
             "audio_list_path",
             "duration_seconds_min",
             "duration_seconds_max",
+            "mode",
+            "cache_manifest",
+            "max_open_shards",
         }
         unknown_background_keys = sorted(
             set(background_cfg) - allowed_background_keys
@@ -287,11 +290,50 @@ class LibriPhraseTrainDataset(Dataset):
                 "Unknown stage2.background_negative fields: "
                 + ", ".join(unknown_background_keys)
             )
+        if "mode" not in background_cfg or background_cfg["mode"] is None:
+            mode = "online"
+        else:
+            mode = str(background_cfg["mode"]).strip()
+        if mode not in {"online", "fbank_cache"}:
+            raise ValueError(
+                "stage2.background_negative.mode must be 'online' or "
+                f"'fbank_cache', got {background_cfg.get('mode')!r}"
+            )
+        if "max_open_shards" in background_cfg:
+            max_open_shards = background_cfg["max_open_shards"]
+            if (
+                isinstance(max_open_shards, bool)
+                or not isinstance(max_open_shards, int)
+                or max_open_shards < 1
+            ):
+                raise ValueError(
+                    "stage2.background_negative.max_open_shards must be a "
+                    f"positive int, got {max_open_shards!r}"
+                )
         if bool(background_cfg.get("enabled", False)):
             probability = float(background_cfg.get("probability", 0.25))
             if not 0.0 <= probability <= 1.0:
                 raise ValueError(
                     "Stage II background negative probability must be between 0 and 1"
+                )
+            if mode == "fbank_cache":
+                cache_manifest = str(
+                    background_cfg.get("cache_manifest", "")
+                ).strip()
+                if not cache_manifest:
+                    raise ValueError(
+                        "stage2.background_negative.cache_manifest is required "
+                        "when mode=fbank_cache"
+                    )
+                if fbank_kwargs is not None and "dither" in fbank_kwargs:
+                    dither = fbank_kwargs["dither"]
+                    if float(dither) != 0.0:
+                        raise ValueError(
+                            "stage2.background_negative.mode=fbank_cache "
+                            f"requires fbank dither=0, got {dither!r}"
+                        )
+                raise ValueError(
+                    "stage2.background_negative.mode=fbank_cache is not wired"
                 )
             audio_list_path = str(
                 background_cfg.get("audio_list_path", "")

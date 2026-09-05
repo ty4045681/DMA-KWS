@@ -85,6 +85,14 @@ background_negative:
   audio_list_path: ""
   duration_seconds_min: 1.0
   duration_seconds_max: 3.0
+  mode: online                 # online | fbank_cache
+  cache_manifest: ""
+  max_open_shards: 8            # positive int; each worker independent
+
+# clips/distances shared LRU; 0 entries disables. Both caps apply per worker.
+metadata_cache:
+  max_entries: 128              # clips/distances shared LRU; 0 disables
+  max_bytes: 33554432           # 32 MiB / worker; both caps apply
 
 # Phoneme-CTC trunk between the frozen encoder and QbyT (see configs/phoneme_adapter).
 # Off by default so the adapter-free v6 recipe remains the canonical baseline.
