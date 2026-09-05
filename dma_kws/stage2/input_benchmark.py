@@ -37,7 +37,7 @@ from dma_kws.stage2.train_data import (
     build_stage2_train_dataset,
 )
 from dma_kws.tokenizer import load_char_tokenizer
-from dma_kws.training.ddp import resolve_precision
+from dma_kws.training.ddp import apply_step_based_validation, resolve_precision
 
 
 class InputBenchmarkError(Exception):
@@ -533,6 +533,26 @@ def _online_crop_timed(source, spec, extractor) -> tuple[torch.Tensor, dict[str,
     }
 
 
+def prepare_train_benchmark_trainer_kwargs(
+    trainer_kwargs: dict[str, Any],
+    loader: Any,
+) -> dict[str, Any]:
+    """Disable checkpoint/loggers/val *execution* the same way official training clocks val.
+
+    Keeps Lightning's integer ``val_check_interval`` and routes it through
+    ``apply_step_based_validation(..., force=True)``. Validation is skipped by
+    ``limit_val_batches=0`` / ``num_sanity_val_steps=0``, not by popping the
+    interval (which is Lightning-version-sensitive).
+    """
+    trainer_kwargs["logger"] = False
+    trainer_kwargs["enable_checkpointing"] = False
+    trainer_kwargs["enable_model_summary"] = False
+    trainer_kwargs["num_sanity_val_steps"] = 0
+    trainer_kwargs["limit_val_batches"] = 0
+    apply_step_based_validation(trainer_kwargs, len(loader), force=True)
+    return trainer_kwargs
+
+
 def _open_background_cache(config: dict[str, Any], manifest: Path):
     from dma_kws.stage2.background_cache import BackgroundFeatureCache
 
@@ -609,21 +629,6 @@ def _run_background(
 
     warmup_ids = crop_ids[: warmup_batches * batch_size]
     measure_ids = crop_ids[warmup_batches * batch_size :]
-    first_next = 0.0
-    warmup_seconds = 0.0
-    if warmup_batches:
-        started = time.perf_counter()
-        for index, crop_id in enumerate(warmup_ids):
-            row = crops[crop_id]
-            spec = _spec_from_row(row)
-            source = source_for(str(row["source_id"]))
-            batch_started = time.perf_counter()
-            _online_crop_timed(source, spec, extractor)
-            cache.read_crop(int(crop_id))
-            if index == 0:
-                first_next = time.perf_counter() - batch_started
-        warmup_seconds = time.perf_counter() - started
-
     component = {
         "read_seconds": 0.0,
         "crop_seconds": 0.0,
@@ -642,30 +647,53 @@ def _run_background(
     def _shard_index(crop_id: int) -> int:
         return int(crops[crop_id]["shard_index"])
 
-    with _profile_cm(profile, output, device) as profile_info:
-        measure_started = time.perf_counter()
-        for batch_index in range(measure_batches):
-            batch_ids = measure_ids[
-                batch_index * batch_size : (batch_index + 1) * batch_size
-            ]
-            batch_started = time.perf_counter()
-            batch_lengths: list[int] = []
-            for crop_id in batch_ids:
-                open_before = _shard_index(crop_id) in cache._open_shards
-                cached_started = time.perf_counter()
-                stored = cache.read_crop(int(crop_id))
+    def _read_cache_batch(batch_ids: Sequence[int], *, record_stats: bool) -> tuple[list[int], float]:
+        nonlocal cache_hits, cache_misses, high_water
+        batch_started = time.perf_counter()
+        batch_lengths: list[int] = []
+        for crop_id in batch_ids:
+            open_before = _shard_index(int(crop_id)) in cache._open_shards
+            cached_started = time.perf_counter()
+            stored = cache.read_crop(int(crop_id))
+            if record_stats:
                 component["cache_read_seconds"] += time.perf_counter() - cached_started
                 if open_before:
                     cache_hits += 1
                 else:
                     cache_misses += 1
                 high_water = max(high_water, len(cache._open_shards))
-                batch_lengths.append(int(stored.shape[0]))
-            waits.append(time.perf_counter() - batch_started)
+            batch_lengths.append(int(stored.shape[0]))
+        return batch_lengths, time.perf_counter() - batch_started
+
+    # Warmup/measure waits are cache read_crop only. Online recompute is timed
+    # separately into component_times and must not enter first_next / warmup /
+    # wait_* / measured_wall_seconds. first_next is the first cache *batch* of
+    # batch_size_per_gpu crops (same unit as loader next()).
+    first_next = 0.0
+    warmup_seconds = 0.0
+    if warmup_batches:
+        started = time.perf_counter()
+        for batch_index in range(warmup_batches):
+            batch_ids = warmup_ids[
+                batch_index * batch_size : (batch_index + 1) * batch_size
+            ]
+            _lengths, wait = _read_cache_batch(batch_ids, record_stats=False)
+            if batch_index == 0:
+                first_next = wait
+        warmup_seconds = time.perf_counter() - started
+
+    with _profile_cm(profile, output, device) as profile_info:
+        measure_started = time.perf_counter()
+        for batch_index in range(measure_batches):
+            batch_ids = measure_ids[
+                batch_index * batch_size : (batch_index + 1) * batch_size
+            ]
+            batch_lengths, wait = _read_cache_batch(batch_ids, record_stats=True)
+            waits.append(wait)
             lengths.extend(batch_lengths)
             padding_ratios.append(padding_ratio(batch_lengths))
             if warmup_batches == 0 and batch_index == 0:
-                first_next = waits[0]
+                first_next = wait
         cache_wall = time.perf_counter() - measure_started
         online_started = time.perf_counter()
         for crop_id in measure_ids:
@@ -714,6 +742,8 @@ def _run_background(
         open_shard_high_water=high_water,
     )
     payload["component_times"] = component
+    payload["first_next_scope"] = "cache_batch"
+    payload["first_next_crops"] = int(batch_size)
     payload["crop_repeat_rate"] = (
         1.0 - (unique_measure / len(measure_ids)) if measure_ids else 0.0
     )
@@ -967,13 +997,7 @@ def _run_train(
         limit_steps=optimizer_steps,
         accelerator=accelerator,
     )
-    trainer_kwargs["logger"] = False
-    trainer_kwargs["enable_checkpointing"] = False
-    trainer_kwargs["enable_model_summary"] = False
-    trainer_kwargs["num_sanity_val_steps"] = 0
-    trainer_kwargs["limit_val_batches"] = 0
-    trainer_kwargs.pop("val_check_interval", None)
-    trainer_kwargs["check_val_every_n_epoch"] = None
+    prepare_train_benchmark_trainer_kwargs(trainer_kwargs, timed)
     precision = str(trainer_kwargs.get("precision") or resolve_precision(stage2, accelerator))
 
     with _profile_cm(profile, output, device) as profile_info:

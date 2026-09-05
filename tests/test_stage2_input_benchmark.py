@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -495,3 +496,95 @@ def test_cli_requires_output_and_background_paths(tmp_path):
     assert args.mode == "background"
     assert args.experiment == DEFAULT_EXPERIMENT
     assert args.override == ["stage2.num_workers=0"]
+
+
+def test_train_benchmark_reuses_official_step_based_validation():
+    from dma_kws.stage2.input_benchmark import prepare_train_benchmark_trainer_kwargs
+    from dma_kws.training.ddp import build_trainer_kwargs
+
+    config = {
+        "stage2": {
+            "val_check_interval": 1000,
+            "max_steps": 50,
+            "accumulate_grad_batches": 2,
+            "log_interval": 10,
+        }
+    }
+    kwargs = build_trainer_kwargs(config, devices=1, limit_steps=4, accelerator="cpu")
+    assert kwargs["val_check_interval"] == 1000
+
+    class _Loader:
+        def __len__(self) -> int:
+            return 3
+
+    prepared = prepare_train_benchmark_trainer_kwargs(kwargs, _Loader())
+    assert prepared is kwargs
+    assert prepared["val_check_interval"] == 1000
+    assert prepared["limit_val_batches"] == 0
+    assert prepared["num_sanity_val_steps"] == 0
+    assert prepared["check_val_every_n_epoch"] is None
+    assert prepared["logger"] is False
+    assert prepared["enable_checkpointing"] is False
+
+
+def test_run_train_does_not_pop_val_check_interval():
+    source = (PROJECT_ROOT / "dma_kws/stage2/input_benchmark.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_train"
+    )
+    call_names: list[str] = []
+    popped: list[str] = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            call_names.append(func.id)
+        elif isinstance(func, ast.Attribute):
+            call_names.append(func.attr)
+            if func.attr == "pop" and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    popped.append(arg.value)
+    assert "prepare_train_benchmark_trainer_kwargs" in call_names
+    assert "val_check_interval" not in popped
+
+
+def test_background_warmup_and_first_next_are_cache_only(tmp_path, monkeypatch):
+    from dma_kws.stage2 import input_benchmark as module
+
+    built = _build_cache(tmp_path)
+    config = built["composed"]
+    config["stage2"]["batch_size_per_gpu"] = 2
+    original = module._online_crop_timed
+    online_sleep = 0.03
+
+    def slow_online(*args, **kwargs):
+        time.sleep(online_sleep)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_online_crop_timed", slow_online)
+    payload = module.run_input_benchmark(
+        mode="background",
+        config=config,
+        output=tmp_path / "bg-cache-only.json",
+        warmup_batches=1,
+        measure_batches=1,
+        device="cpu",
+        manifest=built["manifest_path"],
+        split_dir=built["layout"]["split_dir"],
+    )
+    assert payload["first_next_scope"] == "cache_batch"
+    assert payload["first_next_crops"] == payload["batch_size"] == 2
+    assert payload["warmup_seconds"] < online_sleep
+    assert payload["first_next_seconds"] < online_sleep
+    assert payload["first_next_seconds"] <= payload["warmup_seconds"] + 1e-6
+    assert payload["measured_wall_seconds"] < online_sleep
+    assert payload["wait_p50_ms"] < online_sleep * 1000.0
+    assert payload["component_times"]["online_total_seconds"] >= online_sleep
+    assert payload["component_times"]["read_seconds"] >= 0.0
