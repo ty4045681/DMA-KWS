@@ -215,14 +215,17 @@ def test_dataset_fbank_cache_requires_cache_manifest(monkeypatch):
         )
 
 
-def test_dataset_fbank_cache_raises_not_wired_without_constructing_sampler(
+def test_dataset_fbank_cache_does_not_construct_online_sampler_when_manifest_missing(
     monkeypatch,
 ):
     monkeypatch.setattr(
         "dma_kws.stage2.features.TrainingBackgroundSampler",
         _MustNotConstructSampler,
     )
-    with pytest.raises(ValueError, match="not wired"):
+    with pytest.raises(
+        (FileNotFoundError, ValueError),
+        match="stage2_background_cache/manifest",
+    ):
         _make_dataset(
             background_negative={
                 "enabled": True,
@@ -239,7 +242,18 @@ def test_dataset_fbank_cache_does_not_load_audio_list_even_when_set(monkeypatch)
         "dma_kws.stage2.features.TrainingBackgroundSampler",
         _MustNotConstructSampler,
     )
-    with pytest.raises(ValueError, match="fbank_cache"):
+
+    def _must_not_load(_path):
+        raise AssertionError("fbank_cache must not call _load_noise_files")
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.TrainingNoiseAugmenter._load_noise_files",
+        _must_not_load,
+    )
+    with pytest.raises(
+        (FileNotFoundError, ValueError),
+        match="manifest",
+    ):
         _make_dataset(
             background_negative={
                 "enabled": True,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from dma_kws.pathing import PROJECT_ROOT, resolve_dict_path
 from dma_kws.training.device import resolve_accelerator_and_devices
@@ -34,6 +34,23 @@ def _resolve_path(stage2: dict[str, Any], key: str, default: Path) -> Path:
     if raw:
         return Path(raw)
     return default
+
+
+def background_negative_run_paths(
+    background_negative: Mapping[str, Any] | None,
+    sampler: Any,
+) -> dict[str, Any]:
+    """Fields for the existing Stage II run summary / runs.csv identity block."""
+    cfg = dict(background_negative or {})
+    if not bool(cfg.get("enabled", False)):
+        return {}
+    paths: dict[str, Any] = {
+        "background_audio_list": cfg.get("audio_list_path", ""),
+    }
+    record = getattr(sampler, "run_record_fields", None)
+    if callable(record):
+        paths.update(record())
+    return paths
 
 
 def _build_val_dataloader(config: dict[str, Any], tokenizer: Any) -> Any:
@@ -290,10 +307,22 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         version=run_context.version,
     )
 
+    background_paths = background_negative_run_paths(
+        background_negative,
+        train_dataset._background_sampler,
+    )
     hparams = collect_hparams(
         config,
         effective_max_steps=run_context.effective_max_steps,
-        extra={**run_context.identity(), "checkpoint_dir": str(checkpoint_dir)},
+        extra={
+            **run_context.identity(),
+            "checkpoint_dir": str(checkpoint_dir),
+            **{
+                key: value
+                for key, value in background_paths.items()
+                if key != "background_audio_list"
+            },
+        },
     )
     for train_logger in loggers:
         train_logger.log_hyperparams(hparams)
@@ -360,15 +389,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
                 if noise_augmentation.get("enabled", False)
                 else {}
             ),
-            **(
-                {
-                    "background_audio_list": background_negative.get(
-                        "audio_list_path", ""
-                    )
-                }
-                if background_negative.get("enabled", False)
-                else {}
-            ),
+            **background_paths,
             **(
                 {"resume_from": run_context.resume_from}
                 if run_context.resume_from

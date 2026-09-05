@@ -342,29 +342,43 @@ class LibriPhraseTrainDataset(Dataset):
                             "stage2.background_negative.mode=fbank_cache "
                             f"requires fbank dither=0, got {dither!r}"
                         )
-                raise ValueError(
-                    "stage2.background_negative.mode=fbank_cache is not wired"
-                )
-            audio_list_path = str(
-                background_cfg.get("audio_list_path", "")
-            ).strip()
-            if not audio_list_path:
-                raise ValueError(
-                    "stage2.background_negative.audio_list_path is required when enabled"
-                )
+                from dma_kws.stage2.background_cache import BackgroundFeatureCache
 
-            from dma_kws.stage2.features import TrainingBackgroundSampler
+                self._background_sampler = BackgroundFeatureCache(
+                    cache_manifest,
+                    expected_fbank_kwargs=dict(fbank_kwargs or {}),
+                    duration_seconds_min=float(
+                        background_cfg.get("duration_seconds_min", 1.0)
+                    ),
+                    duration_seconds_max=float(
+                        background_cfg.get("duration_seconds_max", 3.0)
+                    ),
+                    audio_list_path=str(
+                        background_cfg.get("audio_list_path", "")
+                    ).strip(),
+                    max_open_shards=background_cfg.get("max_open_shards", 8),
+                )
+            else:
+                audio_list_path = str(
+                    background_cfg.get("audio_list_path", "")
+                ).strip()
+                if not audio_list_path:
+                    raise ValueError(
+                        "stage2.background_negative.audio_list_path is required when enabled"
+                    )
 
-            self._background_sampler = TrainingBackgroundSampler(
-                audio_list_path=audio_list_path,
-                duration_seconds_min=float(
-                    background_cfg.get("duration_seconds_min", 1.0)
-                ),
-                duration_seconds_max=float(
-                    background_cfg.get("duration_seconds_max", 3.0)
-                ),
-                fbank_kwargs=fbank_kwargs,
-            )
+                from dma_kws.stage2.features import TrainingBackgroundSampler
+
+                self._background_sampler = TrainingBackgroundSampler(
+                    audio_list_path=audio_list_path,
+                    duration_seconds_min=float(
+                        background_cfg.get("duration_seconds_min", 1.0)
+                    ),
+                    duration_seconds_max=float(
+                        background_cfg.get("duration_seconds_max", 3.0)
+                    ),
+                    fbank_kwargs=fbank_kwargs,
+                )
             self._background_probability = probability
 
         max_entries, max_bytes = resolve_metadata_cache_limits(metadata_cache)
