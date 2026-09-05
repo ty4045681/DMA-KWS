@@ -188,6 +188,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
         background_negative=background_negative,
         fbank_kwargs=fbank_kwargs(get_fbank_config(config)),
         seq_label_mode=sequence_objective.target_mode,
+        metadata_cache=stage2.get("metadata_cache", {}) or {},
     )
 
     batch_size = int(stage2.get("batch_size_per_gpu", 64))
