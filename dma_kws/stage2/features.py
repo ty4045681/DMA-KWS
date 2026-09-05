@@ -11,6 +11,12 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
+from dma_kws.stage2.background_sampling import (
+    BackgroundSourceInfo,
+    draw_crop_spec,
+    materialize_crop,
+    probe_source_info,
+)
 from dma_kws.stage2.fbank import FbankExtractor
 
 DEFAULT_NUM_MEL_BINS = 80
@@ -259,11 +265,23 @@ class TrainingBackgroundSampler:
         )
         self._fbank_kwargs = dict(fbank_kwargs or {})
         self._fbank_extractor: FbankExtractor | None = None
+        # Worker-local header cache. Probe sample_rate/frames/channels without
+        # decoding audio or consuming dataset RNG.
+        self._source_info_cache: dict[str, BackgroundSourceInfo] = {}
 
     def _fbank(self) -> FbankExtractor:
         if self._fbank_extractor is None:
             self._fbank_extractor = FbankExtractor(**self._fbank_kwargs)
         return self._fbank_extractor
+
+    def _source_info(self, path: Path) -> BackgroundSourceInfo:
+        key = str(path)
+        cached = self._source_info_cache.get(key)
+        if cached is not None:
+            return cached
+        info = probe_source_info(path)
+        self._source_info_cache[key] = info
+        return info
 
     def extract(self, *, rng: random.Random) -> torch.Tensor:
         """Sample one background crop and return configured fbank features."""
@@ -272,27 +290,9 @@ class TrainingBackgroundSampler:
             self.duration_seconds_max,
         )
         source_path = rng.choice(self.audio_paths)
-
-        # _load_audio only needs a target sample-count/rate ratio to determine
-        # the requested duration. Microsecond units preserve fractional seconds
-        # without first opening the file merely to discover its sample rate.
-        duration_units = max(1, round(duration_seconds * 1_000_000))
-        waveform, sample_rate = _load_audio(
-            source_path,
-            rng=rng,
-            target_samples=duration_units,
-            target_sample_rate=1_000_000,
-        )
-        waveform = TrainingNoiseAugmenter._as_mono(
-            waveform,
-            source=source_path,
-        )
-        target_samples = max(1, round(duration_seconds * sample_rate))
-        waveform = TrainingNoiseAugmenter._match_noise_length(
-            waveform,
-            target_samples,
-            rng=rng,
-        )
+        source = self._source_info(source_path)
+        spec = draw_crop_spec(source, duration_seconds, rng=rng)
+        waveform, sample_rate = materialize_crop(source, spec)
         return self._fbank().extract(waveform, sample_rate)
 
 
