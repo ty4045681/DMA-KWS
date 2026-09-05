@@ -1,0 +1,22 @@
+# @package _global_
+# Frozen Zipformer Stage II v4.1 with a precomputed crop-level background
+# fbank cache. Architecture, readout, loss, optimizer, and MUSAN split stay
+# identical to icefall_zipformer_stage2_eps_softmin_v41; only the data source
+# and run paths change. The cache reader is not wired yet.
+#
+# Usage:
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_eps_softmin_v41_cached \
+#     stage2.freeze_encoder=true
+
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41
+  - _self_
+
+stage2:
+  background_negative:
+    mode: fbank_cache
+    audio_list_path: ""
+    cache_manifest: ${paths.processed_root}/stage2_background_cache/manifest.json
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-eps-softmin-v41-cached
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-eps-softmin-v41-cached
+  run_name: icefall-zipformer-frozen-eps-softmin-v41-cached
