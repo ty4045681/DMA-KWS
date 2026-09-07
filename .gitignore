@@ -47,3 +47,8 @@ qbyt/logs/
 # Local worktrees
 .worktrees/
 worktrees/
+
+work/
+.codegraph
+.commandcode
+.superpowers/
