@@ -616,6 +616,8 @@ class Stage2LightningModule(pl.LightningModule):
         )
         encoder_lengths = encoder_mask.squeeze(1).sum(dim=1).to(dtype=torch.long)
         anchor_lengths = batch["anchor"].ne(0).sum(dim=1).to(dtype=torch.long)
+        labels = batch["label"]
+        utt_sample_mask = torch.ones(labels.shape[0], dtype=torch.bool, device=labels.device)
         if self.qbyt_score.family == "pooling":
             from dma_kws.stage2.losses_pooling import (
                 compute_stage2_losses as compute_pooling_losses,
@@ -624,7 +626,7 @@ class Stage2LightningModule(pl.LightningModule):
             total_loss, losses = compute_pooling_losses(
                 logits=logits,
                 seq_logits=seq_logits,
-                labels=batch["label"],
+                labels=labels,
                 seq_labels=batch["seq_label"],
                 seq_label_mask=batch["seq_label_mask"],
                 seq_progress_weight=self.seq_progress_weight,
@@ -635,6 +637,7 @@ class Stage2LightningModule(pl.LightningModule):
                 ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
                 ctc_weight=self.ctc_weight,
             )
+            losses["utt_sample_mask"] = utt_sample_mask
             return total_loss, losses, logits
 
         valid_path_mask = None
@@ -647,10 +650,11 @@ class Stage2LightningModule(pl.LightningModule):
                 & minimum_path_frames.le(encoder_lengths)
                 & minimum_path_frames.le(self.qbyt_alignment.max_keyword_span_frames)
             )
+            utt_sample_mask = valid_path_mask
         total_loss, losses = compute_stage2_losses(
             logits=logits,
             seq_logits=seq_logits,
-            labels=batch["label"],
+            labels=labels,
             seq_labels=batch["seq_label"],
             seq_label_mask=batch["seq_label_mask"],
             seq_progress_weight=self.seq_progress_weight,
@@ -661,6 +665,7 @@ class Stage2LightningModule(pl.LightningModule):
             ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
             ctc_weight=self.ctc_weight,
         )
+        losses["utt_sample_mask"] = utt_sample_mask
         if valid_path_mask is not None:
             losses["valid_path_mask"] = valid_path_mask
             losses["illegal_path_rate"] = (~valid_path_mask).float().mean()

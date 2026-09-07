@@ -344,6 +344,114 @@ def test_adapter_resume_is_explicit_except_for_tts_to_real_handoff(tmp_path):
     assert _resolve_adapter_resume(real_paths, "real") == str(stale_tts)
 
 
+def _stub_lora_training_module(*, logits, losses, total_loss):
+    from dma_kws.stage2.adapt import Stage2LoraAdaptationModule
+
+    module = Stage2LoraAdaptationModule.__new__(Stage2LoraAdaptationModule)
+    nn.Module.__init__(module)
+    module._forward_train_losses = lambda batch: (total_loss, losses, logits)
+    module._log_train_losses = lambda *args, **kwargs: None
+    logged: dict[str, torch.Tensor] = {}
+    module.log = lambda name, value, **kwargs: logged.__setitem__(name, value)
+    return module, logged
+
+
+def _distinct_source_split_tensors():
+    """Keyword [0,1], LPH [2], excluded LPH [3] with a huge BCE so mix-ups show."""
+    logits = torch.tensor([0.0, 2.0, 1.0, 50.0])
+    labels = torch.tensor([1, 0, 1, 0])
+    source = torch.tensor([1, 1, 0, 0])
+    utt_sample_mask = torch.tensor([True, True, True, False])
+    per_sample = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, labels.float(), reduction="none"
+    )
+    return logits, labels, source, utt_sample_mask, per_sample
+
+
+def test_grouped_utt_bce_totals_exclude_invalid_samples_from_source_means():
+    from dma_kws.stage2.adapt import grouped_utt_bce_totals
+
+    logits, labels, source, utt_sample_mask, per_sample = _distinct_source_split_tensors()
+    totals = grouped_utt_bce_totals(logits, labels, source, utt_sample_mask)
+    keyword_loss_sum, keyword_count, lph_loss_sum, lph_count = totals.unbind()
+
+    torch.testing.assert_close(keyword_loss_sum, (per_sample[0] + per_sample[1]).double())
+    torch.testing.assert_close(keyword_count, torch.tensor(2.0, dtype=torch.float64))
+    torch.testing.assert_close(lph_loss_sum, per_sample[2].double())
+    torch.testing.assert_close(lph_count, torch.tensor(1.0, dtype=torch.float64))
+
+
+def test_lora_training_step_logs_exact_source_means_and_ignores_excluded_loss():
+    logits, labels, source, utt_sample_mask, per_sample = _distinct_source_split_tensors()
+    total_loss = torch.tensor(0.25)
+    module, logged = _stub_lora_training_module(
+        logits=logits,
+        losses={"utt_sample_mask": utt_sample_mask},
+        total_loss=total_loss,
+    )
+
+    loss = module.training_step({"source": source, "label": labels}, 0)
+
+    assert torch.equal(loss, total_loss)
+    torch.testing.assert_close(
+        logged["train/microbatch/loss_keyword_utt_raw"],
+        ((per_sample[0] + per_sample[1]) / 2).double(),
+    )
+    torch.testing.assert_close(
+        logged["train/microbatch/loss_lph_utt_raw"],
+        per_sample[2].double(),
+    )
+    torch.testing.assert_close(
+        logged["train/microbatch/source_keyword_fraction"],
+        torch.tensor(2.0 / 3.0, dtype=torch.float64),
+    )
+
+
+def test_lora_training_step_requires_utt_sample_mask():
+    logits = torch.zeros(2)
+    labels = torch.tensor([1, 0])
+    source = torch.tensor([1, 0])
+    module, _logged = _stub_lora_training_module(
+        logits=logits, losses={}, total_loss=torch.tensor(0.1)
+    )
+
+    with pytest.raises(KeyError, match="utt_sample_mask"):
+        module.training_step({"source": source, "label": labels}, 0)
+
+
+def test_lora_source_logs_nan_when_a_group_or_the_batch_is_empty():
+    logits = torch.tensor([0.0, 1.0])
+    labels = torch.tensor([1, 0])
+    total_loss = torch.tensor(0.1)
+
+    all_lph_module, all_lph_logged = _stub_lora_training_module(
+        logits=logits,
+        losses={"utt_sample_mask": torch.tensor([True, True])},
+        total_loss=total_loss,
+    )
+    all_lph_module.training_step(
+        {"source": torch.tensor([0, 0]), "label": labels}, 0
+    )
+    assert torch.isnan(all_lph_logged["train/microbatch/loss_keyword_utt_raw"])
+    assert torch.isfinite(all_lph_logged["train/microbatch/loss_lph_utt_raw"])
+    torch.testing.assert_close(
+        all_lph_logged["train/microbatch/source_keyword_fraction"],
+        torch.tensor(0.0, dtype=torch.float64),
+    )
+
+    all_invalid_module, all_invalid_logged = _stub_lora_training_module(
+        logits=logits,
+        losses={"utt_sample_mask": torch.tensor([False, False])},
+        total_loss=total_loss,
+    )
+    all_invalid_module.training_step(
+        {"source": torch.tensor([1, 0]), "label": labels}, 0
+    )
+    assert torch.isnan(all_invalid_logged["train/microbatch/loss_keyword_utt_raw"])
+    assert torch.isnan(all_invalid_logged["train/microbatch/loss_lph_utt_raw"])
+    assert torch.isnan(all_invalid_logged["train/microbatch/source_keyword_fraction"])
+
+
 def test_sweep_objective_stub(monkeypatch):
     from dma_kws.stage2 import sweep_adapt
     from dma_kws.stage2.adapt import Stage2AdaptArgs

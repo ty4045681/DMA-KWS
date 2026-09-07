@@ -202,6 +202,7 @@ def test_training_masks_structurally_illegal_paths(monkeypatch):
     _, losses, _ = module._forward_train_losses(batch)
 
     assert captured["valid_path_mask"].tolist() == [True, False, False]
+    assert losses["utt_sample_mask"].tolist() == [True, False, False]
     assert torch.allclose(losses["illegal_path_rate"], torch.tensor(2.0 / 3.0))
 
 
@@ -323,6 +324,23 @@ def test_restore_with_different_alignment_is_rejected(monkeypatch):
     stamp_qbyt_readout_version(checkpoint, alignment=other.qbyt_alignment)
     with pytest.raises(SystemExit, match="current config expects"):
         module.on_load_checkpoint(checkpoint)
+
+
+@pytest.mark.parametrize(
+    ("config_fn", "family"),
+    [(_pooling_config, "pooling"), (_bounded_config, "bounded")],
+)
+def test_forward_train_losses_utt_sample_mask_is_all_valid_without_path_filter(
+    monkeypatch, config_fn, family
+):
+    _patch_model(monkeypatch)
+    module = Stage2LightningModule(config_fn(), vocab_size=20)
+    assert module.qbyt_score.family == family
+
+    _, losses, _ = module._forward_train_losses(_batch())
+
+    assert losses["utt_sample_mask"].tolist() == [True, True]
+    assert "valid_path_mask" not in losses
 
 
 def test_pooling_allows_background_negative_and_negative_tail(monkeypatch):

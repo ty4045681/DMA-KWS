@@ -331,6 +331,33 @@ def _validate_adapter_checkpoint(
     return adapter_state
 
 
+def grouped_utt_bce_totals(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    source: torch.Tensor,
+    utt_sample_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Local (keyword_loss_sum, keyword_count, lph_loss_sum, lph_count) as float64.
+
+    Callers reduce this tensor across ranks before dividing. Empty groups have a
+    zero count so the logger can emit NaN rather than a mean of no samples.
+    """
+    valid_mask = utt_sample_mask.bool()
+    keyword_mask = source.bool() & valid_mask
+    lph_mask = ~source.bool() & valid_mask
+    per_sample = F.binary_cross_entropy_with_logits(
+        logits, labels.float(), reduction="none"
+    )
+    return torch.stack(
+        (
+            per_sample.detach()[keyword_mask].sum(),
+            keyword_mask.sum().to(per_sample),
+            per_sample.detach()[lph_mask].sum(),
+            lph_mask.sum().to(per_sample),
+        )
+    ).to(dtype=torch.float64)
+
+
 class Stage2LoraAdaptationModule(Stage2LightningModule):
     """Stage II module with frozen encoder/base QbyT and trainable LoRA adapters."""
 
@@ -534,51 +561,44 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         total_loss, losses, logits = self._forward_train_losses(batch)
         self._log_train_losses(total_loss, losses)
-
         source = batch.get("source")
         if source is not None:
-            valid_path_mask = losses["valid_path_mask"].bool()
-            keyword_mask = source.bool() & valid_path_mask
-            per_sample = F.binary_cross_entropy_with_logits(
-                logits, batch["label"].float(), reduction="none"
-            )
-            lph_mask = ~source.bool() & valid_path_mask
-            global_stats = sum_across_processes(
-                torch.stack(
-                    (
-                        per_sample.detach()[keyword_mask].sum(),
-                        keyword_mask.sum().to(per_sample),
-                        per_sample.detach()[lph_mask].sum(),
-                        lph_mask.sum().to(per_sample),
-                    )
-                ).to(dtype=torch.float64)
-            )
-            keyword_loss_sum, keyword_count, lph_loss_sum, lph_count = (
-                global_stats.unbind()
-            )
-            total_count = keyword_count + lph_count
-            no_value = global_stats.new_tensor(float("nan"))
-            self.log(
-                "train/microbatch/source_keyword_fraction",
-                keyword_count / total_count if total_count.item() > 0 else no_value,
-                on_step=True,
-                sync_dist=True,
-            )
-            self.log(
-                "train/microbatch/loss_keyword_utt_raw",
-                keyword_loss_sum / keyword_count
-                if keyword_count.item() > 0
-                else no_value,
-                on_step=True,
-                sync_dist=True,
-            )
-            self.log(
-                "train/microbatch/loss_lph_utt_raw",
-                lph_loss_sum / lph_count if lph_count.item() > 0 else no_value,
-                on_step=True,
-                sync_dist=True,
+            self._log_source_losses(
+                logits, batch["label"], source, losses["utt_sample_mask"]
             )
         return total_loss
+
+    def _log_source_losses(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        source: torch.Tensor,
+        utt_sample_mask: torch.Tensor,
+    ) -> None:
+        global_stats = sum_across_processes(
+            grouped_utt_bce_totals(logits, labels, source, utt_sample_mask)
+        )
+        keyword_loss_sum, keyword_count, lph_loss_sum, lph_count = global_stats.unbind()
+        total_count = keyword_count + lph_count
+        no_value = global_stats.new_tensor(float("nan"))
+        self.log(
+            "train/microbatch/source_keyword_fraction",
+            keyword_count / total_count if total_count.item() > 0 else no_value,
+            on_step=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train/microbatch/loss_keyword_utt_raw",
+            keyword_loss_sum / keyword_count if keyword_count.item() > 0 else no_value,
+            on_step=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train/microbatch/loss_lph_utt_raw",
+            lph_loss_sum / lph_count if lph_count.item() > 0 else no_value,
+            on_step=True,
+            sync_dist=True,
+        )
 
     def validation_step(
         self,
