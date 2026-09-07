@@ -597,3 +597,217 @@ def test_background_warmup_and_first_next_are_cache_only(tmp_path, monkeypatch):
     assert payload["wait_p50_ms"] < online_sleep * 1000.0
     assert payload["component_times"]["online_total_seconds"] >= online_sleep
     assert payload["component_times"]["read_seconds"] >= 0.0
+
+
+def test_incomplete_train_window_is_rejected_not_reported_as_success():
+    from dma_kws.stage2.input_benchmark import (
+        InputBenchmarkError,
+        _finish_payload,
+        _require_complete_train_window,
+    )
+
+    with pytest.raises(InputBenchmarkError, match="incomplete"):
+        _require_complete_train_window(
+            microbatches_run=5,
+            warmup_actual=2,
+            measure_actual=4,
+            measured_wall_seconds=0.0,
+        )
+    # The 1e-9 wall floor must not be reachable for an unfinished window.
+    with pytest.raises(InputBenchmarkError):
+        _require_complete_train_window(
+            microbatches_run=5,
+            warmup_actual=2,
+            measure_actual=4,
+            measured_wall_seconds=0.0,
+        )
+        _finish_payload(
+            {"status": "ok"},
+            warmup_actual=2,
+            measure_actual=4,
+            optimizer_requested=3,
+            optimizer_actual=3,
+            first_next_seconds=0.0,
+            warmup_seconds=0.0,
+            measured_wall_seconds=0.0,
+            waits=[],
+            lengths=[],
+            padding_ratios=[],
+            positive_count=0,
+            negative_count=0,
+            background_count=0,
+            samples=4,
+            config={"fbank": {"frame_shift": 10}},
+        )
+
+
+def test_timed_loader_epoch_length_is_the_aligned_window_not_dataset_len():
+    from dma_kws.stage2.input_benchmark import _TimedCyclingLoader
+    from torch.utils.data import DataLoader, TensorDataset
+
+    inner = DataLoader(TensorDataset(torch.zeros(3, 1)), batch_size=1)
+    assert len(inner) == 3
+    timed = _TimedCyclingLoader(inner, window_microbatches=6)
+    assert len(timed) == 6
+
+
+def test_lightning_accum_across_short_epoch_completes_measure_window():
+    import pytorch_lightning as pl
+    from dma_kws.stage2.input_benchmark import (
+        TrainWindowCallback,
+        _TimedCyclingLoader,
+        _require_complete_train_window,
+        bind_train_window_callback,
+    )
+    from torch.utils.data import DataLoader, Dataset
+
+    class _Rows(Dataset):
+        def __len__(self) -> int:
+            return 3
+
+        def __getitem__(self, index: int) -> dict:
+            return {
+                "feat": torch.ones(4, 2),
+                "feat_lengths": torch.tensor(4),
+                "label": torch.tensor(1),
+                "query_lengths": torch.tensor(2),
+            }
+
+    def _collate(rows: list[dict]) -> dict:
+        return {
+            "feat": torch.stack([row["feat"] for row in rows]),
+            "feat_lengths": torch.stack([row["feat_lengths"] for row in rows]),
+            "label": torch.stack([row["label"] for row in rows]),
+            "query_lengths": torch.stack([row["query_lengths"] for row in rows]),
+        }
+
+    class _Tiny(pl.LightningModule):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer = torch.nn.Linear(2, 1)
+
+        def training_step(self, batch, batch_idx):
+            return self.layer(batch["feat"].float().mean(dim=1)).abs().mean()
+
+        def configure_optimizers(self):
+            return torch.optim.SGD(self.parameters(), lr=0.1)
+
+    warmup_actual = 2
+    measure_actual = 4
+    window_microbatches = warmup_actual + measure_actual
+    inner = DataLoader(_Rows(), batch_size=1, collate_fn=_collate)
+    timed = _TimedCyclingLoader(inner, window_microbatches=window_microbatches)
+    callback = TrainWindowCallback(
+        warmup_actual=warmup_actual,
+        measure_actual=measure_actual,
+        device="cpu",
+        timed=timed,
+    )
+    trainer = pl.Trainer(
+        accelerator="cpu",
+        devices=1,
+        max_steps=window_microbatches // 2,
+        accumulate_grad_batches=2,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        limit_val_batches=0,
+        num_sanity_val_steps=0,
+        callbacks=[bind_train_window_callback(pl.Callback, callback)],
+    )
+    trainer.fit(_Tiny(), train_dataloaders=timed)
+    _require_complete_train_window(
+        microbatches_run=callback.micro,
+        warmup_actual=warmup_actual,
+        measure_actual=measure_actual,
+        measured_wall_seconds=callback.measured_wall_seconds,
+    )
+    assert callback.micro == window_microbatches
+    assert callback.measured_wall_seconds > 0.0
+    assert len(callback.lengths) == measure_actual
+
+
+def test_train_callback_does_not_compose_the_lightning_batch(monkeypatch):
+    from dma_kws.stage2.input_benchmark import (
+        TrainWindowCallback,
+        _TimedCyclingLoader,
+    )
+
+    def _boom(batch):
+        raise AssertionError("measure stats must not .cpu() the Lightning GPU batch")
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.input_benchmark._composition_from_batch",
+        _boom,
+    )
+    timed = _TimedCyclingLoader.__new__(_TimedCyclingLoader)
+    timed.waits = []
+    timed.compositions = [(1, 0, 0, [4]), (0, 1, 0, [5])]
+    timed.loader = None
+    timed.window_microbatches = 2
+    callback = TrainWindowCallback(
+        warmup_actual=0,
+        measure_actual=2,
+        device="cpu",
+        timed=timed,
+    )
+    gpuish = {
+        "label": torch.tensor([1]),
+        "feat_lengths": torch.tensor([4]),
+        "query_lengths": torch.tensor([2]),
+    }
+    callback.on_train_batch_start(None, None, gpuish, 0)
+    callback.on_train_batch_end(None, None, None, gpuish, 0)
+    callback.on_train_batch_start(None, None, gpuish, 1)
+    callback.on_train_batch_end(None, None, None, gpuish, 1)
+    assert callback.positive_count == 1
+    assert callback.negative_count == 1
+    assert callback.lengths == [4, 5]
+
+
+def test_gpu_util_monitor_summarizes_window_not_post_fit_snapshot():
+    from dma_kws.stage2.input_benchmark import GpuUtilMonitor, summarize_gpu_util
+
+    assert summarize_gpu_util([]) == "unavailable"
+    assert summarize_gpu_util(["unavailable", "unavailable"]) == "unavailable"
+    assert summarize_gpu_util([10.0, 30.0, "unavailable"]) == pytest.approx(20.0)
+    assert summarize_gpu_util([[10.0, 90.0], [30.0, 70.0]]) == pytest.approx(
+        [20.0, 80.0]
+    )
+
+    reads = {"n": 0}
+
+    def _read():
+        reads["n"] += 1
+        return 40.0
+
+    monitor = GpuUtilMonitor(interval_s=0.01, read=_read)
+    monitor.start()
+    time.sleep(0.04)
+    window = monitor.stop()
+    post_fit_snapshot = 0.0
+    assert reads["n"] >= 1
+    assert window == pytest.approx(40.0)
+    assert window != post_fit_snapshot
+
+
+def test_profile_creates_missing_parent_and_keeps_trace(tmp_path):
+    from dma_kws.stage2.input_benchmark import run_input_benchmark
+
+    dataset = _StubTrainDataset([4, 6], [1, 0], [False, True])
+    output = tmp_path / "nested" / "missing" / "timing.json"
+    payload = run_input_benchmark(
+        mode="loader",
+        config=_tiny_loader_config(tmp_path),
+        output=output,
+        warmup_batches=1,
+        measure_batches=1,
+        device="cpu",
+        dataset=dataset,
+        profile=True,
+    )
+    trace_path = Path(payload["profile"]["trace_path"])
+    assert payload["profile"]["enabled"] is True
+    assert trace_path.is_file()
+    assert output.is_file()

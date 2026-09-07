@@ -8,7 +8,7 @@ rather than reporting toy-encoder throughput.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 import json
 import os
@@ -17,6 +17,7 @@ import random
 import resource
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -159,6 +160,110 @@ def gpu_util() -> Any:
     if len(values) == 1:
         return values[0]
     return values
+
+
+def summarize_gpu_util(samples: Sequence[Any]) -> Any:
+    """Aggregate nvidia-smi samples from a measure window.
+
+    Missing or failed reads stay ``\"unavailable\"``. A real idle GPU reporting
+    ``0`` is kept. Never invent a 0 when no numeric sample exists.
+    """
+    numeric: list[Any] = [
+        sample for sample in samples if sample != "unavailable"
+    ]
+    if not numeric:
+        return "unavailable"
+    if all(
+        isinstance(sample, (int, float)) and not isinstance(sample, bool)
+        for sample in numeric
+    ):
+        return float(sum(numeric) / len(numeric))
+    if all(isinstance(sample, list) and sample for sample in numeric):
+        width = max(len(sample) for sample in numeric)
+        means: list[float] = []
+        for index in range(width):
+            column = [
+                float(sample[index])
+                for sample in numeric
+                if index < len(sample)
+                and isinstance(sample[index], (int, float))
+                and not isinstance(sample[index], bool)
+            ]
+            if not column:
+                return "unavailable"
+            means.append(float(sum(column) / len(column)))
+        return means[0] if len(means) == 1 else means
+    return "unavailable"
+
+
+class GpuUtilMonitor:
+    """Sample ``gpu_util`` on a background thread during a measure window."""
+
+    def __init__(
+        self,
+        *,
+        interval_s: float = 0.1,
+        read: Callable[[], Any] | None = None,
+    ) -> None:
+        self.interval_s = float(interval_s)
+        self._read = read or gpu_util
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.samples: list[Any] = []
+        self.running = False
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self.samples = []
+        self._stop.clear()
+        self.running = True
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="stage2-gpu-util-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while self.running and not self._stop.is_set():
+            try:
+                self.samples.append(self._read())
+            except Exception:
+                self.samples.append("unavailable")
+            self._stop.wait(self.interval_s)
+
+    def stop(self) -> Any:
+        self.running = False
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None:
+            thread.join(timeout=max(1.0, self.interval_s * 4))
+        return summarize_gpu_util(self.samples)
+
+
+def _require_complete_train_window(
+    *,
+    microbatches_run: int,
+    warmup_actual: int,
+    measure_actual: int,
+    measured_wall_seconds: float,
+) -> None:
+    needed = int(warmup_actual) + int(measure_actual)
+    if int(microbatches_run) != needed:
+        raise InputBenchmarkError(
+            "train measure window incomplete: "
+            f"ran {microbatches_run} microbatches, need {needed} "
+            f"(warmup={warmup_actual} measure={measure_actual}). "
+            "Lightning flushes leftover gradient accumulation at epoch "
+            "boundaries; the benchmark loader epoch length must be a "
+            "multiple of accumulate_grad_batches."
+        )
+    if float(measured_wall_seconds) <= 0.0:
+        raise InputBenchmarkError(
+            "train measure window did not record a positive wall time"
+        )
 
 
 def _json_safe(value: Any) -> Any:
@@ -333,6 +438,8 @@ def _profile_cm(enabled: bool, output: Path, device: str):
         return
     from torch.profiler import ProfilerActivity, profile
 
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
     activities = [ProfilerActivity.CPU]
     if device == "cuda" and torch.cuda.is_available():
         activities.append(ProfilerActivity.CUDA)
@@ -340,6 +447,10 @@ def _profile_cm(enabled: bool, output: Path, device: str):
         yield info
     trace_path = output.with_name(f"{output.stem}.profile.json")
     prof.export_chrome_trace(str(trace_path))
+    if not trace_path.is_file():
+        raise InputBenchmarkError(
+            f"Chrome trace was not written to {trace_path}"
+        )
     info["trace_path"] = str(trace_path)
     info["enabled"] = True
 
@@ -377,7 +488,7 @@ def _base_payload(
         "accumulate_grad_batches": int(accumulate),
         "warmup_batches_requested": int(warmup_batches),
         "measure_batches_requested": int(measure_batches),
-        "gpu_util": gpu_util(),
+        "gpu_util": "unavailable",
         "process_rss_bytes": process_rss_bytes(),
     }
 
@@ -403,6 +514,7 @@ def _finish_payload(
     cache_hits: Any = 0,
     cache_misses: Any = 0,
     open_shard_high_water: Any = 0,
+    gpu_util_value: Any = "unavailable",
 ) -> dict[str, Any]:
     wait_ms = [float(item) * 1000.0 for item in waits]
     wall = max(float(measured_wall_seconds), 1e-9)
@@ -434,7 +546,7 @@ def _finish_payload(
             "cache_misses": cache_misses,
             "open_shard_high_water": open_shard_high_water,
             "process_rss_bytes": process_rss_bytes(),
-            "gpu_util": gpu_util(),
+            "gpu_util": gpu_util_value,
         }
     )
     return payload
@@ -682,19 +794,25 @@ def _run_background(
                 first_next = wait
         warmup_seconds = time.perf_counter() - started
 
+    gpu_monitor = GpuUtilMonitor()
+    gpu_util_value: Any = "unavailable"
     with _profile_cm(profile, output, device) as profile_info:
-        measure_started = time.perf_counter()
-        for batch_index in range(measure_batches):
-            batch_ids = measure_ids[
-                batch_index * batch_size : (batch_index + 1) * batch_size
-            ]
-            batch_lengths, wait = _read_cache_batch(batch_ids, record_stats=True)
-            waits.append(wait)
-            lengths.extend(batch_lengths)
-            padding_ratios.append(padding_ratio(batch_lengths))
-            if warmup_batches == 0 and batch_index == 0:
-                first_next = wait
-        cache_wall = time.perf_counter() - measure_started
+        gpu_monitor.start()
+        try:
+            measure_started = time.perf_counter()
+            for batch_index in range(measure_batches):
+                batch_ids = measure_ids[
+                    batch_index * batch_size : (batch_index + 1) * batch_size
+                ]
+                batch_lengths, wait = _read_cache_batch(batch_ids, record_stats=True)
+                waits.append(wait)
+                lengths.extend(batch_lengths)
+                padding_ratios.append(padding_ratio(batch_lengths))
+                if warmup_batches == 0 and batch_index == 0:
+                    first_next = wait
+            cache_wall = time.perf_counter() - measure_started
+        finally:
+            gpu_util_value = gpu_monitor.stop()
         online_started = time.perf_counter()
         for crop_id in measure_ids:
             row = crops[crop_id]
@@ -740,6 +858,7 @@ def _run_background(
         cache_hits=cache_hits,
         cache_misses=cache_misses,
         open_shard_high_water=high_water,
+        gpu_util_value=gpu_util_value,
     )
     payload["component_times"] = component
     payload["first_next_scope"] = "cache_batch"
@@ -792,22 +911,28 @@ def _run_loader(
     lengths: list[int] = []
     padding_ratios: list[float] = []
     positive = negative = background = 0
+    gpu_monitor = GpuUtilMonitor()
+    gpu_util_value: Any = "unavailable"
     with _profile_cm(profile, output, device) as profile_info:
         _synchronize(device)
-        measure_started = time.perf_counter()
-        for index in range(measure_batches):
-            batch, wait = _next_timed(iterator)
-            waits.append(wait)
-            pos, neg, bg, batch_lengths = _composition_from_batch(batch)
-            positive += pos
-            negative += neg
-            background += bg
-            lengths.extend(batch_lengths)
-            padding_ratios.append(padding_ratio(batch_lengths))
-            if warmup_batches == 0 and index == 0:
-                first_next = wait
-        _synchronize(device)
-        measured_wall = time.perf_counter() - measure_started
+        gpu_monitor.start()
+        try:
+            measure_started = time.perf_counter()
+            for index in range(measure_batches):
+                batch, wait = _next_timed(iterator)
+                waits.append(wait)
+                pos, neg, bg, batch_lengths = _composition_from_batch(batch)
+                positive += pos
+                negative += neg
+                background += bg
+                lengths.extend(batch_lengths)
+                padding_ratios.append(padding_ratio(batch_lengths))
+                if warmup_batches == 0 and index == 0:
+                    first_next = wait
+            _synchronize(device)
+            measured_wall = time.perf_counter() - measure_started
+        finally:
+            gpu_util_value = gpu_monitor.stop()
 
     background_cfg = (config.get("stage2") or {}).get("background_negative") or {}
     cache_mode = str(background_cfg.get("mode") or "online") == "fbank_cache" and bool(
@@ -849,6 +974,7 @@ def _run_loader(
         cache_hits=cache_hits,
         cache_misses=cache_misses,
         open_shard_high_water=high_water,
+        gpu_util_value=gpu_util_value,
     )
     if profile_info:
         payload["profile"] = dict(profile_info)
@@ -856,11 +982,25 @@ def _run_loader(
 
 
 class _TimedCyclingLoader:
-    """Iterable wrapper that records real ``next(iterator)`` wait times."""
+    """Iterable wrapper that records real ``next(iterator)`` wait times.
 
-    def __init__(self, loader: Any) -> None:
+    ``window_microbatches`` is the Lightning epoch length. It must be a
+    multiple of ``accumulate_grad_batches`` so epoch-end leftover
+    accumulation cannot end the run before the measure window finishes.
+    Composition stats are taken from the CPU DataLoader batch here, not
+    from the GPU batch inside Lightning's train callback.
+    """
+
+    def __init__(
+        self,
+        loader: Any,
+        *,
+        window_microbatches: int | None = None,
+    ) -> None:
         self.loader = loader
         self.waits: list[float] = []
+        self.compositions: list[tuple[int, int, int, list[int]] | None] = []
+        self.window_microbatches = window_microbatches
         self.batch_size = getattr(loader, "batch_size", None)
 
     @property
@@ -868,6 +1008,8 @@ class _TimedCyclingLoader:
         return self.loader.dataset
 
     def __len__(self) -> int:
+        if self.window_microbatches is not None:
+            return int(self.window_microbatches)
         return len(self.loader)
 
     def __iter__(self) -> Iterator[Any]:
@@ -881,6 +1023,14 @@ class _TimedCyclingLoader:
                 except StopIteration:
                     break
                 self.waits.append(time.perf_counter() - started)
+                if (
+                    isinstance(batch, dict)
+                    and "label" in batch
+                    and "feat_lengths" in batch
+                ):
+                    self.compositions.append(_composition_from_batch(batch))
+                else:
+                    self.compositions.append(None)
                 yielded += 1
                 yield batch
             if yielded == 0:
@@ -888,6 +1038,90 @@ class _TimedCyclingLoader:
                     "Stage II train DataLoader produced no batches "
                     "(drop_last=True requires len(dataset) >= batch_size)"
                 )
+
+
+class TrainWindowCallback:
+    """Record warmup/measure walls using CPU-side loader composition."""
+
+    def __init__(
+        self,
+        *,
+        warmup_actual: int,
+        measure_actual: int,
+        device: str,
+        timed: _TimedCyclingLoader,
+        gpu_monitor: GpuUtilMonitor | None = None,
+    ) -> None:
+        self.warmup_actual = int(warmup_actual)
+        self.measure_actual = int(measure_actual)
+        self.device = device
+        self.timed = timed
+        self._gpu_monitor = gpu_monitor or GpuUtilMonitor()
+        self.micro = 0
+        self.warmup_seconds = 0.0
+        self.measured_wall_seconds = 0.0
+        self._warmup_t0: float | None = None
+        self._measure_t0: float | None = None
+        self.positive_count = 0
+        self.negative_count = 0
+        self.background_count = 0
+        self.lengths: list[int] = []
+        self.padding_ratios: list[float] = []
+        self.gpu_util: Any = "unavailable"
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
+        if self.micro == 0 and self.warmup_actual > 0:
+            self._warmup_t0 = time.perf_counter()
+        if self.micro == self.warmup_actual:
+            if self._warmup_t0 is not None:
+                self.warmup_seconds = time.perf_counter() - self._warmup_t0
+            _synchronize(self.device)
+            self._gpu_monitor.start()
+            self._measure_t0 = time.perf_counter()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        window_end = self.warmup_actual + self.measure_actual
+        in_measure = self.warmup_actual <= self.micro < window_end
+        if in_measure:
+            if (
+                self.micro >= len(self.timed.compositions)
+                or self.timed.compositions[self.micro] is None
+            ):
+                raise InputBenchmarkError(
+                    f"missing CPU-side batch composition for microbatch {self.micro}"
+                )
+            pos, neg, bg, batch_lengths = self.timed.compositions[self.micro]
+            self.positive_count += pos
+            self.negative_count += neg
+            self.background_count += bg
+            self.lengths.extend(batch_lengths)
+            self.padding_ratios.append(padding_ratio(batch_lengths))
+        self.micro += 1
+        if self.micro == window_end:
+            _synchronize(self.device)
+            if self._measure_t0 is not None:
+                self.measured_wall_seconds = time.perf_counter() - self._measure_t0
+            self.gpu_util = self.close_gpu_monitor()
+
+    def close_gpu_monitor(self) -> Any:
+        if self._gpu_monitor.running:
+            self.gpu_util = self._gpu_monitor.stop()
+        return self.gpu_util
+
+
+def bind_train_window_callback(callback_base: Any, window: TrainWindowCallback) -> Any:
+    """Wrap ``TrainWindowCallback`` as a Lightning ``Callback`` subclass."""
+
+    class _Bound(callback_base):
+        def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
+            window.on_train_batch_start(trainer, pl_module, batch, batch_idx)
+
+        def on_train_batch_end(
+            self, trainer, pl_module, outputs, batch, batch_idx
+        ) -> None:
+            window.on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
+
+    return _Bound()
 
 
 def _run_train(
@@ -942,47 +1176,14 @@ def _run_train(
     if dataset is None:
         dataset = build_stage2_train_dataset(config, tokenizer)
     loader = build_stage2_train_dataloader(config, dataset)
-    timed = _TimedCyclingLoader(loader)
-
-    class _TrainWindowCallback(pl.Callback):
-        def __init__(self) -> None:
-            super().__init__()
-            self.micro = 0
-            self.warmup_seconds = 0.0
-            self.measured_wall_seconds = 0.0
-            self._warmup_t0: float | None = None
-            self._measure_t0: float | None = None
-            self.positive_count = 0
-            self.negative_count = 0
-            self.background_count = 0
-            self.lengths: list[int] = []
-            self.padding_ratios: list[float] = []
-
-        def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
-            if self.micro == 0 and warmup_actual > 0:
-                self._warmup_t0 = time.perf_counter()
-            if self.micro == warmup_actual:
-                if self._warmup_t0 is not None:
-                    self.warmup_seconds = time.perf_counter() - self._warmup_t0
-                _synchronize(device)
-                self._measure_t0 = time.perf_counter()
-
-        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
-            in_measure = warmup_actual <= self.micro < warmup_actual + measure_actual
-            if in_measure:
-                pos, neg, bg, batch_lengths = _composition_from_batch(batch)
-                self.positive_count += pos
-                self.negative_count += neg
-                self.background_count += bg
-                self.lengths.extend(batch_lengths)
-                self.padding_ratios.append(padding_ratio(batch_lengths))
-            self.micro += 1
-            if self.micro == warmup_actual + measure_actual:
-                _synchronize(device)
-                if self._measure_t0 is not None:
-                    self.measured_wall_seconds = time.perf_counter() - self._measure_t0
-
-    window = _TrainWindowCallback()
+    window_microbatches = warmup_actual + measure_actual
+    timed = _TimedCyclingLoader(loader, window_microbatches=window_microbatches)
+    window = TrainWindowCallback(
+        warmup_actual=warmup_actual,
+        measure_actual=measure_actual,
+        device=device,
+        timed=timed,
+    )
     vocab_size = len(tokenizer._symbol_table)
     model = Stage2LightningModule(
         config,
@@ -1003,11 +1204,20 @@ def _run_train(
     with _profile_cm(profile, output, device) as profile_info:
         trainer = pl.Trainer(
             accelerator=accelerator,
-            callbacks=[window],
+            callbacks=[bind_train_window_callback(pl.Callback, window)],
             **trainer_kwargs,
         )
-        trainer.fit(model, train_dataloaders=timed)
+        try:
+            trainer.fit(model, train_dataloaders=timed)
+        finally:
+            window.close_gpu_monitor()
 
+    _require_complete_train_window(
+        microbatches_run=window.micro,
+        warmup_actual=warmup_actual,
+        measure_actual=measure_actual,
+        measured_wall_seconds=window.measured_wall_seconds,
+    )
     measure_waits = timed.waits[warmup_actual : warmup_actual + measure_actual]
     first_next = float(timed.waits[0]) if timed.waits else 0.0
     background_cfg = stage2.get("background_negative") or {}
@@ -1047,6 +1257,7 @@ def _run_train(
         cache_hits="unavailable" if cache_mode else 0,
         cache_misses="unavailable" if cache_mode else 0,
         open_shard_high_water="unavailable" if cache_mode else 0,
+        gpu_util_value=window.gpu_util,
     )
     payload["microbatches_requested"] = {
         "warmup": warmup_batches,
