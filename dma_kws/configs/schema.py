@@ -648,6 +648,15 @@ class AdaptValidationConfig:
 
 
 @dataclass
+class AdaptJointConfig:
+    real_fraction: float = 0.6
+    background_keyword_fraction: float = 0.5
+    background_eval_list: str = ""
+    background_val_samples: int = 512
+    background_eval_seed: int = 2026
+
+
+@dataclass
 class AdaptConfig:
     keyword: str = "hey eva"
     slug: str = ""
@@ -680,6 +689,7 @@ class AdaptConfig:
         default_factory=lambda: ["audio_key.weight", "text_query.weight"]
     )
     validation: AdaptValidationConfig = field(default_factory=AdaptValidationConfig)
+    joint: AdaptJointConfig = field(default_factory=AdaptJointConfig)
     sweep: AdaptSweepConfig = field(default_factory=AdaptSweepConfig)
     console: Stage2ConsoleConfig = field(default_factory=Stage2ConsoleConfig)
     logging: Stage2LoggingConfig = field(default_factory=Stage2LoggingConfig)

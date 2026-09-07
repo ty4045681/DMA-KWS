@@ -390,6 +390,15 @@ class LibriPhraseTrainDataset(Dataset):
     def __len__(self) -> int:
         return self.sample_lens
 
+    @property
+    def num_anchors(self) -> int:
+        """Size of the phrase pool, independent of the requested epoch length."""
+        return self._n_anchors
+
+    @property
+    def background_enabled(self) -> bool:
+        return self._background_sampler is not None
+
     def _load_metadata_array(self, path: str):
         key = ("npy", path)
         cached = self._metadata_cache.get(key)
@@ -476,14 +485,60 @@ class LibriPhraseTrainDataset(Dataset):
         return negative_wav["audio_path"], negative_g2p
 
     def __getitem__(self, index: int) -> dict:
+        return self._sample_pair(index)
+
+    def sample_pair(
+        self,
+        index: int,
+        kind: str,
+        *,
+        rng: random.Random,
+        anchor_seq: list[int] | None = None,
+    ) -> dict:
+        """Draw a requested class with an external, sample-local random stream.
+
+        Joint adaptation uses this entry point to enforce batch composition.
+        A target-keyword anchor is only meaningful for pure backgrounds. The
+        legacy random stream is restored even if loading the sample fails.
+        """
+        if kind not in {"positive", "negative", "background"}:
+            raise ValueError(f"Unknown LibriPhrase pair kind: {kind!r}")
+        if anchor_seq is not None and kind != "background":
+            raise ValueError("anchor_seq override is only allowed for background pairs")
+        if kind == "background" and not self.background_enabled:
+            raise ValueError("Cannot draw a background pair without a background sampler")
+        previous_rng = self._rng
+        self._rng = rng
+        try:
+            # Online fbank dither uses torch's CPU RNG. Isolate it as well so a
+            # ticket yields the same features with any DataLoader worker count.
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(rng.getrandbits(63))
+                return self._sample_pair(index, kind=kind, anchor_seq=anchor_seq)
+        finally:
+            self._rng = previous_rng
+
+    def _sample_pair(
+        self,
+        index: int,
+        *,
+        kind: str | None = None,
+        anchor_seq: list[int] | None = None,
+    ) -> dict:
+        if self._n_anchors == 0:
+            raise ValueError("Cannot sample LibriPhrase with an empty anchor pool")
         index = index % self._n_anchors
         anchor_g2p = self._ngram_g2p[index]
-        anchor_seq = self._tokenize_phoneme_string(anchor_g2p)
+        anchor_seq = (
+            self._tokenize_phoneme_string(anchor_g2p)
+            if anchor_seq is None
+            else list(anchor_seq)
+        )
         label = 1
         query_wav: str | None = None
         background_feats: torch.Tensor | None = None
 
-        if self._rng.random() < 0.5:
+        if kind == "positive" or (kind is None and self._rng.random() < 0.5):
             query_wav = self.get_random_clips(self._clips_files[index])["audio_path"]
             query_seq = list(anchor_seq)
             seq_label = build_seq_label(
@@ -495,11 +550,15 @@ class LibriPhraseTrainDataset(Dataset):
             label = 0
             # This gate deliberately lives inside the negative half so enabling
             # background data does not silently change the 50/50 class prior.
-            should_draw_background = self._background_sampler is not None and (
-                self._background_probability >= 1.0
-                or (
-                    self._background_probability > 0.0
-                    and self._rng.random() < self._background_probability
+            should_draw_background = kind == "background" or (
+                kind is None
+                and self._background_sampler is not None
+                and (
+                    self._background_probability >= 1.0
+                    or (
+                        self._background_probability > 0.0
+                        and self._rng.random() < self._background_probability
+                    )
                 )
             )
             if should_draw_background:
@@ -533,6 +592,12 @@ class LibriPhraseTrainDataset(Dataset):
                     ):
                         break
                 else:
+                    if kind == "negative":
+                        raise ValueError(
+                            "Cannot draw a valid LibriPhrase speech negative for "
+                            f"anchor {self.anchor_lists[index]!r} after "
+                            f"{_MAX_CONTAINING_NEGATIVE_DRAWS} attempts"
+                        )
                     # A tiny/adversarial phrase pool may contain no valid negative.
                     # The selected audio still contains the keyword, so relabeling
                     # is the only supervision-consistent fallback.

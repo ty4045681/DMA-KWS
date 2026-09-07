@@ -8,6 +8,14 @@ adapt:
   # real-only dataset can set [real] explicitly instead of failing on a
   # missing tts_train.csv.
   train_phases: [tts, real]
+  # [joint] trains one adapter on real + TTS + LibriPhrase + background data.
+  # Joint cannot be combined with the sequential tts/real phases.
+  joint:
+    real_fraction: 0.6
+    background_keyword_fraction: 0.5
+    background_eval_list: ""
+    background_val_samples: 512
+    background_eval_seed: 2026
   stage: all
   data_root: ""
   exp_root: ""

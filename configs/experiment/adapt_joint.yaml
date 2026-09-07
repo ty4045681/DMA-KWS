@@ -1,0 +1,33 @@
+# @package _global_
+# Compose after the experiment that matches the Stage II checkpoint:
+#   PYTHONPATH=. python scripts/run_keyword_adaptation.py \
+#     '+experiment=[adapt_hey_eva_icefall_adapter_v2,adapt_joint]' \
+#     adapt.stage=train prep.stage2_ckpt=/path/to/stage2.pt
+# Existing real_train/eval.csv and tts_train/eval.csv are required. This overlay
+# preserves the base encoder, phoneme adapter, QbyT readout and LoRA targets.
+adapt:
+  phase: joint
+  train_phases: [joint]
+  # Resolve to paths.exp_root/stage2_adapt_joint/<keyword slug>; never reuse a
+  # sequential run's auto-discovered sweep/best_params.yaml.
+  exp_root: ""
+  params_file: ""
+  mix_ratio: 0.5
+  max_steps: 6000
+  joint:
+    real_fraction: 0.6
+    background_keyword_fraction: 0.5
+    # Set a held-out file list to enable MUSAN validation and FA/h reporting.
+    background_eval_list: ""
+    background_val_samples: 512
+    background_eval_seed: 2026
+  sweep:
+    storage: ""
+    study_name: ""
+
+stage2:
+  background_negative:
+    enabled: true
+    # 0.5 replay * 0.5 negatives * 0.4 = 10% of all examples.
+    probability: 0.4
+    audio_list_path: ${paths.processed_root}/musan_split/train_background.list

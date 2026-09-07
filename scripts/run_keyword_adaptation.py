@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import subprocess
 import sys
@@ -79,6 +80,36 @@ def _clip_eval_metrics(out_dir: Path) -> dict | None:
     return metrics if isinstance(metrics, dict) else None
 
 
+def _musan_keyword_phonemes(real_eval_manifest: Path, prep: dict) -> str:
+    """Keep continuous-background queries aligned with the real clip queries."""
+    if not real_eval_manifest.is_file():
+        raise SystemExit(f"Joint evaluation requires the real manifest: {real_eval_manifest}")
+
+    def normalize(value: str | None) -> str:
+        text = " ".join(str(value or "").split())
+        return "" if text.casefold() in {"nan", "none", "null", "<na>", "n/a", "na"} else text
+
+    with real_eval_manifest.open("r", encoding="utf-8-sig", newline="") as handle:
+        pronunciations = {
+            normalized
+            for row in csv.DictReader(handle)
+            if (normalized := normalize(row.get("keyword_phonemes")))
+        }
+    if len(pronunciations) > 1:
+        raise ValueError(
+            f"{real_eval_manifest} has inconsistent keyword_phonemes: {sorted(pronunciations)}"
+        )
+    manifest_phonemes = next(iter(pronunciations), "")
+    configured = normalize(prep.get("keyword_phonemes"))
+    if manifest_phonemes and configured and manifest_phonemes != configured:
+        raise ValueError(
+            "prep.keyword_phonemes differs from real_eval.csv keyword_phonemes: "
+            f"{configured!r} != {manifest_phonemes!r}. MUSAN and real-clip evaluation "
+            "must use the same keyword pronunciation."
+        )
+    return manifest_phonemes or configured
+
+
 def _build_eval_report(
     config: dict,
     keyword: str,
@@ -91,17 +122,49 @@ def _build_eval_report(
     exp_root = adapt_exp_root(config, keyword)
     reports_dir = exp_root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
+    adapt = config.get("adapt", {}) or {}
+    joint = resolve_adapt_train_phases(adapt) == ("joint",)
+    joint_cfg = adapt.get("joint", {}) or {}
+    background_eval_list = (
+        str(joint_cfg.get("background_eval_list", "") or "").strip() if joint else ""
+    )
+    if background_eval_list:
+        from dma_kws.stage2.joint_manifest import validate_background_eval_split
 
-    eval_manifest = phase_manifest(data_root, "real", split="eval")
-    clips_manifest = reports_dir / "real_eval_clips.csv"
-    if eval_manifest.is_file():
-        clips_eval_manifest_from_adapt(eval_manifest, keyword, clips_manifest)
+        validate_background_eval_split(
+            (config.get("stage2", {}) or {}).get("background_negative", {}) or {},
+            background_eval_list,
+        )
+        if not Path(background_eval_list).is_file():
+            raise SystemExit(f"MUSAN evaluation list not found: {background_eval_list}")
+        musan_root = str((config.get("prep", {}) or {}).get("musan_root", "") or "").strip()
+        if not musan_root or not Path(musan_root).is_dir():
+            raise SystemExit(
+                "prep.musan_root must be an existing MUSAN root directory when "
+                "adapt.joint.background_eval_list is set for FA/h evaluation"
+            )
+        musan_phonemes = _musan_keyword_phonemes(
+            phase_manifest(data_root, "real", split="eval"), config.get("prep", {}) or {},
+        )
 
     report: dict = {"keyword": keyword, "slug": slug, "base_ckpt": base_ckpt, "adapted_ckpt": adapted_ckpt}
 
-    if clips_manifest.is_file():
+    for source in (("real", "tts") if joint else ("real",)):
+        eval_manifest = phase_manifest(data_root, source, split="eval")
+        clips_manifest = reports_dir / f"{source}_eval_clips.csv"
+        if not eval_manifest.is_file():
+            if joint:
+                raise SystemExit(f"Joint evaluation requires the {source} manifest: {eval_manifest}")
+            if reporter is not None:
+                reporter.warn(f"No {source}-phase eval manifest at {eval_manifest}; skipping {source} eval")
+            continue
+        clips_eval_manifest_from_adapt(
+            eval_manifest, keyword, clips_manifest, manifest_root=data_root,
+        )
         for label, ckpt in ("base", base_ckpt), ("adapted", adapted_ckpt):
-            out_dir = reports_dir / f"eval_clips_{label}"
+            out_dir = reports_dir / (
+                f"eval_clips_{label}" if source == "real" else f"eval_tts_clips_{label}"
+            )
             _run_script(
                 "eval_stage2_clips.py",
                 [
@@ -114,9 +177,8 @@ def _build_eval_report(
             )
             metrics = _clip_eval_metrics(out_dir)
             if metrics is not None:
-                report[f"target_{label}"] = metrics
-    elif reporter is not None:
-        reporter.warn(f"No real-phase eval manifest at {eval_manifest}; skipping target keyword eval")
+                prefix = "target" if source == "real" else "tts"
+                report[f"{prefix}_{label}"] = metrics
 
     for label, ckpt in ("base", base_ckpt), ("adapted", adapted_ckpt):
         out_path = reports_dir / f"lph_{label}.json"
@@ -137,6 +199,27 @@ def _build_eval_report(
         metrics = json.loads(result.stdout.strip().splitlines()[-1])
         out_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         report[f"lph_{label}"] = metrics
+
+    if background_eval_list:
+        for label, ckpt in ("base", base_ckpt), ("adapted", adapted_ckpt):
+            out_dir = reports_dir / f"eval_musan_{label}"
+            _run_script(
+                "eval_musan_fa.py",
+                [
+                    f"prep.keyword={keyword!r}",
+                    f"prep.keyword_phonemes={musan_phonemes!r}",
+                    f"prep.musan_root={musan_root}",
+                    f"prep.musan_audio_list_path={background_eval_list}",
+                    f"prep.stage2_ckpt={ckpt}",
+                    f"prep.output_dir={out_dir}",
+                    "run.device=cpu",
+                ],
+                reporter,
+            )
+            summary_path = out_dir / "summary.json"
+            if not summary_path.is_file():
+                raise RuntimeError(f"MUSAN evaluation produced no summary: {summary_path}")
+            report[f"musan_{label}"] = json.loads(summary_path.read_text(encoding="utf-8"))
 
     report_path = reports_dir / "eval_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")

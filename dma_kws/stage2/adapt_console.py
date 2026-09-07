@@ -179,6 +179,11 @@ def prepare_with_console(
             sources=sources,
             skip_existing=skip_existing,
             on_progress=on_progress,
+            joint=(
+                str(adapt.get("phase", "")).strip().casefold() == "joint"
+                or adapt.get("train_phases") == ["joint"]
+                or adapt.get("train_phases") == ("joint",)
+            ),
         )
 
     reporter.print_table(*prep_phase_table(stats), title="Phase Splits")
@@ -332,13 +337,16 @@ def eval_comparison_table(report: dict[str, Any]) -> tuple[list[str], list[list[
     columns = ["metric", "base", "adapted", "delta"]
     rows: list[list[str]] = []
     groups = (
-        ("target", report.get("target_base"), report.get("target_adapted")),
-        ("lph", report.get("lph_base"), report.get("lph_adapted")),
+        ("target", report.get("target_base"), report.get("target_adapted"), METRIC_KEYS),
+        ("tts", report.get("tts_base"), report.get("tts_adapted"), METRIC_KEYS),
+        ("lph", report.get("lph_base"), report.get("lph_adapted"), METRIC_KEYS),
+        ("musan", (report.get("musan_base") or {}).get("metrics"),
+         (report.get("musan_adapted") or {}).get("metrics"), ("fa_per_hour",)),
     )
-    for prefix, base, adapted in groups:
+    for prefix, base, adapted, metric_keys in groups:
         if not isinstance(base, dict) or not isinstance(adapted, dict):
             continue
-        for key in METRIC_KEYS:
+        for key in metric_keys:
             if key not in base and key not in adapted:
                 continue
             base_value = base.get(key)

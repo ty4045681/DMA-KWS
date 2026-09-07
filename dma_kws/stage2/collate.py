@@ -38,6 +38,8 @@ def train_collate_fn(batch: list[dict]) -> dict:
         out["query_lengths"] = torch.tensor([seq.size(0) for seq in query_seqs])
     if "source" in batch[0]:
         out["source"] = torch.tensor([int(item["source"]) for item in batch])
+    if "domain_source" in batch[0]:
+        out["domain_source"] = torch.tensor([int(item["domain_source"]) for item in batch])
     return out
 
 

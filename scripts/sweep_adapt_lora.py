@@ -13,7 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.stage2 import adapt_console
 from dma_kws.stage2.adapt import Stage2AdaptArgs
-from dma_kws.stage2.adapt_paths import adapt_exp_root, slugify
+from dma_kws.stage2.adapt_paths import adapt_exp_root, resolve_adapt_train_phases, slugify
 from dma_kws.stage2.sweep_adapt import (
     compute_sweep_score,
     run_adaptation_trial,
@@ -114,7 +114,7 @@ def _eval_target_auc(
     from dma_kws.config import get_tokenizer_config
     from dma_kws.pathing import resolve_dict_path
     from dma_kws.stage2.adapt_dataset import TargetKeywordValDataset
-    from dma_kws.stage2.adapt_paths import adapt_data_root, phase_manifest
+    from dma_kws.stage2.adapt_paths import adapt_data_root, target_eval_manifest
     from dma_kws.stage2.collate import test_collate_fn
     from dma_kws.stage2.module import Stage2LightningModule, assert_adapter_weights_loaded
     from dma_kws.stage2.readout import (
@@ -141,7 +141,7 @@ def _eval_target_auc(
     phase = str(adapt.get("phase", "real"))
 
     data_root = adapt_data_root(config, keyword)
-    eval_manifest = phase_manifest(data_root, phase, split="eval")
+    eval_manifest = target_eval_manifest(data_root, phase)
     dataset = TargetKeywordValDataset(
         manifest_path=eval_manifest,
         keyword=keyword,
@@ -281,6 +281,7 @@ def main(cfg: DictConfig) -> None:
     adapt = OmegaConf.to_container(cfg.adapt, resolve=True)
     if not isinstance(adapt, dict):
         raise SystemExit("adapt config section must be a mapping")
+    joint = resolve_adapt_train_phases(adapt) == ("joint",)
     sweep_cfg = adapt.get("sweep", {}) or {}
     run = cfg.run
     prep = OmegaConf.to_container(cfg.prep, resolve=True)
@@ -354,7 +355,7 @@ def main(cfg: DictConfig) -> None:
     trial_log: list[dict] = []
 
     def objective(trial: optuna.Trial) -> float:
-        params = suggest_adapt_params(trial, search_mix=search_mix)
+        params = suggest_adapt_params(trial, search_mix=search_mix, joint=joint)
         params["_trial_number"] = trial.number
         completed = sum(
             existing.state == optuna.trial.TrialState.COMPLETE

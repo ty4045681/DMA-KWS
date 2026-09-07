@@ -256,8 +256,23 @@ def load_adapt_manifest(path: str | Path) -> list[dict[str, Any]]:
     return df[list(required)].to_dict(orient="records")
 
 
-def clips_eval_manifest_from_adapt(eval_manifest: Path, keyword: str, output_path: Path) -> Path:
+def clips_eval_manifest_from_adapt(
+    eval_manifest: Path,
+    keyword: str,
+    output_path: Path,
+    *,
+    manifest_root: Path | None = None,
+) -> Path:
+    """Export clip evaluation rows, retaining paths when moving the CSV."""
     df = pd.read_csv(eval_manifest)
+    if manifest_root is not None and "audio_path" in df.columns:
+        root = Path(manifest_root).expanduser()
+
+        def resolve_audio(value: Any) -> str:
+            path = Path(str(value)).expanduser()
+            return str((path if path.is_absolute() else root / path).resolve())
+
+        df["audio_path"] = df["audio_path"].map(resolve_audio)
     if "keyword" not in df.columns:
         df["keyword"] = keyword
     # Keep speaker/split/text/source metadata in the evaluation result's

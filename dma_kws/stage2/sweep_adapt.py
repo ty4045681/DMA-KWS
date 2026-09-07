@@ -27,14 +27,20 @@ if TYPE_CHECKING:
     from dma_kws.stage2.adapt import Stage2AdaptArgs
 
 
-def suggest_adapt_params(trial: Any, *, search_mix: bool = False) -> dict[str, Any]:
+def suggest_adapt_params(
+    trial: Any, *, search_mix: bool = False, joint: bool = False
+) -> dict[str, Any]:
     rank = trial.suggest_categorical("rank", [4, 8, 16, 32])
     alpha_ratio = trial.suggest_categorical("alpha_ratio", [1.0, 2.0])
     params = {
         "rank": rank,
         "alpha": int(alpha_ratio * rank),
         "learning_rate": trial.suggest_float("learning_rate", 1e-4, 2e-3, log=True),
-        "max_steps": trial.suggest_categorical("max_steps", [1000, 2000, 3000]),
+        # A joint run replaces both sequential phases, so keep total update
+        # budgets comparable to the historical two-phase sweep.
+        "max_steps": trial.suggest_categorical(
+            "max_steps", [2000, 4000, 6000] if joint else [1000, 2000, 3000]
+        ),
     }
     if search_mix:
         params["mix_ratio"] = trial.suggest_float("mix_ratio", 0.3, 0.7)
@@ -144,6 +150,7 @@ def run_adaptation_trial(
         "params": training["params"],
         "tts": training["tts"],
         "real": training["real"],
+        "joint": training.get("joint"),
         "merged_checkpoint": merged_ckpt,
     }
 
@@ -244,6 +251,7 @@ def run_adaptation_training_trial(
         "params": effective_params,
         "tts": phase_artifacts.get("tts"),
         "real": phase_artifacts.get("real"),
+        "joint": phase_artifacts.get("joint"),
         "merged_checkpoint": trial_root / "stage2_adapted.pt",
     }
 
@@ -260,6 +268,7 @@ def serialize_training_result(result: dict[str, Any]) -> dict[str, Any]:
         "params": result["params"],
         "tts": stringify_paths(result["tts"]),
         "real": stringify_paths(result["real"]),
+        "joint": stringify_paths(result.get("joint")),
         "merged_checkpoint": str(result["merged_checkpoint"]),
     }
 
@@ -276,6 +285,7 @@ def _deserialize_training_result(payload: dict[str, Any]) -> dict[str, Any]:
         "params": dict(payload["params"]),
         "tts": restore_paths(payload["tts"]),
         "real": restore_paths(payload.get("real")),
+        "joint": restore_paths(payload.get("joint")),
         "merged_checkpoint": Path(payload["merged_checkpoint"]),
     }
 

@@ -368,18 +368,24 @@ def prepare_keyword_adaptation(
     sources: dict[str, Any] | None = None,
     skip_existing: bool = True,
     on_progress: Callable[[str, int], None] | None = None,
+    joint: bool = False,
 ) -> dict[str, Any]:
     """Prepare fbank features and manifests for one keyword slug tree.
 
     ``on_progress(stage, value)`` reports work as it happens; stages are
     ``scan``, ``g2p_total``/``g2p`` and ``fbank_total``/``fbank`` (``*_total``
     carries a count, the others an increment).
+
+    ``joint`` requires both source phases, keeps real speakers and original
+    recording groups within one split, and preserves every explicit assignment.
     """
 
     def report(stage: str, value: int) -> None:
         if on_progress is not None:
             on_progress(stage, value)
 
+    if joint and manifest_csv is not None and not manifest_csv.is_file():
+        raise FileNotFoundError(f"Joint adaptation source manifest not found: {manifest_csv}")
     uses_manifest = manifest_csv is not None and manifest_csv.is_file()
     source_config = sources or {}
     uses_external_sources = any(
@@ -389,7 +395,8 @@ def prepare_keyword_adaptation(
     )
     if uses_manifest:
         all_samples = load_manifest_csv(manifest_csv)
-        validate_manifest_speaker_splits(all_samples)
+        if not joint:
+            validate_manifest_speaker_splits(all_samples)
     elif uses_external_sources:
         all_samples = scan_external_sources(keyword, source_config)
     else:
@@ -401,7 +408,13 @@ def prepare_keyword_adaptation(
         by_phase.setdefault(sample.phase, []).append(sample)
 
     phase_splits: dict[str, tuple[list[AdaptSample], list[AdaptSample]]] = {}
-    for phase, phase_samples in sorted(by_phase.items()):
+    if joint:
+        from dma_kws.stage2.joint_manifest import split_joint_samples
+
+        phase_splits = split_joint_samples(
+            all_samples, data_root=data_root, eval_fraction=eval_fraction, seed=eval_seed,
+        )
+    for phase, phase_samples in (() if joint else sorted(by_phase.items())):
         explicit_split = (
             split_explicit_manifest(phase_samples, phase=phase)
             if uses_manifest

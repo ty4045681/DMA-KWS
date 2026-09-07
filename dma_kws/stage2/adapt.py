@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
@@ -21,7 +22,7 @@ from dma_kws.stage2.adapt_dataset import (
     MixedAdaptationDataset,
     TargetKeywordValDataset,
 )
-from dma_kws.stage2.adapt_paths import adapt_data_root, phase_manifest, slugify
+from dma_kws.stage2.adapt_paths import adapt_data_root, adapt_exp_root, phase_manifest, slugify
 from dma_kws.stage2.module import Stage2LightningModule
 from dma_kws.stage2.objective import (
     assert_sequence_objective_matches,
@@ -77,7 +78,6 @@ def _adapt_section(config: dict[str, Any]) -> dict[str, Any]:
 
 def _resolve_adapt_paths(config: dict[str, Any]) -> dict[str, Path]:
     adapt = _adapt_section(config)
-    paths = config["paths"]
     keyword = str(adapt.get("keyword", ""))
     if not keyword:
         raise ValueError("adapt.keyword is required")
@@ -86,10 +86,7 @@ def _resolve_adapt_paths(config: dict[str, Any]) -> dict[str, Path]:
     data_root = Path(adapt.get("data_root", "")) if adapt.get("data_root") else adapt_data_root(
         config, keyword
     )
-    if adapt.get("exp_root"):
-        exp_root = Path(str(adapt["exp_root"]))
-    else:
-        exp_root = Path(paths["exp_root"]) / "stage2_adapt" / slug
+    exp_root = adapt_exp_root(config, keyword)
     phase = str(adapt.get("phase", "tts"))
 
     return {
@@ -358,6 +355,62 @@ def grouped_utt_bce_totals(
     ).to(dtype=torch.float64)
 
 
+def grouped_domain_bce_totals(logits, labels, domains, valid_mask):
+    """Per domain: BCE sum, valid count, all draws, positive draws.
+
+    Keep the legacy keyword/replay flag separate: a MUSAN sample paired with
+    the target keyword is still a MUSAN audio source.
+    """
+    per_sample = F.binary_cross_entropy_with_logits(logits, labels.float(), reduction="none")
+    rows = []
+    for domain in range(4):
+        selected = domains == domain
+        valid = selected & valid_mask.bool()
+        rows.append(torch.stack((
+            per_sample.detach()[valid].sum(), valid.sum().to(per_sample),
+            selected.sum().to(per_sample), (selected & labels.bool()).sum().to(per_sample),
+        )))
+    return torch.stack(rows).to(dtype=torch.float64)
+
+
+def _joint_data_signature(
+    config: dict, manifests: dict[str, Path], *, parquet_file: Path, wav_dir: Path, dict_path: Path,
+) -> str:
+    """Bind full-state resumes to the same data and sampling policy."""
+    adapt, stage2 = config["adapt"], config["stage2"]
+    bg = stage2.get("background_negative", {}) or {}
+    files = {**manifests, "libri_parquet": Path(parquet_file), "tokenizer": Path(dict_path)}
+    for key, value in (
+        ("background_train", bg.get("audio_list_path")),
+        ("background_cache", bg.get("cache_manifest")),
+        ("background_eval", (adapt.get("joint") or {}).get("background_eval_list")),
+    ):
+        if value:
+            files[key] = Path(value)
+    digests = {}
+    for key, path in files.items():
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digests[key] = {"path": str(path.resolve()), "sha256": digest.hexdigest()}
+    payload = {
+        "files": digests,
+        "joint": adapt.get("joint", {}),
+        "mix_ratio": adapt.get("mix_ratio", 0.5),
+        "seed": config.get("training", {}).get("seed", 2025),
+        "sample_lens": adapt.get("sample_lens"),
+        "background": bg,
+        "fbank": config.get("fbank"),
+        "wav_dir": str(Path(wav_dir).resolve()),
+        "keyword": adapt.get("keyword"),
+        "replay": {key: stage2.get(key) for key in
+                   ("parquet_file", "wav_dir", "negative_ratio", "hard_negative_ratio")},
+        "accumulate_grad_batches": stage2.get("accumulate_grad_batches", 1),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
 class Stage2LoraAdaptationModule(Stage2LightningModule):
     """Stage II module with frozen encoder/base QbyT and trainable LoRA adapters."""
 
@@ -439,6 +492,14 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             ece_num_bins=self.ece_num_bins,
             sync_on_compute=True,
         )
+        self.joint_score_diagnostics = torch.nn.ModuleDict()
+        if str(self._adapt_cfg.get("phase")) == "joint":
+            for domain in ("tts", "musan"):
+                self.joint_score_diagnostics[domain] = BinaryScoreDiagnostics(
+                    deployment_threshold=self.deployment_threshold,
+                    ece_num_bins=self.ece_num_bins,
+                    sync_on_compute=True,
+                )
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         """Make LoRA Lightning checkpoints self-describing for later export."""
@@ -566,6 +627,24 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             self._log_source_losses(
                 logits, batch["label"], source, losses["utt_sample_mask"]
             )
+        if "domain_source" in batch:
+            stats = sum_across_processes(grouped_domain_bce_totals(
+                logits, batch["label"], batch["domain_source"], losses["utt_sample_mask"]
+            ))
+            total = stats[:, 2].sum()
+            for name, (loss_sum, valid_count, count, positives) in zip(
+                ("lph", "real", "tts", "musan"), stats
+            ):
+                nan = total.new_tensor(float("nan"))
+                for key, value in (
+                    (f"source_{name}_fraction", count / total if total > 0 else nan),
+                    (f"loss_{name}_utt_raw", loss_sum / valid_count if valid_count > 0 else nan),
+                    (f"positive_{name}_fraction", positives / count if count > 0 else nan),
+                ):
+                    self.log(f"train/microbatch/{key}", value, on_step=True, sync_dist=True)
+            loader = getattr(getattr(self, "_trainer", None), "train_dataloader", None)
+            if hasattr(loader, "mark_consumed"):
+                loader.mark_consumed()
         return total_loss
 
     def _log_source_losses(
@@ -618,11 +697,17 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
                 labels=labels,
                 sample_ids=batch.get("sample_id"),
             )
-        else:
+        elif dataloader_idx == 1:
             self._update_score_diagnostics(
                 self.score_diagnostics,
                 logits=logits,
                 labels=labels,
+                sample_ids=batch.get("sample_id"),
+            )
+        else:
+            name = {2: "tts", 3: "musan"}[dataloader_idx]
+            self._update_score_diagnostics(
+                self.joint_score_diagnostics[name], logits=logits, labels=labels,
                 sample_ids=batch.get("sample_id"),
             )
 
@@ -655,6 +740,16 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
             "val_target_auc", target_metrics["auc"], sync_dist=True, logger=False
         )
         self.log("val_lph_auc", lph_metrics["auc"], sync_dist=True, logger=False)
+        if self._adapt_cfg.get("phase") == "joint":
+            # In joint mode the primary target metric always means real speech.
+            for key, value in target_metrics.items():
+                self.log(f"val/real_{key}", value.float(), sync_dist=True)
+            for name, metric in self.joint_score_diagnostics.items():
+                if name == "musan" and not (self._adapt_cfg.get("joint") or {}).get("background_eval_list"):
+                    continue
+                metrics = self._log_score_diagnostics(metric, namespace=f"val/{name}_")
+                self.log(f"val/{name}_utt_loss", metrics["log_loss"], sync_dist=True)
+                metric.reset()
         self._log_train_window_metrics()
 
         self.target_score_diagnostics.reset()
@@ -707,6 +802,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
 
     from dma_kws.config import (
         fbank_kwargs,
+        get_eval_fbank_config,
         get_fbank_config,
         get_tokenizer_config,
         require_sections,
@@ -748,14 +844,30 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     reporter = adapt_console.adapt_reporter(config)
     is_primary_process = process_rank() == 0
 
-    train_manifest = adapt_paths["train_manifest"]
-    eval_manifest = adapt_paths["eval_manifest"]
+    phase = adapt_paths["phase_str"]
+    joint = phase == "joint"
+    joint_cfg = adapt.get("joint", {}) or {}
+    joint_manifests = {}
+    if joint:
+        from dma_kws.stage2.joint_manifest import (
+            validate_joint_manifests,
+            validate_background_eval_split,
+        )
+        joint_manifests = validate_joint_manifests(adapt_paths["data_root"])
+        validate_background_eval_split(
+            stage2.get("background_negative", {}) or {},
+            joint_cfg.get("background_eval_list", ""),
+        )
+    train_manifest = joint_manifests.get("real_train", adapt_paths["train_manifest"])
+    eval_manifest = joint_manifests.get("real_eval", adapt_paths["eval_manifest"])
+    if joint:
+        adapt_paths["train_manifest"] = train_manifest
+        adapt_paths["eval_manifest"] = eval_manifest
     if not train_manifest.exists():
         raise SystemExit(f"Adaptation train manifest not found: {train_manifest}")
     if not eval_manifest.exists():
         raise SystemExit(f"Adaptation eval manifest not found: {eval_manifest}")
 
-    phase = adapt_paths["phase_str"]
     if args.limit_steps:
         # Keep the cosine schedule horizon in sync with the truncated run, otherwise
         # training stops while the LR is still on its way down.
@@ -862,13 +974,32 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         metadata_cache=stage2.get("metadata_cache", {}) or {},
     )
 
-    train_dataset = MixedAdaptationDataset(
-        keyword_dataset=keyword_dataset,
-        libri_dataset=libri_dataset,
-        mix_ratio=float(adapt.get("mix_ratio", 0.5)),
-        sample_lens=int(adapt.get("sample_lens", stage2.get("sample_lens", 5000))),
-        seed=sampling_seed,
-    )
+    if joint:
+        from dma_kws.stage2.joint_dataset import JointAdaptationDataset, JointBatchSampler
+        from dma_kws.stage2.joint_loader import JointDataLoader, JointEvalSampler
+
+        tts_dataset = KeywordAdaptationDataset(
+            manifest_path=joint_manifests["tts_train"],
+            keyword=adapt_paths["keyword_str"], fbank_root=adapt_paths["fbank_root"],
+            tokenizer=tokenizer, manifest_root=adapt_paths["data_root"],
+            seq_label_mode=seq_label_mode,
+        )
+        train_dataset = JointAdaptationDataset(
+            real_dataset=keyword_dataset, tts_dataset=tts_dataset, libri_dataset=libri_dataset,
+            mix_ratio=float(adapt.get("mix_ratio", 0.5)),
+            real_fraction=float(joint_cfg.get("real_fraction", 0.6)),
+            background_keyword_fraction=float(joint_cfg.get("background_keyword_fraction", 0.5)),
+            sample_lens=int(adapt.get("sample_lens", stage2.get("sample_lens", 5000))),
+            seed=seed,
+        )
+    else:
+        train_dataset = MixedAdaptationDataset(
+            keyword_dataset=keyword_dataset,
+            libri_dataset=libri_dataset,
+            mix_ratio=float(adapt.get("mix_ratio", 0.5)),
+            sample_lens=int(adapt.get("sample_lens", stage2.get("sample_lens", 5000))),
+            seed=sampling_seed,
+        )
 
     batch_size = int(adapt.get("batch_size_per_gpu", stage2.get("batch_size_per_gpu", 64)))
     num_workers = int(adapt.get("num_workers", stage2.get("num_workers", 2)))
@@ -882,18 +1013,27 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     dataloader_cfg = stage2.get("dataloader", {}) or {}
     loader_kwargs = build_loader_kwargs(num_workers, dataloader_cfg)
     val_loader_kwargs = build_loader_kwargs(val_num_workers, dataloader_cfg)
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=train_collate_fn,
-        drop_last=True,
-        # Reseeds both the mixed wrapper and the LibriPhrase dataset it holds;
-        # otherwise every worker draws the same mix decisions and negatives.
-        worker_init_fn=stage2_worker_init_fn,
-        **loader_kwargs,
-    )
+    if joint:
+        train_dataloader = JointDataLoader(
+            train_dataset, data_signature=_joint_data_signature(
+                config, joint_manifests, parquet_file=parquet_file, wav_dir=wav_dir, dict_path=dict_path,
+            ),
+            batch_sampler=JointBatchSampler(train_dataset, batch_size=batch_size, seed=seed),
+            accumulation_steps=int(stage2.get("accumulate_grad_batches", 1)),
+            num_workers=num_workers, collate_fn=train_collate_fn,
+            worker_init_fn=stage2_worker_init_fn, **loader_kwargs,
+        )
+    else:
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=train_collate_fn,
+            drop_last=True,
+            worker_init_fn=stage2_worker_init_fn,
+            **loader_kwargs,
+        )
 
     target_val_dataset = TargetKeywordValDataset(
         manifest_path=eval_manifest,
@@ -909,9 +1049,51 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         num_workers=val_num_workers,
         collate_fn=test_collate_fn,
         drop_last=False,
+        sampler=JointEvalSampler(target_val_dataset) if joint else None,
         **val_loader_kwargs,
     )
     lph_val_loader = _build_val_dataloader(config, tokenizer)
+    val_loaders = [target_val_loader, lph_val_loader]
+    if joint:
+        lph_val_loader = DataLoader(
+            lph_val_loader.dataset, batch_size=lph_val_loader.batch_size,
+            sampler=JointEvalSampler(lph_val_loader.dataset),
+            num_workers=val_num_workers, collate_fn=test_collate_fn, **val_loader_kwargs,
+        )
+        tts_val_dataset = TargetKeywordValDataset(
+            manifest_path=joint_manifests["tts_eval"], keyword=adapt_paths["keyword_str"],
+            fbank_root=adapt_paths["fbank_root"], tokenizer=tokenizer,
+            manifest_root=adapt_paths["data_root"],
+        )
+        # Each manifest may carry an explicit pronunciation. Comparing resolved
+        # IDs also catches an override present in only one source or split.
+        for dataset in (tts_dataset, tts_val_dataset, target_val_dataset):
+            if list(dataset._anchor_seq) != list(keyword_dataset._anchor_seq):
+                raise ValueError("Joint real/TTS train/eval keyword pronunciations must match")
+        tts_val_loader = DataLoader(
+            tts_val_dataset, batch_size=int(adapt.get("val_batch_size", batch_size)),
+            sampler=JointEvalSampler(tts_val_dataset), num_workers=val_num_workers,
+            collate_fn=test_collate_fn, **val_loader_kwargs,
+        )
+        val_loaders = [target_val_loader, lph_val_loader, tts_val_loader]
+        if joint_cfg.get("background_eval_list"):
+            from dma_kws.stage2.joint_validation import BackgroundValidationDataset
+            bg_val_dataset = BackgroundValidationDataset(
+                audio_list_path=joint_cfg["background_eval_list"],
+                anchor_seq=keyword_dataset._anchor_seq,
+                num_samples=joint_cfg.get("background_val_samples", 512),
+                seed=joint_cfg.get("background_eval_seed", 2026),
+                duration_seconds_min=background_negative.get("duration_seconds_min", 1.0),
+                duration_seconds_max=background_negative.get("duration_seconds_max", 3.0),
+                fbank_kwargs=fbank_kwargs(get_eval_fbank_config(config)),
+            )
+            val_loaders.append(DataLoader(
+                bg_val_dataset, batch_size=int(adapt.get("val_batch_size", batch_size)),
+                sampler=JointEvalSampler(bg_val_dataset), num_workers=val_num_workers,
+                collate_fn=test_collate_fn, **val_loader_kwargs,
+            ))
+        elif is_primary_process:
+            reporter.warn("Joint MUSAN validation is disabled: set adapt.joint.background_eval_list to a held-out list")
 
     mix_ratio = float(adapt.get("mix_ratio", 0.5))
     if is_primary_process:
@@ -919,10 +1101,12 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             *adapt_console.dataset_table(
                 [
                     (
-                        "keyword train",
+                        "real keyword train" if joint else "keyword train",
                         len(keyword_dataset),
                         adapt_console.label_breakdown(keyword_dataset),
                     ),
+                    *([("tts keyword train", len(tts_dataset), adapt_console.label_breakdown(tts_dataset))]
+                      if joint else []),
                     (
                         "libriphrase train pool",
                         len(libri_dataset),
@@ -947,6 +1131,12 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             ),
             title="Datasets",
         )
+        if joint:
+            reporter.print_table(
+                ["joint draw", "fraction"],
+                [[name, f"{weight:.2%}"] for name, weight in train_dataset.weights.items()],
+                title="Joint batch quotas",
+            )
 
     lora_rank = int(adapt.get("rank", 16))
     lora_alpha = float(adapt.get("alpha", 32))
@@ -1001,6 +1191,8 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             "slug": adapt_paths["slug_str"],
             **run_context.identity(),
             "checkpoint_dir": str(checkpoint_dir),
+            **({"joint_sampling_weights": json.dumps(train_dataset.weights, sort_keys=True),
+                "joint_data_signature": train_dataloader.data_signature} if joint else {}),
         },
     )
     if is_primary_process:
@@ -1015,6 +1207,10 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         accelerator=accelerator,
     )
     trainer_kwargs["max_steps"] = limit_steps
+    if joint:
+        # The joint batch sampler owns rank sharding and source quotas. All
+        # validation loaders have explicit dynamic rank samplers as well.
+        trainer_kwargs["use_distributed_sampler"] = False
 
     # Adaptation runs on short virtual epochs, so it needs its own validation
     # cadence instead of inheriting the Stage II pretraining schedule.
@@ -1023,6 +1219,11 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         trainer_kwargs["val_check_interval"] = int(adapt_validation["val_check_interval"])
     if adapt_validation.get("limit_val_batches") is not None:
         trainer_kwargs["limit_val_batches"] = adapt_validation["limit_val_batches"]
+    if joint and int(trainer_kwargs["val_check_interval"]) % train_dataloader.accumulation_steps:
+        raise ValueError(
+            "Joint adapt.validation.val_check_interval must be divisible by "
+            "stage2.accumulate_grad_batches so validation checkpoints retain complete optimizer updates"
+        )
     # Keep Lightning's train-batch interval on one counter across virtual
     # epochs. The dataloader is sharded only later during DDP setup, so
     # comparing against its pre-DDP length is also incorrect.
@@ -1063,7 +1264,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             accelerator=accelerator,
             section="adapt",
             train_samples=len(train_dataset),
-            val_samples=len(target_val_dataset) + len(lph_val_loader.dataset),
+            val_samples=sum(len(loader.dataset) for loader in val_loaders),
             param_counts=model.lora_param_counts,
             extra_rows=[
                 ("keyword", adapt_paths["keyword_str"]),
@@ -1110,7 +1311,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     trainer.fit(
         model,
         train_dataloaders=train_dataloader,
-        val_dataloaders=[target_val_loader, lph_val_loader],
+        val_dataloaders=val_loaders,
         ckpt_path=resume_path,
     )
 

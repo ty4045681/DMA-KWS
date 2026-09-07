@@ -22,13 +22,17 @@ def resolve_adapt_train_phases(adapt: dict[str, Any]) -> tuple[str, ...]:
         raise ValueError("adapt.train_phases must be a list or comma-separated string")
     if not phases:
         raise ValueError("adapt.train_phases must contain at least one phase")
-    invalid = sorted(set(phases) - {"tts", "real"})
+    invalid = sorted(set(phases) - {"tts", "real", "joint"})
     if invalid:
         raise ValueError(
-            f"adapt.train_phases contains unsupported phases {invalid}; expected tts and/or real"
+            f"adapt.train_phases contains unsupported phases {invalid}; expected tts/real or joint"
         )
     if len(phases) != len(set(phases)):
         raise ValueError(f"adapt.train_phases contains duplicates: {phases}")
+    if "joint" in phases and len(phases) != 1:
+        raise ValueError("adapt.train_phases=[joint] cannot be combined with tts/real")
+    if str(adapt.get("phase", "")).strip().casefold() == "joint" and phases != ["joint"]:
+        raise ValueError("adapt.phase=joint requires adapt.train_phases=[joint]")
     return tuple(phases)
 
 
@@ -64,12 +68,13 @@ def adapt_data_root(config: dict[str, Any], keyword: str) -> Path:
 
 def adapt_exp_root(config: dict[str, Any], keyword: str) -> Path:
     adapt = config.get("adapt", {}) or {}
-    slug = slugify(keyword)
+    slug = str(adapt.get("slug", "")) or slugify(keyword)
     if adapt.get("exp_root"):
         return Path(str(adapt["exp_root"]))
     paths = config.get("paths", {})
     exp_root = Path(paths.get("exp_root", "data/dma-kws/exp"))
-    return exp_root / "stage2_adapt" / slug
+    joint = resolve_adapt_train_phases(adapt) == ("joint",)
+    return exp_root / ("stage2_adapt_joint" if joint else "stage2_adapt") / slug
 
 
 def manifest_paths(data_root: Path) -> dict[str, Path]:
@@ -86,10 +91,21 @@ def phase_manifest(data_root: Path, phase: str, *, split: str) -> Path:
     return data_root / "manifests" / f"{phase}_{split}.csv"
 
 
-def clips_eval_manifest_from_adapt(eval_manifest: Path, keyword: str, output_path: Path) -> Path:
+def target_eval_manifest(data_root: Path, phase: str) -> Path:
+    """Use held-out real recordings for the joint run's primary target metric."""
+    return phase_manifest(data_root, "real" if phase == "joint" else phase, split="eval")
+
+
+def clips_eval_manifest_from_adapt(
+    eval_manifest: Path,
+    keyword: str,
+    output_path: Path,
+    *,
+    manifest_root: Path | None = None,
+) -> Path:
     from dma_kws.stage2.adapt_dataset import clips_eval_manifest_from_adapt as _fn
 
-    return _fn(eval_manifest, keyword, output_path)
+    return _fn(eval_manifest, keyword, output_path, manifest_root=manifest_root)
 
 
 def fbank_path_for_wav(fbank_root: Path, wav_path: Path) -> Path:

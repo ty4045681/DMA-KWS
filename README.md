@@ -1272,6 +1272,31 @@ python3 scripts/run_keyword_adaptation.py adapt.keyword="hey eva" prep.stage2_ck
 
 Outputs: `exp/stage2_adapt/<slug>/adapter_<slug>.pt` (small LoRA only), `stage2_adapted.pt` (merged, loadable by `Stage2Verifier`). To adapt another wake word, change `adapt.keyword` and place data under `data/dma-kws/processed/adapt/<new_slug>/raw/...`.
 
+### Joint LoRA: real + TTS + LibriPhrase + MUSAN
+
+The [joint overlay](configs/experiment/adapt_joint.yaml) runs one adapter and one optimizer schedule from the original Stage II base. Compose it after the experiment matching the checkpoint; it preserves the encoder, phoneme adapter and QbyT readout configuration. Existing TTS → real runs remain available.
+
+```bash
+PYTHONPATH=. python scripts/run_keyword_adaptation.py \
+  '+experiment=[adapt_hey_eva_icefall_adapter_v2,adapt_joint]' \
+  adapt.stage=train \
+  adapt.data_root=/path/to/prepared/adapt \
+  prep.stage2_ckpt=/path/to/stage2_base.pt \
+  stage2.background_negative.audio_list_path=/path/to/train_background.list
+```
+
+The data root must contain `manifests/{real,tts}_{train,eval}.csv` and the matching `fbank/` tree. There is no `joint_train.csv`: the [joint dataset](dma_kws/stage2/joint_dataset.py) reads the two keyword sources separately and reuses LibriPhrase replay. Each keyword source/split must contain positives and negatives. For preparation with `adapt.stage=all`, provide a combined `prep.manifest_csv` with `phase=real` or `phase=tts` on every row, or configure both raw source trees. The adapter-v2 experiment's default real-only source CSV is insufficient for joint preparation.
+
+Default sample shares are real **30%**, TTS **20%**, LibriPhrase **40%**, MUSAN **10%**. The underlying strata are real positive/negative 15% each, TTS positive/negative 10% each, LibriPhrase positive 25% / speech negative 15%, and background 10%. The [sampler](dma_kws/stage2/joint_dataset.py) carries fractional quotas across batches and epochs; it balances real speakers and TTS voices/negative phrases where metadata is available. Background examples use the target keyword for half their queries and LibriPhrase queries for the other half.
+
+Adjust `adapt.mix_ratio` (all keyword data), `adapt.joint.real_fraction` (real share within keyword data), and `stage2.background_negative.probability` (background share within replay negatives). Thus background's global share is `(1 - mix_ratio) * 0.5 * probability`. These are sampling settings; the existing readout-specific losses and frozen base are retained by the [training entry point](dma_kws/stage2/adapt.py). Online additive noise augmentation remains unsupported for LoRA.
+
+The [manifest checks](dma_kws/stage2/joint_manifest.py) reject real speaker leakage, shared audio/recording identities across train/eval, and inconsistent keyword pronunciations. Joint preparation groups related recordings before splitting; explicit splits are preserved. Supply `speaker_id`, `voice_id`, and original-recording metadata when available: relationships cannot be inferred from missing metadata. MUSAN training and validation lists must refer to disjoint original recordings; background cache source records are checked too.
+
+Training logs separate `real`, `tts`, `lph` and `musan` source fractions and BCE losses. Validation keeps real, TTS and LibriPhrase separate; `val_target_auc` and the default checkpoint selection refer to **real speech**. Set `adapt.joint.background_eval_list=/path/to/validation_background.list` to add fixed background-crop validation (`val/musan_deploy_fpr`). Clip FPR is not continuous-audio FA/h. Run `adapt.stage=eval` with that list and `prep.musan_root=/path/to/musan` for the [evaluation report](scripts/run_keyword_adaptation.py), including base/adapted real, TTS, LibriPhrase and continuous MUSAN FA/h. Use a validation list here; keep final blind-test recordings separate. This change does not automatically enforce a FA/h or forgetting constraint during checkpoint selection.
+
+The default joint output root is `paths.exp_root/stage2_adapt_joint/<slug>`, isolated from sequential runs. Full Lightning resumes (`run.resume_from`) restore the [consumed-batch cursor](dma_kws/stage2/joint_loader.py), optimizer and scheduler. Data manifests, replay parquet, tokenizer, sampling policy, batch size and world size must match. With gradient accumulation, both batches per rank per epoch and the validation interval must be divisible by `stage2.accumulate_grad_batches`; incomplete-accumulation checkpoints are rejected. Adapter-only initialization (`run.resume_checkpoint`) starts a new optimizer schedule. A first joint run starts directly from the base without automatically loading a prior TTS adapter.
+
 ### Console output
 
 All four adaptation scripts print rich progress and summary tables: a plan table before any heavy work, G2P/fbank progress bars during preparation, dataset composition and LoRA parameter budget before training, the resolved run summary (`Stage II LoRA Adaptation Run`), per-trial sweep scores, and a base-vs-adapted metric comparison with deltas at eval time. Each table is followed by the machine-readable JSON/YAML line the scripts have always emitted.
