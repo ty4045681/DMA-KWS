@@ -1,4 +1,4 @@
-"""Exercise the real joint training entry point through LoRA export on CPU."""
+"""Exercise joint adaptation methods through training and export on CPU."""
 
 from __future__ import annotations
 
@@ -37,6 +37,16 @@ class _TinyEncoder(nn.Module):
     def forward(self, feat, lengths, **kwargs):
         mask = torch.arange(feat.shape[1], device=feat.device)[None] < lengths[:, None]
         return self.projection(feat), mask[:, None]
+
+    def apply_stream_config(self, chunk_sizes, left_context_frames):
+        pass  # The fixture has no time-dependent receptive field.
+
+    def set_batch_count(self, batch_count):
+        self.batch_count = float(batch_count)
+        return 1
+
+    def output_frames(self, num_frames):
+        return num_frames
 
 
 class _BackgroundFeatures:
@@ -100,7 +110,10 @@ def _write_corpus(root: Path) -> tuple[Path, Path, Path]:
 
 
 @pytest.mark.parametrize("background_validation", [False, True])
-def test_joint_entry_point_trains_and_exports_real_lora(tmp_path, monkeypatch, background_validation):
+@pytest.mark.parametrize("method", ["lora", "qbyt_full", "encoder_qbyt_full"])
+def test_joint_entry_point_trains_and_exports(
+    tmp_path, monkeypatch, background_validation, method,
+):
     import pytorch_lightning as pl
     from dma_kws.stage2 import adapt as adapt_module
     from dma_kws.stage2 import adapt_dataset, features, joint_validation
@@ -108,15 +121,20 @@ def test_joint_entry_point_trains_and_exports_real_lora(tmp_path, monkeypatch, b
 
     data_root = tmp_path / "data"
     parquet, background_train, background_eval = _write_corpus(data_root)
-    config = config_to_dict(compose_config(overrides=["+experiment=adapt_joint"]))
+    experiments = (
+        "+experiment=adapt_joint" if method == "lora" else
+        f"+experiment=[icefall_zipformer_stage2_eps_softmin_v41,adapt_joint,adapt_{method}]"
+    )
+    config = config_to_dict(compose_config(overrides=[experiments]))
     config["paths"].update({
         "processed_root": str(data_root), "feature_root": str(data_root),
         "exp_root": str(tmp_path / "exp"),
     })
-    config["stage1"].update({"input_dim": 8, "causal": False})
+    config["stage1"].update({"input_dim": 8, "causal": method != "lora"})
     config["fbank"]["num_mel_bins"] = 8
     config["stage2"].update({
-        "encoder_output_dim": 8, "qbyt_embed_dim": 8, "qbyt_layers": 0,
+        "encoder_output_dim": 8, "qbyt_embed_dim": 8,
+        "qbyt_layers": 0 if method == "lora" else 1,
         "parquet_file": str(parquet), "wav_dir": str(parquet.parent),
         "precision": "32-true", "accumulate_grad_batches": 1,
         "log_interval": 1,
@@ -139,6 +157,8 @@ def test_joint_entry_point_trains_and_exports_real_lora(tmp_path, monkeypatch, b
         "num_workers": 0, "val_num_workers": 0, "rank": 2, "alpha": 4,
         "warmup_steps": 0, "learning_rate": 0.01,
     })
+    if method == "encoder_qbyt_full":
+        config["adapt"]["encoder_learning_rate"] = 0.001
     config["adapt"]["logging"]["backends"] = ["csv"]
     config["adapt"]["console"]["rich"] = False
     config["adapt"]["validation"].update({"val_check_interval": 1, "limit_val_batches": 1})
@@ -149,6 +169,10 @@ def test_joint_entry_point_trains_and_exports_real_lora(tmp_path, monkeypatch, b
 
     monkeypatch.setattr(
         "dma_kws.stage2.module.build_encoder",
+        lambda stage1, *, output_dim: _TinyEncoder(stage1["input_dim"], output_dim),
+    )
+    monkeypatch.setattr(
+        "dma_kws.nn.build_encoder",
         lambda stage1, *, output_dim: _TinyEncoder(stage1["input_dim"], output_dim),
     )
     monkeypatch.setattr(adapt_dataset, "make_g2p", lambda: None)
@@ -182,6 +206,14 @@ def test_joint_entry_point_trains_and_exports_real_lora(tmp_path, monkeypatch, b
     }, alignment=base.qbyt_score), base_path)
 
     observed = {}
+    atomic_destinations = []
+    atomic_save = adapt_module._atomic_torch_save
+
+    def observe_atomic_save(payload, destination):
+        atomic_destinations.append(Path(destination))
+        return atomic_save(payload, destination)
+
+    monkeypatch.setattr(adapt_module, "_atomic_torch_save", observe_atomic_save)
 
     class Observe(pl.Callback):
         def on_train_start(self, trainer, model):
@@ -208,6 +240,21 @@ def test_joint_entry_point_trains_and_exports_real_lora(tmp_path, monkeypatch, b
     monkeypatch.setattr(pl, "Trainer", make_trainer)
     artifacts = run_stage2_adaptation(config, Stage2AdaptArgs(init_checkpoint=str(base_path), device="cpu"))
 
+    # Check the artifact contract through the real runner for each method.
+    # Stable aliases must be published atomically, while callers receive the
+    # immutable per-run files that cannot be replaced by a subsequent run.
+    exp_root = adapt_exp_root(config, "hey")
+    stable_paths = {exp_root / "stage2_adapted.pt"}
+    stable_paths.add(exp_root / "joint" / (
+        "stage2_adapted.pt" if method != "lora" else "adapter_hey.pt"
+    ))
+    assert stable_paths <= set(atomic_destinations)
+    assert set(artifacts.values()).isdisjoint(stable_paths)
+    for artifact_path in artifacts.values():
+        assert artifact_path in atomic_destinations
+        assert artifact_path.is_file()
+        assert "checkpoints" in artifact_path.relative_to(exp_root).parts
+
     assert observed["step"] == 2
     assert len(observed["batches"]) == 2
     for sources in observed["batches"]:
@@ -220,19 +267,93 @@ def test_joint_entry_point_trains_and_exports_real_lora(tmp_path, monkeypatch, b
         assert float(metrics["val/musan_num_neg"]) == 2
 
     assert observed["trainable"]
-    assert all(name.endswith((".lora_A", ".lora_B")) for name in observed["trainable"])
     changed = {
         name for name, tensor in observed["trained"].items()
         if not torch.equal(tensor, observed["initial"][name])
     }
     assert changed
     assert changed <= set(observed["trainable"])
+    if method != "lora":
+        expected_trainable = {f"qbyt.{name}" for name, _ in base.qbyt.named_parameters()}
+        if method == "encoder_qbyt_full":
+            expected_trainable |= {f"encoder.{name}" for name, _ in base.encoder.named_parameters()}
+            assert "encoder.projection.weight" in changed
+        assert expected_trainable == set(observed["trainable"])
+        assert {"qbyt.audio_projection.weight", "qbyt.final_pos_fc.weight"} <= changed
+        assert not any("parametrizations" in name or "lora_" in name for name in observed["trained"])
+        assert "adapter" not in artifacts
+        exported = torch.load(artifacts["merged"], map_location="cpu", weights_only=False)
+        assert exported["phase"] == "joint"
+        assert exported["method"] == method
+        assert exported["dma_kws_run_context"]["run_id"].startswith(f"adapt_hey_joint_{method}/")
+        assert exported[QBYT_READOUT_VERSION_KEY] == 4
+        assert_qbyt_readout_version(exported, source="full QbyT CPU smoke", expected_alignment=base.qbyt_score)
+        assert not any("parametrizations" in name or "lora_" in name for name in exported["model_state_dict"])
+        frozen_prefixes = ("adapter.",) if method == "encoder_qbyt_full" else ("encoder.", "adapter.")
+        for name, tensor in exported["model_state_dict"].items():
+            if name.startswith(frozen_prefixes):
+                torch.testing.assert_close(tensor, base_state[name], rtol=0, atol=0)
+        if method == "encoder_qbyt_full":
+            assert not torch.equal(exported["model_state_dict"]["encoder.projection.weight"], base_state["encoder.projection.weight"])
+
+        # Compare the exported inference model with the selected Lightning
+        # checkpoint, not the last training step: best-AUC selection may differ.
+        best_path = observed["trainer"].checkpoint_callback.best_model_path
+        selected = torch.load(best_path, map_location="cpu", weights_only=False)
+        assert selected["checkpoint_kind"] == f"stage2_{method}"
+        assert selected["method"] == method
+        probe = next(iter(observed["val_loaders"][0]))
+        base.load_state_dict(selected["state_dict"], strict=True)
+        base.eval()
+        with torch.no_grad():
+            expected = base(probe["feat"], probe["feat_lengths"], probe["anchor"])[0]
+        base.load_state_dict(exported["model_state_dict"], strict=True)
+        with torch.no_grad():
+            actual = base(probe["feat"], probe["feat_lengths"], probe["anchor"])[0]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        if method == "encoder_qbyt_full":
+            from dma_kws.inference.stage2_verifier import Stage2Verifier
+            monkeypatch.setattr(
+                "dma_kws.inference.stage2_verifier.build_encoder",
+                lambda stage1, *, output_dim: _TinyEncoder(stage1["input_dim"], output_dim),
+            )
+            # This comparison starts from precomputed features; waveform
+            # extraction is outside its scope and requires optional Lhotse.
+            monkeypatch.setattr(
+                "dma_kws.inference.stage2_verifier.FbankExtractor", lambda **kwargs: None,
+            )
+            verifier = Stage2Verifier.from_config(
+                config, {"stage2_ckpt": str(artifacts["merged"])}, torch.device("cpu"),
+            )
+            clips = [feat[:int(length)] for feat, length in zip(probe["feat"], probe["feat_lengths"])]
+            keywords = [anchor[anchor != 0].tolist() for anchor in probe["anchor"]]
+            deployed = verifier.score_clip_feats_with_logits(clips, keywords)
+            torch.testing.assert_close(torch.tensor([raw for raw, _ in deployed]), expected, rtol=0, atol=0)
+
+        from dma_kws.training.checkpoint_convert import convert_checkpoint
+        converted_path = tmp_path / "converted-full.pt"
+        convert_checkpoint(best_path, converted_path)
+        converted = torch.load(converted_path, map_location="cpu", weights_only=False)
+        assert_qbyt_readout_version(converted, source=converted_path, expected_alignment=base.qbyt_score)
+        base.load_state_dict(converted["model_state_dict"], strict=True)
+        with torch.no_grad():
+            converted_logits = base(probe["feat"], probe["feat_lengths"], probe["anchor"])[0]
+        torch.testing.assert_close(converted_logits, expected, rtol=0, atol=0)
+        exp_root = adapt_exp_root(config, "hey")
+        assert (exp_root / "joint" / "stage2_adapted.pt").is_file()
+        assert (exp_root / "stage2_adapted.pt").is_file()
+        assert not (exp_root / "joint" / "adapter_hey.pt").exists()
+        return
+
+    assert all(name.endswith((".lora_A", ".lora_B")) for name in observed["trainable"])
     assert fingerprint_stage2_base(observed["trained"]) == fingerprint_stage2_base(base_state)
 
     adapter = torch.load(artifacts["adapter"], map_location="cpu", weights_only=False)
     merged = torch.load(artifacts["merged"], map_location="cpu", weights_only=False)
     for payload in (adapter, merged):
         assert payload["phase"] == "joint"
+        assert payload["dma_kws_run_context"]["run_id"].startswith("adapt_hey_joint/")
         assert payload[QBYT_READOUT_VERSION_KEY] == 7
         assert_qbyt_readout_version(payload, source="CPU joint smoke", expected_alignment=base.qbyt_score)
     assert adapter["step"] == merged["step"]

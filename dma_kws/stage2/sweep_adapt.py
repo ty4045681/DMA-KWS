@@ -1,4 +1,4 @@
-"""Optuna hyperparameter search for Stage II LoRA adaptation."""
+"""Optuna hyperparameter search for Stage II keyword adaptation."""
 
 from __future__ import annotations
 
@@ -16,32 +16,44 @@ from typing import TYPE_CHECKING, Any, Callable
 import yaml
 
 from dma_kws.pathing import PROJECT_ROOT
+from dma_kws.stage2.adapt_config import is_full_adapt_method, resolve_adapt_method
 from dma_kws.stage2.adapt_paths import (
     adapt_exp_root,
     resolve_adapt_train_phases,
     slugify,
 )
-from dma_kws.training.adapt_params import merge_adapt_params, normalize_adapt_params
+from dma_kws.training.adapt_params import merge_adapt_params
 
 if TYPE_CHECKING:
     from dma_kws.stage2.adapt import Stage2AdaptArgs
 
 
 def suggest_adapt_params(
-    trial: Any, *, search_mix: bool = False, joint: bool = False
+    trial: Any, *, search_mix: bool = False, joint: bool = False, method: str = "lora"
 ) -> dict[str, Any]:
-    rank = trial.suggest_categorical("rank", [4, 8, 16, 32])
-    alpha_ratio = trial.suggest_categorical("alpha_ratio", [1.0, 2.0])
-    params = {
-        "rank": rank,
-        "alpha": int(alpha_ratio * rank),
-        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 2e-3, log=True),
-        # A joint run replaces both sequential phases, so keep total update
-        # budgets comparable to the historical two-phase sweep.
-        "max_steps": trial.suggest_categorical(
-            "max_steps", [2000, 4000, 6000] if joint else [1000, 2000, 3000]
-        ),
-    }
+    method = resolve_adapt_method({"method": method})
+    if is_full_adapt_method(method):
+        params = {
+            "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-4, log=True),
+            "max_steps": trial.suggest_categorical("max_steps", [500, 1000, 2000]),
+        }
+        if method == "encoder_qbyt_full":
+            params["encoder_learning_rate"] = trial.suggest_float(
+                "encoder_learning_rate", 1e-6, 1e-5, log=True
+            )
+    else:
+        rank = trial.suggest_categorical("rank", [4, 8, 16, 32])
+        alpha_ratio = trial.suggest_categorical("alpha_ratio", [1.0, 2.0])
+        params = {
+            "rank": rank,
+            "alpha": int(alpha_ratio * rank),
+            "learning_rate": trial.suggest_float("learning_rate", 1e-4, 2e-3, log=True),
+            # A joint run replaces both sequential phases, so keep total update
+            # budgets comparable to the historical two-phase sweep.
+            "max_steps": trial.suggest_categorical(
+                "max_steps", [2000, 4000, 6000] if joint else [1000, 2000, 3000]
+            ),
+        }
     if search_mix:
         params["mix_ratio"] = trial.suggest_float("mix_ratio", 0.3, 0.7)
     return params
@@ -75,6 +87,21 @@ def compute_sweep_score(
 def apply_trial_params(config: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     """Write normalized trial params into ``config['adapt']`` and return them."""
     return merge_adapt_params(config.setdefault("adapt", {}), params)
+
+
+def bind_study_adapt_method(study: Any, method: str) -> None:
+    """Prevent a durable Optuna study from mixing incompatible parameter scopes."""
+    method = resolve_adapt_method({"method": method})
+    saved_method = study.user_attrs.get("adapt_method")
+    if saved_method is None and study.trials:
+        # Studies created before method selection only trained LoRA.
+        saved_method = "lora"
+    if saved_method is not None and saved_method != method:
+        raise ValueError(
+            f"Sweep study contains adapt.method={saved_method!r}, but this run uses "
+            f"{method!r}. Set a different adapt.sweep.study_name or storage."
+        )
+    study.set_user_attr("adapt_method", method)
 
 
 def disable_persistent_workers(config: dict[str, Any]) -> dict[str, Any]:
@@ -183,7 +210,7 @@ def _validate_sweep_runtime_args(base_args: Stage2AdaptArgs) -> None:
     ]
     if unsupported:
         raise ValueError(
-            "LoRA sweep trials do not support "
+            "Adaptation sweep trials do not support "
             f"{', '.join(unsupported)}. Optuna resumes completed trials through its "
             "study storage, and trial parameters are already fixed in the request."
         )
@@ -207,6 +234,12 @@ def run_adaptation_training_trial(
         params,
     )
     adapt = trial_config["adapt"]
+    method = resolve_adapt_method(adapt)
+    if is_full_adapt_method(method) and base_args.resume_checkpoint:
+        raise ValueError(
+            f"{method} sweep trials cannot resume a LoRA adapter. Pass a merged "
+            "stage2_adapted.pt as init_checkpoint and leave resume_checkpoint empty."
+        )
 
     def report(stage: str, detail: str) -> None:
         if on_event is not None:
@@ -215,6 +248,7 @@ def run_adaptation_training_trial(
     def train_phase(
         phase: str,
         *,
+        init_checkpoint: str,
         adapter_checkpoint: str = "",
     ) -> dict[str, Path]:
         adapt["phase"] = phase
@@ -222,7 +256,7 @@ def run_adaptation_training_trial(
         return run_stage2_adaptation(
             trial_config,
             Stage2AdaptArgs(
-                init_checkpoint=base_args.init_checkpoint,
+                init_checkpoint=init_checkpoint,
                 resume_checkpoint=adapter_checkpoint,
                 device=base_args.device,
                 devices=base_args.devices,
@@ -234,16 +268,23 @@ def run_adaptation_training_trial(
     if single_phase:
         phases = phases[:1]
     phase_artifacts: dict[str, dict[str, Path]] = {}
+    init_checkpoint = base_args.init_checkpoint
     adapter_checkpoint = base_args.resume_checkpoint
     for index, phase in enumerate(phases):
-        artifacts = train_phase(phase, adapter_checkpoint=adapter_checkpoint)
+        artifacts = train_phase(
+            phase, init_checkpoint=init_checkpoint, adapter_checkpoint=adapter_checkpoint
+        )
         phase_artifacts[phase] = artifacts
         if index + 1 < len(phases):
-            if "adapter" not in artifacts:
+            handoff_key = "adapter" if method == "lora" else "merged"
+            if handoff_key not in artifacts:
                 raise RuntimeError(
-                    f"Adaptation phase {phase!r} produced no adapter for the next phase"
+                    f"Adaptation phase {phase!r} produced no {handoff_key} for the next phase"
                 )
-            adapter_checkpoint = str(artifacts["adapter"])
+            if method == "lora":
+                adapter_checkpoint = str(artifacts["adapter"])
+            else:
+                init_checkpoint = str(artifacts["merged"])
 
     return {
         "config": trial_config,
@@ -382,7 +423,7 @@ def launch_distributed_adaptation_trial(
                 raise
     if not result_path.is_file():
         raise RuntimeError(
-            f"Distributed LoRA trial finished without a rank-zero result: {result_path}"
+            f"Distributed adaptation trial finished without a rank-zero result: {result_path}"
         )
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     return _deserialize_training_result(payload)
@@ -404,9 +445,13 @@ def _local_port_is_available(port: int) -> bool:
     return True
 
 
-def save_best_params(path: Path, params: dict[str, Any], *, score: float) -> None:
+def save_best_params(
+    path: Path, params: dict[str, Any], *, score: float, method: str = "lora"
+) -> None:
     """Persist sweep best params using ``adapt`` config keys (not Optuna search keys)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"score": score, **normalize_adapt_params(params)}
+    method = resolve_adapt_method({"method": method})
+    normalized = merge_adapt_params({"method": method}, params)
+    payload = {"score": score, **normalized, "method": method}
     with path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)

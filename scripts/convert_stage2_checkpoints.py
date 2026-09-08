@@ -20,6 +20,11 @@ Examples:
       --output-dir exp/converted \
       --experiment adapt_hey_eva
 
+  # Pooling / joint LoRA Lightning checkpoints (v2-v4 phone_matchor LoRA).
+  # Current training ckpts embed config; no --experiment is required.
+  python scripts/convert_stage2_checkpoints.py \
+      --checkpoint exp/stage2_adapt_joint/hey_eva/joint/checkpoints/last.ckpt
+
 LoRA checkpoints produce both a merged full-model ``.pt`` and an
 ``.adapter.pt`` by default.  Use ``--lora-output`` to select one.
 """

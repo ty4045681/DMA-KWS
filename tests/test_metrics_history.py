@@ -305,6 +305,7 @@ def test_collect_hparams_records_alignment_overrides():
 
 def test_collect_hparams_adapt_section():
     hparams = collect_hparams(CONFIG, section="adapt", extra={"slug": "hey-eva"})
+    assert hparams["adapt_method"] == "lora"
     assert hparams["learning_rate"] == 4e-4
     assert hparams["optimizer"] == "adamw"
     assert hparams["max_steps"] == 3000
@@ -315,6 +316,18 @@ def test_collect_hparams_adapt_section():
     assert hparams["keyword"] == "hey eva"
     assert hparams["phase"] == "tts"
     assert hparams["slug"] == "hey-eva"
+
+
+def test_collect_hparams_full_qbyt_reports_effective_method_without_lora_settings():
+    config = {
+        **CONFIG,
+        "adapt": {**CONFIG["adapt"], "method": "qbyt_full", "learning_rate": 3e-5},
+    }
+    hparams = collect_hparams(config, section="adapt")
+    assert hparams["adapt_method"] == "qbyt_full"
+    assert hparams["learning_rate"] == 3e-5
+    assert "rank" not in hparams
+    assert "alpha" not in hparams
 
 
 def test_collect_hparams_adapt_lr_alias_wins():

@@ -1,4 +1,4 @@
-"""Stage II LoRA continual adaptation training."""
+"""Stage II continual adaptation with explicit trainable module scopes."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import json
 import math
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,12 +17,18 @@ import torch.nn.functional as F
 
 from dma_kws.pathing import resolve_dict_path
 from dma_kws.phonemes import normalize_english_text
+from dma_kws.stage2.adapt_config import (
+    adapt_method_label,
+    is_full_adapt_method,
+    resolve_adapt_method,
+)
 from dma_kws.stage2.adapt_dataset import (
     KeywordAdaptationDataset,
     MixedAdaptationDataset,
     TargetKeywordValDataset,
 )
 from dma_kws.stage2.adapt_paths import adapt_data_root, adapt_exp_root, phase_manifest, slugify
+from dma_kws.stage2.encoder_schedule import EncoderFinetuneSchedule
 from dma_kws.stage2.module import Stage2LightningModule
 from dma_kws.stage2.objective import (
     assert_sequence_objective_matches,
@@ -33,11 +39,13 @@ from dma_kws.training.adapt_params import (
     load_adapt_params_file,
     merge_adapt_params,
     resolve_adapt_lr,
+    resolve_encoder_adapt_lr,
 )
 from dma_kws.training.checkpoint_io import (
     STAGE2_BASE_FINGERPRINT_KEY,
     assert_qbyt_readout_version,
     assert_stream_policy_matches,
+    extract_state_dict,
     fingerprint_stage2_base,
     restore_best_checkpoint_weights,
     stamp_qbyt_readout_version,
@@ -54,11 +62,16 @@ from dma_kws.training.lora import (
     normalize_lora_targets,
 )
 from dma_kws.training.score_diagnostics import BinaryScoreDiagnostics
+from dma_kws.training.random_state import (
+    capture_rank_random_states,
+    restore_rank_random_states,
+    validate_rank_random_states,
+)
 
 
 @dataclass
 class Stage2AdaptArgs:
-    """Runtime options for Stage II LoRA adaptation."""
+    """Runtime options for Stage II adaptation."""
 
     init_checkpoint: str = ""
     resume_checkpoint: str = ""
@@ -136,11 +149,12 @@ def _apply_adapt_overrides(config: dict[str, Any], args: Stage2AdaptArgs) -> dic
     )
 
 
-def _validate_lora_runtime_config(stage2: dict[str, Any]) -> None:
+def _validate_lora_runtime_config(stage2: dict[str, Any], *, method: str = "lora") -> None:
+    label = "LoRA" if method == "lora" else method
     noise_augmentation = stage2.get("noise_augmentation", {}) or {}
     if bool(noise_augmentation.get("enabled", False)):
         raise ValueError(
-            "stage2.noise_augmentation.enabled is not supported for LoRA "
+            f"stage2.noise_augmentation.enabled is not supported for {label} "
             "adaptation: adaptation manifests contain precomputed features, not "
             "the source waveforms required for online mixing. Disable it for "
             "adaptation or run base Stage II QbyT training."
@@ -149,9 +163,9 @@ def _validate_lora_runtime_config(stage2: dict[str, Any]) -> None:
     ema = stage2.get("ema", {}) or {}
     if bool(ema.get("enabled", False)):
         raise ValueError(
-            "stage2.ema.enabled is not supported for LoRA adaptation: Lightning "
-            "weight averaging also updates the frozen base and invalidates "
-            "adapter/base identity. Keep EMA disabled."
+            f"stage2.ema.enabled is not supported for {label} adaptation: Lightning "
+            "weight averaging is not part of adaptation checkpoint selection and "
+            "can update frozen modules. Keep EMA disabled."
         )
 
     precision = str(stage2.get("precision", "") or "").lower()
@@ -159,7 +173,7 @@ def _validate_lora_runtime_config(stage2: dict[str, Any]) -> None:
         raise ValueError(
             f"stage2.precision={precision!r} changes frozen base parameter dtypes "
             "after adapter identity is checked. Use 'bf16-mixed', '16-mixed', or "
-            "'32-true' for LoRA adaptation."
+            f"'32-true' for {label} adaptation."
         )
 
 
@@ -222,12 +236,13 @@ def _validate_lora_metadata(
     source: str | Path,
     expected: dict[str, Any],
     required: tuple[str, ...],
+    label: str = "LoRA",
 ) -> None:
     source_label = str(source)
     missing = [key for key in required if not _metadata_candidates(checkpoint, key)]
     if missing:
         raise SystemExit(
-            f"Cannot resume LoRA checkpoint {source_label}: required metadata is "
+            f"Cannot resume {label} checkpoint {source_label}: required metadata is "
             f"missing: {', '.join(missing)}."
         )
 
@@ -238,13 +253,13 @@ def _validate_lora_metadata(
         try:
             normalized_expected = _normalize_lora_metadata(key, expected_value)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid expected LoRA {key}: {expected_value!r}") from exc
+            raise ValueError(f"Invalid expected {label} {key}: {expected_value!r}") from exc
         for location, saved_value in candidates:
             try:
                 normalized_saved = _normalize_lora_metadata(key, saved_value)
             except (TypeError, ValueError) as exc:
                 raise SystemExit(
-                    f"Cannot resume LoRA checkpoint {source_label}: invalid "
+                    f"Cannot resume {label} checkpoint {source_label}: invalid "
                     f"{key}={saved_value!r} in {location}."
                 ) from exc
             matches = normalized_saved == normalized_expected
@@ -257,7 +272,7 @@ def _validate_lora_metadata(
                 )
             if not matches:
                 raise SystemExit(
-                    f"Cannot resume LoRA checkpoint {source_label}: "
+                    f"Cannot resume {label} checkpoint {source_label}: "
                     f"{key}={saved_value!r} in {location}, expected "
                     f"{expected_value!r}."
                 )
@@ -411,8 +426,84 @@ def _joint_data_signature(
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-class Stage2LoraAdaptationModule(Stage2LightningModule):
-    """Stage II module with frozen encoder/base QbyT and trainable LoRA adapters."""
+def _validate_adapt_checkpoint_method(checkpoint: dict[str, Any], *, expected: str) -> None:
+    """A historical LoRA checkpoint has no method field; its kind is sufficient."""
+    kind = str(checkpoint.get("checkpoint_kind", ""))
+    inferred = {
+        "stage2_lora": "lora",
+        "stage2_qbyt_full": "qbyt_full",
+        "stage2_encoder_qbyt_full": "encoder_qbyt_full",
+    }.get(kind)
+    candidates = _metadata_candidates(checkpoint, "method")
+    if inferred is not None:
+        candidates.append(("checkpoint.checkpoint_kind", inferred))
+    for location, saved in candidates:
+        if saved != expected:
+            raise SystemExit(
+                f"Cannot resume adapt.method={expected!r} from {saved!r} in {location}. "
+                "To change method, start a new run from complete model weights "
+                "with run.init_checkpoint; merge LoRA first."
+            )
+
+
+def _validate_qbyt_full_initialization(
+    checkpoint: dict[str, Any], *, source: str | Path, method: str = "qbyt_full",
+) -> None:
+    if not isinstance(checkpoint, dict):
+        raise SystemExit(
+            f"Cannot initialize {method} from {source}: expected a complete Stage II checkpoint."
+        )
+    state = extract_state_dict(checkpoint)
+    unmerged = (
+        checkpoint.get("checkpoint_kind") in {"stage2_lora", "stage2_lora_adapter"}
+        or "lora_state_dict" in checkpoint
+        or isinstance(state, dict) and any(
+            isinstance(key, str) and (
+                ".parametrizations." in key or key.endswith((".lora_A", ".lora_B"))
+            )
+            for key in state
+        )
+    )
+    if unmerged:
+        raise SystemExit(
+            f"Cannot initialize {method} from unmerged LoRA checkpoint {source}. "
+            "Merge LoRA first and use the complete stage2_adapted.pt model, or convert "
+            "the full LoRA .ckpt with scripts/convert_stage2_checkpoints.py --lora-output merged."
+        )
+
+
+def fingerprint_frozen_modules(
+    state: dict[str, torch.Tensor], module_names: tuple[str, ...],
+) -> str:
+    """Hash a declared frozen subset; no frozen modules has a valid empty hash."""
+    prefixes = tuple(name + "." for name in module_names)
+    trunk = {key: value for key, value in state.items() if key.startswith(prefixes)}
+    for name in module_names:
+        if not any(key.startswith(name + ".") for key in trunk):
+            raise ValueError(f"Cannot identify frozen adaptation module without {name}.* weights")
+    digest = hashlib.sha256()
+    for key in sorted(trunk):
+        tensor = trunk[key].detach().cpu().contiguous()
+        metadata = f"{key}\0{tensor.dtype}\0{tuple(tensor.shape)}\0{tensor.layout}\0".encode()
+        raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        digest.update(len(metadata).to_bytes(8, "big"))
+        digest.update(metadata)
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def fingerprint_adaptation_trunk(state: dict[str, torch.Tensor]) -> str:
+    """Backward-compatible identity of a frozen encoder and optional adapter."""
+    names = ("encoder", "adapter") if any(key.startswith("adapter.") for key in state) else ("encoder",)
+    return fingerprint_frozen_modules(state, names)
+
+
+class Stage2AdaptationModule(Stage2LightningModule):
+    """Shared adaptation objective, diagnostics and explicit training policy."""
+
+    adaptation_method: str
+    train_encoder = False
 
     def __init__(
         self,
@@ -420,73 +511,43 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         *,
         vocab_size: int,
         init_checkpoint: str | Path | None = None,
-        lora_rank: int = 16,
-        lora_alpha: float = 32.0,
-        lora_targets: tuple[str, ...] | None = None,
-        adapter_checkpoint: str | Path | None = None,
         restoring_full_checkpoint: bool = False,
     ) -> None:
-        module_config = config
-        if restoring_full_checkpoint:
-            module_config = copy.deepcopy(config)
-            adapter_cfg = module_config.get("stage2", {}).get("phoneme_adapter")
-            if isinstance(adapter_cfg, dict):
+        requested = _adapt_section(config)
+        if (
+            requested.get("method") is not None
+            and resolve_adapt_method(requested) != self.adaptation_method
+        ):
+            raise ValueError(
+                f"{type(self).__name__} requires adapt.method={self.adaptation_method!r}"
+            )
+        module_config = copy.deepcopy(config)
+        module_config["adapt"]["method"] = self.adaptation_method
+        module_config["stage2"]["freeze_encoder"] = not self.train_encoder
+        adapter_cfg = module_config.get("stage2", {}).get("phoneme_adapter")
+        if isinstance(adapter_cfg, dict):
+            adapter_cfg["freeze"] = True
+            adapter_cfg["ctc_weight"] = 0.0
+            if restoring_full_checkpoint or (
+                self.adaptation_method != "lora" and init_checkpoint
+            ):
+                # Full tuning takes the frozen trunk solely from the selected
+                # complete model. An older Step-A file must not overwrite it.
                 adapter_cfg["init_checkpoint"] = ""
         super().__init__(
             module_config,
             vocab_size=vocab_size,
-            freeze_encoder=True,
+            freeze_encoder=not self.train_encoder,
             init_checkpoint=init_checkpoint,
             require_full_qbyt_init=bool(init_checkpoint),
         )
         for param in self.parameters():
             param.requires_grad = False
-        # The phoneme adapter trunk is part of the shared Stage I/II forward
-        # pass; letting LoRA move it would break the premise that both stages
-        # read one encoder pass. Freeze it and turn off the auxiliary CTC loss.
         self.freeze_adapter = self.adapter is not None
         self.ctc_weight = 0.0
-
-        self._base_model_sha256 = fingerprint_stage2_base(self.state_dict())
-        normalized_targets = lora_targets_for_qbyt_family(
-            lora_targets, family=self.qbyt_score.family
-        )
-        self.lora_injected = inject_qbyt_lora(
-            self.qbyt,
-            rank=lora_rank,
-            alpha=lora_alpha,
-            targets=normalized_targets,
-        )
-        self._lora_rank = int(lora_rank)
-        self._lora_alpha = float(lora_alpha)
-        self._lora_targets = normalized_targets
-        checkpoint_adapt = _adapt_section(self._checkpoint_config)
-        checkpoint_adapt["rank"] = self._lora_rank
-        checkpoint_adapt["alpha"] = self._lora_alpha
-        checkpoint_adapt["lora_targets"] = list(self._lora_targets)
-        if adapter_checkpoint:
-            state = torch.load(adapter_checkpoint, map_location="cpu")
-            # LoRA weights are tuned against a specific encoder operating point.
-            assert_stream_policy_matches(state, self.stream_policy, source=adapter_checkpoint)
-            # LoRA is meaningful only on the exact same bounded path topology.
-            assert_qbyt_readout_version(
-                state,
-                source=adapter_checkpoint,
-                expected_alignment=self.qbyt_score,
-            )
-            adapter_state = _validate_adapter_checkpoint(
-                state,
-                source=adapter_checkpoint,
-                keyword=str(checkpoint_adapt.get("keyword", "")),
-                rank=self._lora_rank,
-                alpha=self._lora_alpha,
-                targets=self._lora_targets,
-                base_model_sha256=self._base_model_sha256,
-            )
-            load_lora_state_dict(self.qbyt, adapter_state, strict=True)
-
-        self.lora_param_counts = count_lora_params(self)
-        self._adapt_cfg = _adapt_section(config)
+        self.encoder.requires_grad_(self.train_encoder)
+        self._set_frozen_submodules_to_eval()
+        self._adapt_cfg = _adapt_section(module_config)
         self.target_score_diagnostics = BinaryScoreDiagnostics(
             deployment_threshold=self.deployment_threshold,
             ece_num_bins=self.ece_num_bins,
@@ -501,90 +562,44 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
                     sync_on_compute=True,
                 )
 
-    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        """Make LoRA Lightning checkpoints self-describing for later export."""
-        super().on_save_checkpoint(checkpoint)
-        adapt = _adapt_section(self._checkpoint_config)
-        keyword = str(adapt.get("keyword", ""))
-        checkpoint.update(
-            {
-                "checkpoint_kind": "stage2_lora",
-                "keyword": keyword,
-                "slug": str(adapt.get("slug", "")) or slugify(keyword),
-                "phase": str(adapt.get("phase", "tts")),
-                "rank": self._lora_rank,
-                "alpha": self._lora_alpha,
-                "lora_targets": list(self._lora_targets),
-                STAGE2_BASE_FINGERPRINT_KEY: self._base_model_sha256,
-            }
-        )
+    @property
+    def adaptation_param_counts(self) -> dict[str, int]:
+        return {
+            "total": sum(param.numel() for param in self.parameters()),
+            "trainable": sum(param.numel() for param in self.parameters() if param.requires_grad),
+        }
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        """Reject a resume whose Python-only LoRA scaling metadata changed."""
-        assert_qbyt_readout_version(
-            checkpoint,
-            source="the LoRA checkpoint being restored",
-            expected_alignment=self.qbyt_score,
-        )
+        _validate_adapt_checkpoint_method(checkpoint, expected=self.adaptation_method)
         super().on_load_checkpoint(checkpoint)
-        adapt = _adapt_section(self._checkpoint_config)
-        keyword = str(adapt.get("keyword", ""))
-        _validate_lora_metadata(
-            checkpoint,
-            source="the LoRA checkpoint being restored",
-            expected={
-                "checkpoint_kind": "stage2_lora",
-                "keyword": keyword,
-                "slug": str(adapt.get("slug", "")) or slugify(keyword),
-                "phase": str(adapt.get("phase", "tts")),
-                "rank": self._lora_rank,
-                "alpha": self._lora_alpha,
-                "lora_targets": self._lora_targets,
-            },
-            required=(
-                "checkpoint_kind",
-                "keyword",
-                "phase",
-                "rank",
-                "alpha",
-                "lora_targets",
-            ),
-        )
-        state = checkpoint.get("state_dict")
-        if not isinstance(state, dict):
-            raise SystemExit(
-                "Cannot resume LoRA checkpoint: state_dict is missing or invalid."
-            )
-        actual_base_sha256 = fingerprint_stage2_base(state)
-        _validate_base_fingerprint(
-            checkpoint,
-            source="the LoRA checkpoint being restored",
-            expected=actual_base_sha256,
-        )
-        self._base_model_sha256 = actual_base_sha256
 
-    def train(self, mode: bool = True):
-        """Keep frozen feature extractors deterministic while LoRA is training."""
-        super().train(mode)
-        if mode:
-            self.encoder.eval()
-            if self.adapter is not None:
-                self.adapter.eval()
-        return self
-
-    def configure_optimizers(self) -> dict:
-        trainable = [param for param in self.parameters() if param.requires_grad]
-        if not trainable:
-            raise RuntimeError("No trainable LoRA parameters found")
+    def _optimizer_config(self) -> dict[str, Any]:
         adapt = self._adapt_cfg
         lr, _ = resolve_adapt_lr(adapt)
-        optim_cfg = {
+        return {
             "optimizer": str(adapt.get("optimizer", "adam")).lower(),
             "lr": lr,
             "weight_decay": float(adapt.get("weight_decay", 0.0)),
             "warmup_steps": int(adapt.get("warmup_steps", 100)),
             "total_steps": int(adapt.get("max_steps", 3000)),
         }
+
+    def train(self, mode: bool = True):
+        """Keep frozen feature extractors deterministic during adaptation."""
+        super().train(mode)
+        if mode:
+            self._set_frozen_submodules_to_eval()
+        return self
+
+    def _optimizer_parameters(self) -> list:
+        trainable = [param for param in self.parameters() if param.requires_grad]
+        if not trainable:
+            raise RuntimeError(f"No trainable {self.adaptation_method} parameters found")
+        return trainable
+
+    def configure_optimizers(self) -> dict:
+        trainable = self._optimizer_parameters()
+        optim_cfg = self._optimizer_config()
 
         import torch as torch_mod
         from transformers import get_cosine_schedule_with_warmup
@@ -756,6 +771,397 @@ class Stage2LoraAdaptationModule(Stage2LightningModule):
         self.score_diagnostics.reset()
 
 
+class Stage2LoraAdaptationModule(Stage2AdaptationModule):
+    """Frozen Stage II base with trainable LoRA adapters."""
+
+    adaptation_method = "lora"
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        vocab_size: int,
+        init_checkpoint: str | Path | None = None,
+        lora_rank: int = 16,
+        lora_alpha: float = 32.0,
+        lora_targets: tuple[str, ...] | None = None,
+        adapter_checkpoint: str | Path | None = None,
+        restoring_full_checkpoint: bool = False,
+    ) -> None:
+        super().__init__(
+            config, vocab_size=vocab_size, init_checkpoint=init_checkpoint,
+            restoring_full_checkpoint=restoring_full_checkpoint,
+        )
+        self._base_model_sha256 = fingerprint_stage2_base(self.state_dict())
+        normalized_targets = lora_targets_for_qbyt_family(
+            lora_targets, family=self.qbyt_score.family
+        )
+        self.lora_injected = inject_qbyt_lora(
+            self.qbyt,
+            rank=lora_rank,
+            alpha=lora_alpha,
+            targets=normalized_targets,
+        )
+        self._lora_rank = int(lora_rank)
+        self._lora_alpha = float(lora_alpha)
+        self._lora_targets = normalized_targets
+        checkpoint_adapt = _adapt_section(self._checkpoint_config)
+        checkpoint_adapt["rank"] = self._lora_rank
+        checkpoint_adapt["alpha"] = self._lora_alpha
+        checkpoint_adapt["lora_targets"] = list(self._lora_targets)
+        if adapter_checkpoint:
+            state = torch.load(adapter_checkpoint, map_location="cpu")
+            # LoRA weights are tuned against a specific encoder operating point.
+            assert_stream_policy_matches(state, self.stream_policy, source=adapter_checkpoint)
+            # LoRA is meaningful only on the exact same bounded path topology.
+            assert_qbyt_readout_version(
+                state,
+                source=adapter_checkpoint,
+                expected_alignment=self.qbyt_score,
+            )
+            adapter_state = _validate_adapter_checkpoint(
+                state,
+                source=adapter_checkpoint,
+                keyword=str(checkpoint_adapt.get("keyword", "")),
+                rank=self._lora_rank,
+                alpha=self._lora_alpha,
+                targets=self._lora_targets,
+                base_model_sha256=self._base_model_sha256,
+            )
+            load_lora_state_dict(self.qbyt, adapter_state, strict=True)
+
+        self.lora_param_counts = count_lora_params(self)
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Make LoRA Lightning checkpoints self-describing for later export."""
+        super().on_save_checkpoint(checkpoint)
+        adapt = _adapt_section(self._checkpoint_config)
+        keyword = str(adapt.get("keyword", ""))
+        checkpoint.update(
+            {
+                "checkpoint_kind": "stage2_lora",
+                "method": self.adaptation_method,
+                "keyword": keyword,
+                "slug": str(adapt.get("slug", "")) or slugify(keyword),
+                "phase": str(adapt.get("phase", "tts")),
+                "rank": self._lora_rank,
+                "alpha": self._lora_alpha,
+                "lora_targets": list(self._lora_targets),
+                STAGE2_BASE_FINGERPRINT_KEY: self._base_model_sha256,
+            }
+        )
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Reject a resume whose Python-only LoRA scaling metadata changed."""
+        assert_qbyt_readout_version(
+            checkpoint,
+            source="the LoRA checkpoint being restored",
+            expected_alignment=self.qbyt_score,
+        )
+        super().on_load_checkpoint(checkpoint)
+        adapt = _adapt_section(self._checkpoint_config)
+        keyword = str(adapt.get("keyword", ""))
+        _validate_lora_metadata(
+            checkpoint,
+            source="the LoRA checkpoint being restored",
+            expected={
+                "checkpoint_kind": "stage2_lora",
+                "method": self.adaptation_method,
+                "keyword": keyword,
+                "slug": str(adapt.get("slug", "")) or slugify(keyword),
+                "phase": str(adapt.get("phase", "tts")),
+                "rank": self._lora_rank,
+                "alpha": self._lora_alpha,
+                "lora_targets": self._lora_targets,
+            },
+            required=(
+                "checkpoint_kind",
+                "keyword",
+                "phase",
+                "rank",
+                "alpha",
+                "lora_targets",
+            ),
+        )
+        state = checkpoint.get("state_dict")
+        if not isinstance(state, dict):
+            raise SystemExit(
+                "Cannot resume LoRA checkpoint: state_dict is missing or invalid."
+            )
+        actual_base_sha256 = fingerprint_stage2_base(state)
+        _validate_base_fingerprint(
+            checkpoint,
+            source="the LoRA checkpoint being restored",
+            expected=actual_base_sha256,
+        )
+        self._base_model_sha256 = actual_base_sha256
+
+
+class Stage2FullAdaptationModule(Stage2AdaptationModule):
+    """Common initialization and checkpoint contract for full model adaptation."""
+
+    checkpoint_kind: str
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        vocab_size: int,
+        init_checkpoint: str | Path | None = None,
+        restoring_full_checkpoint: bool = False,
+    ) -> None:
+        super().__init__(
+            config, vocab_size=vocab_size, init_checkpoint=init_checkpoint,
+            restoring_full_checkpoint=restoring_full_checkpoint,
+        )
+        self.qbyt.requires_grad_(True)
+        self._frozen_trunk_sha256 = fingerprint_frozen_modules(
+            self.state_dict(), self.frozen_module_names,
+        )
+        self._initial_model_sha256 = (
+            None if restoring_full_checkpoint else fingerprint_stage2_base(self.state_dict())
+        )
+
+    @property
+    def frozen_module_names(self) -> tuple[str, ...]:
+        return tuple(
+            name for name, frozen, module in (
+                ("encoder", self.freeze_encoder, self.encoder),
+                ("adapter", self.freeze_adapter, self.adapter),
+            )
+            if frozen and module is not None
+        )
+
+    def assert_frozen_modules_unchanged(self) -> None:
+        current = fingerprint_frozen_modules(self.state_dict(), self.frozen_module_names)
+        if current != self._frozen_trunk_sha256:
+            raise RuntimeError(
+                f"Frozen modules {self.frozen_module_names} changed during {self.adaptation_method}"
+            )
+
+    def full_adaptation_metadata(self) -> dict[str, Any]:
+        """Pure export metadata, excluding training progress and stochastic state."""
+        return {
+            "checkpoint_kind": self.checkpoint_kind,
+            "method": self.adaptation_method,
+            "frozen_modules": list(self.frozen_module_names),
+            "frozen_trunk_sha256": self._frozen_trunk_sha256,
+            "initial_model_sha256": self._initial_model_sha256,
+        }
+
+    def _load_init_checkpoint(
+        self, checkpoint_path: Path, *, require_full_qbyt: bool = False,
+    ) -> None:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        _validate_qbyt_full_initialization(
+            checkpoint, source=checkpoint_path, method=self.adaptation_method,
+        )
+        state = extract_state_dict(checkpoint)
+        if self.adapter is not None and not any(
+            isinstance(key, str) and key.startswith("adapter.") for key in state
+        ):
+            raise SystemExit(
+                f"Cannot initialize {self.adaptation_method} from {checkpoint_path}: "
+                "stage2.phoneme_adapter is enabled but the complete model has no "
+                "adapter.* weights. Supply a model trained with the adapter or "
+                "disable the adapter; external Step-A initialization cannot replace "
+                "the selected model's frozen trunk."
+            )
+        super()._load_init_checkpoint(checkpoint_path, require_full_qbyt=require_full_qbyt)
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        super().on_save_checkpoint(checkpoint)
+        adapt = _adapt_section(self._checkpoint_config)
+        keyword = str(adapt.get("keyword", ""))
+        checkpoint.update({
+            **self.full_adaptation_metadata(),
+            "keyword": keyword,
+            "slug": str(adapt.get("slug", "")) or slugify(keyword),
+            "phase": str(adapt.get("phase", "tts")),
+            "adapt_optimizer": self._optimizer_config(),
+        })
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        super().on_load_checkpoint(checkpoint)
+        source = f"the {self.adaptation_method} checkpoint being restored"
+        adapt = _adapt_section(self._checkpoint_config)
+        keyword = str(adapt.get("keyword", ""))
+        _validate_lora_metadata(
+            checkpoint, source=source,
+            expected={
+                "checkpoint_kind": self.checkpoint_kind,
+                "method": self.adaptation_method,
+                "keyword": keyword,
+                "slug": str(adapt.get("slug", "")) or slugify(keyword),
+                "phase": str(adapt.get("phase", "tts")),
+            },
+            required=("checkpoint_kind", "method", "keyword", "phase", "frozen_trunk_sha256"),
+            label=self.adaptation_method,
+        )
+        assert_sequence_objective_matches(checkpoint, self._stage2_cfg, source=source)
+        state = checkpoint.get("state_dict")
+        if not isinstance(state, dict):
+            raise SystemExit(f"Cannot resume {self.adaptation_method} checkpoint: state_dict is missing or invalid.")
+        _validate_qbyt_full_initialization(checkpoint, source=source, method=self.adaptation_method)
+        saved_modules = checkpoint.get("frozen_modules")
+        if saved_modules is not None and saved_modules != list(self.frozen_module_names):
+            raise SystemExit(f"Cannot resume {self.adaptation_method}: frozen module selection changed")
+        actual_trunk = fingerprint_frozen_modules(state, self.frozen_module_names)
+        if checkpoint.get("frozen_trunk_sha256") != actual_trunk:
+            raise SystemExit(
+                f"Cannot resume {self.adaptation_method} checkpoint: frozen_trunk_sha256 "
+                "does not match its frozen module weights."
+            )
+        if checkpoint.get("adapt_optimizer") != self._optimizer_config():
+            raise SystemExit(
+                f"Cannot resume {self.adaptation_method} checkpoint with changed optimizer, learning rate, "
+                "weight decay, warmup or schedule horizon. Use run.init_checkpoint for a new weights-only run."
+            )
+        self._frozen_trunk_sha256 = actual_trunk
+        self._initial_model_sha256 = checkpoint.get("initial_model_sha256")
+
+
+class Stage2QbytFullAdaptationModule(Stage2FullAdaptationModule):
+    """Train every QbyT parameter while keeping encoder and adapter fixed."""
+
+    adaptation_method = "qbyt_full"
+    checkpoint_kind = "stage2_qbyt_full"
+
+
+class Stage2EncoderQbytFullAdaptationModule(Stage2FullAdaptationModule):
+    """Fine-tune encoder and QbyT, with an optional frozen differentiable adapter."""
+
+    adaptation_method = "encoder_qbyt_full"
+    checkpoint_kind = "stage2_encoder_qbyt_full"
+    train_encoder = True
+
+    def __init__(
+        self, config: dict[str, Any], *, vocab_size: int,
+        init_checkpoint: str | Path | None = None,
+        restoring_full_checkpoint: bool = False,
+    ) -> None:
+        super().__init__(
+            config, vocab_size=vocab_size, init_checkpoint=init_checkpoint,
+            restoring_full_checkpoint=restoring_full_checkpoint,
+        )
+        self._encoder_schedule = (
+            EncoderFinetuneSchedule.from_config(self._checkpoint_config)
+            if self.stream_policy.backend == "icefall_zipformer" else None
+        )
+        self._pending_microbatches = 0
+        self._pending_random_state = None
+        self._resume_training_device = None
+        if self._encoder_schedule is not None:
+            if not callable(getattr(self.encoder, "set_batch_count", None)):
+                raise ValueError("Icefall encoder fine-tuning requires an encoder.set_batch_count hook")
+            self.encoder.set_batch_count(self._encoder_schedule.batch_count)
+
+    def _optimizer_config(self) -> dict[str, Any]:
+        config = super()._optimizer_config()
+        config["param_groups"] = [
+            {"name": "qbyt", "lr": config["lr"]},
+            {"name": "encoder", "lr": resolve_encoder_adapt_lr(self._adapt_cfg)},
+        ]
+        config["accumulate_grad_batches"] = int(self._stage2_cfg.get("accumulate_grad_batches", 1))
+        stage1 = self._checkpoint_config["stage1"]
+        scheduled_dropout = bool(stage1.get("use_icefall_dropout_schedule", True))
+        config["encoder_training"] = {
+            "stream_policy": asdict(self.stream_policy),
+            "use_icefall_dropout_schedule": scheduled_dropout,
+            "dropout_rate": (
+                None if scheduled_dropout and self.stream_policy.backend == "icefall_zipformer"
+                else float(stage1.get("dropout_rate", 0.1))
+            ),
+            "warmup_batches": float(stage1.get("warmup_batches", 4000.0)),
+            "positional_dropout_rate": float(stage1.get("positional_dropout_rate", 0.1)),
+            "attention_dropout_rate": float(stage1.get("attention_dropout_rate", 0.0)),
+            "precision": str(self._stage2_cfg.get("precision", "32-true")),
+            "gradient_clip_val": float(self._stage2_cfg.get("gradient_clip_val", 1.0)),
+        }
+        return config
+
+    def _optimizer_parameters(self) -> list[dict[str, Any]]:
+        groups = [
+            {**spec, "params": list(getattr(self, spec["name"]).parameters())}
+            for spec in self._optimizer_config()["param_groups"]
+        ]
+        parameters = [parameter for group in groups for parameter in group["params"]]
+        expected = {id(parameter) for parameter in self.parameters() if parameter.requires_grad}
+        actual = [id(parameter) for parameter in parameters]
+        if len(actual) != len(set(actual)) or set(actual) != expected:
+            raise RuntimeError("Encoder/QbyT optimizer groups must partition all trainable parameters exactly once")
+        return groups
+
+    def on_train_start(self) -> None:
+        super().on_train_start()
+        if self._pending_random_state is not None:
+            if self.device.type != self._resume_training_device:
+                raise SystemExit(
+                    f"Cannot resume encoder adaptation on {self.device.type} from "
+                    f"{self._resume_training_device} training: stochastic state is accelerator-specific. "
+                    "Use run.init_checkpoint for a new weights-only run."
+                )
+            restore_rank_random_states(self._pending_random_state)
+            self._pending_random_state = None
+
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        if self._encoder_schedule is not None:
+            self.encoder.set_batch_count(self._encoder_schedule.batch_count)
+            self.log("train/microbatch/encoder_batch_count", self._encoder_schedule.batch_count, on_step=True)
+        loss = super().training_step(batch, batch_idx)
+        if self._encoder_schedule is not None:
+            frames = sum_across_processes(batch["feat_lengths"].to(dtype=torch.int64).sum())
+            self._encoder_schedule.advance(int(frames.item()))
+        self._pending_microbatches += 1
+        return loss
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        super().on_before_optimizer_step(optimizer)
+        from pytorch_lightning.utilities import grad_norm
+
+        for group in optimizer.param_groups:
+            name = group["name"]
+            self.log(f"train/optimizer/{name}_lr", group["lr"], on_step=True)
+            if self._log_grad_norm:
+                total = grad_norm(getattr(self, name), norm_type=2).get("grad_2.0_norm_total")
+                if total is not None:
+                    self.log(f"train/optimizer/{name}_grad_norm_pre_clip", total, on_step=True)
+        # Lightning checkpoints do not preserve partially accumulated gradients.
+        # This hook also handles an epoch's final, shorter accumulation window.
+        self._pending_microbatches = 0
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        if self._pending_microbatches:
+            raise RuntimeError("Cannot checkpoint encoder adaptation during gradient accumulation; save after an optimizer step")
+        super().on_save_checkpoint(checkpoint)
+        checkpoint["encoder_schedule"] = (
+            self._encoder_schedule.state_dict() if self._encoder_schedule is not None else None
+        )
+        checkpoint["adapt_training_device"] = self.device.type
+        # Trainer.save_checkpoint invokes this hook on every rank before the
+        # strategy persists the rank-zero payload, so collecting RNG here is safe.
+        checkpoint["adapt_random_state"] = capture_rank_random_states()
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        super().on_load_checkpoint(checkpoint)
+        if checkpoint.get("frozen_modules") != list(self.frozen_module_names):
+            raise SystemExit("Cannot resume encoder adaptation: frozen module selection is missing or changed")
+        try:
+            if self._encoder_schedule is not None:
+                self._encoder_schedule.load_state_dict(checkpoint.get("encoder_schedule"))
+                self.encoder.set_batch_count(self._encoder_schedule.batch_count)
+            elif checkpoint.get("encoder_schedule") is not None:
+                raise ValueError("Cannot restore an Icefall schedule into a different encoder backend")
+            validate_rank_random_states(checkpoint.get("adapt_random_state"))
+        except ValueError as exc:
+            raise SystemExit(f"Cannot resume encoder adaptation: {exc}") from exc
+        device = checkpoint.get("adapt_training_device")
+        if not isinstance(device, str) or not device:
+            raise SystemExit("Cannot resume encoder adaptation: training device type is missing")
+        self._resume_training_device = device
+        self._pending_random_state = checkpoint["adapt_random_state"]
+
+
 def _resolve_init_checkpoint(config: dict[str, Any], adapt_paths: dict[str, Any], args: Stage2AdaptArgs) -> str:
     adapt = _adapt_section(config)
     prep = config.get("prep", {}) or {}
@@ -790,8 +1196,24 @@ def _resolve_adapter_resume(
     return None
 
 
+def _resolve_full_init_checkpoint(
+    config: dict[str, Any], adapt_paths: dict[str, Any], args: Stage2AdaptArgs,
+) -> str:
+    """Continue sequential full tuning from complete prior-phase weights."""
+    if args.resume_checkpoint:
+        path = Path(args.resume_checkpoint)
+        if not path.is_file():
+            raise FileNotFoundError(f"Full-model weights checkpoint not found: {path}")
+        return str(path)
+    if not args.init_checkpoint and adapt_paths["phase_str"] == "real":
+        previous = adapt_paths["phase_dir"].parent / "tts" / "stage2_adapted.pt"
+        if previous.is_file():
+            return str(previous)
+    return _resolve_init_checkpoint(config, adapt_paths, args)
+
+
 def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict[str, Path]:
-    """Run Stage II LoRA adaptation for the configured keyword phase."""
+    """Run Stage II adaptation for the configured keyword phase and method."""
     try:
         import pytorch_lightning as pl_mod
         from torch.utils.data import DataLoader
@@ -834,11 +1256,13 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     require_sections(config, ["paths", "stage1", "stage2", "tokenizer", "training", "adapt"])
 
     adapt = _adapt_section(config)
+    method = resolve_adapt_method(adapt)
+    adapt["method"] = method
     adapt_paths = _resolve_adapt_paths(config)
     paths = config["paths"]
     stage1 = config["stage1"]
     stage2 = config["stage2"]
-    _validate_lora_runtime_config(stage2)
+    _validate_lora_runtime_config(stage2, method=method)
     training = config["training"]
     tokenizer_cfg = get_tokenizer_config(config)
     reporter = adapt_console.adapt_reporter(config)
@@ -878,6 +1302,9 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     checkpoint_root = adapt_paths["phase_dir"] / "checkpoints"
     log_dir = adapt_paths["phase_dir"] / "logs"
     run_name = f"adapt_{adapt_paths['slug_str']}_{phase}"
+    if is_full_adapt_method(method):
+        # Run IDs also appear in shared CSV/remote logs, outside the method's directory.
+        run_name += f"_{method}"
     resume_path = resolve_versioned_resume_path(
         args.resume_from,
         checkpoint_root,
@@ -886,7 +1313,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     if resume_path is not None and args.resume_checkpoint:
         raise ValueError(
             "Choose either run.resume_from (full Lightning state) or "
-            "run.resume_checkpoint (adapter weights), not both."
+            "run.resume_checkpoint (weights only), not both."
         )
     if resume_path is not None:
         # A full Lightning checkpoint already contains encoder, QbyT, LoRA and
@@ -895,16 +1322,21 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         init_checkpoint = ""
         adapter_resume = None
     else:
-        init_checkpoint = _resolve_init_checkpoint(config, adapt_paths, args)
-        adapter_resume = _resolve_adapter_resume(
-            adapt_paths,
-            phase,
-            args.resume_checkpoint,
-        )
+        if is_full_adapt_method(method):
+            init_checkpoint = _resolve_full_init_checkpoint(config, adapt_paths, args)
+            adapter_resume = None
+        else:
+            init_checkpoint = _resolve_init_checkpoint(config, adapt_paths, args)
+            adapter_resume = _resolve_adapter_resume(
+                adapt_paths,
+                phase,
+                args.resume_checkpoint,
+            )
 
     resume_payload = None
     if resume_path is not None:
         resume_payload = torch.load(resume_path, map_location="cpu")
+        _validate_adapt_checkpoint_method(resume_payload, expected=method)
         assert_sequence_objective_matches(
             resume_payload,
             stage2,
@@ -1138,30 +1570,31 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 title="Joint batch quotas",
             )
 
-    lora_rank = int(adapt.get("rank", 16))
-    lora_alpha = float(adapt.get("alpha", 32))
-    from dma_kws.stage2.readout import resolve_qbyt_score_spec
-
-    score = resolve_qbyt_score_spec(config.get("stage2", {}))
-    lora_targets = lora_targets_for_qbyt_family(
-        adapt.get("lora_targets"),
-        family=score.family,
-    )
-    adapt["rank"] = lora_rank
-    adapt["alpha"] = lora_alpha
-    adapt["lora_targets"] = list(lora_targets)
-
-    if resume_path is not None:
-        model = Stage2LoraAdaptationModule(
+    lora_rank = lora_alpha = None
+    lora_targets: tuple[str, ...] = ()
+    if is_full_adapt_method(method):
+        full_module_class = {
+            "qbyt_full": Stage2QbytFullAdaptationModule,
+            "encoder_qbyt_full": Stage2EncoderQbytFullAdaptationModule,
+        }[method]
+        model = full_module_class(
             config,
             vocab_size=vocab_size,
             init_checkpoint=init_checkpoint,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_targets=lora_targets,
-            restoring_full_checkpoint=True,
+            restoring_full_checkpoint=resume_path is not None,
         )
     else:
+        lora_rank = int(adapt.get("rank", 16))
+        lora_alpha = float(adapt.get("alpha", 32))
+        from dma_kws.stage2.readout import resolve_qbyt_score_spec
+
+        score = resolve_qbyt_score_spec(config.get("stage2", {}))
+        lora_targets = lora_targets_for_qbyt_family(
+            adapt.get("lora_targets"), family=score.family,
+        )
+        adapt["rank"] = lora_rank
+        adapt["alpha"] = lora_alpha
+        adapt["lora_targets"] = list(lora_targets)
         model = Stage2LoraAdaptationModule(
             config,
             vocab_size=vocab_size,
@@ -1170,6 +1603,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             lora_alpha=lora_alpha,
             lora_targets=lora_targets,
             adapter_checkpoint=adapter_resume,
+            restoring_full_checkpoint=resume_path is not None,
         )
 
     if accelerator == "gpu":
@@ -1265,19 +1699,27 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             section="adapt",
             train_samples=len(train_dataset),
             val_samples=sum(len(loader.dataset) for loader in val_loaders),
-            param_counts=model.lora_param_counts,
+            param_counts=(model.lora_param_counts if method == "lora" else model.adaptation_param_counts),
             extra_rows=[
                 ("keyword", adapt_paths["keyword_str"]),
                 ("phase", phase),
                 ("batches_per_epoch", str(len(train_dataloader))),
                 ("mix_ratio", str(mix_ratio)),
-                ("lora_rank", str(lora_rank)),
-                ("lora_alpha", str(lora_alpha)),
-                ("lora_targets", ", ".join(lora_targets)),
-                (
-                    "lora_injected_modules",
-                    str(len(getattr(model, "lora_injected", ()) or ())),
-                ),
+                *([
+                    ("lora_rank", str(lora_rank)),
+                    ("lora_alpha", str(lora_alpha)),
+                    ("lora_targets", ", ".join(lora_targets)),
+                    ("lora_injected_modules", str(len(model.lora_injected))),
+                ] if method == "lora" else [
+                    ("trainable_module", (
+                        "encoder and qbyt (all parameters)" if method == "encoder_qbyt_full"
+                        else "qbyt (all parameters)"
+                    )),
+                    ("frozen_modules", ", ".join(
+                        (["encoder"] if method == "qbyt_full" else [])
+                        + (["phoneme adapter"] if model.adapter is not None else [])
+                    ) or "(none)"),
+                ]),
                 ("params_file", str(args.params_file or "(none)")),
             ],
             paths={
@@ -1316,17 +1758,17 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     )
 
     global_step = int(trainer.global_step)
-    adapter_out = checkpoint_dir / f"adapter_{adapt_paths['slug_str']}.pt"
     merged_out = checkpoint_dir / "stage2_adapted.pt"
-    artifacts = {
-        "adapter": adapter_out,
-        "merged": merged_out,
-    }
-    published_outputs = {
-        "phase_adapter": adapt_paths["phase_dir"]
-        / f"adapter_{adapt_paths['slug_str']}.pt",
-        "merged": adapt_paths["merged_path"],
-    }
+    artifacts = {"merged": merged_out}
+    published_outputs = {"merged": adapt_paths["merged_path"]}
+    if method == "lora":
+        adapter_out = checkpoint_dir / f"adapter_{adapt_paths['slug_str']}.pt"
+        artifacts["adapter"] = adapter_out
+        published_outputs["phase_adapter"] = (
+            adapt_paths["phase_dir"] / f"adapter_{adapt_paths['slug_str']}.pt"
+        )
+    else:
+        published_outputs["phase_model"] = adapt_paths["phase_dir"] / "stage2_adapted.pt"
 
     if trainer.is_global_zero:
         artifact_step, artifact_source = restore_best_checkpoint_weights(
@@ -1334,34 +1776,38 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             checkpoint_callback,
             final_step=global_step,
         )
-        base_model_sha256 = fingerprint_stage2_base(model.state_dict())
-        if base_model_sha256 != model._base_model_sha256:
-            raise RuntimeError(
-                "The frozen Stage II base changed during LoRA training. Refusing "
-                "to save an adapter whose recorded base identity would be false."
+        if method == "lora":
+            base_model_sha256 = fingerprint_stage2_base(model.state_dict())
+            if base_model_sha256 != model._base_model_sha256:
+                raise RuntimeError(
+                    "The frozen Stage II base changed during LoRA training. Refusing "
+                    "to save an adapter whose recorded base identity would be false."
+                )
+            adapter_payload = stamp_run_context(
+                stamp_qbyt_readout_version(
+                    {
+                        "checkpoint_kind": "stage2_lora_adapter",
+                        "method": method,
+                        "lora_state_dict": lora_state_dict(model.qbyt),
+                        "config": model._checkpoint_config,
+                        "step": artifact_step,
+                        "keyword": adapt_paths["keyword_str"],
+                        "slug": adapt_paths["slug_str"],
+                        "phase": phase,
+                        "rank": lora_rank,
+                        "alpha": lora_alpha,
+                        "lora_targets": list(lora_targets),
+                        STAGE2_BASE_FINGERPRINT_KEY: base_model_sha256,
+                    },
+                    alignment=model.qbyt_score,
+                ),
+                run_context,
             )
-        adapter_payload = stamp_run_context(
-            stamp_qbyt_readout_version(
-                {
-                    "checkpoint_kind": "stage2_lora_adapter",
-                    "lora_state_dict": lora_state_dict(model.qbyt),
-                    "config": model._checkpoint_config,
-                    "step": artifact_step,
-                    "keyword": adapt_paths["keyword_str"],
-                    "slug": adapt_paths["slug_str"],
-                    "phase": phase,
-                    "rank": lora_rank,
-                    "alpha": lora_alpha,
-                    "lora_targets": list(lora_targets),
-                    STAGE2_BASE_FINGERPRINT_KEY: base_model_sha256,
-                },
-                alignment=model.qbyt_score,
-            ),
-            run_context,
-        )
-        _atomic_torch_save(adapter_payload, adapter_out)
-
-        merge_lora(model.qbyt)
+            _atomic_torch_save(adapter_payload, adapter_out)
+            _atomic_torch_save(adapter_payload, published_outputs["phase_adapter"])
+            merge_lora(model.qbyt)
+        else:
+            model.assert_frozen_modules_unchanged()
         merged_payload = stamp_run_context(
             stamp_qbyt_readout_version(
                 {
@@ -1371,20 +1817,20 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     "keyword": adapt_paths["keyword_str"],
                     "slug": adapt_paths["slug_str"],
                     "phase": phase,
+                    "method": method,
                     "tokenizer_dict_path": str(dict_path),
                     "vocab_size": vocab_size,
+                    **(model.full_adaptation_metadata() if is_full_adapt_method(method) else {}),
                 },
                 alignment=model.qbyt_score,
             ),
             run_context,
         )
         _atomic_torch_save(merged_payload, merged_out)
-
-        # Stable outputs are required by the standalone TTS -> real handoff and
-        # orchestration CLI. Atomic replacement prevents concurrent publishers
-        # from exposing a partially written checkpoint.
-        _atomic_torch_save(adapter_payload, published_outputs["phase_adapter"])
+        # Stable full-model outputs support sequential phases and deployment.
         _atomic_torch_save(merged_payload, published_outputs["merged"])
+        if is_full_adapt_method(method):
+            _atomic_torch_save(merged_payload, published_outputs["phase_model"])
 
         final_metrics = numeric_callback_metrics(dict(trainer.callback_metrics))
         runs_csv = Path(paths["exp_root"]) / "stage2_adapt" / "runs.csv"
@@ -1445,14 +1891,13 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 },
             },
             artifact_sources={
-                "adapter": artifact_source,
-                "merged": artifact_source,
+                **{name: artifact_source for name in artifacts},
                 **{
                     f"published_output/{name}": "stable output (atomic last-writer pointer)"
                     for name in published_outputs
                 },
             },
-            title=f"Stage II LoRA Adaptation Result · {phase}",
+            title=f"Stage II {adapt_method_label(method)} Adaptation Result · {phase}",
             rich=bool((adapt.get("console", {}) or {}).get("rich", True)),
         )
         print(
@@ -1461,6 +1906,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                     "keyword": adapt_paths["keyword_str"],
                     "slug": adapt_paths["slug_str"],
                     "phase": phase,
+                    "method": method,
                     "run_id": run_context.run_id,
                     "step": global_step,
                     "metrics": metrics,
@@ -1475,8 +1921,8 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         )
 
     # With externally launched DDP all ranks execute this function. Keep non-zero
-    # ranks alive until rank 0 has saved the TTS adapter, otherwise the real phase
-    # can race ahead and silently start without it.
-    trainer.strategy.barrier("stage2_lora_artifacts_saved")
+    # ranks alive until rank 0 has saved the phase handoff artifact, otherwise
+    # the next phase can race ahead and silently start from the original base.
+    trainer.strategy.barrier("stage2_adaptation_artifacts_saved")
 
     return artifacts

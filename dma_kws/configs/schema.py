@@ -657,7 +657,14 @@ class AdaptJointConfig:
 
 
 @dataclass
+class AdaptEncoderScheduleConfig:
+    start_batch_count: float = 100000.0
+    reference_duration: float = 600.0
+
+
+@dataclass
 class AdaptConfig:
+    method: str = "lora"
     keyword: str = "hey eva"
     slug: str = ""
     phase: str = "tts"
@@ -669,6 +676,8 @@ class AdaptConfig:
     alpha: int = 32
     lr: float | None = None
     learning_rate: float = 4e-4
+    encoder_learning_rate: float = 3e-6
+    encoder_schedule: AdaptEncoderScheduleConfig = field(default_factory=AdaptEncoderScheduleConfig)
     optimizer: str = "adam"
     weight_decay: float = 0.0
     warmup_steps: int = 100

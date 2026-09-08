@@ -1,5 +1,8 @@
 # @package _global_
 adapt:
+  # lora trains low-rank deltas; qbyt_full trains all QbyT weights.
+  # encoder_qbyt_full additionally trains the entire encoder (no LoRA).
+  method: lora
   keyword: hey eva
   slug: ""
   phase: tts
@@ -8,7 +11,7 @@ adapt:
   # real-only dataset can set [real] explicitly instead of failing on a
   # missing tts_train.csv.
   train_phases: [tts, real]
-  # [joint] trains one adapter on real + TTS + LibriPhrase + background data.
+  # [joint] adapts once on real + TTS + LibriPhrase + background data.
   # Joint cannot be combined with the sequential tts/real phases.
   joint:
     real_fraction: 0.6
@@ -30,6 +33,13 @@ adapt:
   alpha: 32
   lr: null            # alias for learning_rate; only applied when explicitly set
   learning_rate: 4.0e-4
+  # Only used by encoder_qbyt_full; independent of learning_rate and its lr alias.
+  encoder_learning_rate: 3.0e-6
+  encoder_schedule:
+    # Icefall fine-tuning schedule starts after the initial training ramp.
+    start_batch_count: 100000.0
+    # Global audio seconds across all ranks per schedule-count increment.
+    reference_duration: 600.0
   optimizer: adam
   weight_decay: 0.0
   warmup_steps: 100

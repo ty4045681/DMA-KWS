@@ -10,6 +10,7 @@ The adapter ensures shape consistency:
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,22 @@ class IcefallZipformerEncoder(nn.Module):
                 output_dim = 128  # Default fallback
         
         self.output_dim = output_dim
+
+    def set_batch_count(self, batch_count: float) -> None:
+        """Set all Icefall schedules, including the input subsampling modules.
+
+        Mirror the recipe's ``train.set_batch_count`` without importing its
+        command-line training entrypoint and unrelated training dependencies.
+        ``ScheduledFloat`` is an nn.Module, so named_modules reaches schedules
+        as well as modules that carry their own progress-dependent behavior.
+        """
+        if not math.isfinite(batch_count) or batch_count < 0:
+            raise ValueError("Icefall batch_count must be finite and non-negative")
+        for name, module in self.named_modules():
+            if hasattr(module, "batch_count"):
+                module.batch_count = float(batch_count)
+            if hasattr(module, "name"):
+                module.name = name
 
     def apply_stream_config(
         self,

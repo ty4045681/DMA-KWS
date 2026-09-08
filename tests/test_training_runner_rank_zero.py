@@ -100,7 +100,7 @@ def _assert_post_fit_artifacts_are_rank_zero(
             "dma_kws/stage2/adapt.py",
             "run_stage2_adaptation",
             {"_atomic_torch_save", "append_wide_row", "merge_lora"},
-            "stage2_lora_artifacts_saved",
+            "stage2_adaptation_artifacts_saved",
         ),
     ],
 )

@@ -17,6 +17,11 @@ from dma_kws.config import require_sections
 from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.pathing import PROJECT_ROOT
 from dma_kws.stage2 import adapt_console
+from dma_kws.stage2.adapt_config import (
+    adapt_method_label,
+    is_full_adapt_method,
+    resolve_adapt_method,
+)
 from dma_kws.stage2.adapt_paths import (
     adapt_data_root,
     adapt_exp_root,
@@ -39,9 +44,11 @@ def _forward_overrides() -> list[str]:
     excluded = {
         "adapt.stage",
         "adapt.keyword",
+        "adapt.method",
         "adapt.phase",
         "prep.stage2_ckpt",
         "run.device",
+        "run.resume_from",
     }
     return [
         arg for arg in sys.argv[1:]
@@ -240,6 +247,7 @@ def main(cfg: DictConfig) -> None:
     adapt = OmegaConf.to_container(cfg.adapt, resolve=True)
     if not isinstance(adapt, dict):
         raise SystemExit("adapt config section must be a mapping")
+    method = resolve_adapt_method(adapt)
     prep = OmegaConf.to_container(cfg.prep, resolve=True)
     if not isinstance(prep, dict):
         prep = {}
@@ -250,15 +258,31 @@ def main(cfg: DictConfig) -> None:
         raise SystemExit("adapt.keyword is required")
 
     stage = str(adapt.get("stage", "all"))
-    base_ckpt = str(run.init_checkpoint or prep.get("stage2_ckpt", ""))
-    if stage != "prepare" and not base_ckpt:
-        raise SystemExit("prep.stage2_ckpt or run.init_checkpoint is required")
+    base_ckpt = str(
+        run.init_checkpoint
+        or prep.get("stage2_ckpt", "")
+        or adapt.get("init_checkpoint", "")
+        or config.get("stage2", {}).get("init_checkpoint", "")
+        or ""
+    )
+    train_phases = resolve_adapt_train_phases(adapt)
+    resume_from = str(run.resume_from or "")
+    full_resume = is_full_adapt_method(method) and bool(resume_from)
+    if full_resume and stage in {"train", "all"} and len(train_phases) != 1:
+        raise SystemExit(
+            f"{method} run.resume_from restores one phase; set adapt.train_phases=[joint], "
+            "[tts], or [real] to match the saved checkpoint."
+        )
+    if stage != "prepare" and not base_ckpt and not (stage == "train" and full_resume):
+        raise SystemExit(
+            "prep.stage2_ckpt, run.init_checkpoint, or adapt.init_checkpoint is required. "
+            "A full-weight training-only resume can instead use run.resume_from."
+        )
 
     data_root = Path(adapt["data_root"]) if adapt.get("data_root") else adapt_data_root(config, keyword)
     exp_root = adapt_exp_root(config, keyword)
     sweep_cfg = adapt.get("sweep", {}) or {}
-    train_phases = resolve_adapt_train_phases(adapt)
-    common = [f"adapt.keyword={keyword!r}"]
+    common = [f"adapt.keyword={keyword!r}", f"adapt.method={method}"]
 
     reporter = adapt_console.adapt_reporter(config, prep)
     reporter.section(f"Keyword adaptation · {keyword}")
@@ -267,7 +291,8 @@ def main(cfg: DictConfig) -> None:
             ("keyword", keyword),
             ("slug", slugify(keyword)),
             ("stage", stage),
-            ("base_checkpoint", base_ckpt or "(not required for prepare)"),
+            ("method", method),
+            ("base_checkpoint", base_ckpt or ("(restored from resume)" if full_resume else "(not required for prepare)")),
             ("data_root", str(data_root)),
             ("exp_root", str(exp_root)),
             ("device", f"{run.device} x{run.devices}"),
@@ -295,15 +320,26 @@ def main(cfg: DictConfig) -> None:
         params_file = str(best_params)
 
     if stage in {"train", "all"}:
-        train_overrides = common + [f"prep.stage2_ckpt={base_ckpt}", f"run.device={run.device}"]
+        train_overrides = common + [f"run.device={run.device}"]
+        if base_ckpt:
+            train_overrides.append(f"prep.stage2_ckpt={base_ckpt}")
+        if resume_from:
+            train_overrides.append(f"run.resume_from={resume_from}")
         if params_file:
             train_overrides.append(f"adapt.params_file={params_file}")
             reporter.info(f"Using swept hyperparameters from {params_file}")
-        for phase in train_phases:
-            reporter.section(f"LoRA training · phase={phase}")
+        for index, phase in enumerate(train_phases):
+            training_label = adapt_method_label(method)
+            reporter.section(f"{training_label} training · phase={phase}")
+            phase_overrides = train_overrides + [f"adapt.phase={phase}"]
+            if is_full_adapt_method(method) and index:
+                previous_model = exp_root / train_phases[index - 1] / "stage2_adapted.pt"
+                phase_overrides.extend(
+                    [f"run.init_checkpoint={previous_model}", "run.resume_checkpoint="]
+                )
             _run_script(
                 "adapt_stage2_keyword.py",
-                train_overrides + [f"adapt.phase={phase}"],
+                phase_overrides,
                 reporter,
             )
 

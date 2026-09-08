@@ -1,4 +1,4 @@
-"""Console helpers for Stage II LoRA keyword adaptation.
+"""Console helpers for Stage II keyword adaptation.
 
 Row builders stay free of rich so they can be unit tested; rendering goes through
 :class:`~dma_kws.stage2.prep_console.Stage2PrepReporter`.
@@ -201,6 +201,7 @@ def adapt_plan_rows(
     adapter_resume: str | None,
     resume_path: Path | None,
     params_file: str = "",
+    method: str = "lora",
 ) -> list[tuple[str, str]]:
     """Identity and path table printed before adaptation training starts."""
     rows = [
@@ -216,8 +217,11 @@ def adapt_plan_rows(
             "init_checkpoint",
             init_checkpoint if init_checkpoint else "restored from full checkpoint",
         ),
-        ("adapter_resume", str(adapter_resume) if adapter_resume else "none (fresh LoRA)"),
     ]
+    if method == "lora":
+        rows.append(("adapter_resume", str(adapter_resume) if adapter_resume else "none (fresh LoRA)"))
+    else:
+        rows.append(("adapt_method", method))
     if resume_path is not None:
         rows.append(("resume_ckpt", str(resume_path)))
     if params_file:

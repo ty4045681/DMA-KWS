@@ -317,7 +317,7 @@ class Stage2LightningModule(pl.LightningModule):
         if is_icefall_format:
             if require_full_qbyt:
                 raise SystemExit(
-                    "LoRA adaptation requires a complete Stage II checkpoint with "
+                    "Stage II adaptation requires a complete Stage II checkpoint with "
                     f"QbyT weights, but {checkpoint_path} is an encoder-only Icefall "
                     "checkpoint. Supply the trained Stage II .pt/.ckpt (or a merged "
                     "LoRA export) as the adaptation base."
@@ -363,10 +363,9 @@ class Stage2LightningModule(pl.LightningModule):
                 ]
                 if missing_roots:
                     raise SystemExit(
-                        "LoRA adaptation requires a complete Stage II checkpoint, "
+                        "Stage II adaptation requires a complete Stage II checkpoint, "
                         f"but {checkpoint_path} has no {', '.join(missing_roots)} "
-                        "weights. The encoder and QbyT base are frozen during LoRA "
-                        "training, so missing weights would remain random."
+                        "weights. Adaptation requires initialized encoder and QbyT weights."
                     )
 
             if encoder_state:
@@ -395,7 +394,7 @@ class Stage2LightningModule(pl.LightningModule):
                     )
             if qbyt_state:
                 self.qbyt.load_state_dict(qbyt_state, strict=True)
-                rank_zero_print(f"Loaded QbyT v6 weights from {checkpoint_path}")
+                rank_zero_print(f"Loaded QbyT v{self.qbyt_score.version} weights from {checkpoint_path}")
 
     def _load_adapter_checkpoint(self, checkpoint_path: Path) -> None:
         """Load a Step A adapter export produced by ``scripts/train_ctc_adapter.py``.
@@ -517,11 +516,15 @@ class Stage2LightningModule(pl.LightningModule):
     def on_train_start(self) -> None:
         # Only warn once a fit actually starts; eval scripts build this module with
         # the default freeze_encoder=False and must stay quiet.
-        if not self.freeze_encoder and self.stream_policy.backend == "icefall_zipformer":
+        if (
+            not self.freeze_encoder
+            and self.stream_policy.backend == "icefall_zipformer"
+            and getattr(self, "_encoder_schedule", None) is None
+        ):
             if process_rank() == 0:
                 warnings.warn(
-                    "Fine-tuning an icefall Zipformer encoder: icefall's set_batch_count() is never "
-                    "called here, so every ScheduledFloat (dropout, Balancer limits, layerdrop, "
+                    "Fine-tuning an icefall Zipformer encoder without an active batch-count schedule: "
+                    "ScheduledFloat (dropout, Balancer limits, layerdrop, "
                     "whitening) stays pinned to its `default` and the icefall training recipe is not "
                     "reproduced.",
                     UserWarning,

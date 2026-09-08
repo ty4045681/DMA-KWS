@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Iterable
 
 import torch
@@ -48,6 +49,39 @@ _SUPPORTED_LORA_TARGETS = frozenset(
 )
 _POOLING_DEFAULT_LORA_TARGETS = ("in_proj_weight", "out_proj.weight")
 _POOLING_SUPPORTED_LORA_TARGETS = frozenset(_POOLING_DEFAULT_LORA_TARGETS)
+_PROJECTION_WEIGHT_RE = re.compile(
+    r"^qbyt\.(?P<target>audio_projection|audio_key|text_query)\.weight$"
+)
+_POOLING_WEIGHT_RE = re.compile(
+    r"^qbyt\.phone_matchor\.layers\.\d+\.self_attn\."
+    r"(?P<target>in_proj_weight|out_proj\.weight)$"
+)
+_PROJECTION_READOUT_FAMILIES = frozenset({"bounded", "keyword_filler"})
+
+
+def classify_qbyt_lora_weight_key(key: str) -> tuple[str, str] | None:
+    """Map a full ``qbyt.*`` weight path to ``(layout, canonical_target)``.
+
+    Layout is the parametrized-module shape, not the QbyT readout family:
+    bounded v5 and keyword-filler v6/v7 share the projection layout. Canonical
+    names match :func:`normalize_lora_targets`.
+    """
+    match = _PROJECTION_WEIGHT_RE.fullmatch(key)
+    if match is not None:
+        return "projection", f"{match.group('target')}.weight"
+    match = _POOLING_WEIGHT_RE.fullmatch(key)
+    if match is not None:
+        return "pooling", match.group("target")
+    return None
+
+
+def lora_layout_compatible_with_readout(layout: str, family: str) -> bool:
+    """Return whether a LoRA weight layout can appear on a readout family."""
+    if layout == "pooling":
+        return family == "pooling"
+    if layout == "projection":
+        return family in _PROJECTION_READOUT_FAMILIES
+    return False
 
 
 def normalize_lora_targets(

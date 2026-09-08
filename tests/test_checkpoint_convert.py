@@ -24,7 +24,7 @@ from dma_kws.training.checkpoint_io import (
     extract_state_dict,
     fingerprint_stage2_base,
 )
-from dma_kws.training.lora import inject_qbyt_lora, merge_lora
+from dma_kws.training.lora import inject_qbyt_lora, load_lora_state_dict, merge_lora
 from scripts.convert_stage2_checkpoints import (
     build_parser,
     discover_checkpoints,
@@ -133,14 +133,140 @@ def _checkpoint(
         checkpoint["config"] = config
     if readout_version is not None:
         checkpoint[QBYT_READOUT_VERSION_KEY] = readout_version
-        if alignment_spec is None and config is not None:
-            stage2 = config.get("stage2")
-            if isinstance(stage2, dict):
-                alignment_spec = resolve_qbyt_alignment(stage2).as_dict()
-        checkpoint[QBYT_ALIGNMENT_SPEC_KEY] = (
-            _alignment() if alignment_spec is None else copy.deepcopy(alignment_spec)
-        )
+        if readout_version >= 5:
+            if alignment_spec is None and config is not None:
+                stage2 = config.get("stage2")
+                if isinstance(stage2, dict):
+                    alignment_spec = resolve_qbyt_alignment(stage2).as_dict()
+            checkpoint[QBYT_ALIGNMENT_SPEC_KEY] = (
+                _alignment() if alignment_spec is None else copy.deepcopy(alignment_spec)
+            )
     return checkpoint
+
+
+_POOLING_V41_READOUT = {
+    "mode": "eps_softmin",
+    "temperature": 1.0,
+    "sink_token": True,
+    "text_position": "learned",
+    "audio_position": "relative_bias",
+    "relative_num_buckets": 32,
+    "relative_max_distance": 64,
+}
+
+
+def _pooling_config(
+    *,
+    rank: int = 2,
+    alpha: float | None = 4.0,
+    phase: str = "joint",
+    targets: list[str] | None = None,
+) -> dict:
+    config = _config(
+        rank=rank,
+        alpha=alpha,
+        targets=targets or ["in_proj_weight", "out_proj.weight"],
+    )
+    config["adapt"]["phase"] = phase
+    config["adapt"]["slug"] = ""
+    config["stage2"] = {
+        "encoder_output_dim": 3,
+        "qbyt_embed_dim": 8,
+        "qbyt_layers": 1,
+        "qbyt_readout_version": 4,
+        "qbyt_readout": dict(_POOLING_V41_READOUT),
+    }
+    return config
+
+
+def _pooling_lora_state() -> dict[str, torch.Tensor]:
+    qbyt = build_qbyt(
+        _pooling_config()["stage2"],
+        input_dim=3,
+        vocab_size=VOCAB_SIZE,
+    )
+    inject_qbyt_lora(qbyt, rank=2, alpha=4.0)
+    with torch.no_grad():
+        for name, parameter in qbyt.named_parameters():
+            if name.endswith(".lora_A"):
+                parameter.fill_(0.25)
+            elif name.endswith(".lora_B"):
+                parameter.fill_(0.5)
+    state = {
+        "encoder.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        "encoder.bias": torch.arange(2, dtype=torch.float32),
+    }
+    state.update({f"qbyt.{key}": value for key, value in qbyt.state_dict().items()})
+    return state
+
+
+def _bounded_alignment() -> dict:
+    from dma_kws.stage2.readout_bounded import QbyTAlignmentSpec
+
+    return QbyTAlignmentSpec().as_dict()
+
+
+def _bounded_config(
+    *,
+    rank: int = 2,
+    alpha: float | None = 4.0,
+    phase: str = "tts",
+) -> dict:
+    config = _config(rank=rank, alpha=alpha)
+    config["adapt"]["phase"] = phase
+    config["stage2"] = {
+        "encoder_output_dim": 3,
+        "qbyt_embed_dim": 8,
+        "qbyt_layers": 1,
+        "qbyt_readout_version": 5,
+        "qbyt_alignment": _bounded_alignment(),
+    }
+    return config
+
+
+def _bounded_lora_state() -> dict[str, torch.Tensor]:
+    qbyt = build_qbyt(
+        _bounded_config()["stage2"],
+        input_dim=3,
+        vocab_size=VOCAB_SIZE,
+    )
+    inject_qbyt_lora(qbyt, rank=2, alpha=4.0)
+    with torch.no_grad():
+        for name, parameter in qbyt.named_parameters():
+            if name.endswith(".lora_A"):
+                parameter.fill_(0.25)
+            elif name.endswith(".lora_B"):
+                parameter.fill_(0.5)
+    state = {
+        "encoder.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        "encoder.bias": torch.arange(2, dtype=torch.float32),
+    }
+    state.update({f"qbyt.{key}": value for key, value in qbyt.state_dict().items()})
+    return state
+
+
+def _assert_converted_adapter_loads(
+    adapter: dict,
+    *,
+    stage2: dict,
+    rank: int,
+    alpha: float,
+    targets: tuple[str, ...],
+) -> None:
+    from dma_kws.stage2.adapt import _validate_adapter_checkpoint
+
+    state = _validate_adapter_checkpoint(
+        adapter,
+        source="converted.adapter.pt",
+        keyword=str(adapter["keyword"]),
+        rank=rank,
+        alpha=alpha,
+        targets=targets,
+        base_model_sha256=adapter.get(STAGE2_BASE_FINGERPRINT_KEY),
+    )
+    qbyt = build_qbyt(stage2, input_dim=3, vocab_size=VOCAB_SIZE)
+    inject_qbyt_lora(qbyt, rank=rank, alpha=alpha, targets=list(targets))
+    load_lora_state_dict(qbyt, state)
 
 
 def _add_lora_group(
@@ -251,6 +377,36 @@ def test_convert_stage2_checkpoint_writes_only_inference_payload(tmp_path: Path)
         expected_alignment=resolve_qbyt_alignment(config["stage2"]),
     )
     assert extract_state_dict(payload) is payload["model_state_dict"]
+
+
+@pytest.mark.parametrize("method", ["qbyt_full", "encoder_qbyt_full"])
+def test_full_adaptation_conversion_preserves_trained_encoder_and_qbyt(
+    tmp_path: Path, method: str,
+) -> None:
+    config = _config()
+    config["adapt"]["method"] = method
+    state = _stage2_state()
+    # A fine-tuned encoder must survive conversion; rebuilding the initial
+    # encoder or exporting QbyT alone would silently lose these updates.
+    state["encoder.weight"] = state["encoder.weight"] + 0.125
+    checkpoint = _checkpoint(state, config=config)
+    checkpoint["checkpoint_kind"] = f"stage2_{method}"
+    checkpoint["method"] = method
+    source, output = tmp_path / "full.ckpt", tmp_path / "full.pt"
+    torch.save(checkpoint, source)
+
+    result = convert_checkpoint(source, output)
+
+    assert result.kind == "stage2"
+    assert result.outputs == (output,)
+    payload = torch.load(output, map_location="cpu")
+    assert payload["config"]["adapt"]["method"] == method
+    assert set(payload["model_state_dict"]) == set(state)
+    for key, expected in state.items():
+        torch.testing.assert_close(payload["model_state_dict"][key], expected, rtol=0, atol=0)
+    assert "optimizer_states" not in payload
+    with pytest.raises(CheckpointConversionError, match="non-LoRA"):
+        convert_checkpoint(source, tmp_path / "adapter.pt", lora_output="adapter")
 
 
 @pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
@@ -607,23 +763,19 @@ def test_raw_lora_merge_matches_formula_and_rejects_incomplete_group() -> None:
     with pytest.raises(CheckpointConversionError, match="Incomplete LoRA"):
         merge_lora_checkpoint_state(broken, alpha=4.0)
 
-    for unsupported_target in (
+    unsupported = dict(state)
+    _add_lora_group(
+        unsupported,
         "encoder.block.weight",
-        "qbyt.phone_matchor.layers.0.self_attn.in_proj_weight",
+        original=torch.ones(4, 4),
+        lora_a=torch.ones(2, 4),
+        lora_b=torch.ones(4, 2),
+    )
+    with pytest.raises(
+        CheckpointConversionError,
+        match="Unsupported parametrization",
     ):
-        unsupported = dict(state)
-        _add_lora_group(
-            unsupported,
-            unsupported_target,
-            original=torch.ones(4, 4),
-            lora_a=torch.ones(2, 4),
-            lora_b=torch.ones(4, 2),
-        )
-        with pytest.raises(
-            CheckpointConversionError,
-            match="Unsupported parametrization",
-        ):
-            merge_lora_checkpoint_state(unsupported, alpha=4.0)
+        merge_lora_checkpoint_state(unsupported, alpha=4.0)
 
 
 def test_raw_lora_merge_matches_project_parametrization() -> None:
@@ -659,6 +811,165 @@ def test_raw_lora_merge_matches_project_parametrization() -> None:
     assert converted.keys() == expected_state.keys()
     for key, value in expected_state.items():
         assert torch.allclose(converted[key], value)
+
+
+def test_pooling_lora_merge_matches_phone_matchor_parametrization() -> None:
+    qbyt = build_qbyt(
+        _pooling_config()["stage2"],
+        input_dim=3,
+        vocab_size=VOCAB_SIZE,
+    )
+    inject_qbyt_lora(qbyt, rank=2, alpha=4.0)
+    with torch.no_grad():
+        for name, parameter in qbyt.named_parameters():
+            if name.endswith(".lora_A"):
+                parameter.fill_(0.25)
+            elif name.endswith(".lora_B"):
+                parameter.fill_(0.5)
+
+    wrapper = nn.Module()
+    wrapper.qbyt = qbyt
+    expected = copy.deepcopy(wrapper)
+    merge_lora(expected.qbyt)
+
+    converted = merge_lora_checkpoint_state(wrapper.state_dict(), alpha=4.0)
+    expected_state = expected.state_dict()
+    assert converted.keys() == expected_state.keys()
+    for key, value in expected_state.items():
+        assert torch.allclose(converted[key], value)
+
+
+def test_convert_pooling_lora_checkpoint_writes_joint_merged_and_adapter(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "pooling_lora.ckpt"
+    merged_output = tmp_path / "pooling_lora.pt"
+    adapter_output = tmp_path / "pooling_lora.adapter.pt"
+    state = _pooling_lora_state()
+    config = _pooling_config()
+    torch.save(
+        _checkpoint(state, config=config, readout_version=4),
+        source,
+    )
+
+    result = convert_checkpoint(source, merged_output)
+
+    assert result.kind == "lora"
+    assert result.outputs == (merged_output, adapter_output)
+    merged = torch.load(merged_output, map_location="cpu")
+    adapter = torch.load(adapter_output, map_location="cpu")
+
+    assert merged["phase"] == "joint"
+    assert adapter["phase"] == "joint"
+    assert adapter["lora_targets"] == ["in_proj_weight", "out_proj.weight"]
+    assert merged[QBYT_READOUT_VERSION_KEY] == 4
+    assert adapter[QBYT_READOUT_VERSION_KEY] == 4
+    assert QBYT_ALIGNMENT_SPEC_KEY not in merged or merged[QBYT_ALIGNMENT_SPEC_KEY] is None
+    assert QBYT_ALIGNMENT_SPEC_KEY not in adapter
+    assert not any(
+        ".parametrizations." in key or key.endswith((".lora_A", ".lora_B"))
+        for key in merged["model_state_dict"]
+    )
+    qbyt = build_qbyt(config["stage2"], input_dim=3, vocab_size=VOCAB_SIZE)
+    qbyt.load_state_dict(
+        {
+            key[len("qbyt.") :]: value
+            for key, value in merged["model_state_dict"].items()
+            if key.startswith("qbyt.")
+        },
+        strict=True,
+    )
+    assert adapter["lora_state_dict"]
+    assert all(
+        not key.startswith("qbyt.") for key in adapter["lora_state_dict"]
+    )
+    assert all("phone_matchor" in key for key in adapter["lora_state_dict"])
+    assert all(
+        key.endswith((".lora_A", ".lora_B"))
+        for key in adapter["lora_state_dict"]
+    )
+    assert adapter[STAGE2_BASE_FINGERPRINT_KEY] == fingerprint_stage2_base(state)
+    assert_qbyt_readout_version(adapter, source=adapter_output)
+
+
+def test_convert_pooling_lora_rewrites_default_keyword_filler_targets(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "pooling_fallback.ckpt"
+    output = tmp_path / "pooling_fallback.pt"
+    state = _pooling_lora_state()
+    config = _pooling_config(targets=["audio_key.weight", "text_query.weight"])
+    torch.save(_checkpoint(state, config=config, readout_version=4), source)
+
+    convert_checkpoint(source, output)
+
+    adapter = torch.load(output.with_name("pooling_fallback.adapter.pt"), map_location="cpu")
+    assert adapter["lora_targets"] == ["in_proj_weight", "out_proj.weight"]
+    assert adapter["config"]["adapt"]["lora_targets"] == [
+        "in_proj_weight",
+        "out_proj.weight",
+    ]
+    _assert_converted_adapter_loads(
+        adapter,
+        stage2=config["stage2"],
+        rank=2,
+        alpha=4.0,
+        targets=("in_proj_weight", "out_proj.weight"),
+    )
+
+
+def test_convert_v5_bounded_lora_checkpoint_roundtrips_adapter(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "bounded_lora.ckpt"
+    merged_output = tmp_path / "bounded_lora.pt"
+    state = _bounded_lora_state()
+    config = _bounded_config()
+    torch.save(
+        _checkpoint(
+            state,
+            config=config,
+            readout_version=5,
+            alignment_spec=_bounded_alignment(),
+        ),
+        source,
+    )
+
+    result = convert_checkpoint(source, merged_output)
+    adapter = torch.load(result.outputs[1], map_location="cpu")
+    assert adapter["lora_targets"] == ["audio_key.weight", "text_query.weight"]
+    assert adapter[QBYT_READOUT_VERSION_KEY] == 5
+    qbyt = build_qbyt(config["stage2"], input_dim=3, vocab_size=VOCAB_SIZE)
+    qbyt.load_state_dict(
+        {
+            key[len("qbyt.") :]: value
+            for key, value in torch.load(merged_output, map_location="cpu")[
+                "model_state_dict"
+            ].items()
+            if key.startswith("qbyt.")
+        },
+        strict=True,
+    )
+    _assert_converted_adapter_loads(
+        adapter,
+        stage2=config["stage2"],
+        rank=2,
+        alpha=4.0,
+        targets=("audio_key.weight", "text_query.weight"),
+    )
+
+
+def test_lora_merge_rejects_mixed_readout_families() -> None:
+    state, _ = _lora_state()
+    _add_lora_group(
+        state,
+        "qbyt.phone_matchor.layers.0.self_attn.in_proj_weight",
+        original=torch.ones(12, 4),
+        lora_a=torch.ones(2, 4),
+        lora_b=torch.ones(12, 2),
+    )
+    with pytest.raises(CheckpointConversionError, match="mixes LoRA layouts"):
+        merge_lora_checkpoint_state(state, alpha=4.0)
 
 
 def test_lora_conversion_requires_exact_alpha_and_rank(tmp_path: Path) -> None:

@@ -26,11 +26,16 @@ from dma_kws.stage2.adapt_paths import slugify
 from dma_kws.tokenizer import validate_lang_char_dict
 from dma_kws.training.checkpoint_io import (
     QBYT_ALIGNMENT_SPEC_KEY,
-    QBYT_READOUT_VERSION,
     QBYT_READOUT_VERSION_KEY,
     STAGE2_BASE_FINGERPRINT_KEY,
     canonical_stage2_base_state,
     fingerprint_stage2_base,
+    stamp_qbyt_readout_version,
+)
+from dma_kws.training.lora import (
+    classify_qbyt_lora_weight_key,
+    lora_layout_compatible_with_readout,
+    lora_targets_for_qbyt_family,
 )
 
 CheckpointKind = Literal["stage2", "lora"]
@@ -38,9 +43,6 @@ LoraOutput = Literal["merged", "adapter", "both"]
 
 _PARAMETRIZED_ORIGINAL_RE = re.compile(
     r"^(?P<module>.+)\.parametrizations\.(?P<parameter>[^.]+)\.original$"
-)
-_PROJECT_LORA_TARGET_RE = re.compile(
-    r"^qbyt\.(?:audio_projection|audio_key|text_query)\.weight$"
 )
 _LORA_PARAMETER_SUFFIXES = (".lora_A", ".lora_B")
 
@@ -142,8 +144,10 @@ def _validate_checkpoint_kind_metadata(
     saved = checkpoint.get("checkpoint_kind")
     if saved is None:
         return
-    expected = "stage2_lora" if detected == "lora" else "stage2"
-    if str(saved) != expected:
+    expected = {"stage2_lora"} if detected == "lora" else {
+        "stage2", "stage2_qbyt_full", "stage2_encoder_qbyt_full",
+    }
+    if str(saved) not in expected:
         raise CheckpointConversionError(
             f"checkpoint_kind={saved!r} disagrees with detected {detected!r} weights"
         )
@@ -203,7 +207,7 @@ def _require_compatible_readout(
     checkpoint: Mapping[str, Any],
     config: Mapping[str, Any],
 ) -> int:
-    """Require exact v6 alignment metadata; older score heads are not convertible."""
+    """Require the checkpoint readout to match the resolved config family."""
 
     from dma_kws.stage2.readout import resolve_qbyt_score_spec
     from dma_kws.training.checkpoint_io import (
@@ -552,12 +556,20 @@ def _lora_groups(
                 f"Incomplete LoRA parametrization for {original_key}: missing {missing}"
             )
         target_key = f"{match.group('module')}.{match.group('parameter')}"
-        if _PROJECT_LORA_TARGET_RE.fullmatch(target_key) is None:
+        if classify_qbyt_lora_weight_key(target_key) is None:
             raise CheckpointConversionError(
-                "Unsupported parametrization outside the QbyT v6 projection set "
-                f"(audio_projection/audio_key/text_query weights): {target_key}"
+                "Unsupported parametrization outside the QbyT LoRA target set "
+                f"(projection weights or pooling phone_matchor attention): "
+                f"{target_key}"
             )
         groups.append((target_key, original_key, a_key, b_key))
+    layouts = {
+        classify_qbyt_lora_weight_key(target_key)[0] for target_key, *_ in groups
+    }
+    if len(layouts) > 1:
+        raise CheckpointConversionError(
+            "LoRA checkpoint mixes LoRA layouts: " + ", ".join(sorted(layouts))
+        )
 
     lora_keys = {
         key
@@ -668,17 +680,36 @@ def _lora_hyperparameters(
         raise CheckpointConversionError(f"Conflicting LoRA alpha metadata: {details}")
 
     inferred_targets: set[str] = set()
+    inferred_layout: str | None = None
     for target_key, *_ in groups:
-        target = target_key.removeprefix("qbyt.")
-        if target not in {
-            "audio_projection.weight",
-            "audio_key.weight",
-            "text_query.weight",
-        }:
+        classified = classify_qbyt_lora_weight_key(target_key)
+        if classified is None:
             raise CheckpointConversionError(
                 f"Unsupported LoRA target in checkpoint: {target_key}"
             )
-        inferred_targets.add(target)
+        layout, canonical = classified
+        if inferred_layout is None:
+            inferred_layout = layout
+        elif layout != inferred_layout:
+            raise CheckpointConversionError(
+                "LoRA checkpoint mixes LoRA layouts: "
+                f"{inferred_layout}, {layout}"
+            )
+        inferred_targets.add(canonical)
+
+    from dma_kws.stage2.readout import resolve_qbyt_score_spec
+
+    stage2 = config.get("stage2")
+    if not isinstance(stage2, Mapping):
+        raise CheckpointConversionError("Resolved config has no stage2 mapping")
+    spec_family = resolve_qbyt_score_spec(stage2).family
+    if inferred_layout is None or not lora_layout_compatible_with_readout(
+        inferred_layout, spec_family
+    ):
+        raise CheckpointConversionError(
+            f"LoRA weights use {inferred_layout} layout but config.stage2 "
+            f"readout family is {spec_family}"
+        )
 
     for source, configured_targets in (
         ("checkpoint.lora_targets", checkpoint.get("lora_targets")),
@@ -686,15 +717,24 @@ def _lora_hyperparameters(
     ):
         if configured_targets is None:
             continue
+        raw: Any
         if isinstance(configured_targets, str):
-            configured = {configured_targets}
+            raw = configured_targets
         else:
             try:
-                configured = {str(value) for value in configured_targets}
+                raw = [str(value) for value in configured_targets]
             except TypeError as exc:
                 raise CheckpointConversionError(
                     "LoRA targets metadata must be a sequence of target names"
                 ) from exc
+        try:
+            configured = set(
+                lora_targets_for_qbyt_family(raw, family=spec_family)
+            )
+        except ValueError as exc:
+            raise CheckpointConversionError(
+                f"LoRA targets from {source} are invalid for {spec_family}: {exc}"
+            ) from exc
         if configured != inferred_targets:
             raise CheckpointConversionError(
                 f"LoRA targets disagree: {source}={sorted(configured)} "
@@ -732,6 +772,21 @@ def merge_lora_checkpoint_state(
             f"LoRA merge left parametrization keys behind: {residual[:5]}"
         )
     return merged
+
+
+def _config_with_normalized_lora_targets(
+    config: Mapping[str, Any],
+    targets: list[str],
+) -> dict[str, Any]:
+    """Copy config and stamp the resolved LoRA targets into ``adapt``."""
+    updated = copy.deepcopy(dict(config))
+    adapt = updated.get("adapt")
+    if not isinstance(adapt, dict):
+        raise CheckpointConversionError(
+            "Resolved config has no adapt mapping for LoRA metadata"
+        )
+    adapt["lora_targets"] = list(targets)
+    return updated
 
 
 def _adapter_state(
@@ -822,8 +877,7 @@ def convert_checkpoint(
     kind = detect_checkpoint_kind(state)
     _validate_checkpoint_kind_metadata(checkpoint, kind)
     config = _resolved_config(checkpoint, fallback_config)
-    readout_version = _require_compatible_readout(checkpoint, config)
-    alignment_spec = copy.deepcopy(checkpoint[QBYT_ALIGNMENT_SPEC_KEY])
+    _require_compatible_readout(checkpoint, config)
 
     if kind == "stage2":
         if lora_output == "adapter":
@@ -859,6 +913,7 @@ def convert_checkpoint(
         groups,
         alpha=lora_alpha,
     )
+    config = _config_with_normalized_lora_targets(config, targets)
     identity = _lora_identity(checkpoint, config)
     try:
         base_state = canonical_stage2_base_state(state)
@@ -929,19 +984,22 @@ def convert_checkpoint(
 
     if lora_output in {"adapter", "both"}:
         assert resolved_adapter_path is not None
-        adapter_payload = {
-            "checkpoint_kind": "stage2_lora_adapter",
-            "lora_state_dict": _adapter_state(state),
-            "config": config,
-            "step": step,
-            **identity,
-            "rank": rank,
-            "alpha": alpha,
-            "lora_targets": targets,
-            STAGE2_BASE_FINGERPRINT_KEY: base_model_sha256,
-            QBYT_READOUT_VERSION_KEY: readout_version,
-            QBYT_ALIGNMENT_SPEC_KEY: alignment_spec,
-        }
+        from dma_kws.stage2.readout import resolve_qbyt_score_spec
+
+        adapter_payload = stamp_qbyt_readout_version(
+            {
+                "checkpoint_kind": "stage2_lora_adapter",
+                "lora_state_dict": _adapter_state(state),
+                "config": config,
+                "step": step,
+                **identity,
+                "rank": rank,
+                "alpha": alpha,
+                "lora_targets": targets,
+                STAGE2_BASE_FINGERPRINT_KEY: base_model_sha256,
+            },
+            alignment=resolve_qbyt_score_spec(config["stage2"]),
+        )
         outputs.append(
             _write_payload(
                 adapter_payload,

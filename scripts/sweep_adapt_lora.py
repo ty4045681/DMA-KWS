@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Optuna hyperparameter sweep for Stage II LoRA keyword adaptation."""
+"""Optuna sweep for LoRA and full-weight keyword adaptation methods."""
 
 from __future__ import annotations
 
@@ -13,8 +13,10 @@ from omegaconf import DictConfig, OmegaConf
 from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.stage2 import adapt_console
 from dma_kws.stage2.adapt import Stage2AdaptArgs
+from dma_kws.stage2.adapt_config import adapt_method_label, resolve_adapt_method
 from dma_kws.stage2.adapt_paths import adapt_exp_root, resolve_adapt_train_phases, slugify
 from dma_kws.stage2.sweep_adapt import (
+    bind_study_adapt_method,
     compute_sweep_score,
     run_adaptation_trial,
     save_best_params,
@@ -281,6 +283,7 @@ def main(cfg: DictConfig) -> None:
     adapt = OmegaConf.to_container(cfg.adapt, resolve=True)
     if not isinstance(adapt, dict):
         raise SystemExit("adapt config section must be a mapping")
+    method = resolve_adapt_method(adapt)
     joint = resolve_adapt_train_phases(adapt) == ("joint",)
     sweep_cfg = adapt.get("sweep", {}) or {}
     run = cfg.run
@@ -303,9 +306,28 @@ def main(cfg: DictConfig) -> None:
     search_mix = bool(sweep_cfg.get("search_mix", False))
     single_phase = bool(sweep_cfg.get("single_phase", False))
 
-    base_ckpt = str(run.init_checkpoint or prep.get("stage2_ckpt", ""))
+    base_ckpt = str(
+        run.init_checkpoint
+        or prep.get("stage2_ckpt", "")
+        or adapt.get("init_checkpoint", "")
+        or config.get("stage2", {}).get("init_checkpoint", "")
+        or ""
+    )
     if not base_ckpt:
-        raise SystemExit("prep.stage2_ckpt or run.init_checkpoint is required for sweep baseline")
+        raise SystemExit(
+            "prep.stage2_ckpt, run.init_checkpoint, or adapt.init_checkpoint "
+            "is required for sweep baseline"
+        )
+
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=True,
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(),
+        pruner=optuna.pruners.MedianPruner(),
+    )
+    bind_study_adapt_method(study, method)
 
     reporter = adapt_console.adapt_reporter(config, prep)
     if reporter.use_rich:
@@ -324,7 +346,8 @@ def main(cfg: DictConfig) -> None:
 
     eval_accelerator, _ = resolve_accelerator_and_devices(str(run.device), 1)
 
-    reporter.section(f"LoRA hyperparameter sweep · {keyword}")
+    method_label = adapt_method_label(method)
+    reporter.section(f"{method_label} hyperparameter sweep · {keyword}")
     reporter.info("Measuring LibriPhrase baseline AUC for the un-adapted checkpoint...")
     lph_base = _eval_lph_auc(config, base_ckpt, subset=lph_subset, accelerator=eval_accelerator)
     _release_cuda_cache(torch)
@@ -355,7 +378,7 @@ def main(cfg: DictConfig) -> None:
     trial_log: list[dict] = []
 
     def objective(trial: optuna.Trial) -> float:
-        params = suggest_adapt_params(trial, search_mix=search_mix, joint=joint)
+        params = suggest_adapt_params(trial, search_mix=search_mix, joint=joint, method=method)
         params["_trial_number"] = trial.number
         completed = sum(
             existing.state == optuna.trial.TrialState.COMPLETE
@@ -409,14 +432,6 @@ def main(cfg: DictConfig) -> None:
         )
         return score
 
-    study = optuna.create_study(
-        study_name=study_name,
-        storage=storage,
-        load_if_exists=True,
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(),
-        pruner=optuna.pruners.MedianPruner(),
-    )
     # ``Optuna.optimize(n_trials=N)`` means N *additional* trials, not N total.
     # Count only successful trials so rerunning after this DDP infrastructure
     # failure fills the configured target instead of adding another full sweep.
@@ -437,7 +452,7 @@ def main(cfg: DictConfig) -> None:
         )
     best = study.best_trial
     best_path = sweep_root / "best_params.yaml"
-    save_best_params(best_path, best.params, score=float(best.value))
+    save_best_params(best_path, best.params, score=float(best.value), method=method)
     persisted = yaml.safe_load(best_path.read_text(encoding="utf-8")) or {}
     best_params = {key: value for key, value in persisted.items() if key != "score"}
 

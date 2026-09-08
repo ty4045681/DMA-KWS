@@ -1,10 +1,14 @@
-"""Joint LoRA integration: diagnostics and real Lightning loader resumes."""
+"""Joint adaptation integration: diagnostics and real Lightning loader resumes."""
 
 import pytest
 import torch
 from torch.utils.data import Dataset
 
-from dma_kws.stage2.adapt import Stage2LoraAdaptationModule, grouped_domain_bce_totals
+from dma_kws.stage2.adapt import (
+    Stage2LoraAdaptationModule,
+    Stage2QbytFullAdaptationModule,
+    grouped_domain_bce_totals,
+)
 from dma_kws.stage2.joint_dataset import JointBatchSampler
 from dma_kws.stage2.joint_loader import JointDataLoader, JointEvalSampler
 from dma_kws.training.score_diagnostics import BinaryScoreDiagnostics
@@ -166,8 +170,9 @@ def test_four_domain_losses_use_audio_source_and_valid_sample_mask():
     assert totals[:, 3].tolist() == [1, 0, 1, 0]
 
 
-def test_joint_validation_keeps_real_tts_lph_and_background_separate():
-    module = Stage2LoraAdaptationModule.__new__(Stage2LoraAdaptationModule)
+@pytest.mark.parametrize("module_type", [Stage2LoraAdaptationModule, Stage2QbytFullAdaptationModule])
+def test_joint_validation_keeps_real_tts_lph_and_background_separate(module_type):
+    module = module_type.__new__(module_type)
     torch.nn.Module.__init__(module)
     module._adapt_cfg = {"phase": "joint", "joint": {"background_eval_list": "val.list"}}
     module._score_calibration_slope = 1.0
@@ -218,14 +223,15 @@ def test_background_validation_is_fixed_and_preserves_cpu_rng(monkeypatch):
     assert a["label"] == 0
 
 
-def test_joint_training_logs_four_sources_and_acknowledges_once():
+@pytest.mark.parametrize("module_type", [Stage2LoraAdaptationModule, Stage2QbytFullAdaptationModule])
+def test_joint_training_logs_four_sources_and_acknowledges_once(module_type):
     from types import SimpleNamespace
     from dma_kws.stage2.collate import train_collate_fn
     sample = {"feat": torch.zeros(3, 80), "anchor_seq": torch.tensor([1]),
               "query_seq": torch.tensor([]).long(), "seq_label": torch.tensor([0]),
               "label": torch.tensor(0), "source": 0, "domain_source": 3}
     batch = train_collate_fn([sample])
-    module = Stage2LoraAdaptationModule.__new__(Stage2LoraAdaptationModule)
+    module = module_type.__new__(module_type)
     torch.nn.Module.__init__(module)
     logits = torch.tensor([0.])
     module._forward_train_losses = lambda b: (logits.sum(), {"utt_sample_mask": torch.tensor([True])}, logits)

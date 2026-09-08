@@ -1,0 +1,21 @@
+# @package _global_
+# Compose after the architecture and adaptation data overlay, e.g.:
+# +experiment=[icefall_zipformer_stage2_eps_softmin_v41,adapt_joint,adapt_encoder_qbyt_full]
+adapt:
+  method: encoder_qbyt_full
+  exp_root: ""
+  params_file: ""
+  lr: null
+  learning_rate: 3.0e-5
+  encoder_learning_rate: 3.0e-6
+  encoder_schedule:
+    start_batch_count: 100000.0
+    reference_duration: 600.0
+  warmup_steps: 100
+  max_steps: 1000
+  validation:
+    val_check_interval: 100
+  sweep:
+    enabled: false
+    storage: ""
+    study_name: ""

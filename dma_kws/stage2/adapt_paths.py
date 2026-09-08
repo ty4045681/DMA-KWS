@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from dma_kws.stage2.adapt_config import is_full_adapt_method, resolve_adapt_method
+
 
 DEFAULT_ADAPT_TRAIN_PHASES = ("tts", "real")
 
@@ -68,13 +70,17 @@ def adapt_data_root(config: dict[str, Any], keyword: str) -> Path:
 
 def adapt_exp_root(config: dict[str, Any], keyword: str) -> Path:
     adapt = config.get("adapt", {}) or {}
+    method = resolve_adapt_method(adapt)
     slug = str(adapt.get("slug", "")) or slugify(keyword)
     if adapt.get("exp_root"):
         return Path(str(adapt["exp_root"]))
     paths = config.get("paths", {})
     exp_root = Path(paths.get("exp_root", "data/dma-kws/exp"))
     joint = resolve_adapt_train_phases(adapt) == ("joint",)
-    return exp_root / ("stage2_adapt_joint" if joint else "stage2_adapt") / slug
+    namespace = "stage2_adapt_joint" if joint else "stage2_adapt"
+    if is_full_adapt_method(method):
+        namespace += f"_{method}"
+    return exp_root / namespace / slug
 
 
 def manifest_paths(data_root: Path) -> dict[str, Path]:

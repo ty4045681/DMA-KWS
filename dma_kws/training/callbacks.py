@@ -266,7 +266,7 @@ def build_run_summary_rows(
 ) -> list[tuple[str, str]]:
     """Build ``(setting, value)`` rows describing a training run.
 
-    ``section`` selects where data/optimizer/trainer settings come from. LoRA
+    ``section`` selects where data/optimizer/trainer settings come from. Keyword
     adaptation is the one exception: its optimizer/data values live in
     ``adapt``, while shared Trainer precision/accumulation live in ``stage2``.
     """
@@ -338,6 +338,15 @@ def build_run_summary_rows(
         ("optimizer", opt_cfg["optimizer"]),
         ("weight_decay", str(opt_cfg["weight_decay"])),
     ]
+    if section == "adapt":
+        from dma_kws.stage2.adapt_config import resolve_adapt_method
+
+        method = resolve_adapt_method(stage)
+        rows.append(("adapt_method", method))
+        if method == "encoder_qbyt_full":
+            from dma_kws.training.adapt_params import resolve_encoder_adapt_lr
+
+            rows.append(("encoder_learning_rate", str(resolve_encoder_adapt_lr(stage))))
     if section == "stage1":
         max_epochs = int(stage.get("max_epochs", 1))
         rows.append(("max_epochs", str(max_epochs)))
@@ -500,8 +509,8 @@ def build_run_summary_rows(
                     "phoneme_adapter",
                     "enabled={enabled} freeze={freeze} ctc_weight={ctc:g}".format(
                         enabled=bool(adapter_cfg.get("enabled", False)),
-                        freeze=bool(adapter_cfg.get("freeze", False)),
-                        ctc=float(adapter_cfg.get("ctc_weight", 0.0)),
+                        freeze=True if section == "adapt" else bool(adapter_cfg.get("freeze", False)),
+                        ctc=0.0 if section == "adapt" else float(adapter_cfg.get("ctc_weight", 0.0)),
                     ),
                 ),
             ]
@@ -558,6 +567,11 @@ def print_run_summary(
         effective_logging_backends=effective_logging_backends,
     )
     heading = title or RUN_SUMMARY_TITLES.get(section, f"{section} Training Run")
+    if title is None and section == "adapt":
+        from dma_kws.stage2.adapt_config import adapt_method_label, resolve_adapt_method
+
+        method = resolve_adapt_method(config.get("adapt") or {})
+        heading = f"Stage II {adapt_method_label(method)} Adaptation Run"
 
     selected = config.get(section, {}) or {}
     console_cfg = selected.get("console", {}) or {}

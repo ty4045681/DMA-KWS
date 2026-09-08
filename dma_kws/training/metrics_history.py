@@ -186,21 +186,37 @@ def collect_hparams(
         return stage2.get(key, default) if value is None else value
 
     if section == "adapt":
+        from dma_kws.stage2.adapt_config import resolve_adapt_method
         from dma_kws.training.adapt_params import resolve_adapt_lr
 
         lr, _ = resolve_adapt_lr(stage)
+        method = resolve_adapt_method(stage)
         hparams: dict[str, Any] = {
+            "adapt_method": method,
             "learning_rate": lr,
             "optimizer": str(stage.get("optimizer", "adam")).lower(),
             "weight_decay": float(stage.get("weight_decay", 0.0)),
             "warmup_steps": int(stage.get("warmup_steps", 100)),
             "max_steps": int(stage.get("max_steps", 3000)),
-            "rank": int(stage.get("rank", 16)),
-            "alpha": float(stage.get("alpha", 32)),
             "mix_ratio": float(stage.get("mix_ratio", 0.5)),
             "keyword": str(stage.get("keyword", "")),
             "phase": str(stage.get("phase", "tts")),
         }
+        if method == "lora":
+            hparams.update(
+                rank=int(stage.get("rank", 16)), alpha=float(stage.get("alpha", 32))
+            )
+        elif method == "encoder_qbyt_full":
+            from dma_kws.training.adapt_params import resolve_encoder_adapt_lr
+
+            hparams["encoder_learning_rate"] = resolve_encoder_adapt_lr(stage)
+            schedule = stage.get("encoder_schedule") or {}
+            hparams["encoder_schedule_start_batch_count"] = float(
+                schedule.get("start_batch_count", 100000.0)
+            )
+            hparams["encoder_schedule_reference_duration"] = float(
+                schedule.get("reference_duration", 600.0)
+            )
     elif section == "stage1":
         configured_steps = int(stage.get("max_train_steps", 0))
         hparams = {

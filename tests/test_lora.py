@@ -8,8 +8,10 @@ pytest.importorskip("torch")
 
 from dma_kws.training.lora import (
     LoRAParametrization,
+    classify_qbyt_lora_weight_key,
     count_lora_params,
     inject_qbyt_lora,
+    lora_layout_compatible_with_readout,
     lora_state_dict,
     load_lora_state_dict,
     merge_lora,
@@ -63,6 +65,38 @@ def test_pooling_lora_targets_are_phone_matchor_attention_weights():
     injected = inject_qbyt_lora(qbyt, rank=2, alpha=4.0)
     assert injected
     assert all("phone_matchor" in name for name in injected)
+
+
+def test_classify_qbyt_lora_weight_key_maps_layout_and_canonical_target():
+    assert classify_qbyt_lora_weight_key("qbyt.audio_key.weight") == (
+        "projection",
+        "audio_key.weight",
+    )
+    assert classify_qbyt_lora_weight_key("qbyt.text_query.weight") == (
+        "projection",
+        "text_query.weight",
+    )
+    assert classify_qbyt_lora_weight_key("qbyt.audio_projection.weight") == (
+        "projection",
+        "audio_projection.weight",
+    )
+    assert classify_qbyt_lora_weight_key(
+        "qbyt.phone_matchor.layers.0.self_attn.in_proj_weight"
+    ) == ("pooling", "in_proj_weight")
+    assert classify_qbyt_lora_weight_key(
+        "qbyt.phone_matchor.layers.3.self_attn.out_proj.weight"
+    ) == ("pooling", "out_proj.weight")
+    assert classify_qbyt_lora_weight_key("encoder.block.weight") is None
+    assert classify_qbyt_lora_weight_key(
+        "qbyt.phone_matchor.layers.0.self_attn.out_proj.bias"
+    ) is None
+    assert classify_qbyt_lora_weight_key("qbyt.audio_key.bias") is None
+    assert lora_layout_compatible_with_readout("projection", "keyword_filler")
+    assert lora_layout_compatible_with_readout("projection", "bounded")
+    assert lora_layout_compatible_with_readout("pooling", "pooling")
+    assert not lora_layout_compatible_with_readout("projection", "pooling")
+    assert not lora_layout_compatible_with_readout("pooling", "bounded")
+    assert not lora_layout_compatible_with_readout("pooling", "keyword_filler")
 
 
 def test_lora_targets_reject_empty_and_misspelled_entries():

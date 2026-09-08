@@ -1274,7 +1274,7 @@ Outputs: `exp/stage2_adapt/<slug>/adapter_<slug>.pt` (small LoRA only), `stage2_
 
 ### Joint LoRA: real + TTS + LibriPhrase + MUSAN
 
-The [joint overlay](configs/experiment/adapt_joint.yaml) runs one adapter and one optimizer schedule from the original Stage II base. Compose it after the experiment matching the checkpoint; it preserves the encoder, phoneme adapter and QbyT readout configuration. Existing TTS → real runs remain available.
+By default (`adapt.method=lora`), the [joint overlay](configs/experiment/adapt_joint.yaml) runs one LoRA adapter and one optimizer schedule from the original Stage II base. Compose it after the experiment matching the checkpoint; it preserves the encoder, phoneme adapter and QbyT readout configuration. Existing TTS → real runs remain available.
 
 ```bash
 PYTHONPATH=. python scripts/run_keyword_adaptation.py \
@@ -1289,7 +1289,7 @@ The data root must contain `manifests/{real,tts}_{train,eval}.csv` and the match
 
 Default sample shares are real **30%**, TTS **20%**, LibriPhrase **40%**, MUSAN **10%**. The underlying strata are real positive/negative 15% each, TTS positive/negative 10% each, LibriPhrase positive 25% / speech negative 15%, and background 10%. The [sampler](dma_kws/stage2/joint_dataset.py) carries fractional quotas across batches and epochs; it balances real speakers and TTS voices/negative phrases where metadata is available. Background examples use the target keyword for half their queries and LibriPhrase queries for the other half.
 
-Adjust `adapt.mix_ratio` (all keyword data), `adapt.joint.real_fraction` (real share within keyword data), and `stage2.background_negative.probability` (background share within replay negatives). Thus background's global share is `(1 - mix_ratio) * 0.5 * probability`. These are sampling settings; the existing readout-specific losses and frozen base are retained by the [training entry point](dma_kws/stage2/adapt.py). Online additive noise augmentation remains unsupported for LoRA.
+Adjust `adapt.mix_ratio` (all keyword data), `adapt.joint.real_fraction` (real share within keyword data), and `stage2.background_negative.probability` (background share within replay negatives). Thus background's global share is `(1 - mix_ratio) * 0.5 * probability`. These are sampling settings; the [training entry point](dma_kws/stage2/adapt.py) retains the existing readout-specific losses across all three methods. LoRA keeps the whole base frozen; `qbyt_full` trains QbyT with a frozen encoder; `encoder_qbyt_full` trains both encoder and QbyT. Any phoneme adapter stays frozen. Online additive noise augmentation remains unsupported for these adaptation manifests.
 
 The [manifest checks](dma_kws/stage2/joint_manifest.py) reject real speaker leakage, shared audio/recording identities across train/eval, and inconsistent keyword pronunciations. Joint preparation groups related recordings before splitting; explicit splits are preserved. Supply `speaker_id`, `voice_id`, and original-recording metadata when available: relationships cannot be inferred from missing metadata. MUSAN training and validation lists must refer to disjoint original recordings; background cache source records are checked too.
 
@@ -1297,9 +1297,65 @@ Training logs separate `real`, `tts`, `lph` and `musan` source fractions and BCE
 
 The default joint output root is `paths.exp_root/stage2_adapt_joint/<slug>`, isolated from sequential runs. Full Lightning resumes (`run.resume_from`) restore the [consumed-batch cursor](dma_kws/stage2/joint_loader.py), optimizer and scheduler. Data manifests, replay parquet, tokenizer, sampling policy, batch size and world size must match. With gradient accumulation, both batches per rank per epoch and the validation interval must be divisible by `stage2.accumulate_grad_batches`; incomplete-accumulation checkpoints are rejected. Adapter-only initialization (`run.resume_checkpoint`) starts a new optimizer schedule. A first joint run starts directly from the base without automatically loading a prior TTS adapter.
 
+#### Full QbyT adaptation with a frozen encoder
+
+The [adaptation trainer](dma_kws/stage2/adapt.py) supports `adapt.method=qbyt_full` for joint and sequential data. This trains all QbyT parameters, freezes the encoder and any phoneme adapter, and disables auxiliary CTC. It does not inject LoRA. The existing `lora` method remains the default.
+
+For an initial experiment on the same joint data, compose the [full-QbyT overlay](configs/experiment/adapt_qbyt_full.yaml) last:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/run_keyword_adaptation.py \
+  '+experiment=[icefall_zipformer_stage2_eps_softmin_v41,adapt_joint,adapt_qbyt_full]' \
+  adapt.stage=train \
+  prep.stage2_ckpt=/path/to/current/joint/stage2_adapted.pt \
+  adapt.data_root=/path/to/existing/adapt/hey_eva
+```
+
+Use a complete Stage II checkpoint or a merged LoRA `stage2_adapted.pt` as the starting model. Loading a merged model preserves the LoRA update in the ordinary QbyT weights and starts a new optimizer/scheduler. Raw adapter files and unmerged LoRA Lightning checkpoints are rejected; merge a full LoRA checkpoint first with the [checkpoint converter](scripts/convert_stage2_checkpoints.py). Keep the experiment's readout and streaming configuration consistent with the starting checkpoint, including the v4.1 pooling fields.
+
+The [overlay](configs/experiment/adapt_qbyt_full.yaml) starts at learning rate `3e-5`, 100 warmup steps and 1000 optimizer steps, with validation every 100 training microbatches per rank. These are experiment starting values, not measured optimal settings. The validation interval must remain divisible by `stage2.accumulate_grad_batches`. Joint data, sampling proportions, losses and source diagnostics are shared with LoRA. Compare checkpoints at a fixed false-positive budget on held-out validation data; the default checkpoint monitor remains real-speech AUC and does not enforce a FA/h constraint.
+
+The [path resolver](dma_kws/stage2/adapt_paths.py) uses `paths.exp_root/stage2_adapt_joint_qbyt_full/<slug>` for joint full-QbyT runs and `paths.exp_root/stage2_adapt_qbyt_full/<slug>` for sequential full-QbyT runs. Data manifests are shared with LoRA, while default model and sweep outputs are separate. The trainer saves a complete model at `stage2_adapted.pt` and a per-phase copy at `<phase>/stage2_adapted.pt`; it produces no LoRA adapter file. In sequential TTS → real training, the real phase starts from the TTS full model.
+
+Resume an interrupted full-QbyT run using its Lightning `.ckpt`, preserving the original data and experiment settings:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/adapt_stage2_keyword.py \
+  '+experiment=[icefall_zipformer_stage2_eps_softmin_v41,adapt_joint,adapt_qbyt_full]' \
+  adapt.data_root=/path/to/existing/adapt/hey_eva \
+  run.resume_from=/path/to/full_qbyt_run/last.ckpt
+```
+
+The [resume hooks](dma_kws/stage2/adapt.py) restore the complete training state, validate the frozen feature trunk and reject cross-method resumes. Full-state resume requires the same optimizer, learning rate, weight decay, warmup and schedule horizon; change these through a new weights-only run. To switch from LoRA to full QbyT, start a new run from merged model weights instead. The joint sampler's existing data-signature and accumulation-boundary checks still apply. The [sweep implementation](dma_kws/stage2/sweep_adapt.py) supports all three methods. Full-QbyT trials search learning rate and update budget without rank/alpha; encoder/full-QbyT trials additionally search an independent encoder learning rate. Method-tagged studies and parameter files prevent accidental mixing of results.
+
+
+#### Full encoder and QbyT adaptation
+
+The [adaptation trainer](dma_kws/stage2/adapt.py) also supports `adapt.method=encoder_qbyt_full`. It trains the complete Stage II encoder (including input subsampling) and all QbyT parameters without LoRA. An enabled phoneme adapter remains frozen in evaluation mode with auxiliary CTC disabled; gradients still pass through it to the encoder. Existing joint fbank manifests and background fbank caches remain usable because they contain input features, not frozen encoder outputs.
+
+Compose the [encoder/full-QbyT experiment overlay](configs/experiment/adapt_encoder_qbyt_full.yaml) last:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/run_keyword_adaptation.py \
+  '+experiment=[icefall_zipformer_stage2_eps_softmin_v41,adapt_joint,adapt_encoder_qbyt_full]' \
+  adapt.stage=train \
+  prep.stage2_ckpt=/path/to/current/joint/stage2_adapted.pt \
+  adapt.data_root=/path/to/existing/adapt/hey_eva
+```
+
+`adapt.learning_rate` controls QbyT; `adapt.encoder_learning_rate` controls the encoder. Initial experiment values are `3e-5` and `3e-6`, with 100 warmup steps, 1000 optimizer steps and validation every 100 training microbatches per rank. These are unvalidated starting values. Keep data, sampling and update budget fixed when comparing against `qbyt_full`; select thresholds on validation data and compare real-speech recall at the same false-positive budget on separate test data. The default checkpoint monitor remains real-speech AUC.
+
+For Icefall, the [encoder schedule](dma_kws/stage2/encoder_schedule.py) drives the [wrapper's batch-count hook](dma_kws/stage2/icefall_encoder.py). `adapt.encoder_schedule.start_batch_count=100000` starts in the fine-tuning portion of the schedules; `reference_duration=600` sets the seconds per normalized batch. Progress uses globally summed, unpadded fbank frames and the configured frame shift. Every consumed training microbatch advances this duration clock, independently of optimizer accumulation; validation does not. This is the adaptation duration-clock contract, not a reproduction of the upstream maximum-batch-duration estimate.
+
+New-mode Lightning checkpoints retain the encoder schedule and [per-rank Python, NumPy, Torch and CUDA random state](dma_kws/training/random_state.py). Resume rejects incompatible optimizer groups, schedule settings, world size or accelerator type (CPU versus CUDA), and checkpoints must be taken after completed optimizer updates. Use weights-only initialization when changing accelerator type. Joint mode additionally restores the deterministic data cursor. Sequential mode retains its existing data-loader behavior; restoring model and optimizer state there does not promise the identical subsequent sample sequence. Inference `.pt` exports contain model weights and provenance rather than end-of-run training counters.
+
+The [path resolver](dma_kws/stage2/adapt_paths.py) isolates joint outputs under `paths.exp_root/stage2_adapt_joint_encoder_qbyt_full/<slug>` and sequential outputs under `paths.exp_root/stage2_adapt_encoder_qbyt_full/<slug>`. Both the run checkpoint directory and stable `stage2_adapted.pt` outputs contain the updated encoder and QbyT. Deployment must load this complete model, as [Stage2Verifier](dma_kws/inference/stage2_verifier.py) does; retaining the old encoder would discard part of the adaptation.
+
+Initialize from complete Stage II weights, a merged LoRA model, or a full-QbyT model. Switching methods starts a new optimizer/scheduler. Full-state resume uses `run.resume_from=/path/to/last.ckpt` with the same method and configuration, rather than `prep.stage2_ckpt`; it restores both optimizer parameter groups. Sequential TTS → real training passes the complete trained model to the next phase. The [checkpoint converter](scripts/convert_stage2_checkpoints.py) accepts this mode's Lightning checkpoints and preserves all trained model tensors.
+
 ### Console output
 
-All four adaptation scripts print rich progress and summary tables: a plan table before any heavy work, G2P/fbank progress bars during preparation, dataset composition and LoRA parameter budget before training, the resolved run summary (`Stage II LoRA Adaptation Run`), per-trial sweep scores, and a base-vs-adapted metric comparison with deltas at eval time. Each table is followed by the machine-readable JSON/YAML line the scripts have always emitted.
+All four adaptation scripts print rich progress and summary tables: a plan table before any heavy work, G2P/fbank progress bars during preparation, dataset composition and trainable parameter budget before training, the resolved run summary (`Stage II LoRA Adaptation Run`, `Stage II Full QbyT Adaptation Run`, or `Stage II Encoder + QbyT Adaptation Run`), per-trial sweep scores, and a base-vs-adapted metric comparison with deltas at eval time. Each table is followed by the machine-readable JSON/YAML line the scripts have always emitted.
 
 Set `prep.use_rich=false` for plain text; output also degrades to plain text automatically when stdout is not a TTY (piped output, CI logs, captured subprocesses).
 
@@ -1307,7 +1363,7 @@ Set `prep.use_rich=false` for plain text; output also degrades to plain text aut
 
 Stage II training and LoRA adaptation write metrics through the backends in `stage2.logging.backends` (default `[csv, tensorboard]`; W&B and Trackio optional). Per run (`logs/<run_name>/version_N/`):
 
-- `metrics.csv` / TensorBoard events: Lightning's native step-level stream, with `train/loss`, `train/utt_loss`, `train/seq_loss`, `train/lr`, `train/grad_norm`, and all `val/*` metrics. Adaptation additionally logs per-source training metrics: `train/keyword_utt_loss`, `train/libri_utt_loss`, and `train/keyword_frac` (actual keyword share per batch). Hyperparameters (lr, batch size, max_steps, seed; plus rank/alpha/mix_ratio/keyword/phase for adaptation) are logged once at startup, so the TensorBoard HPARAMS tab is populated. Set `stage2.logging.grad_norm=false` to disable gradient-norm logging.
+- `metrics.csv` / TensorBoard events: Lightning's native step-level stream, with `train/loss`, `train/utt_loss`, `train/seq_loss`, `train/lr`, `train/grad_norm`, and all `val/*` metrics. Adaptation additionally logs per-source training metrics: `train/keyword_utt_loss`, `train/libri_utt_loss`, and `train/keyword_frac` (actual keyword share per batch). [Hyperparameters](dma_kws/training/metrics_history.py) (lr, batch size, max_steps, seed; plus adapt_method/mix_ratio/keyword/phase for adaptation and rank/alpha for LoRA only) are logged once at startup, so the TensorBoard HPARAMS tab is populated. Set `stage2.logging.grad_norm=false` to disable gradient-norm logging.
 - `eval_history.csv`: one dense row per validation pass (no sparse columns), with step, epoch, wall time, steps/sec, the latest train metrics, and every val metric. Use this for within-run comparison and plotting.
 
 Cross-run comparison: every completed run appends one row (timestamp, run name, hyperparameters, final and best val metrics, step count, duration) to `exp/stage2_qbyt/runs.csv` (Stage II) or `exp/stage2_adapt/runs.csv` (adaptation). Best-metric direction is inferred per metric (AUC-like → max, EER/loss → min).
