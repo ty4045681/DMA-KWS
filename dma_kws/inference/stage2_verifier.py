@@ -6,6 +6,7 @@ the QbyT query-by-text model, returning per-candidate detection scores.
 
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -370,6 +371,135 @@ class Stage2Verifier:
             (raw_logit, self._calibrator.predict_one(raw_logit))
             for raw_logit in raw_values
         ]
+
+    def score_clip_feats_multi_with_logits(
+        self,
+        feats: Sequence,
+        query_ids: Sequence[Sequence[int]],
+        *,
+        query_batch_size: int = 64,
+    ) -> list[list[tuple[float, float]]]:
+        """Score every clip against every unique query with one encoder pass.
+
+        Returns ``[num_clips][num_unique_queries]`` pairs of
+        ``(raw_logit, calibrated_score)``. Query order is the caller's
+        enrolled order. Empty ``feats`` returns ``[]``. An empty query list is
+        a configuration error. Pair tensors are chunked so one QbyT call never
+        exceeds ``query_batch_size`` rows.
+        """
+
+        from dma_kws.inference.keyword_set import (
+            KeywordEvalConfigError,
+            KeywordSetScoreError,
+            require_positive_int,
+        )
+
+        torch = self._torch
+        queries = [tuple(int(token) for token in ids) for ids in query_ids]
+        if not queries:
+            raise KeywordEvalConfigError(
+                "query_ids must be a non-empty list of pronunciation sequences"
+            )
+        if any(not ids for ids in queries):
+            raise KeywordEvalConfigError("each query must be a non-empty token sequence")
+        chunk_limit = require_positive_int(
+            query_batch_size,
+            field="query_batch_size",
+        )
+        if not feats:
+            return []
+
+        from torch.nn.utils.rnn import pad_sequence
+
+        padded_feats = pad_sequence(list(feats), batch_first=True, padding_value=0)
+        feat_lengths = torch.tensor([feat.size(0) for feat in feats], dtype=torch.long)
+        num_clips = len(feats)
+        num_queries = len(queries)
+        raw_matrix = torch.empty(num_clips, num_queries, dtype=torch.float32)
+
+        with torch.no_grad(), self._inference_amp():
+            speech, encoder_lens = self._model.encode_for_qbyt(
+                padded_feats.to(self._device),
+                feat_lengths.to(self._device),
+            )
+            encoder_lens = encoder_lens.to(dtype=torch.long)
+            num_pairs = num_clips * num_queries
+            for start in range(0, num_pairs, chunk_limit):
+                end = min(start + chunk_limit, num_pairs)
+                pair_count = end - start
+                clip_indices = [index // num_queries for index in range(start, end)]
+                query_indices = [index % num_queries for index in range(start, end)]
+                speech_rows = [
+                    speech[clip_index, : encoder_lens[clip_index]]
+                    for clip_index in clip_indices
+                ]
+                chunk_speech = pad_sequence(speech_rows, batch_first=True, padding_value=0)
+                chunk_speech_lengths = torch.stack(
+                    [encoder_lens[clip_index] for clip_index in clip_indices]
+                )
+                anchors = pad_sequence(
+                    [
+                        torch.tensor(
+                            list(queries[query_index]),
+                            dtype=torch.long,
+                            device=self._device,
+                        )
+                        for query_index in query_indices
+                    ],
+                    batch_first=True,
+                    padding_value=0,
+                )
+                anchor_lengths = torch.tensor(
+                    [len(queries[query_index]) for query_index in query_indices],
+                    dtype=torch.long,
+                    device=self._device,
+                )
+                logits, _extra = self._model.qbyt(
+                    chunk_speech,
+                    anchors,
+                    speech_lengths=chunk_speech_lengths,
+                    text_lengths=anchor_lengths,
+                )
+                values = logits.reshape(-1).detach().float().cpu()
+                if int(values.numel()) != pair_count:
+                    raise RuntimeError(
+                        "QbyT returned a different number of pair scores than "
+                        f"inputs: expected={pair_count}, actual={int(values.numel())}"
+                    )
+                for offset, pair_index in enumerate(range(start, end)):
+                    raw_matrix[
+                        pair_index // num_queries,
+                        pair_index % num_queries,
+                    ] = values[offset]
+                del (
+                    speech_rows,
+                    chunk_speech,
+                    chunk_speech_lengths,
+                    anchors,
+                    anchor_lengths,
+                    logits,
+                    values,
+                )
+
+        results: list[list[tuple[float, float]]] = []
+        for clip_index in range(num_clips):
+            row: list[tuple[float, float]] = []
+            for query_index in range(num_queries):
+                raw_logit = float(raw_matrix[clip_index, query_index])
+                if not math.isfinite(raw_logit):
+                    raise KeywordSetScoreError(
+                        "non-finite raw logit for clip "
+                        f"{clip_index} query {query_index}: {raw_logit}"
+                    )
+                calibrated = float(self._calibrator.predict_one(raw_logit))
+                if not math.isfinite(calibrated):
+                    raise KeywordSetScoreError(
+                        "non-finite calibrated score for clip "
+                        f"{clip_index} query {query_index}: {calibrated}"
+                    )
+                row.append((raw_logit, calibrated))
+            results.append(row)
+        return results
 
     def emission_diagnostics(
         self,

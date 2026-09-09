@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, NamedTuple, Sequence
 
 _THREAD_EXTRACTORS = threading.local()
@@ -497,6 +498,177 @@ class Stage2ClipRunner:
                 )
         return results
 
+    def enroll_keyword_set(
+        self,
+        prep: Mapping[str, Any],
+        *,
+        tokenizer_dict_path: str | Path,
+    ):
+        """Resolve ``prep.keyword_eval`` with this runner's tokenizer and G2P."""
+
+        from dma_kws.inference.keyword_set import resolve_keyword_set
+
+        return resolve_keyword_set(
+            prep,
+            self._tokenizer,
+            g2p=self._g2p,
+            tokenizer_dict_path=tokenizer_dict_path,
+        )
+
+    def _score_feats_multi_with_logits(
+        self,
+        feats: Sequence,
+        query_ids: Sequence[Sequence[int]],
+        *,
+        query_batch_size: int,
+    ) -> list[list[tuple[float | None, float]]]:
+        scorer = getattr(self._verifier, "score_clip_feats_multi_with_logits", None)
+        if scorer is None:
+            raise RuntimeError(
+                "verifier does not implement score_clip_feats_multi_with_logits"
+            )
+        scored = scorer(
+            feats,
+            query_ids,
+            query_batch_size=query_batch_size,
+        )
+        if len(scored) != len(feats):
+            raise RuntimeError(
+                "Stage-II multi-query scorer returned a different number of "
+                f"clips than inputs: expected={len(feats)}, actual={len(scored)}"
+            )
+        expected_queries = len(query_ids)
+        for row in scored:
+            if len(row) != expected_queries:
+                raise RuntimeError(
+                    "Stage-II multi-query scorer returned a different number of "
+                    f"queries than enrolled: expected={expected_queries}, "
+                    f"actual={len(row)}"
+                )
+        return scored
+
+    def run_batch_multi(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        keyword_set,
+        *,
+        batch_size: int = 64,
+        num_workers: int = 0,
+        left_padding_ms: int = 0,
+        right_padding_ms: int = 0,
+        waveform_transform: WaveformTransform | None = None,
+        waveform_observer: Callable[[int, Any, int], None] | None = None,
+        eval_protocol: str | None = None,
+    ) -> list[dict]:
+        """Score each source-audio row once against an enrolled keyword set."""
+
+        from dma_kws.inference.keyword_set import (
+            CLIP_EVAL_PROTOCOL,
+            aggregate_query_scores,
+            require_qbyt_threshold,
+            scored_keyword_set_fields,
+            skipped_keyword_set_fields,
+        )
+
+        try:
+            from torch.utils.data import DataLoader
+        except ImportError as exc:
+            raise SystemExit(
+                "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
+            ) from exc
+
+        rows = list(rows)
+        threshold = require_qbyt_threshold(
+            self._demo_cfg.get("qbyt_threshold", 0.5),
+            field="demo.qbyt_threshold",
+        )
+        protocol = str(eval_protocol or CLIP_EVAL_PROTOCOL)
+        query_ids = keyword_set.query_token_ids()
+        transform_enabled = waveform_transform is not None and bool(
+            getattr(waveform_transform, "enabled", True)
+        )
+        reports_augmented_duration = transform_enabled and bool(
+            getattr(waveform_transform, "changes_duration", True)
+        )
+        dataset = ClipFeatureDataset(
+            audio_paths=[row["audio_path"] for row in rows],
+            sample_rate=self._sample_rate,
+            fbank_extractor=self._verifier.fbank_extractor,
+            fbank_kwargs=self._verifier.fbank_kwargs,
+            min_fbank_frames=self._verifier.min_fbank_frames,
+            left_padding_ms=left_padding_ms,
+            right_padding_ms=right_padding_ms,
+            waveform_transform=waveform_transform,
+            waveform_observer=waveform_observer,
+            include_augmented_duration=True,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=max(1, int(batch_size)),
+            shuffle=False,
+            num_workers=max(0, int(num_workers)),
+            collate_fn=collate_clip_feature_batch,
+        )
+
+        results: list[dict | None] = [None] * len(rows)
+
+        for batch in loader:
+            feats = []
+            pending: list[tuple[int, float, float]] = []
+            for index, feat, end_sec, augmented_duration_sec in batch:
+                if feat is None:
+                    result = skipped_keyword_set_fields(
+                        keyword_set,
+                        threshold=threshold,
+                    )
+                    result["eval_protocol"] = protocol
+                    result["audio_path"] = rows[index]["audio_path"]
+                    result["clip_span_sec"] = {"start_sec": 0.0, "end_sec": end_sec}
+                    if reports_augmented_duration:
+                        result["augmented_duration_sec"] = float(augmented_duration_sec)
+                    results[index] = result
+                    continue
+                feats.append(feat)
+                pending.append((index, end_sec, augmented_duration_sec))
+            if not feats:
+                continue
+            scored = self._score_feats_multi_with_logits(
+                feats,
+                query_ids,
+                query_batch_size=keyword_set.query_batch_size,
+            )
+            if len(scored) != len(pending):
+                raise RuntimeError(
+                    "Stage-II multi-query scorer returned a different number of "
+                    f"clips than inputs: expected={len(pending)}, actual={len(scored)}"
+                )
+            for (index, end_sec, augmented_duration_sec), query_scores in zip(
+                pending,
+                scored,
+                strict=True,
+            ):
+                aggregation = aggregate_query_scores(
+                    keyword_set,
+                    query_scores,
+                    threshold=threshold,
+                    audio_id=rows[index]["audio_path"],
+                    scored=True,
+                )
+                result = scored_keyword_set_fields(
+                    keyword_set,
+                    aggregation,
+                    threshold=threshold,
+                )
+                result["eval_protocol"] = protocol
+                result["audio_path"] = rows[index]["audio_path"]
+                result["clip_span_sec"] = {"start_sec": 0.0, "end_sec": end_sec}
+                if reports_augmented_duration:
+                    result["augmented_duration_sec"] = float(augmented_duration_sec)
+                results[index] = result
+        if any(result is None for result in results):
+            raise RuntimeError("Stage-II multi-query runner dropped one or more clips")
+        return results
+
     @staticmethod
     def _clip_result(
         audio_path: str,
@@ -539,19 +711,6 @@ class Stage2ClipRunner:
     ) -> PreparedFileWindows:
         """Load one file and extract hop-grid window features on CPU."""
 
-        from dma_kws.inference.audio_utils import (
-            has_min_fbank_frames,
-            window_fbank_frame_span,
-        )
-        from dma_kws.stage2.features import waveform_to_fbank
-
-        mode = str(fbank_windows or "independent").strip().lower()
-        if mode not in {"independent", "file"}:
-            raise ValueError(
-                "fbank_windows must be 'independent' or 'file', "
-                f"got {fbank_windows!r}"
-            )
-
         keyword_phonemes = self.resolve_keyword_phonemes(
             keyword,
             keyword_phonemes,
@@ -566,6 +725,43 @@ class Stage2ClipRunner:
                 f"keyword={keyword!r}, phonemes={len(keyword_phonemes)}, "
                 f"token_ids={len(keyword_ids)}"
             )
+        feats, spans = self.extract_file_window_features(
+            audio_path,
+            window_sec=window_sec,
+            hop_sec=hop_sec,
+            fbank_windows=fbank_windows,
+        )
+        return PreparedFileWindows(
+            audio_path=audio_path,
+            keyword=keyword,
+            keyword_phonemes=keyword_phonemes,
+            keyword_ids=keyword_ids,
+            feats=feats,
+            spans=spans,
+        )
+
+    def extract_file_window_features(
+        self,
+        audio_path: str,
+        *,
+        window_sec: float,
+        hop_sec: float,
+        fbank_windows: str = "independent",
+    ) -> tuple[list[Any], list[tuple[int, float, float]]]:
+        """Extract hop-grid window features without scoring or enrollment."""
+
+        from dma_kws.inference.audio_utils import (
+            has_min_fbank_frames,
+            window_fbank_frame_span,
+        )
+        from dma_kws.stage2.features import waveform_to_fbank
+
+        mode = str(fbank_windows or "independent").strip().lower()
+        if mode not in {"independent", "file"}:
+            raise ValueError(
+                "fbank_windows must be 'independent' or 'file', "
+                f"got {fbank_windows!r}"
+            )
         min_stage2_fbank_frames = self._verifier.min_fbank_frames
         extractor = getattr(_THREAD_EXTRACTORS, "extractor", None)
         if extractor is None:
@@ -575,22 +771,12 @@ class Stage2ClipRunner:
             _THREAD_EXTRACTORS.extractor = extractor
 
         waveform, sample_rate = load_audio(audio_path, sample_rate=self._sample_rate)
-        waveform, sample_rate = extractor.prepare_waveform(
-            waveform, sample_rate
-        )
+        waveform, sample_rate = extractor.prepare_waveform(waveform, sample_rate)
         total_samples = waveform.size(1)
         window_samples = int(window_sec * sample_rate)
         hop_samples = int(hop_sec * sample_rate)
-        empty = PreparedFileWindows(
-            audio_path=audio_path,
-            keyword=keyword,
-            keyword_phonemes=keyword_phonemes,
-            keyword_ids=keyword_ids,
-            feats=[],
-            spans=[],
-        )
         if window_samples <= 0 or hop_samples <= 0 or total_samples < window_samples:
-            return empty
+            return [], []
 
         fbank_kwargs = self._verifier.fbank_kwargs
         frame_kwargs = {
@@ -642,14 +828,7 @@ class Stage2ClipRunner:
                 )
             feats.append(feat)
             spans.append((window_index, start / sample_rate, end / sample_rate))
-        return PreparedFileWindows(
-            audio_path=audio_path,
-            keyword=keyword,
-            keyword_phonemes=keyword_phonemes,
-            keyword_ids=keyword_ids,
-            feats=feats,
-            spans=spans,
-        )
+        return feats, spans
 
     def score_prepared_windows(
         self,
@@ -689,6 +868,74 @@ class Stage2ClipRunner:
             )
             result["window_index"] = window_index
             results.append(result)
+        return results
+
+    def score_window_features_multi(
+        self,
+        audio_path: str,
+        feats: Sequence,
+        spans: Sequence[tuple[int, float, float]],
+        keyword_set,
+        *,
+        batch_size: int = 64,
+    ) -> list[dict]:
+        """Score extracted windows against an enrolled keyword set."""
+
+        from dma_kws.inference.keyword_set import (
+            WINDOW_EVAL_PROTOCOL,
+            aggregate_query_scores,
+            require_qbyt_threshold,
+            scored_keyword_set_fields,
+        )
+
+        if not feats:
+            return []
+        if len(feats) != len(spans):
+            raise RuntimeError("window feats and spans must have the same length")
+        threshold = require_qbyt_threshold(
+            self._demo_cfg.get("qbyt_threshold", 0.5),
+            field="demo.qbyt_threshold",
+        )
+        query_ids = keyword_set.query_token_ids()
+        chunk = max(1, int(batch_size))
+        results: list[dict] = []
+        for start in range(0, len(feats), chunk):
+            batch_feats = list(feats[start : start + chunk])
+            batch_spans = list(spans[start : start + chunk])
+            scored = self._score_feats_multi_with_logits(
+                batch_feats,
+                query_ids,
+                query_batch_size=keyword_set.query_batch_size,
+            )
+            if len(scored) != len(batch_spans):
+                raise RuntimeError(
+                    "Stage-II multi-query window scorer returned an unexpected "
+                    f"result count: expected={len(batch_spans)}, actual={len(scored)}"
+                )
+            for (window_index, start_sec, end_sec), query_scores in zip(
+                batch_spans,
+                scored,
+                strict=True,
+            ):
+                aggregation = aggregate_query_scores(
+                    keyword_set,
+                    query_scores,
+                    threshold=threshold,
+                    audio_id=f"{audio_path}#window={window_index}",
+                )
+                result = scored_keyword_set_fields(
+                    keyword_set,
+                    aggregation,
+                    threshold=threshold,
+                )
+                result["eval_protocol"] = WINDOW_EVAL_PROTOCOL
+                result["audio_path"] = audio_path
+                result["clip_span_sec"] = {
+                    "start_sec": start_sec,
+                    "end_sec": end_sec,
+                }
+                result["window_index"] = window_index
+                results.append(result)
         return results
 
     def _score_window_feats(

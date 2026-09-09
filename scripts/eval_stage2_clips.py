@@ -43,11 +43,22 @@ from dma_kws.inference.detection_plots import (
     binary_roc_points as _binary_roc_points,
     write_detection_plots as _write_detection_plots,
 )
-from dma_kws.inference.manifest import load_manifest
+from dma_kws.inference.keyword_set import (
+    CLIP_EVAL_PROTOCOL,
+    KeywordEvalConfigError,
+    KeywordSetManifestError,
+    KeywordSetScoreError,
+    keyword_eval_mode,
+    keyword_eval_provenance_block,
+    keyword_set_summary_fields,
+)
+from dma_kws.inference.manifest import load_keyword_set_manifest, load_manifest
+from dma_kws.pathing import resolve_dict_path
 from dma_kws.inference.metrics import summarize_labeled_results
 from dma_kws.inference.musan_mix import MusanWaveformMixer
 from dma_kws.inference.stage2_clip import Stage2ClipRunner
 from dma_kws.inference.stage2_reporting import (
+    build_keyword_set_result_record as _keyword_set_result_record,
     build_result_record as _result_record,
     build_score_provenance as _score_provenance,
 )
@@ -153,7 +164,35 @@ def run_eval(cfg: DictConfig) -> dict:
     output_dir = Path(str(output_dir_override or prep.get("stage2_clip_output_dir", "outputs/eval_stage2_clips")))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = load_manifest(manifest_path)
+    eval_mode = keyword_eval_mode(prep)
+    rows: list[dict]
+    keyword_set = None
+    if eval_mode == "any":
+        try:
+            from dma_kws.g2p import make_g2p
+            from dma_kws.tokenizer import load_char_tokenizer
+            from dma_kws.config import get_tokenizer_config
+
+            tokenizer_cfg = get_tokenizer_config(config)
+            tokenizer = load_char_tokenizer(
+                resolve_dict_path(config),
+                split_with_space=tokenizer_cfg.get("split_with_space", " "),
+            )
+            from dma_kws.inference.keyword_set import resolve_keyword_set
+
+            keyword_set = resolve_keyword_set(
+                prep,
+                tokenizer,
+                g2p=make_g2p(),
+                tokenizer_dict_path=resolve_dict_path(config),
+            )
+            if keyword_set is None:
+                raise SystemExit("prep.keyword_eval.mode=any produced no keyword set")
+            rows = load_keyword_set_manifest(manifest_path, keyword_set.texts)
+        except (KeywordEvalConfigError, KeywordSetManifestError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+    else:
+        rows = load_manifest(manifest_path)
     audio_paths = [str(row["audio_path"]) for row in rows]
     try:
         audio_aug = AudioAugWaveformTransform.from_prep(
@@ -201,25 +240,50 @@ def run_eval(cfg: DictConfig) -> dict:
         stream=stream_description,
         left_padding_ms=left_padding_ms,
         right_padding_ms=right_padding_ms,
+        keyword_eval=keyword_eval_provenance_block(keyword_set, mode=eval_mode),
     )
-    runner_results = runner.run_batch(
-        rows,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        left_padding_ms=left_padding_ms,
-        right_padding_ms=right_padding_ms,
-        waveform_transform=(
-            waveform_augmentation if waveform_augmentation.enabled else None
-        ),
-        waveform_observer=audio_exporter if audio_exporter.enabled else None,
-    )
+    try:
+        if eval_mode == "any":
+            runner_results = runner.run_batch_multi(
+                rows,
+                keyword_set,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                left_padding_ms=left_padding_ms,
+                right_padding_ms=right_padding_ms,
+                waveform_transform=(
+                    waveform_augmentation if waveform_augmentation.enabled else None
+                ),
+                waveform_observer=audio_exporter if audio_exporter.enabled else None,
+            )
+        else:
+            runner_results = runner.run_batch(
+                rows,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                left_padding_ms=left_padding_ms,
+                right_padding_ms=right_padding_ms,
+                waveform_transform=(
+                    waveform_augmentation if waveform_augmentation.enabled else None
+                ),
+                waveform_observer=audio_exporter if audio_exporter.enabled else None,
+            )
+    except (KeywordEvalConfigError, KeywordSetScoreError, RuntimeError) as exc:
+        raise SystemExit(str(exc)) from exc
     try:
         audio_export_summary = audio_exporter.finalize()
     except (OSError, TypeError, ValueError) as exc:
         raise SystemExit(f"Failed to finalize transformed WAV exports: {exc}") from exc
     results = []
     for index, (row, runner_result) in enumerate(zip(rows, runner_results)):
-        record = _result_record(row, runner_result)
+        if eval_mode == "any":
+            record = _keyword_set_result_record(
+                row,
+                runner_result,
+                eval_protocol=CLIP_EVAL_PROTOCOL,
+            )
+        else:
+            record = _result_record(row, runner_result)
         if waveform_augmentation.enabled:
             record.update(waveform_augmentation.recipe_metadata(index))
         exported_audio_path = audio_exporter.result_path(index)
@@ -234,6 +298,7 @@ def run_eval(cfg: DictConfig) -> dict:
                 json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
             )
 
+    labeled = [record for record in results if "label" in record]
     summary = {
         "manifest": str(Path(manifest_path).resolve()),
         "num_samples": len(results),
@@ -244,9 +309,18 @@ def run_eval(cfg: DictConfig) -> dict:
         },
         "stream": stream_description,
         "num_skipped": sum(bool(record.get("skipped", False)) for record in results),
+        "num_scored": sum(not bool(record.get("skipped", False)) for record in results),
+        "num_labeled": len(labeled),
         "provenance": provenance,
         "audio_exports": audio_export_summary,
+        "keyword_eval_mode": eval_mode,
+        "score_semantics": (
+            "max_over_keywords_and_pronunciations" if eval_mode == "any" else "per_row"
+        ),
     }
+    if eval_mode == "any" and keyword_set is not None:
+        summary["eval_protocol"] = CLIP_EVAL_PROTOCOL
+        summary.update(keyword_set_summary_fields(keyword_set))
     summary.update(waveform_augmentation.summary())
     scored_results = [record for record in results if not record.get("skipped", False)]
     deployment_threshold = float(runner._demo_cfg.get("qbyt_threshold", 0.5))
@@ -278,6 +352,35 @@ def run_eval(cfg: DictConfig) -> dict:
                 min_recall=prep.get("plot_min_recall"),
                 max_fpr=prep.get("plot_max_fpr"),
             )
+    if eval_mode == "any" and keyword_set is not None:
+        per_keyword: dict[str, dict] = {}
+        for keyword in keyword_set.keywords:
+            keyword_rows = []
+            for record in scored_results:
+                labels = record.get("keyword_labels")
+                if not isinstance(labels, dict) or keyword.text not in labels:
+                    continue
+                score = None
+                for item in record.get("keyword_results") or []:
+                    if item.get("text") == keyword.text:
+                        score = float(item["qbyt_score"])
+                        break
+                if score is None:
+                    continue
+                keyword_rows.append(
+                    {
+                        "label": int(labels[keyword.text]),
+                        "best_qbyt_score": score,
+                    }
+                )
+            keyword_metrics = summarize_labeled_results(
+                keyword_rows,
+                threshold=deployment_threshold,
+            )
+            if keyword_metrics:
+                per_keyword[keyword.text] = keyword_metrics
+        if per_keyword:
+            summary["per_keyword_metrics"] = per_keyword
 
     summary_path = output_dir / "summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
