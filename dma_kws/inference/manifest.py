@@ -5,7 +5,9 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
+
+from dma_kws.inference.keyword_set import KeywordSetManifestError
 
 
 _REQUIRED_COLUMNS = ("audio_path", "keyword")
@@ -126,6 +128,304 @@ def load_manifest(path: str | Path) -> list[dict]:
         return rows
 
     raise ValueError(f"Unsupported manifest format: {manifest_path.suffix}")
+
+
+def _strip_manifest_mapping(row: Mapping[str, Any]) -> dict:
+    return {
+        str(key).strip(): (value.strip() if isinstance(value, str) else value)
+        for key, value in row.items()
+        if key is not None and str(key).strip() != ""
+    }
+
+
+def _resolve_audio_path_field(
+    row: dict,
+    base_dir: Path | None,
+) -> dict:
+    audio_path = row.get("audio_path", "")
+    if audio_path and base_dir is not None and not Path(str(audio_path)).is_absolute():
+        row = dict(row)
+        row["audio_path"] = str((base_dir / str(audio_path)).resolve())
+    return row
+
+
+def _iter_manifest_dicts(path: str | Path) -> Iterator[tuple[int, dict]]:
+    """Yield ``(row_number, stripped row)`` with resolved ``audio_path``."""
+
+    manifest_path = Path(path)
+    if not manifest_path.exists():
+        raise FileNotFoundError(manifest_path)
+    base_dir = manifest_path.parent
+    suffix = manifest_path.suffix.lower()
+    if suffix == ".jsonl":
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Manifest row {line_number} is not valid JSON: {exc.msg}"
+                    ) from exc
+                if not isinstance(parsed, Mapping):
+                    raise ValueError(f"Manifest row {line_number} must be a JSON object")
+                yield line_number, _resolve_audio_path_field(
+                    _strip_manifest_mapping(parsed),
+                    base_dir,
+                )
+        return
+    if suffix == ".csv":
+        with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for line_number, row in enumerate(reader, start=2):
+                yield line_number, _resolve_audio_path_field(
+                    _strip_manifest_mapping(row),
+                    base_dir,
+                )
+        return
+    raise ValueError(f"Unsupported manifest format: {manifest_path.suffix}")
+
+
+def _parse_json_cell(value: object, *, field: str, row_number: int) -> object:
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        raise KeywordSetManifestError(
+            f"Manifest row {row_number} {field} must be JSON text"
+        )
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise KeywordSetManifestError(
+            f"Manifest row {row_number} {field} is not valid JSON: {exc.msg}"
+        ) from exc
+
+
+def _strict_binary_int(
+    value: object,
+    *,
+    field: str,
+    row_number: int,
+    allow_csv_string: bool = False,
+) -> int:
+    if allow_csv_string and isinstance(value, str) and value in {"0", "1"}:
+        return int(value)
+    if isinstance(value, bool) or type(value) is not int or value not in (0, 1):
+        raise KeywordSetManifestError(
+            f"Manifest row {row_number} {field} must be integer 0 or 1, "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _row_has_field(row: Mapping[str, Any], key: str) -> bool:
+    if key not in row:
+        return False
+    value = row[key]
+    if value is None:
+        return False
+    if isinstance(value, str) and value.strip() == "":
+        return False
+    return True
+
+
+def load_keyword_set_manifest(
+    path: str | Path,
+    target_texts: Sequence[str],
+) -> list[dict]:
+    """Load an any-mode audio-level manifest.
+
+    Accepts JSONL or CSV. One source audio per row. Labels never change the
+    enrolled query set; they only populate ``label`` / ``keyword_labels``.
+    """
+
+    from dma_kws.inference.keyword_set import (
+        ANY_MANIFEST_FORMAT_EXAMPLES,
+        normalize_keyword_text,
+    )
+
+    try:
+        configured = [
+            normalize_keyword_text(text, field="target_texts")
+            for text in target_texts
+        ]
+    except Exception as exc:
+        raise KeywordSetManifestError(str(exc)) from exc
+    configured_set = set(configured)
+    if len(configured_set) != len(configured):
+        raise KeywordSetManifestError("target_texts must not contain duplicates")
+    if not configured_set:
+        raise KeywordSetManifestError("target_texts must not be empty")
+
+    rows: list[dict] = []
+    seen_paths: dict[Path, int] = {}
+    for row_number, raw in _iter_manifest_dicts(path):
+        audio_path = raw.get("audio_path", "")
+        if not audio_path:
+            raise KeywordSetManifestError(
+                f"Manifest row {row_number} is missing audio_path"
+            )
+        resolved = Path(str(audio_path)).expanduser().resolve()
+        previous = seen_paths.get(resolved)
+        if previous is not None:
+            raise KeywordSetManifestError(
+                f"Manifest row {row_number} duplicates canonical audio path "
+                f"from row {previous}: {resolved}"
+            )
+        seen_paths[resolved] = row_number
+
+        if _row_has_field(raw, "keyword") or _row_has_field(raw, "keyword_phonemes"):
+            raise KeywordSetManifestError(
+                f"Manifest row {row_number} uses legacy pair fields "
+                "`keyword` / `keyword_phonemes`, which any-mode rejects.\n"
+                f"{ANY_MANIFEST_FORMAT_EXAMPLES}"
+            )
+
+        has_keyword_labels = _row_has_field(raw, "keyword_labels")
+        has_scope = _row_has_field(raw, "label_scope")
+        has_target_texts = _row_has_field(raw, "target_texts")
+        has_label = _row_has_field(raw, "label")
+        labeled_bits = (has_keyword_labels, has_scope, has_target_texts, has_label)
+
+        row = dict(raw)
+        row["audio_path"] = str(resolved)
+        row["_manifest_row_number"] = row_number
+        for key in ("label", "keyword_labels", "label_scope", "target_texts"):
+            if not _row_has_field(row, key):
+                row.pop(key, None)
+
+        if not any(labeled_bits):
+            rows.append(row)
+            continue
+
+        if has_keyword_labels:
+            if has_scope or has_target_texts:
+                raise KeywordSetManifestError(
+                    f"Manifest row {row_number} mixes keyword_labels with "
+                    "label_scope/target_texts"
+                )
+            labels_raw = raw["keyword_labels"]
+            if isinstance(labels_raw, str):
+                labels_raw = _parse_json_cell(
+                    labels_raw,
+                    field="keyword_labels",
+                    row_number=row_number,
+                )
+            if not isinstance(labels_raw, Mapping):
+                raise KeywordSetManifestError(
+                    f"Manifest row {row_number} keyword_labels must be a mapping"
+                )
+            normalized_labels: dict[str, int] = {}
+            unused: dict[str, int] = {}
+            for key, value in labels_raw.items():
+                try:
+                    text = normalize_keyword_text(
+                        key,
+                        field=f"Manifest row {row_number} keyword_labels key",
+                    )
+                except Exception as exc:
+                    raise KeywordSetManifestError(str(exc)) from exc
+                flag = _strict_binary_int(
+                    value,
+                    field=f"keyword_labels[{key!r}]",
+                    row_number=row_number,
+                )
+                if text in configured_set:
+                    previous_flag = normalized_labels.get(text)
+                    if previous_flag is not None and previous_flag != flag:
+                        raise KeywordSetManifestError(
+                            f"Manifest row {row_number} has conflicting labels "
+                            f"for {text!r}"
+                        )
+                    normalized_labels[text] = flag
+                else:
+                    unused[text] = flag
+            missing = sorted(configured_set - set(normalized_labels))
+            if missing:
+                raise KeywordSetManifestError(
+                    f"Manifest row {row_number} keyword_labels is missing "
+                    f"configured texts: {missing}. A negative label for one "
+                    "keyword does not imply the whole target set is negative."
+                )
+            derived = max(normalized_labels[text] for text in configured)
+            if has_label:
+                given = _strict_binary_int(
+                    raw["label"],
+                    field="label",
+                    row_number=row_number,
+                    allow_csv_string=True,
+                )
+                if given != derived:
+                    raise KeywordSetManifestError(
+                        f"Manifest row {row_number} label={given} does not "
+                        f"match max(keyword_labels)={derived}"
+                    )
+            row["keyword_labels"] = {
+                text: normalized_labels[text] for text in configured
+            }
+            if unused:
+                row["unused_keyword_labels"] = unused
+            row["label"] = derived
+            row["label_scope"] = "target_set"
+            rows.append(row)
+            continue
+
+        if not (has_scope and has_target_texts and has_label):
+            raise KeywordSetManifestError(
+                f"Manifest row {row_number} has incomplete label fields. "
+                "Provide keyword_labels covering every configured text, or "
+                "label_scope='target_set' with matching target_texts and "
+                f"label 0|1, or omit every label field.\n"
+                f"{ANY_MANIFEST_FORMAT_EXAMPLES}"
+            )
+        scope = raw["label_scope"]
+        if scope != "target_set":
+            raise KeywordSetManifestError(
+                f"Manifest row {row_number} label_scope must be 'target_set', "
+                f"got {scope!r}"
+            )
+        texts_raw = raw["target_texts"]
+        if isinstance(texts_raw, str):
+            texts_raw = _parse_json_cell(
+                texts_raw,
+                field="target_texts",
+                row_number=row_number,
+            )
+        if not isinstance(texts_raw, list) or not all(
+            isinstance(item, str) for item in texts_raw
+        ):
+            raise KeywordSetManifestError(
+                f"Manifest row {row_number} target_texts must be a JSON list "
+                "of strings"
+            )
+        try:
+            provided = {
+                normalize_keyword_text(
+                    item,
+                    field=f"Manifest row {row_number} target_texts",
+                )
+                for item in texts_raw
+            }
+        except Exception as exc:
+            raise KeywordSetManifestError(str(exc)) from exc
+        if provided != configured_set:
+            raise KeywordSetManifestError(
+                f"Manifest row {row_number} target_texts {sorted(provided)} "
+                f"must equal configured texts {sorted(configured_set)}"
+            )
+        row["label"] = _strict_binary_int(
+            raw["label"],
+            field="label",
+            row_number=row_number,
+            allow_csv_string=True,
+        )
+        row["label_scope"] = "target_set"
+        row["target_texts"] = list(configured)
+        rows.append(row)
+
+    return rows
 
 
 def iter_audio_files(
