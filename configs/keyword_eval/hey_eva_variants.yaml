@@ -1,0 +1,8 @@
+# @package prep.keyword_eval
+mode: any
+query_batch_size: 64
+targets:
+  - text: "hey eva"
+    pronunciations:
+      - "HH EY1 IY1 V AH0"
+      - "HH EY1 EY1 V AH0"

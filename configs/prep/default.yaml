@@ -177,6 +177,13 @@ keyword_phonemes: ""
 keyword_mode: single
 keywords: []
 keyword_labels: {}
+# Opt-in Stage II keyword-set eval. Default per_row keeps one query per
+# manifest row. mode=any enrolls prep.keyword_eval.targets and scores each
+# clip once, taking max over keywords and pronunciations.
+keyword_eval:
+  mode: per_row
+  targets: []
+  query_batch_size: 64
 skip_unmatched: true
 match_casefold: true
 recursive: true
