@@ -22,9 +22,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dma_kws.config import compose_config, config_to_dict
-from dma_kws.inference.manifest import iter_audio_files, load_manifest
+from dma_kws.config import compose_config, config_to_dict, get_tokenizer_config
+from dma_kws.inference.keyword_set import (
+    KeywordEvalConfigError,
+    KeywordSetManifestError,
+    keyword_eval_mode,
+    resolve_keyword_set,
+)
+from dma_kws.inference.manifest import (
+    iter_audio_files,
+    load_keyword_set_manifest,
+    load_manifest,
+)
 from dma_kws.pathing import resolve_dict_path
+from dma_kws.tokenizer import load_char_tokenizer
 
 
 EVAL_SCRIPT = PROJECT_ROOT / "scripts" / "eval_stage2_clips.py"
@@ -429,9 +440,11 @@ def _file_identity(path: Path) -> dict[str, str | int]:
     }
 
 
-def _manifest_audio_identity(manifest: Path) -> dict[str, Any]:
+def _manifest_audio_identity_from_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
     entries = []
-    for row in load_manifest(manifest):
+    for row in rows:
         path = Path(str(row["audio_path"])).resolve()
         stat = path.stat()
         entries.append(
@@ -444,6 +457,81 @@ def _manifest_audio_identity(manifest: Path) -> dict[str, Any]:
     identity: dict[str, Any] = {"files": entries}
     identity["sha256"] = _canonical_digest(identity)
     return identity
+
+
+def _manifest_audio_identity(manifest: Path) -> dict[str, Any]:
+    return _manifest_audio_identity_from_rows(load_manifest(manifest))
+
+
+def _resolved_from_cfg(cfg: Any) -> dict[str, Any]:
+    from omegaconf import OmegaConf
+
+    resolved = config_to_dict(cfg)
+    prep = OmegaConf.to_container(cfg.prep, resolve=True)
+    if isinstance(prep, dict):
+        resolved["prep"] = prep
+    return resolved
+
+
+def _compose_model_config(
+    model: ModelSpec,
+    common_overrides: Sequence[str],
+) -> dict[str, Any]:
+    # Later Hydra overrides win. Match build_eval_command: common, then model.
+    try:
+        cfg = compose_config(
+            model.experiment,
+            overrides=[*list(common_overrides), *list(model.overrides)],
+        )
+        return _resolved_from_cfg(cfg)
+    except Exception as exc:
+        raise BatchConfigError(
+            f"failed to compose config for model {model.name!r}: {exc}"
+        ) from exc
+
+
+def _load_matrix_manifest(
+    manifest: Path,
+    resolved_config: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], Any]:
+    prep = resolved_config.get("prep")
+    if not isinstance(prep, Mapping):
+        prep = {}
+    try:
+        mode = keyword_eval_mode(prep)
+    except KeywordEvalConfigError as exc:
+        raise BatchConfigError(str(exc)) from exc
+    if mode != "any":
+        try:
+            rows = load_manifest(manifest)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise BatchConfigError(f"invalid manifest {manifest}: {exc}") from exc
+        return rows, None
+    try:
+        dict_path = resolve_dict_path(resolved_config)
+        tokenizer_cfg = get_tokenizer_config(dict(resolved_config))
+        tokenizer = load_char_tokenizer(
+            dict_path,
+            split_with_space=tokenizer_cfg.get("split_with_space", " "),
+        )
+        keyword_set = resolve_keyword_set(
+            prep,
+            tokenizer,
+            tokenizer_dict_path=dict_path,
+        )
+        if keyword_set is None:
+            raise BatchConfigError("prep.keyword_eval.mode=any produced no keyword set")
+        rows = load_keyword_set_manifest(manifest, keyword_set.texts)
+    except (
+        KeywordEvalConfigError,
+        KeywordSetManifestError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise BatchConfigError(f"invalid any-mode manifest {manifest}: {exc}") from exc
+    return rows, keyword_set
 
 
 def _validate_experiment(experiment: str) -> None:
@@ -487,19 +575,7 @@ def _validate_full_stage2_checkpoint(path: Path, *, model_name: str) -> None:
         )
 
 
-def validate_inputs(
-    *,
-    manifest: Path,
-    models: Sequence[ModelSpec],
-    conditions: Sequence[ConditionSpec],
-    musan_root: Path | None,
-) -> list[dict[str, Any]]:
-    if not manifest.is_file():
-        raise BatchConfigError(f"manifest not found: {manifest}")
-    try:
-        rows = load_manifest(manifest)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise BatchConfigError(f"invalid manifest {manifest}: {exc}") from exc
+def _require_binary_labels(rows: Sequence[Mapping[str, Any]], *, manifest: Path) -> None:
     if not rows:
         raise BatchConfigError(f"manifest is empty: {manifest}")
     missing_labels = [index + 1 for index, row in enumerate(rows) if "label" not in row]
@@ -527,6 +603,26 @@ def validate_inputs(
         preview = ", ".join(str(path) for path in missing_audio[:3])
         suffix = " ..." if len(missing_audio) > 3 else ""
         raise BatchConfigError(f"manifest audio files not found: {preview}{suffix}")
+
+
+def validate_inputs(
+    *,
+    manifest: Path,
+    models: Sequence[ModelSpec],
+    conditions: Sequence[ConditionSpec],
+    musan_root: Path | None,
+    common_overrides: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    if not manifest.is_file():
+        raise BatchConfigError(f"manifest not found: {manifest}")
+    rows: list[dict[str, Any]] | None = None
+    for model in models:
+        resolved = _compose_model_config(model, common_overrides)
+        model_rows, _keyword_set = _load_matrix_manifest(manifest, resolved)
+        _require_binary_labels(model_rows, manifest=manifest)
+        if rows is None:
+            rows = model_rows
+    assert rows is not None
 
     for model in models:
         if not model.checkpoint.is_file():
@@ -661,7 +757,7 @@ def _resolved_job_config(
     # command[2] is +experiment=...; compose_config adds that group itself.
     try:
         cfg = compose_config(model.experiment, overrides=command[3:])
-        return config_to_dict(cfg)
+        return _resolved_from_cfg(cfg)
     except Exception as exc:
         raise BatchConfigError(
             f"failed to compose config for model {model.name!r}: {exc}"
@@ -746,7 +842,7 @@ def build_jobs(
     if audio_export is None:
         audio_export = AudioExportSpec(mode="random", count=5, seed=seed)
     manifest_identity = _file_identity(manifest)
-    audio_identity = _manifest_audio_identity(manifest)
+    audio_identity = None
     model_identities = {
         model.name: _file_identity(model.checkpoint) for model in models
     }
@@ -774,6 +870,10 @@ def build_jobs(
                 audio_export=audio_export,
             )
             resolved_config = _resolved_job_config(model=model, command=command)
+            rows, keyword_set = _load_matrix_manifest(manifest, resolved_config)
+            row_audio_identity = _manifest_audio_identity_from_rows(rows)
+            if audio_identity is None:
+                audio_identity = row_audio_identity
             tokenizer_path = resolve_dict_path(resolved_config).resolve()
             if not tokenizer_path.is_file():
                 raise BatchConfigError(
@@ -804,6 +904,12 @@ def build_jobs(
                 "seed": seed,
                 "common_overrides": list(common_overrides),
                 "audio_export": asdict(audio_export),
+                "keyword_set_id": (
+                    None if keyword_set is None else keyword_set.keyword_set_id
+                ),
+                "keyword_eval_mode": (
+                    "per_row" if keyword_set is None else "any"
+                ),
             }
             fingerprint = _canonical_digest(fingerprint_payload)
             jobs.append(
@@ -816,6 +922,8 @@ def build_jobs(
                     audio_export=audio_export,
                 )
             )
+    if audio_identity is None:
+        audio_identity = _manifest_audio_identity(manifest)
     identities = {
         "manifest": manifest_identity,
         "manifest_audio": audio_identity,
@@ -1505,6 +1613,7 @@ def run_batch(args: argparse.Namespace) -> dict[str, Any] | None:
         models=models,
         conditions=conditions,
         musan_root=musan_root,
+        common_overrides=args.override,
     )
     jobs, identities = build_jobs(
         models=models,

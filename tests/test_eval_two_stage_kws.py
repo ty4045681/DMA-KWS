@@ -1337,3 +1337,34 @@ def test_stage2_clip_result_record_rejects_non_finite_deployed_score(field):
             {"audio_path": "/tmp/audio.wav", "keyword": "hello", "label": 0},
             runner_result,
         )
+
+
+def test_two_stage_kws_rejects_any_mode(monkeypatch):
+    import scripts.eval_two_stage_kws as two_stage
+
+    monkeypatch.setattr(
+        two_stage,
+        "resolved_config",
+        lambda _cfg: {
+            "paths": {},
+            "stage1": {},
+            "stage2": {},
+            "demo": {},
+            "tokenizer": {},
+        },
+    )
+    monkeypatch.setattr(two_stage, "require_sections", lambda *_args, **_kwargs: None)
+    cfg = OmegaConf.create(
+        {
+            "prep": {
+                "manifest": "unused.jsonl",
+                "keyword_eval": {
+                    "mode": "any",
+                    "targets": [{"text": "hey eva"}],
+                },
+            },
+            "run": {"device": "cpu"},
+        }
+    )
+    with pytest.raises(SystemExit, match="does not support"):
+        two_stage.run_eval(cfg)

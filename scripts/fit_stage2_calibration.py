@@ -141,6 +141,18 @@ def load_labeled_scores(
     """Load finite scores, binary labels, and the resolved score field."""
 
     rows = _read_rows(path)
+    for row_number, row in enumerate(rows, start=1):
+        protocol = row.get("eval_protocol")
+        mode = row.get("keyword_eval_mode")
+        if mode == "any" or protocol in {
+            "stage2_clip_keyword_set",
+            "stage2_window_keyword_set",
+        }:
+            raise SystemExit(
+                f"Row {row_number} is an any-mode keyword-set aggregate; "
+                "fit_stage2_calibration.py only accepts per-query pair scores. "
+                "Do not fit a calibrator from max-aggregated results."
+            )
     resolved_field = _resolve_score_field(rows, score_field)
     scores: list[float] = []
     labels: list[int] = []

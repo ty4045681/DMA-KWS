@@ -53,6 +53,15 @@ def run_eval(cfg: DictConfig) -> dict:
     prep = OmegaConf.to_container(cfg.prep, resolve=True)
     if not isinstance(prep, dict):
         prep = {}
+    from dma_kws.inference.keyword_set import (
+        KeywordEvalConfigError,
+        reject_unsupported_any_mode,
+    )
+
+    try:
+        reject_unsupported_any_mode(prep, entry="scripts/eval_two_stage_kws.py")
+    except KeywordEvalConfigError as exc:
+        raise SystemExit(str(exc)) from exc
     run_cfg = cfg.run
 
     manifest_path = str(prep.get("manifest", ""))

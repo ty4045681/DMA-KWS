@@ -38,11 +38,18 @@ def aggregate(root: Path) -> list[dict]:
 
         row: dict = {
             "keyword": keyword,
+            "keyword_eval_mode": summary.get("keyword_eval_mode", "per_row"),
+            "keyword_set_id": summary.get("keyword_set_id", ""),
+            "num_keywords": summary.get("num_keywords", ""),
+            "num_pronunciations": summary.get("num_pronunciations", ""),
             "ckpt_name": ckpt_name,
             "output_dir": str(summary_path.parent),
             "total_files": summary.get("total_files", 0),
             "total_hours": summary.get("total_hours", 0.0),
             "num_samples": summary.get("num_samples", 0),
+            "file_trigger_rate": (summary.get("file_metrics") or {}).get(
+                "file_trigger_rate", ""
+            ),
         }
         metrics = summary.get("metrics", {})
         row.update(

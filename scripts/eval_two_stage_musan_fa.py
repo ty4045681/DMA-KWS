@@ -21,6 +21,10 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from dma_kws.config import require_sections
+from dma_kws.inference.keyword_set import (
+    KeywordEvalConfigError,
+    reject_unsupported_any_mode,
+)
 from dma_kws.hydra_app import CONFIG_DIR, resolved_config
 from dma_kws.inference.detection_plots import (
     DEFAULT_PLOT_DPI,
@@ -63,6 +67,12 @@ def run_eval(cfg: DictConfig) -> dict:
     prep = OmegaConf.to_container(cfg.prep, resolve=True)
     if not isinstance(prep, dict):
         prep = {}
+    try:
+        reject_unsupported_any_mode(
+            prep, entry="scripts/eval_two_stage_musan_fa.py"
+        )
+    except KeywordEvalConfigError as exc:
+        raise SystemExit(str(exc)) from exc
     run_cfg = cfg.run
 
     keyword = str(prep.get("keyword", "")).strip()

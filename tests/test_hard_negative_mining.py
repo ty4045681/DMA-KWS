@@ -86,6 +86,19 @@ def test_comparable_results_ignore_location_only_provenance_paths(tmp_path):
     _validate_comparable_results([mac, linux])
 
 
+def test_comparable_results_accept_schema3_and_schema4_per_row(tmp_path):
+    schema3 = _score_provenance(
+        checkpoint_path="/models/stage2.pt",
+        tokenizer_path="/dict/lang_char.txt",
+    )
+    schema4 = deepcopy(schema3)
+    schema4["schema_version"] = 4
+    schema4["keyword_eval"] = {"mode": "per_row"}
+    first = _results_with_summary(tmp_path, "schema3", schema3)
+    second = _results_with_summary(tmp_path, "schema4", schema4)
+    _validate_comparable_results([first, second])
+
+
 def test_comparable_results_reject_content_or_score_semantics_mismatch(tmp_path):
     baseline = _score_provenance(
         checkpoint_path="/models/stage2.pt",

@@ -34,6 +34,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from dma_kws.inference.keyword_set import any_mode_summary_identity_error
 from dma_kws.inference.metrics import binary_auc, binary_eer
 
 
@@ -75,6 +76,10 @@ class ScanInput:
     subset_hours: dict[str, float]
     subset_names: dict[str, str]
     num_skipped: int
+    keyword_eval_mode: str = "per_row"
+    keyword_set_id: str | None = None
+    score_semantics: str | None = None
+    eval_protocol: str | None = None
 
 
 def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
@@ -231,6 +236,42 @@ def load_scan_input(
     summary = _read_json(resolved_summary) if resolved_summary else {}
     records = _read_results(results_path)
     resolved_mode = _infer_mode(mode, records, summary)
+    eval_modes = {
+        str(record.get("keyword_eval_mode") or "per_row") for record in records
+    }
+    if len(eval_modes) > 1:
+        raise SystemExit(
+            f"{results_path} mixes keyword_eval modes {sorted(eval_modes)}"
+        )
+    keyword_eval_mode = next(iter(eval_modes))
+    if keyword_eval_mode == "any":
+        if resolved_summary is None:
+            raise SystemExit(
+                "any-mode threshold scans require summary.json beside results "
+                "or --summary so keyword_set_id and skip rules can be checked"
+            )
+        set_ids = {record.get("keyword_set_id") for record in records}
+        if len(set_ids) != 1 or None in set_ids:
+            raise SystemExit(
+                f"{results_path} mixes or is missing keyword_set_id values"
+            )
+        record_id = next(iter(set_ids))
+        protocols = {
+            record.get("eval_protocol")
+            for record in records
+            if record.get("eval_protocol")
+        }
+        if len(protocols) > 1:
+            raise SystemExit(
+                f"{results_path} mixes eval_protocol values {sorted(map(str, protocols))}"
+            )
+        identity_error = any_mode_summary_identity_error(
+            summary,
+            keyword_set_id=record_id,
+            eval_protocol=next(iter(protocols)) if protocols else None,
+        )
+        if identity_error:
+            raise SystemExit(identity_error)
 
     scored_records: list[dict[str, Any]] = []
     scores: list[float] = []
@@ -305,6 +346,23 @@ def load_scan_input(
         subset_hours=subset_hours,
         subset_names=subset_names,
         num_skipped=num_skipped,
+        keyword_eval_mode=keyword_eval_mode,
+        keyword_set_id=(
+            next(iter({record.get("keyword_set_id") for record in records}))
+            if keyword_eval_mode == "any"
+            else None
+        ),
+        score_semantics=(
+            str(summary.get("score_semantics") or "max_over_keywords_and_pronunciations")
+            if keyword_eval_mode == "any"
+            else None
+        ),
+        eval_protocol=(
+            next(
+                (str(record.get("eval_protocol")) for record in records if record.get("eval_protocol")),
+                None,
+            )
+        ),
     )
 
 
@@ -766,6 +824,10 @@ def run_scan(args: argparse.Namespace) -> dict[str, Any]:
         "results": str(scan_input.results_path),
         "source_summary": str(scan_input.summary_path) if scan_input.summary_path else None,
         "mode": scan_input.mode,
+        "keyword_eval_mode": scan_input.keyword_eval_mode,
+        "keyword_set_id": scan_input.keyword_set_id,
+        "score_semantics": scan_input.score_semantics,
+        "eval_protocol": scan_input.eval_protocol,
         "num_samples": int(scan_input.scores.size),
         "num_input_rows": int(scan_input.scores.size + scan_input.num_skipped),
         "num_skipped_excluded": scan_input.num_skipped,

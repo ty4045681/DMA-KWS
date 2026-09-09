@@ -642,3 +642,157 @@ def test_matrix_summary_keeps_failed_and_successful_rows(tmp_path):
     csv_text = (tmp_path / MODULE.MATRIX_CSV_FILENAME).read_text()
     assert "model,condition,family" in csv_text
     assert "b,clean" in csv_text
+
+
+def test_any_mode_dry_run_accepts_keyword_labels_without_top_level_label(tmp_path, capsys):
+    manifest, checkpoints, musan_root = _make_inputs(tmp_path)
+    any_manifest = tmp_path / "keyword_set.jsonl"
+    any_manifest.write_text(
+        json.dumps(
+            {
+                "audio_path": str((tmp_path / "negative.wav").resolve()),
+                "keyword_labels": {"hey eva": 0},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "audio_path": str((tmp_path / "positive.wav").resolve()),
+                "keyword_labels": {"hey eva": 1},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    argv = [
+        "--manifest",
+        str(any_manifest),
+        "--musan-root",
+        str(musan_root),
+        "--output-root",
+        str(tmp_path / "out"),
+        "--model",
+        f"candidate={checkpoints[0]}::icefall_zipformer_stage2_eps_softmin_v41",
+        "--condition",
+        "clean",
+        "--override",
+        "+keyword_eval=hey_eva_variants",
+        "--dry-run",
+    ]
+    args = MODULE.build_parser().parse_args(argv)
+    payload = MODULE.run_batch(args)
+    assert payload["counts"]["planned"] == 1
+    output = capsys.readouterr().out
+    assert "+keyword_eval=hey_eva_variants" in output
+    assert "eval_stage2_clips.py" in output
+
+
+def test_fingerprint_changes_when_a_pronunciation_is_added(tmp_path):
+    manifest, checkpoints, musan_root = _make_inputs(tmp_path)
+    any_manifest = tmp_path / "keyword_set.jsonl"
+    any_manifest.write_text(
+        json.dumps(
+            {
+                "audio_path": str((tmp_path / "negative.wav").resolve()),
+                "keyword_labels": {"hey eva": 0},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "audio_path": str((tmp_path / "positive.wav").resolve()),
+                "keyword_labels": {"hey eva": 1},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    model = MODULE.ModelSpec(
+        "candidate",
+        checkpoints[0],
+        "icefall_zipformer_stage2_eps_softmin_v41",
+    )
+    common = dict(
+        models=[model],
+        conditions=[MODULE.CONDITION_BY_NAME["clean"]],
+        manifest=any_manifest,
+        musan_root=musan_root,
+        output_root=tmp_path / "out",
+        device="cpu",
+        batch_size=0,
+        num_workers=0,
+        seed=2025,
+    )
+    two_prons = ["+keyword_eval=hey_eva_variants"]
+    one_pron = [
+        "+keyword_eval=hey_eva_variants",
+        'prep.keyword_eval.targets=[{text: "hey eva", pronunciations: ["HH EY1 IY1 V AH0"]}]',
+    ]
+    jobs_two, _ = MODULE.build_jobs(common_overrides=two_prons, **common)
+    jobs_two_again, _ = MODULE.build_jobs(common_overrides=two_prons, **common)
+    jobs_one, _ = MODULE.build_jobs(
+        common_overrides=one_pron,
+        **{**common, "output_root": tmp_path / "out_one"},
+    )
+    assert jobs_two[0].fingerprint == jobs_two_again[0].fingerprint
+    assert jobs_two[0].fingerprint != jobs_one[0].fingerprint
+
+
+def test_precheck_override_order_matches_executed_command(tmp_path):
+    from omegaconf import OmegaConf
+
+    manifest, checkpoints, musan_root = _make_inputs(tmp_path)
+    lamp_only = tmp_path / "lamp.jsonl"
+    lamp_only.write_text(
+        json.dumps(
+            {
+                "audio_path": str((tmp_path / "negative.wav").resolve()),
+                "keyword_labels": {"ok lamp": 0},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "audio_path": str((tmp_path / "positive.wav").resolve()),
+                "keyword_labels": {"ok lamp": 1},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    model = MODULE.ModelSpec(
+        "candidate",
+        checkpoints[0],
+        "icefall_zipformer_stage2_eps_softmin_v41",
+        overrides=(
+            'prep.keyword_eval.targets=[{text: "ok lamp", pronunciations: ["OW1 K EY1 L AE1 M P"]}]',
+        ),
+    )
+    common_overrides = ["+keyword_eval=hey_eva_variants"]
+    command = MODULE.build_eval_command(
+        model=model,
+        condition=MODULE.CONDITION_BY_NAME["clean"],
+        manifest=lamp_only,
+        musan_root=musan_root,
+        output_dir=tmp_path / "out",
+        device="cpu",
+        batch_size=0,
+        num_workers=0,
+        seed=2025,
+        common_overrides=common_overrides,
+    )
+    executed = OmegaConf.to_container(
+        MODULE.compose_config(model.experiment, overrides=command[3:]).prep.keyword_eval,
+        resolve=True,
+    )
+    precheck = MODULE._compose_model_config(model, common_overrides)["prep"][
+        "keyword_eval"
+    ]
+    assert executed["targets"] == precheck["targets"]
+    assert executed["targets"][0]["text"] == "ok lamp"
+    rows, keyword_set = MODULE._load_matrix_manifest(
+        lamp_only,
+        MODULE._compose_model_config(model, common_overrides),
+    )
+    assert keyword_set.texts == ("ok lamp",)
+    assert {int(row["label"]) for row in rows} == {0, 1}

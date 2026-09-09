@@ -6,7 +6,11 @@ from copy import deepcopy
 from typing import Any, Mapping
 
 
-PROVENANCE_SCHEMA_VERSION = 3
+LEGACY_PROVENANCE_SCHEMA_VERSION = 3
+PROVENANCE_SCHEMA_VERSION = 4
+SUPPORTED_PROVENANCE_SCHEMA_VERSIONS = frozenset(
+    {LEGACY_PROVENANCE_SCHEMA_VERSION, PROVENANCE_SCHEMA_VERSION}
+)
 
 _REQUIRED_FIELDS = {
     "schema_version",
@@ -44,12 +48,36 @@ def validate_score_provenance(
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version != PROVENANCE_SCHEMA_VERSION
+        or schema_version not in SUPPORTED_PROVENANCE_SCHEMA_VERSIONS
     ):
         raise ValueError(
             f"unsupported score provenance version "
             f"{provenance['schema_version']!r} in {source}"
         )
+    if schema_version >= PROVENANCE_SCHEMA_VERSION:
+        keyword_eval = provenance.get("keyword_eval")
+        if not isinstance(keyword_eval, Mapping):
+            raise ValueError(f"{source} provenance 'keyword_eval' must be a mapping")
+        mode = keyword_eval.get("mode")
+        if mode not in {"per_row", "any"}:
+            raise ValueError(
+                f"{source} provenance keyword_eval.mode must be 'per_row' or 'any'"
+            )
+        if mode == "any":
+            missing_eval = [
+                key
+                for key in (
+                    "aggregation",
+                    "keyword_set_id",
+                    "texts",
+                    "token_sequences",
+                )
+                if key not in keyword_eval
+            ]
+            if missing_eval:
+                raise ValueError(
+                    f"{source} provenance keyword_eval is missing: {missing_eval}"
+                )
 
     for section, required_fields in _REQUIRED_SECTION_FIELDS.items():
         value = provenance.get(section)
@@ -95,11 +123,26 @@ def semantic_score_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
     calibration = value.get("calibration")
     if isinstance(calibration, dict):
         calibration.pop("path", None)
+    from dma_kws.inference.keyword_set import semantic_keyword_eval
+
+    schema_version = value.get("schema_version", LEGACY_PROVENANCE_SCHEMA_VERSION)
+    try:
+        schema_version = int(schema_version)
+    except (TypeError, ValueError):
+        schema_version = LEGACY_PROVENANCE_SCHEMA_VERSION
+    value["keyword_eval"] = semantic_keyword_eval(
+        value.get("keyword_eval"),
+        schema_version=schema_version,
+    )
+    if schema_version in SUPPORTED_PROVENANCE_SCHEMA_VERSIONS:
+        value["schema_version"] = PROVENANCE_SCHEMA_VERSION
     return value
 
 
 __all__ = [
+    "LEGACY_PROVENANCE_SCHEMA_VERSION",
     "PROVENANCE_SCHEMA_VERSION",
+    "SUPPORTED_PROVENANCE_SCHEMA_VERSIONS",
     "semantic_score_provenance",
     "validate_score_provenance",
 ]

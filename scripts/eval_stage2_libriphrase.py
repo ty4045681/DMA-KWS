@@ -68,6 +68,15 @@ def main(cfg: DictConfig) -> None:
     prep = OmegaConf.to_container(cfg.prep, resolve=True)
     if not isinstance(prep, dict):
         prep = {}
+    from dma_kws.inference.keyword_set import (
+        KeywordEvalConfigError,
+        reject_unsupported_any_mode,
+    )
+
+    try:
+        reject_unsupported_any_mode(prep, entry="scripts/eval_stage2_libriphrase.py")
+    except KeywordEvalConfigError as exc:
+        raise SystemExit(str(exc)) from exc
     run = cfg.run
 
     tokenizer_cfg = get_tokenizer_config(config)

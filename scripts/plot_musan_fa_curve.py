@@ -26,6 +26,7 @@ from dma_kws.inference.detection_plots import (
     DEFAULT_PLOT_DPI,
     write_false_accept_rate_plot,
 )
+from dma_kws.inference.keyword_set import any_mode_summary_identity_error
 from dma_kws.inference.musan_fa import load_jsonl_records
 
 
@@ -102,6 +103,35 @@ def plot_musan_fa_curve(
     records = load_jsonl_records(results_path)
     if not records:
         raise SystemExit(f"No result rows found in {results_path}")
+    modes = {str(record.get("keyword_eval_mode") or "per_row") for record in records}
+    if len(modes) > 1:
+        raise SystemExit(
+            f"{results_path} mixes keyword_eval modes {sorted(modes)}"
+        )
+    keyword_eval_mode = next(iter(modes))
+    set_ids: set[object] = set()
+    if keyword_eval_mode == "any":
+        set_ids = {record.get("keyword_set_id") for record in records}
+        if len(set_ids) != 1 or None in set_ids:
+            raise SystemExit(
+                f"{results_path} mixes or is missing keyword_set_id values"
+            )
+        protocols = {
+            record.get("eval_protocol")
+            for record in records
+            if record.get("eval_protocol")
+        }
+        if len(protocols) > 1:
+            raise SystemExit(
+                f"{results_path} mixes eval_protocol values {sorted(map(str, protocols))}"
+            )
+        identity_error = any_mode_summary_identity_error(
+            summary,
+            keyword_set_id=next(iter(set_ids)),
+            eval_protocol=next(iter(protocols)) if protocols else None,
+        )
+        if identity_error:
+            raise SystemExit(identity_error)
     hours = resolve_total_hours(summary, total_hours)
     deploy_threshold = resolve_threshold(summary, threshold)
     destination = (output_dir or results_path.parent).expanduser().resolve()
@@ -115,6 +145,11 @@ def plot_musan_fa_curve(
     if plot_summary.get("status") != "generated":
         reason = plot_summary.get("reason", "unknown plot failure")
         raise SystemExit(f"Did not write fa_per_hour_curve.png/.csv: {reason}")
+    plot_summary["keyword_eval_mode"] = next(iter(modes))
+    if set_ids:
+        plot_summary["keyword_set_id"] = next(iter(set_ids))
+    if summary.get("eval_protocol"):
+        plot_summary["eval_protocol"] = summary.get("eval_protocol")
     return plot_summary
 
 

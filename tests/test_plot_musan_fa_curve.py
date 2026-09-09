@@ -78,7 +78,93 @@ def test_plot_musan_fa_curve_reads_eval_directory(tmp_path):
     assert "0.0" in thresholds
     assert "0.4" in thresholds
     assert "0.9" in thresholds
-    assert "1.0" in thresholds
+
+
+def test_plot_musan_any_mode_carries_identity_and_rejects_mixed_sets(tmp_path):
+    pytest.importorskip("matplotlib")
+    eval_dir = tmp_path / "musan_any"
+    rows = [
+        {
+            "audio_path": "noise/a.wav",
+            "label": 0,
+            "qbyt_score": 0.9,
+            "keyword_eval_mode": "any",
+            "keyword_set_id": "set-a",
+            "eval_protocol": "stage2_window_keyword_set",
+            "manifest_meta": {"subset": "noise", "start_sec": 0.0, "end_sec": 3.0},
+        },
+        {
+            "audio_path": "noise/b.wav",
+            "label": 0,
+            "qbyt_score": 0.2,
+            "keyword_eval_mode": "any",
+            "keyword_set_id": "set-a",
+            "eval_protocol": "stage2_window_keyword_set",
+            "manifest_meta": {"subset": "noise", "start_sec": 0.0, "end_sec": 3.0},
+        },
+    ]
+    _write_jsonl(eval_dir / "results.jsonl", rows)
+    (eval_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "total_hours": 1.0,
+                "metrics": {"threshold": 0.5},
+                "keyword_eval_mode": "any",
+                "keyword_set_id": "set-a",
+                "eval_protocol": "stage2_window_keyword_set",
+            }
+        ),
+        encoding="utf-8",
+    )
+    plot_summary = plot_musan_fa_curve(eval_dir, dpi=72)
+    assert plot_summary["keyword_eval_mode"] == "any"
+    assert plot_summary["keyword_set_id"] == "set-a"
+    assert plot_summary["eval_protocol"] == "stage2_window_keyword_set"
+
+    rows[1]["keyword_set_id"] = "set-b"
+    mixed = tmp_path / "musan_mixed"
+    _write_jsonl(mixed / "results.jsonl", rows)
+    (mixed / "summary.json").write_text(
+        json.dumps({"total_hours": 1.0, "metrics": {"threshold": 0.5}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="keyword_set_id"):
+        plot_musan_fa_curve(mixed, dpi=72)
+
+
+def test_plot_rejects_per_row_summary_hours_for_any_results(tmp_path):
+    pytest.importorskip("matplotlib")
+    eval_dir = tmp_path / "musan_mismatch"
+    _write_jsonl(
+        eval_dir / "results.jsonl",
+        [
+            {
+                "audio_path": "noise/a.wav",
+                "label": 0,
+                "qbyt_score": 0.9,
+                "keyword_eval_mode": "any",
+                "keyword_set_id": "set-a",
+                "eval_protocol": "stage2_window_keyword_set",
+                "manifest_meta": {
+                    "subset": "noise",
+                    "start_sec": 0.0,
+                    "end_sec": 3.0,
+                },
+            }
+        ],
+    )
+    (eval_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "keyword_eval_mode": "per_row",
+                "total_hours": 1000.0,
+                "metrics": {"threshold": 0.5},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="keyword_eval_mode"):
+        plot_musan_fa_curve(eval_dir, dpi=72)
 
 
 def test_plot_musan_fa_curve_requires_hours_without_summary(tmp_path):

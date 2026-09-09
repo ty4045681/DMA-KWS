@@ -36,13 +36,24 @@ from dma_kws.inference.detection_plots import (
     DEFAULT_PLOT_DPI,
     write_false_accept_rate_plot as _write_false_accept_rate_plot,
 )
+from dma_kws.inference.keyword_set import (
+    WINDOW_EVAL_PROTOCOL,
+    KeywordEvalConfigError,
+    KeywordSetScoreError,
+    keyword_eval_mode,
+    keyword_eval_provenance_block,
+    keyword_set_summary_fields,
+)
 from dma_kws.inference.manifest import iter_audio_files, load_audio_file_list
+from dma_kws.pathing import resolve_dict_path
 from dma_kws.inference.metrics import summarize_false_accept_rate
 from dma_kws.inference.musan_fa import (
     audio_duration_sec,
+    compute_file_metrics,
     detect_subset,
     metrics_record,
     musan_catalog_sha256,
+    musan_keyword_set_result_record,
     musan_result_record,
     select_shard,
     subset_summary,
@@ -99,6 +110,42 @@ def _iter_prepared_windows(
             yield ready_row, future.result()
 
 
+def _iter_window_feats(
+    runner: Stage2ClipRunner,
+    source_rows: Sequence[Mapping[str, Any]],
+    *,
+    window_sec: float,
+    hop_sec: float,
+    fbank_windows: str,
+    num_workers: int,
+) -> Iterator[tuple[Mapping[str, Any], list[Any], list[tuple[int, float, float]]]]:
+    def prepare(row: Mapping[str, Any]):
+        return runner.extract_file_window_features(
+            row["audio_path"],
+            window_sec=window_sec,
+            hop_sec=hop_sec,
+            fbank_windows=fbank_windows,
+        )
+
+    if num_workers <= 1:
+        for row in source_rows:
+            feats, spans = prepare(row)
+            yield row, feats, spans
+        return
+
+    pending: list[tuple[Mapping[str, Any], Future]] = []
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        for row in source_rows:
+            pending.append((row, pool.submit(prepare, row)))
+            if len(pending) >= num_workers:
+                ready_row, future = pending.pop(0)
+                feats, spans = future.result()
+                yield ready_row, feats, spans
+        for ready_row, future in pending:
+            feats, spans = future.result()
+            yield ready_row, feats, spans
+
+
 def run_eval(cfg: DictConfig) -> dict:
     try:
         import torch
@@ -116,9 +163,14 @@ def run_eval(cfg: DictConfig) -> dict:
         prep = {}
     run_cfg = cfg.run
 
+    eval_mode = keyword_eval_mode(prep)
     keyword = str(prep.get("keyword", "")).strip()
-    if not keyword:
+    if eval_mode != "any" and not keyword:
         raise SystemExit("prep.keyword is required")
+    if eval_mode == "any" and keyword:
+        raise SystemExit(
+            "prep.keyword_eval.mode=any cannot be combined with non-empty prep.keyword"
+        )
     musan_root = str(prep.get("musan_root", ""))
     if not musan_root:
         raise SystemExit("prep.musan_root is required")
@@ -179,23 +231,47 @@ def run_eval(cfg: DictConfig) -> dict:
     device = torch.device(accelerator if accelerator == "cpu" else "cuda")
     runner = Stage2ClipRunner.from_config(config, prep, device)
     threshold = float(runner._demo_cfg.get("qbyt_threshold", 0.5))
+    keyword_set = None
+    if eval_mode == "any":
+        try:
+            keyword_set = runner.enroll_keyword_set(
+                prep,
+                tokenizer_dict_path=resolve_dict_path(config),
+            )
+            from dma_kws.inference.keyword_set import require_qbyt_threshold
 
-    raw_keyword_phonemes = prep.get("keyword_phonemes")
-    use_keyword_phoneme_override = raw_keyword_phonemes is not None and not (
-        isinstance(raw_keyword_phonemes, str)
-        and not raw_keyword_phonemes.strip()
-    )
-    try:
-        keyword_phonemes = runner.resolve_keyword_phonemes(
-            keyword,
-            raw_keyword_phonemes if use_keyword_phoneme_override else None,
-            field_name="prep.keyword_phonemes",
+            threshold = require_qbyt_threshold(
+                runner._demo_cfg.get("qbyt_threshold", 0.5),
+                field="demo.qbyt_threshold",
+            )
+        except KeywordEvalConfigError as exc:
+            raise SystemExit(str(exc)) from exc
+        if keyword_set is None:
+            raise SystemExit("prep.keyword_eval.mode=any produced no keyword set")
+
+    keyword_phonemes: list[str] = []
+    keyword_phonemes_source = None
+    override_phonemes = None
+    if eval_mode != "any":
+        raw_keyword_phonemes = prep.get("keyword_phonemes")
+        use_keyword_phoneme_override = raw_keyword_phonemes is not None and not (
+            isinstance(raw_keyword_phonemes, str)
+            and not raw_keyword_phonemes.strip()
         )
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
-    keyword_phonemes_source = (
-        "prep.keyword_phonemes" if use_keyword_phoneme_override else "g2p"
-    )
+        try:
+            keyword_phonemes = runner.resolve_keyword_phonemes(
+                keyword,
+                raw_keyword_phonemes if use_keyword_phoneme_override else None,
+                field_name="prep.keyword_phonemes",
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        keyword_phonemes_source = (
+            "prep.keyword_phonemes" if use_keyword_phoneme_override else "g2p"
+        )
+        override_phonemes = (
+            keyword_phonemes if use_keyword_phoneme_override else None
+        )
 
     stream_description = runner.stream_policy.describe()
     provenance = build_score_provenance(
@@ -207,6 +283,7 @@ def run_eval(cfg: DictConfig) -> dict:
         # does not add zero-valued waveform context around each window.
         left_padding_ms=0,
         right_padding_ms=0,
+        keyword_eval=keyword_eval_provenance_block(keyword_set, mode=eval_mode),
     )
     catalog = [
         {
@@ -230,44 +307,95 @@ def run_eval(cfg: DictConfig) -> dict:
     subset_results: dict[str, list[dict[str, Any]]] = defaultdict(list)
     subset_hours: dict[str, float] = defaultdict(float)
     total_hours = 0.0
-    override_phonemes = (
-        keyword_phonemes if use_keyword_phoneme_override else None
-    )
+    source_files: list[dict[str, Any]] = []
 
     with results_path.open("w", encoding="utf-8") as results_handle:
-        for source_row, prepared in _iter_prepared_windows(
-            runner,
-            source_rows,
-            keyword=keyword,
-            window_sec=window_sec,
-            hop_sec=hop_sec,
-            keyword_phonemes=override_phonemes,
-            fbank_windows=fbank_windows,
-            num_workers=num_workers,
-        ):
-            audio_path = source_row["audio_path"]
-            subset = source_row["subset"]
-            duration = float(source_row["duration_sec"])
-            total_hours += duration / 3600.0
-            subset_hours[subset] += duration / 3600.0
-
-            window_results = runner.score_prepared_windows(
-                prepared,
-                batch_size=batch_size,
+        if eval_mode == "any":
+            window_iter = _iter_window_feats(
+                runner,
+                source_rows,
+                window_sec=window_sec,
+                hop_sec=hop_sec,
+                fbank_windows=fbank_windows,
+                num_workers=num_workers,
             )
-            for window_result in window_results:
-                record = musan_result_record(
-                    audio_path,
-                    keyword,
-                    subset,
-                    window_result,
-                    window_index=int(window_result["window_index"]),
+            for source_row, feats, spans in window_iter:
+                audio_path = source_row["audio_path"]
+                subset = source_row["subset"]
+                duration = float(source_row["duration_sec"])
+                total_hours += duration / 3600.0
+                subset_hours[subset] += duration / 3600.0
+                try:
+                    window_results = runner.score_window_features_multi(
+                        audio_path,
+                        feats,
+                        spans,
+                        keyword_set,
+                        batch_size=batch_size,
+                    )
+                except (KeywordEvalConfigError, KeywordSetScoreError, RuntimeError) as exc:
+                    raise SystemExit(str(exc)) from exc
+                source_files.append(
+                    {
+                        "path": audio_path,
+                        "subset": subset,
+                        "duration": duration,
+                        "scored_window_count": len(window_results),
+                    }
                 )
-                all_results.append(record)
-                subset_results[subset].append(record)
-                results_handle.write(
-                    json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+                for window_result in window_results:
+                    record = musan_keyword_set_result_record(
+                        audio_path,
+                        subset,
+                        window_result,
+                        window_index=int(window_result["window_index"]),
+                    )
+                    all_results.append(record)
+                    subset_results[subset].append(record)
+                    results_handle.write(
+                        json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+                    )
+        else:
+            for source_row, prepared in _iter_prepared_windows(
+                runner,
+                source_rows,
+                keyword=keyword,
+                window_sec=window_sec,
+                hop_sec=hop_sec,
+                keyword_phonemes=override_phonemes,
+                fbank_windows=fbank_windows,
+                num_workers=num_workers,
+            ):
+                audio_path = source_row["audio_path"]
+                subset = source_row["subset"]
+                duration = float(source_row["duration_sec"])
+                total_hours += duration / 3600.0
+                subset_hours[subset] += duration / 3600.0
+                window_results = runner.score_prepared_windows(
+                    prepared,
+                    batch_size=batch_size,
                 )
+                source_files.append(
+                    {
+                        "path": audio_path,
+                        "subset": subset,
+                        "duration": duration,
+                        "scored_window_count": len(window_results),
+                    }
+                )
+                for window_result in window_results:
+                    record = musan_result_record(
+                        audio_path,
+                        keyword,
+                        subset,
+                        window_result,
+                        window_index=int(window_result["window_index"]),
+                    )
+                    all_results.append(record)
+                    subset_results[subset].append(record)
+                    results_handle.write(
+                        json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+                    )
 
     summary: dict[str, Any] = {
         "num_samples": len(all_results),
@@ -299,7 +427,24 @@ def run_eval(cfg: DictConfig) -> dict:
         "total_hours": total_hours,
         "stream": stream_description,
         "provenance": provenance,
+        "keyword_eval_mode": eval_mode,
+        "fa_count_unit": "window",
+        "source_files": source_files,
+        "file_metrics": compute_file_metrics(
+            all_results,
+            source_files,
+            threshold=threshold,
+        ),
     }
+    if eval_mode == "any" and keyword_set is not None:
+        summary["eval_protocol"] = WINDOW_EVAL_PROTOCOL
+        summary.update(keyword_set_summary_fields(keyword_set))
+        summary["score_semantics"] = "max_over_keywords_and_pronunciations"
+    scored_windows = [
+        record for record in all_results if not bool(record.get("skipped", False))
+    ]
+    if not scored_windows:
+        summary["metrics_status"] = "no_scored_windows"
 
     overall_metrics = summarize_false_accept_rate(
         [metrics_record(record) for record in all_results],

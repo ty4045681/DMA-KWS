@@ -14,7 +14,10 @@ from pathlib import Path
 from typing import Any
 
 from dma_kws.inference.metrics import summarize_false_accept_rate
-from dma_kws.inference.stage2_reporting import build_result_record
+from dma_kws.inference.stage2_reporting import (
+    build_keyword_set_result_record,
+    build_result_record,
+)
 
 TWO_STAGE_WAKEUP_PROTOCOL = "two_stage_wakeup"
 
@@ -142,6 +145,84 @@ def two_stage_wakeup_result_record(
     return record
 
 
+def musan_keyword_set_result_record(
+    source_path: str,
+    subset: str,
+    runner_result: dict,
+    *,
+    window_index: int | None = None,
+) -> dict:
+    """Build one any-mode MUSAN window result. Background audio is label 0."""
+
+    from dma_kws.inference.keyword_set import WINDOW_EVAL_PROTOCOL
+
+    span = runner_result["clip_span_sec"]
+    manifest_row = {
+        "audio_path": source_path,
+        "label": 0,
+        "label_scope": "target_set",
+        "subset": subset,
+        "start_sec": float(span["start_sec"]),
+        "end_sec": float(span["end_sec"]),
+    }
+    if window_index is not None:
+        manifest_row["window_index"] = int(window_index)
+    record = build_keyword_set_result_record(
+        manifest_row,
+        runner_result,
+        eval_protocol=WINDOW_EVAL_PROTOCOL,
+    )
+    if window_index is not None:
+        record["window_index"] = int(window_index)
+    return record
+
+
+def compute_file_metrics(
+    results: Sequence[Mapping[str, Any]],
+    source_files: Sequence[Mapping[str, Any]],
+    *,
+    threshold: float,
+) -> dict[str, Any]:
+    """File-level trigger stats. Several windows on one file count as one file."""
+
+    scored_by_path: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for record in results:
+        if bool(record.get("skipped", False)):
+            continue
+        scored_by_path[str(record.get("audio_path", ""))].append(record)
+
+    total_files = len(source_files)
+    num_scored_files = 0
+    num_skipped_files = 0
+    num_triggered_files = 0
+    for item in source_files:
+        path = str(item.get("path") or item.get("audio_path") or "")
+        windows = scored_by_path.get(path, [])
+        counted = int(item.get("scored_window_count", len(windows)))
+        if counted <= 0 and not windows:
+            num_skipped_files += 1
+            continue
+        num_scored_files += 1
+        if any(
+            (not bool(window.get("skipped", False)))
+            and float(window.get("qbyt_score", 0.0)) >= float(threshold)
+            for window in windows
+        ):
+            num_triggered_files += 1
+    trigger_rate = (
+        float(num_triggered_files) / float(num_scored_files)
+        if num_scored_files
+        else None
+    )
+    return {
+        "total_files": total_files,
+        "num_scored_files": num_scored_files,
+        "num_skipped_files": num_skipped_files,
+        "num_triggered_files": num_triggered_files,
+        "file_trigger_rate": trigger_rate,
+    }
+
+
 def empty_false_accept_metrics(
     *,
     threshold: float,
@@ -230,6 +311,9 @@ _MERGE_IDENTITY_KEYS = (
     "keyword",
     "keyword_phonemes",
     "keyword_phonemes_source",
+    "keyword_eval_mode",
+    "keyword_set_id",
+    "score_semantics",
     "stage2_ckpt",
     "stage2_calibration",
     "window_sec",
@@ -459,6 +543,44 @@ def merge_musan_summaries(
         merged["eval_protocol"] = reference.get("eval_protocol")
     if "locator" in reference:
         merged["locator"] = reference.get("locator")
+    for key in (
+        "keyword_eval_mode",
+        "keyword_set_id",
+        "score_semantics",
+        "num_keywords",
+        "num_pronunciations",
+        "texts",
+        "fa_count_unit",
+        "query_batch_size",
+    ):
+        if key in reference:
+            merged[key] = reference.get(key)
+
+    source_files: list[dict[str, Any]] = []
+    seen_source_paths: dict[str, int] = {}
+    for summary in shard_summaries:
+        for item in summary.get("source_files") or []:
+            if not isinstance(item, Mapping):
+                raise ValueError("source_files entries must be mappings")
+            path = str(item.get("path") or item.get("audio_path") or "")
+            previous = seen_source_paths.get(path)
+            if previous is not None:
+                raise ValueError(f"Cannot merge shards with duplicate source file {path}")
+            seen_source_paths[path] = 1
+            source_files.append(dict(item))
+    if source_files:
+        merged["source_files"] = source_files
+        merged["file_metrics"] = compute_file_metrics(
+            all_results,
+            source_files,
+            threshold=threshold,
+        )
+        merged["total_files"] = len(source_files)
+        scored_windows = [
+            record for record in all_results if not bool(record.get("skipped", False))
+        ]
+        if not scored_windows:
+            merged["metrics_status"] = "no_scored_windows"
     for key in (
         "num_stage1_candidates",
         "num_stage2_scored",
