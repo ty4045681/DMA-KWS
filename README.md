@@ -1693,6 +1693,30 @@ In `auto_assign` mode, unmatched files are skipped when `prep.skip_unmatched=tru
 
 Default output directory: `outputs/eval_stage2_clips` (`prep.stage2_clip_output_dir`). Override with `prep.output_dir=/path/to/output` if needed. The script writes `results.jsonl` with per-clip scores and `summary.json` with accuracy, precision, recall, f1, auc, and eer when labels are present. With both classes present and `prep.plot_curves=true` (the default) it also writes `roc_curve.png`, `det_curve.png`, and `roc_curve.csv` (`threshold`, `tpr`, `fpr` for every empirical operating point). If a manifest row contains extra columns beyond `audio_path`, `keyword`, and optional `label`, those key-value pairs are copied into `results.jsonl` under `manifest_meta`.
 
+### Multi-keyword / multi-pronunciation (`prep.keyword_eval.mode=any`)
+
+Default clip and MUSAN eval is still one query per row (`mode=per_row`). Opt in with the `keyword_eval` Hydra group. `+keyword_eval=hey_eva_variants` enrolls two hey-eva pronunciations; `+keyword_eval=multi_wakeup` adds `ok lamp` with G2P. Each clip or MUSAN window is encoded once, each pronunciation is scored, then `qbyt_score` is the max over keywords and pronunciations. Several hits on one audio still count as one detection. Too-short clips are `skipped=true` and never detect, even at threshold 0. LibriPhrase and two-stage KWS reject `mode=any`.
+
+Labeled any-mode manifests use one source-audio row, not a keyword pair:
+
+```json
+{"audio_path":"audio/eva.wav","keyword_labels":{"hey eva":1,"ok lamp":0}}
+{"audio_path":"audio/neg.wav","label_scope":"target_set","target_texts":["hey eva","ok lamp"],"label":0}
+```
+
+CSV cells for `keyword_labels` / `target_texts` are JSON. Unlabeled rows may omit every label field. Do not set `prep.keyword`, `prep.keyword_phonemes`, or `prep.keywords` together with `mode=any`.
+
+Config compose (checked locally; no checkpoint required):
+
+```bash
+PYTHONPATH=. python3 scripts/eval_stage2_clips.py \
+  +experiment=icefall_zipformer_stage2_eps_softmin_v41 \
+  +keyword_eval=multi_wakeup \
+  --cfg job --resolve
+```
+
+That resolve keeps the v4.1 readout (`eps_softmin`, `sink_token: true`) and other prep fields, with `prep.keyword_eval.mode=any` and both target texts. Real scoring still needs `prep.manifest` / `prep.stage2_ckpt` (clips) or `prep.musan_root` (MUSAN). MUSAN `metrics.fa_per_hour` is over-threshold windows / source-file hours (`fa_count_unit=window`). `file_metrics.file_trigger_rate` is triggered files / scored files, not event FA/h.
+
 Clips are scored in padded GPU batches, with audio loading and fbank extraction parallelized across DataLoader workers and G2P/tokenization cached per unique keyword. Tune with:
 
 - `prep.batch_size`: clips per forward pass (default 64 when unset/0).
