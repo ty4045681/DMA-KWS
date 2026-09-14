@@ -3,8 +3,8 @@
 
 Reuses the Stage II clip Hydra stack (``resolved_config``,
 ``Stage2ClipRunner.from_config``, ``ClipFeatureDataset``, clip padding) and the
-Task 3 ``attention_diagnostics`` API. HTML/PNG figures are produced by a later
-task; this entry writes a minimal ``report.html`` shell plus the data files.
+Task 3 ``attention_diagnostics`` API. HTML/PNG figures come from
+``dma_kws.inference.qbyt_attention_report``.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from html import escape as html_escape
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -48,6 +47,17 @@ from dma_kws.inference.qbyt_attention_manifest import (
     PAIR_OK,
     AttentionManifestRow,
     validate_attention_manifest_rows,
+)
+from dma_kws.inference.qbyt_attention_report import (
+    FbankTimeSpec,
+    SampleTimeAxis,
+    build_sample_time_axis,
+    extra_region_metric_rows,
+    inspect_encoder_time_map,
+    noise_region_masks,
+    pair_time_grids_comparable,
+    render_sink_attention_report,
+    serialize_encoder_time_map,
 )
 from dma_kws.inference.stage2_clip import (
     ClipFeatureDataset,
@@ -174,6 +184,7 @@ class PreparedSample:
     token_ids: list[int]
     query_id: str
     source_duration_sec: float
+    source_sample_rate: int = 0
     feat: Any | None = None
     audio_len: int | None = None
     skip_reason: str | None = None
@@ -190,6 +201,7 @@ class SampleOutcome:
     record_rows: list[dict[str, str]] = field(default_factory=list)
     metric_rows: list[dict[str, str]] = field(default_factory=list)
     position_rows: list[dict[str, str]] = field(default_factory=list)
+    time_axis: dict[str, Any] = field(default_factory=dict)
 
 
 def resolve_diagnostic_batch_size(prep: Mapping[str, Any]) -> int:
@@ -429,7 +441,7 @@ def _online_augmentation_enabled(prep: Mapping[str, Any]) -> bool:
     return False
 
 
-def _source_duration_sec(path: str) -> float:
+def _source_audio_info(path: str) -> tuple[float, int]:
     audio_path = Path(path)
     if not audio_path.is_file():
         raise SystemExit(f"audio file not found: {audio_path}")
@@ -439,14 +451,16 @@ def _source_duration_sec(path: str) -> float:
         info = sf.info(str(audio_path))
     except Exception as exc:
         raise SystemExit(f"Failed to decode audio {audio_path}: {exc}") from exc
+    rate = int(getattr(info, "samplerate", 0) or 0)
     duration = float(getattr(info, "duration", 0.0))
     if not math.isfinite(duration) or duration < 0.0:
         frames = int(getattr(info, "frames", 0) or 0)
-        rate = int(getattr(info, "samplerate", 0) or 0)
         if frames < 0 or rate <= 0:
             raise SystemExit(f"Failed to decode audio {audio_path}: invalid header")
         duration = float(frames) / float(rate)
-    return duration
+    if rate <= 0:
+        raise SystemExit(f"Failed to decode audio {audio_path}: invalid sample rate")
+    return duration, rate
 
 
 def _git_identity(repo: Path) -> dict[str, Any]:
@@ -786,6 +800,8 @@ def _metrics_rows(
     run_id: str,
     sample_id: str,
     result: SinkAblationResult,
+    time_axis=None,
+    noise_spans=None,
 ) -> list[dict[str, str]]:
     trace = result.trace
     rows: list[dict[str, str]] = []
@@ -814,6 +830,20 @@ def _metrics_rows(
                         "row_sum_error": _csv_float(trace.row_sum_max_error),
                     }
                 )
+    if time_axis is not None:
+        rows.extend(
+            extra_region_metric_rows(
+                run_id=run_id,
+                sample_id=sample_id,
+                ablation=result.spec.name,
+                layer_ids=trace.layer_ids,
+                head_ids=trace.head_ids,
+                audio_to_sink=trace.audio_to_sink,
+                time_axis=time_axis,
+                noise_spans=noise_spans,
+                row_sum_error=float(trace.row_sum_max_error),
+            )
+        )
     return rows
 
 
@@ -922,6 +952,7 @@ def _materialize_scored_sample(
     prepared: PreparedSample,
     sample: SampleAttentionDiagnostics,
     trace_paths: Mapping[str, str],
+    time_axis=None,
 ) -> SampleOutcome:
     """Copy scalars/CSV rows out of capture results and drop tensor handles."""
 
@@ -929,6 +960,14 @@ def _materialize_scored_sample(
     record_rows: list[dict[str, str]] = []
     metric_rows: list[dict[str, str]] = []
     position_rows: list[dict[str, str]] = []
+    axis_payload: dict[str, Any] = {}
+    if time_axis is not None:
+        axis_payload = time_axis.as_dict()
+        if time_axis.status == "ok":
+            _noise, _outside, intervals = noise_region_masks(
+                time_axis, prepared.row.noise_spans
+            )
+            axis_payload["noise_intervals"] = intervals
     for result in conditions:
         record_rows.append(
             _scored_record(
@@ -943,6 +982,8 @@ def _materialize_scored_sample(
                 run_id=run_id,
                 sample_id=prepared.row.sample_id,
                 result=result,
+                time_axis=time_axis,
+                noise_spans=prepared.row.noise_spans,
             )
         )
         position_rows.extend(
@@ -963,6 +1004,7 @@ def _materialize_scored_sample(
         record_rows=record_rows,
         metric_rows=metric_rows,
         position_rows=position_rows,
+        time_axis=axis_payload,
     )
     del conditions
     return outcome
@@ -1032,7 +1074,9 @@ def _select_report_samples(
     return selected_set
 
 
-def _pair_rows(outcomes: Sequence[SampleOutcome]) -> list[dict[str, str]]:
+def _pair_rows(
+    outcomes: Sequence[SampleOutcome], *, fbank_spec: FbankTimeSpec | None
+) -> list[dict[str, str]]:
     by_pair: dict[str, list[SampleOutcome]] = {}
     for outcome in outcomes:
         pair_id = outcome.prepared.row.pair_id
@@ -1064,7 +1108,7 @@ def _pair_rows(outcomes: Sequence[SampleOutcome]) -> list[dict[str, str]]:
                         ),
                         "pair_status": status,
                         "normal_score_delta": "",
-                        "time_grid_comparable": "unknown",
+                        "time_grid_comparable": "false",
                         "pair_reason": reason or "",
                     }
                 )
@@ -1085,6 +1129,7 @@ def _pair_rows(outcomes: Sequence[SampleOutcome]) -> list[dict[str, str]]:
                 if base_score is None or var_score is None
                 else _csv_float(var_score - base_score)
             )
+            comparable, grid_reason = _pair_time_grid(baseline, member, fbank_spec)
             rows.append(
                 {
                     "baseline_sample_id": baseline.prepared.row.sample_id,
@@ -1097,11 +1142,79 @@ def _pair_rows(outcomes: Sequence[SampleOutcome]) -> list[dict[str, str]]:
                     ),
                     "pair_status": PAIR_OK,
                     "normal_score_delta": delta,
-                    "time_grid_comparable": "unknown",
-                    "pair_reason": "",
+                    "time_grid_comparable": _csv_bool(comparable),
+                    "pair_reason": "" if comparable else grid_reason,
                 }
             )
     return rows
+
+
+def _pair_time_grid(
+    baseline: SampleOutcome,
+    variant: SampleOutcome,
+    fbank_spec: FbankTimeSpec | None,
+) -> tuple[bool, str]:
+    if baseline.status != "ok" or variant.status != "ok":
+        return False, "member_not_scored"
+    base_len = _outcome_audio_length(baseline)
+    var_len = _outcome_audio_length(variant)
+    axis_a = SampleTimeAxis.from_dict(baseline.time_axis, audio_length=base_len)
+    axis_b = SampleTimeAxis.from_dict(variant.time_axis, audio_length=var_len)
+    return pair_time_grids_comparable(
+        axis_a,
+        axis_b,
+        token_ids_a=baseline.prepared.token_ids,
+        token_ids_b=variant.prepared.token_ids,
+        source_duration_a=baseline.prepared.source_duration_sec,
+        source_duration_b=variant.prepared.source_duration_sec,
+        fbank_a=fbank_spec,
+        fbank_b=fbank_spec,
+    )
+
+
+def _outcome_audio_length(outcome: SampleOutcome) -> int:
+    for row in outcome.record_rows:
+        if row.get("audio_length"):
+            try:
+                return int(row["audio_length"])
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _sample_run_metadata(
+    outcome: SampleOutcome, *, model_sample_rate: int, time_axis_method: str
+) -> dict[str, Any]:
+    row = outcome.prepared.row
+    payload = dict(outcome.time_axis)
+    payload.update(
+        {
+            "internal_sample_id": row.internal_sample_id,
+            "source_duration_sec": float(outcome.prepared.source_duration_sec),
+            "source_sample_rate": int(outcome.prepared.source_sample_rate or 0),
+            "model_sample_rate": int(model_sample_rate),
+            "audio_length": _outcome_audio_length(outcome) or None,
+            "text_length": len(outcome.prepared.token_ids),
+            "keyword_spans": (
+                [list(span) for span in row.keyword_spans]
+                if row.keyword_spans is not None
+                else None
+            ),
+            "noise_spans": (
+                [list(span) for span in row.noise_spans]
+                if row.noise_spans is not None
+                else None
+            ),
+            "time_axis_status": payload.get("status") or "unavailable",
+            "time_axis_method": payload.get("method") or time_axis_method,
+            "query_id": outcome.prepared.query_id,
+            "token_ids": list(outcome.prepared.token_ids),
+            "phonemes": list(outcome.prepared.phonemes),
+            "status": outcome.status,
+            "skip_reason": outcome.skip_reason,
+        }
+    )
+    return payload
 
 
 def _pair_stats(outcomes: Sequence[SampleOutcome]) -> dict[str, int]:
@@ -1173,30 +1286,8 @@ def _write_report_html(
     run_id: str,
     summary: Mapping[str, Any],
 ) -> None:
-    title = html_escape(f"QbyT sink diagnostics {run_id}")
-    body = [
-        "<!DOCTYPE html>",
-        '<html lang="en">',
-        "<head>",
-        '<meta charset="utf-8">',
-        f"<title>{title}</title>",
-        "</head>",
-        "<body>",
-        "<h1>QbyT sink attention diagnostics</h1>",
-        f"<p>run_id: {html_escape(run_id)}</p>",
-        f"<p>status: {html_escape(str(summary.get('status', '')))}</p>",
-        "<p>"
-        f"input: {int(summary.get('num_input', 0))}, "
-        f"success: {int(summary.get('num_success', 0))}, "
-        f"skipped: {int(summary.get('num_skipped', 0))}, "
-        f"unlabeled: {int(summary.get('num_unlabeled', 0))}"
-        "</p>",
-        "<p>Figures are not generated in this data-only run.</p>",
-        "</body>",
-        "</html>",
-        "",
-    ]
-    _atomic_write_text(path, "\n".join(body))
+    del run_id, summary
+    render_sink_attention_report(path.parent)
 
 
 def _is_resource_error(exc: BaseException) -> bool:
@@ -1415,8 +1506,11 @@ def run_diagnose(cfg: DictConfig) -> dict:
         )
 
     durations: list[float] = []
+    source_rates: list[int] = []
     for row in loaded_rows:
-        durations.append(_source_duration_sec(str(row["audio_path"])))
+        duration, source_rate = _source_audio_info(str(row["audio_path"]))
+        durations.append(duration)
+        source_rates.append(source_rate)
     try:
         validated = validate_attention_manifest_rows(
             loaded_rows,
@@ -1435,6 +1529,23 @@ def run_diagnose(cfg: DictConfig) -> dict:
 
     qbyt = runner.verifier._model.qbyt
     qbyt_score = getattr(runner.verifier, "qbyt_score", None)
+    encoder = runner.verifier._model.encoder
+    time_map = inspect_encoder_time_map(encoder)
+    fbank_kwargs = runner.verifier.fbank_kwargs
+    model_sample_rate = int(
+        runner.verifier.fbank_extractor.output_sample_rate(runner.sample_rate)
+    )
+    fbank_spec = FbankTimeSpec(
+        frame_length_ms=float(fbank_kwargs["frame_length"]),
+        frame_shift_ms=float(fbank_kwargs["frame_shift"]),
+        snip_edges=bool(fbank_kwargs.get("snip_edges", True)),
+        model_sample_rate=model_sample_rate,
+        backend=str(fbank_kwargs.get("backend", "")),
+    )
+    time_axis_method = (
+        time_map.method if time_map is not None else "unavailable"
+    )
+    time_axis_status = "ok" if time_map is not None else "unavailable"
     try:
         _assert_live_v41_knobs(qbyt, qbyt_score)
     except ValueError as exc:
@@ -1483,8 +1594,8 @@ def run_diagnose(cfg: DictConfig) -> dict:
     query_catalog: list[dict[str, Any]] = []
     seen_queries: set[str] = set()
     try:
-        for validated_row, raw_row, duration in zip(
-            validated, loaded_rows, durations, strict=True
+        for validated_row, raw_row, duration, source_rate in zip(
+            validated, loaded_rows, durations, source_rates, strict=True
         ):
             phonemes, token_ids = _enroll_row(
                 runner, raw_row, record_number=validated_row.record_number
@@ -1508,6 +1619,7 @@ def run_diagnose(cfg: DictConfig) -> dict:
                     token_ids=list(token_ids),
                     query_id=query_id,
                     source_duration_sec=float(duration),
+                    source_sample_rate=int(source_rate),
                 )
             )
     except ValueError as exc:
@@ -1517,8 +1629,6 @@ def run_diagnose(cfg: DictConfig) -> dict:
     partial_dir = output_dir / _PARTIAL_DIRNAME
 
     def _observer(index: int, waveform, sample_rate: int) -> None:
-        if not sink["save_traces"]:
-            return
         prepared_waveforms[index] = (
             waveform.detach().cpu().contiguous().clone(),
             int(sample_rate),
@@ -1571,7 +1681,6 @@ def run_diagnose(cfg: DictConfig) -> dict:
             num_workers=num_workers,
             collate_fn=collate_clip_feature_batch,
         )
-        encoder = runner.verifier._model.encoder
         try:
             for batch in loader:
                 pending: list[PreparedSample] = []
@@ -1642,23 +1751,41 @@ def run_diagnose(cfg: DictConfig) -> dict:
                             )
                         sample_index = prepared.row.record_number - 2
                         trace_paths: dict[str, str] = {}
-                        if sink["save_traces"]:
-                            waveform_pack = prepared_waveforms.get(sample_index)
-                            for result in conditions:
-                                rel = (
-                                    Path("traces")
-                                    / f"{prepared.row.internal_sample_id}__{result.spec.name}.npz"
-                                )
-                                payload = _npz_payload(
-                                    result,
-                                    phonemes=prepared.phonemes,
-                                    prepared_waveform=(
-                                        None if waveform_pack is None else waveform_pack[0]
-                                    ),
-                                    prepared_sample_rate=(
-                                        None if waveform_pack is None else waveform_pack[1]
-                                    ),
-                                )
+                        waveform_pack = prepared_waveforms.get(sample_index)
+                        observed_rate = (
+                            None if waveform_pack is None else int(waveform_pack[1])
+                        )
+                        if observed_rate:
+                            model_sample_rate = observed_rate
+                        num_fbank = (
+                            int(prepared.feat.size(0)) if prepared.feat is not None else None
+                        )
+                        time_axis = build_sample_time_axis(
+                            audio_length=int(sample.normal.trace.audio_length),
+                            encoder_map=time_map,
+                            fbank=fbank_spec,
+                            left_padding_ms=left_padding_ms,
+                            right_padding_ms=right_padding_ms,
+                            source_duration_sec=prepared.source_duration_sec,
+                            num_fbank_frames=num_fbank,
+                        )
+                        for result in conditions:
+                            name = (
+                                f"{prepared.row.internal_sample_id}__{result.spec.name}.npz"
+                            )
+                            payload = _npz_payload(
+                                result,
+                                phonemes=prepared.phonemes,
+                                prepared_waveform=(
+                                    None if waveform_pack is None else waveform_pack[0]
+                                ),
+                                prepared_sample_rate=(
+                                    None if waveform_pack is None else waveform_pack[1]
+                                ),
+                            )
+                            _save_npz(partial_dir / "traces" / name, payload)
+                            if sink["save_traces"]:
+                                rel = Path("traces") / name
                                 _save_npz(output_dir / rel, payload)
                                 trace_paths[result.spec.name] = str(rel).replace("\\", "/")
                         outcome = _materialize_scored_sample(
@@ -1666,6 +1793,7 @@ def run_diagnose(cfg: DictConfig) -> dict:
                             prepared=prepared,
                             sample=sample,
                             trace_paths=trace_paths,
+                            time_axis=time_axis,
                         )
                         _persist_sample_partial(partial_dir, outcome)
                         outcomes[sample_index] = outcome
@@ -1711,7 +1839,7 @@ def run_diagnose(cfg: DictConfig) -> dict:
         metric_rows.extend(outcome.metric_rows)
         position_rows.extend(outcome.position_rows)
 
-    pair_rows = _pair_rows(finalized)
+    pair_rows = _pair_rows(finalized, fbank_spec=fbank_spec)
     num_input = len(finalized)
     num_success = sum(outcome.status == "ok" for outcome in finalized)
     num_skipped = sum(outcome.status == "skipped" for outcome in finalized)
@@ -1783,7 +1911,25 @@ def run_diagnose(cfg: DictConfig) -> dict:
         "expanded_capture_layers": list(capture_layers),
         "expanded_capture_heads": list(capture_heads),
         "expanded_ablations": expanded_ablations,
-        "time_axis_method": "pending",
+        "time_axis_method": time_axis_method,
+        "time_axis_status": time_axis_status,
+        "time_axis": {
+            "status": time_axis_status,
+            "method": time_axis_method,
+            "fbank": fbank_spec.as_dict(),
+            "model_sample_rate": model_sample_rate,
+            "padding_ms": {"left": left_padding_ms, "right": right_padding_ms},
+            "stream": runner.stream_policy.describe(),
+            "encoder": serialize_encoder_time_map(time_map),
+        },
+        "samples": {
+            outcome.prepared.row.sample_id: _sample_run_metadata(
+                outcome,
+                model_sample_rate=model_sample_rate,
+                time_axis_method=time_axis_method,
+            )
+            for outcome in finalized
+        },
         "parity_atol": float(sink["parity_atol"]),
         "parity_rtol": float(sink["parity_rtol"]),
         "seed": (config.get("training") or {}).get("seed"),

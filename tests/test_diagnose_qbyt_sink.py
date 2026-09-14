@@ -519,7 +519,14 @@ def test_t12_pairs_and_span_duration_after_decode(tmp_path, monkeypatch, install
     ok_row = next(row for row in pairs if row["pair_status"] == "ok")
     assert ok_row["baseline_sample_id"] == "clean_001"
     assert ok_row["variant_sample_id"] == "noisy_001"
-    assert ok_row["time_grid_comparable"] in {"unknown", "pending"}
+    assert ok_row["time_grid_comparable"] == "true"
+    metrics = _read_csv(tmp_path / "out" / "attention_metrics.csv")
+    regions = {row["region"] for row in metrics}
+    assert "noise" in regions
+    assert "outside_noise_annotation" in regions
+    for row in metrics:
+        if row["region"] in {"noise", "outside_noise_annotation"} and row["query_count"] == "0":
+            assert row["mean"] == ""
     assert ok_row["normal_score_delta"] != ""
     missing = next(row for row in pairs if row["pair_status"] == "missing_clean_baseline")
     assert missing["pair_reason"]
@@ -639,7 +646,9 @@ def test_t14_csv_quoting_npz_json_finite_and_refuse_existing_output(
     assert run["qbyt_readout"]["version"] == 4
     assert run["qbyt_readout"]["sink_token"] is True
     assert run["expanded_ablations"]
-    assert run["time_axis_method"] in {"pending", "unknown"}
+    assert run["time_axis_method"] != "pending"
+    assert run["time_axis_status"] in {"ok", "unavailable"}
+    assert run["time_axis"]["fbank"]["frame_shift_ms"] == 10.0
     summary_json = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     json.dumps(summary_json, allow_nan=False)
     assert summary_json["status"] == "complete"
