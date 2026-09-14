@@ -8,6 +8,7 @@ the live module device (CPU or CUDA) with autocast disabled.
 from __future__ import annotations
 
 import inspect
+import math
 from dataclasses import dataclass
 from typing import Any, Sequence
 from weakref import WeakSet
@@ -26,11 +27,13 @@ __all__ = [
     "assert_attention_capture_parity",
     "assert_pooling_sink_attention_compatible",
     "capture_pooling_attention",
+    "estimate_attention_workspace_bytes",
 ]
 
 
 _MODELS_IN_CAPTURE: WeakSet[nn.Module] = WeakSet()
 _BYTES_PER_FLOAT32 = 4
+_ATTENTION_TEMP_FACTOR = 4
 
 
 @dataclass(frozen=True)
@@ -105,6 +108,7 @@ class SampleAttentionDiagnostics:
     threshold: float
     normal: SinkAblationResult
     ablations: tuple[SinkAblationResult, ...]
+    max_parity_error: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -182,20 +186,20 @@ def capture_pooling_attention(
             f"packed sequence length {packed_l} exceeds max_combined_tokens="
             f"{capture_spec.max_combined_tokens}"
         )
-    if capture_spec.save_full_attention:
-        nbytes = (
-            batch_size
-            * len(layer_ids)
-            * len(head_ids)
-            * packed_l
-            * packed_l
-            * _BYTES_PER_FLOAT32
+    # need_weights=True materializes every MHA head on every hooked layer.
+    n_heads_all = int(getattr(qbyt, "nhead", n_heads) or n_heads)
+    hooked_layers = len(set(layer_ids) | set(blocked_layers))
+    workspace_bytes = estimate_attention_workspace_bytes(
+        batch_size,
+        hooked_layers,
+        n_heads_all,
+        packed_l,
+    )
+    if workspace_bytes > capture_spec.max_attention_bytes:
+        raise ValueError(
+            f"attention workspace estimate {workspace_bytes} bytes exceeds "
+            f"max_attention_bytes={capture_spec.max_attention_bytes}"
         )
-        if nbytes > capture_spec.max_attention_bytes:
-            raise ValueError(
-                f"full attention storage estimate {nbytes} bytes exceeds "
-                f"max_attention_bytes={capture_spec.max_attention_bytes}"
-            )
 
     if qbyt in _MODELS_IN_CAPTURE:
         raise RuntimeError(
@@ -286,12 +290,16 @@ def capture_pooling_attention(
             _MODELS_IN_CAPTURE.discard(qbyt)
 
 
-def _require_eval_fp32(qbyt, speech, anchors) -> None:
+def _require_qbyt_eval(qbyt, *, what: str) -> None:
     if qbyt.training:
         raise RuntimeError(
-            "capture_pooling_attention requires the model to already be in eval(); "
+            f"{what} requires the model to already be in eval(); "
             "refusing to call eval() on a training-mode QbyT"
         )
+
+
+def _require_eval_fp32(qbyt, speech, anchors) -> None:
+    _require_qbyt_eval(qbyt, what="capture_pooling_attention")
     if speech.dtype != torch.float32:
         raise ValueError(
             f"capture_pooling_attention requires float32 speech, got {speech.dtype}"
@@ -435,8 +443,12 @@ def assert_attention_capture_parity(
     position_logits: torch.Tensor,
     atol: float,
     rtol: float,
-) -> None:
-    """Compare normal capture logits to an unhooked details forward."""
+) -> float:
+    """Compare normal capture logits to an unhooked details forward.
+
+    Returns the measured max absolute error on success. Non-finite actual or
+    expected values fail; ``NaN > 0`` must not count as a pass.
+    """
 
     if position_logits is None:
         raise ValueError("parity comparison requires EPS position logits")
@@ -449,35 +461,42 @@ def assert_attention_capture_parity(
     worst_index = 0
     worst_field = "raw_logit"
     worst_error = 0.0
+    measured = 0.0
     failed = False
     for index, trace in enumerate(traces):
-        raw_error = _parity_abs_error(
-            torch.as_tensor(trace.raw_logit, dtype=torch.float32),
-            expected_logits[index],
-        )
-        raw_excess = _parity_excess(
-            torch.as_tensor(trace.raw_logit, dtype=torch.float32),
-            expected_logits[index],
+        actual_raw = torch.as_tensor(trace.raw_logit, dtype=torch.float32)
+        expected_raw = expected_logits[index]
+        raw_error, raw_failed = _compare_parity_field(
+            actual_raw,
+            expected_raw,
             atol=atol,
             rtol=rtol,
         )
-        if raw_excess > 0.0 and (not failed or raw_error > worst_error):
-            worst_index = index
-            worst_field = "raw_logit"
-            worst_error = raw_error
+        if raw_failed:
+            if _should_record_parity_failure(failed, worst_error, raw_error):
+                worst_index = index
+                worst_field = "raw_logit"
+                worst_error = raw_error
             failed = True
+        elif raw_error > measured:
+            measured = raw_error
         expected_positions = position_logits[index, : trace.text_length].detach().to(
             device="cpu", dtype=torch.float32
         )
-        pos_error = _parity_abs_error(trace.position_logits, expected_positions)
-        pos_excess = _parity_excess(
-            trace.position_logits, expected_positions, atol=atol, rtol=rtol
+        pos_error, pos_failed = _compare_parity_field(
+            trace.position_logits,
+            expected_positions,
+            atol=atol,
+            rtol=rtol,
         )
-        if pos_excess > 0.0 and (not failed or pos_error > worst_error):
-            worst_index = index
-            worst_field = "position_logits"
-            worst_error = pos_error
+        if pos_failed:
+            if _should_record_parity_failure(failed, worst_error, pos_error):
+                worst_index = index
+                worst_field = "position_logits"
+                worst_error = pos_error
             failed = True
+        elif pos_error > measured:
+            measured = pos_error
     if failed:
         raise AttentionParityError(
             sample_index=worst_index,
@@ -486,6 +505,63 @@ def assert_attention_capture_parity(
             atol=atol,
             rtol=rtol,
         )
+    return measured
+
+
+def estimate_attention_workspace_bytes(
+    batch_size: int,
+    n_layers: int,
+    n_heads: int,
+    packed_l: int,
+) -> int:
+    """Conservative float32 attention workspace, not saved-trace size.
+
+    ``need_weights=True`` materializes all heads on hooked layers. The x4
+    factor covers QK^T, softmax, weights, and a saved copy.
+    """
+
+    if batch_size <= 0 or n_layers <= 0 or n_heads <= 0 or packed_l <= 0:
+        return 0
+    return (
+        int(batch_size)
+        * int(n_layers)
+        * int(n_heads)
+        * int(packed_l)
+        * int(packed_l)
+        * _BYTES_PER_FLOAT32
+        * _ATTENTION_TEMP_FACTOR
+    )
+
+
+def _should_record_parity_failure(
+    already_failed: bool, worst_error: float, candidate: float
+) -> bool:
+    if not already_failed:
+        return True
+    if not math.isfinite(candidate):
+        return math.isfinite(worst_error)
+    if not math.isfinite(worst_error):
+        return False
+    return candidate > worst_error
+
+
+def _compare_parity_field(
+    actual, expected, *, atol: float, rtol: float
+) -> tuple[float, bool]:
+    if not _parity_values_finite(actual, expected):
+        return float("nan"), True
+    error = _parity_abs_error(actual, expected)
+    excess = _parity_excess(actual, expected, atol=atol, rtol=rtol)
+    return error, excess > 0.0
+
+
+def _parity_values_finite(actual, expected) -> bool:
+    actual_tensor = torch.as_tensor(actual, dtype=torch.float32).reshape(-1)
+    expected_tensor = torch.as_tensor(expected, dtype=torch.float32).reshape(-1)
+    return bool(
+        torch.isfinite(actual_tensor).all().item()
+        and torch.isfinite(expected_tensor).all().item()
+    )
 
 
 def _parity_abs_error(actual, expected) -> float:
@@ -501,6 +577,8 @@ def _parity_excess(actual, expected, *, atol: float, rtol: float) -> float:
     expected_tensor = torch.as_tensor(expected, dtype=torch.float32).reshape(-1)
     if actual_tensor.numel() == 0:
         return 0.0
+    if not torch.isfinite(actual_tensor).all() or not torch.isfinite(expected_tensor).all():
+        return float("inf")
     allowed = atol + rtol * expected_tensor.abs()
     return float((actual_tensor - expected_tensor).abs().sub(allowed).max().item())
 

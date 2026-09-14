@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -466,6 +468,22 @@ def test_t08_attention_diagnostics_rejects_unsupported_amp_and_spec():
         )
 
 
+def test_attention_diagnostics_refuses_train_mode_before_encode():
+    from dma_kws.inference.qbyt_attention_diagnostics import AttentionCaptureSpec
+
+    qbyt = _attention_qbyt().train()
+    verifier = _build_attention_verifier(qbyt)
+    feats = [torch.randn(9, _ATTENTION_ENCODER_DIM)]
+    keywords = [[3, 4, 5]]
+    spec = AttentionCaptureSpec(layers=(0, 1), heads=(0, 1, 2, 3))
+    with pytest.raises(RuntimeError, match="eval"):
+        verifier.attention_diagnostics(
+            feats, keywords, capture_spec=spec, ablations=[]
+        )
+    assert verifier._model.encode_calls == 0
+    assert qbyt.training is True
+
+
 def test_t09_attention_diagnostics_reuses_encoder_and_preserves_score_api(monkeypatch):
     from dma_kws.inference.qbyt_attention_diagnostics import (
         AttentionCaptureSpec,
@@ -499,6 +517,8 @@ def test_t09_attention_diagnostics_reuses_encoder_and_preserves_score_api(monkey
     )
     assert verifier._model.encode_calls == 1
     assert len(diagnostics) == 2
+    assert diagnostics[0].max_parity_error >= 0.0
+    assert math.isfinite(diagnostics[0].max_parity_error)
 
     threshold = 0.4
     for sample in diagnostics:

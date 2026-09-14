@@ -482,6 +482,21 @@ def test_t11_and_cli_guards_reject_aug_amp_windows_unknown_keys_and_missing_grou
         _run_diagnose(monkeypatch, missing_group)
 
 
+def test_resolve_sink_diagnostics_rejects_bool_and_float_limits():
+    import scripts.diagnose_qbyt_sink as diagnose
+
+    for key in (
+        "max_combined_tokens",
+        "max_attention_bytes",
+        "max_report_samples",
+        "plot_dpi",
+    ):
+        with pytest.raises(SystemExit, match="integer"):
+            diagnose.resolve_sink_diagnostics({"sink_diagnostics": {key: True}})
+        with pytest.raises(SystemExit, match="integer"):
+            diagnose.resolve_sink_diagnostics({"sink_diagnostics": {key: 1.5}})
+
+
 def test_batch_size_zero_becomes_one_not_eval_default(tmp_path, monkeypatch, install_runner):
     import scripts.diagnose_qbyt_sink as diagnose
 
@@ -499,6 +514,29 @@ def test_batch_size_zero_becomes_one_not_eval_default(tmp_path, monkeypatch, ins
     assert summary["status"] == "complete"
     assert summary["batch_size"] == 1
     assert summary["num_workers"] == 0
+    assert summary["max_parity_error"] is not None
+    assert summary["max_parity_error"] >= 0.0
+    assert math.isfinite(summary["max_parity_error"])
+
+
+def test_num_workers_forced_zero_when_waveform_observer_installed(
+    tmp_path, monkeypatch, install_runner
+):
+    wav = _write_wav(tmp_path / "clip.wav", 1.0)
+    manifest = _write_csv(
+        tmp_path / "manifest.csv",
+        "audio_path,keyword,label",
+        f"{wav.name},hey eva,1",
+    )
+    summary = _run_diagnose(
+        monkeypatch, _cfg(tmp_path, manifest=manifest, num_workers=2)
+    )
+    assert summary["status"] == "complete"
+    assert summary["num_workers"] == 0
+    traces = list((tmp_path / "out" / "traces").glob("*__normal.npz"))
+    assert traces
+    with np.load(traces[0], allow_pickle=False) as payload:
+        assert "prepared_waveform" in payload
 
 
 def test_t12_pairs_and_span_duration_after_decode(tmp_path, monkeypatch, install_runner):
@@ -779,6 +817,38 @@ def test_group_field_keyword_and_pair_id_appear_in_summary(
         ),
     )
     assert set(pair_summary["group_metrics"]) == {"p001", "p002"}
+
+
+def test_extra_group_field_is_copied_onto_records_and_group_pngs(
+    tmp_path, monkeypatch, install_runner
+):
+    wav_a = _write_wav(tmp_path / "a.wav", 1.0)
+    wav_b = _write_wav(tmp_path / "b.wav", 1.0)
+    manifest = _write_csv(
+        tmp_path / "manifest.csv",
+        "audio_path,keyword,label,sample_id,variant",
+        f"{wav_a.name},hey eva,1,clean_001,room",
+        f"{wav_b.name},ok google,0,other_001,street",
+    )
+    summary = _run_diagnose(
+        monkeypatch,
+        _cfg(
+            tmp_path,
+            manifest=manifest,
+            sink=_sink_defaults(group_field="variant", ablations=[]),
+        ),
+    )
+    assert summary["status"] == "complete"
+    assert set(summary["group_metrics"]) == {"room", "street"}
+    records = _read_csv(tmp_path / "out" / "records.csv")
+    assert "variant" in records[0]
+    variants = {
+        row["sample_id"]: row["variant"]
+        for row in records
+        if row["ablation"] == "normal"
+    }
+    assert variants == {"clean_001": "room", "other_001": "street"}
+    assert (tmp_path / "out" / "figures" / "s_audio_by_variant.png").is_file()
 
 
 def test_materialize_scored_sample_drops_capture_tensors():

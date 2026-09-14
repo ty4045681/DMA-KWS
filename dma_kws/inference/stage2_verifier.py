@@ -578,6 +578,11 @@ class Stage2Verifier:
             )
         qbyt = self._model.qbyt
         assert_pooling_sink_attention_compatible(qbyt, getattr(self, "qbyt_score", None))
+        if qbyt.training:
+            raise RuntimeError(
+                "attention_diagnostics requires the QbyT to already be in eval(); "
+                "refusing to encode or run an unhooked baseline in train mode"
+            )
         if not feats:
             return []
 
@@ -620,7 +625,7 @@ class Stage2Verifier:
                 capture_spec=capture_spec,
                 ablation_spec=normal_spec,
             )
-            assert_attention_capture_parity(
+            max_parity_error = assert_attention_capture_parity(
                 normal_traces,
                 logits=baseline_logits,
                 position_logits=baseline_details.position_logits,
@@ -687,6 +692,7 @@ class Stage2Verifier:
                     threshold=threshold,
                     normal=normal_result,
                     ablations=tuple(ablated_results),
+                    max_parity_error=max_parity_error,
                 )
             )
         del padded_feats, feat_lengths, anchors, anchor_lengths, speech, encoder_lens

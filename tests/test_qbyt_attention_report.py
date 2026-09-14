@@ -647,6 +647,23 @@ def test_unavailable_time_axis_separates_frame_axis_from_waveform_time(tmp_path)
     assert "independent" in html.lower() or "separate" in html.lower() or "frame axis" in html.lower()
 
 
+def test_group_boxplots_use_extra_group_field_column(tmp_path):
+    out = _write_minimal_run(tmp_path, n_samples=2)
+    records_path = out / "records.csv"
+    with records_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    for index, row in enumerate(rows):
+        row["variant"] = "room" if index % 2 == 0 else "street"
+    _write_csv(records_path, list(rows[0].keys()), rows)
+    run_path = out / "run.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    run["sink_diagnostics"]["group_field"] = "variant"
+    run_path.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+    render_sink_attention_report(out)
+    assert (out / "figures" / "s_audio_by_variant.png").is_file()
+    assert (out / "figures" / "s_text_by_variant.png").is_file()
+
+
 def test_figure_cap_does_not_drop_records_csv_rows(tmp_path):
     out = _write_minimal_run(
         tmp_path, n_samples=3, max_report_samples=1, selected=True

@@ -11,9 +11,13 @@ from qbyt.pooling import QbyT
 
 from dma_kws.inference.qbyt_attention_diagnostics import (
     AttentionCaptureSpec,
+    AttentionParityError,
+    SampleAttentionTrace,
     SinkAblationSpec,
+    assert_attention_capture_parity,
     assert_pooling_sink_attention_compatible,
     capture_pooling_attention,
+    estimate_attention_workspace_bytes,
     _clone_and_block_sink_key,
 )
 from dma_kws.stage2.readout import QbyTAlignmentSpec, QbyTScoreSpec
@@ -577,6 +581,26 @@ def test_packed_length_and_full_attention_bytes_precheck():
                 max_combined_tokens=packed_l - 1,
             ),
         )
+    one_head = estimate_attention_workspace_bytes(1, 2, 1, packed_l)
+    all_heads = estimate_attention_workspace_bytes(1, 2, int(model.nhead), packed_l)
+    assert all_heads == one_head * int(model.nhead)
+    assert all_heads == 1 * 2 * int(model.nhead) * packed_l * packed_l * 4 * 4
+    budget = one_head + (all_heads - one_head) // 2
+    assert one_head < budget < all_heads
+    with pytest.raises(ValueError, match="max_attention_bytes"):
+        _capture(
+            model,
+            speech,
+            anchors,
+            speech_lengths,
+            anchor_lengths,
+            AttentionCaptureSpec(
+                layers=(0, 1),
+                heads=(0,),
+                save_full_attention=False,
+                max_attention_bytes=budget,
+            ),
+        )
     with pytest.raises(ValueError, match="max_attention_bytes"):
         _capture(
             model,
@@ -590,6 +614,63 @@ def test_packed_length_and_full_attention_bytes_precheck():
                 save_full_attention=True,
                 max_attention_bytes=8,
             ),
+        )
+
+
+def _parity_trace(*, raw_logit: float, position_logits: torch.Tensor) -> SampleAttentionTrace:
+    text_len = int(position_logits.numel())
+    return SampleAttentionTrace(
+        layer_ids=(),
+        head_ids=(),
+        audio_to_sink=torch.zeros(0, 0, 1),
+        text_to_sink=torch.zeros(0, 0, text_len),
+        text_to_audio=torch.zeros(0, 0, text_len, 1),
+        position_logits=position_logits,
+        raw_logit=raw_logit,
+        text_length=text_len,
+        audio_length=1,
+        sink_index=text_len,
+        row_sum_max_error=0.0,
+        padding_mass_max=0.0,
+    )
+
+
+def test_parity_rejects_nonfinite_and_returns_measured_error():
+    positions = torch.tensor([0.25, -0.5], dtype=torch.float32)
+    expected_logits = torch.tensor([1.0], dtype=torch.float32)
+    expected_positions = positions.unsqueeze(0)
+    measured = assert_attention_capture_parity(
+        [_parity_trace(raw_logit=1.25, position_logits=positions)],
+        logits=expected_logits,
+        position_logits=expected_positions,
+        atol=0.5,
+        rtol=0.0,
+    )
+    assert measured == pytest.approx(0.25, rel=0.0, abs=0.0)
+
+    with pytest.raises(AttentionParityError, match="raw_logit"):
+        assert_attention_capture_parity(
+            [_parity_trace(raw_logit=float("nan"), position_logits=positions)],
+            logits=expected_logits,
+            position_logits=expected_positions,
+            atol=1e-5,
+            rtol=1e-4,
+        )
+    with pytest.raises(AttentionParityError, match="position_logits"):
+        assert_attention_capture_parity(
+            [_parity_trace(raw_logit=1.0, position_logits=torch.tensor([0.1, float("inf")]))],
+            logits=expected_logits,
+            position_logits=expected_positions,
+            atol=1e-5,
+            rtol=1e-4,
+        )
+    with pytest.raises(AttentionParityError):
+        assert_attention_capture_parity(
+            [_parity_trace(raw_logit=1.0, position_logits=positions)],
+            logits=torch.tensor([float("nan")]),
+            position_logits=expected_positions,
+            atol=1e-5,
+            rtol=1e-4,
         )
 
 

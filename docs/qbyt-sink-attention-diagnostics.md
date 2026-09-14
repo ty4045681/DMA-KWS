@@ -91,7 +91,7 @@ audio/noise_001.wav,hey eva,0,noise_001,noise_only,,,"[[0.0,2.0]]"
 
 有校准文件时两个命令都加相同的 `prep.stage2_calibration=/ABS/PATH/TO/calibration.json`。padding 走共享 helper `resolve_clip_audio_padding_ms`（与 `eval_stage2_clips` 一致）。GPU 可按现有 `run.device=cuda` 约定替换，但仍须 FP32 eager（`prep.amp=off`）；**本仓库未在此分支实测 GPU 数值对照**。
 
-诊断入口对 `prep.batch_size <= 0` 取 `1`，`prep.num_workers <= 0` 取 `0`，不会套用普通评测默认 64。
+诊断入口对 `prep.batch_size <= 0` 取 `1`，`prep.num_workers <= 0` 取 `0`，不会套用普通评测默认 64。安装了 `waveform_observer`（保存 traces / 报告声谱图）时会强制 `num_workers=0`：worker 进程无法回写父进程的波形缓存。
 
 默认 `prep.sink_diagnostics`（见 `configs/prep/default.yaml`）：
 
@@ -153,7 +153,7 @@ sink_diagnostics:
 ## 资源限制
 
 - `max_combined_tokens`（默认 1024）：打包后文本+sink+音频 token 上限；超出则该样本 `skip_reason=resource_limit`。
-- `max_attention_bytes`（默认 256 MiB）：attention 工作量估计上限；批内会再拆组，仍超则跳过。
+- `max_attention_bytes`（默认 256 MiB）：attention **工作区**估计上限（hook 层 × `qbyt.nhead` 全部 head × packed L² × float32 × 4 倍临时张量），不是 `save_full_attention` 落盘大小，也不是所选 `capture_heads`。批内会再拆组，仍超则跳过。
 - 捕获路径会暂时关掉 MHA/encoder fused **fastpath**，并在 `finally` 里恢复进入前状态。fastpath 是**进程级**开关；本工具按单线程串行设计，**不要**嵌进并发在线服务或对同一模型嵌套 capture。
 
 ## 验收状态

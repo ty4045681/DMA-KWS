@@ -39,6 +39,7 @@ from dma_kws.inference.qbyt_attention_diagnostics import (
     SinkAblationResult,
     SinkAblationSpec,
     assert_pooling_sink_attention_compatible,
+    estimate_attention_workspace_bytes,
 )
 from dma_kws.inference.qbyt_attention_manifest import (
     PAIR_INCONSISTENT,
@@ -73,8 +74,6 @@ from dma_kws.training.device import resolve_accelerator
 
 
 RUN_SCHEMA_VERSION = 1
-_BYTES_PER_FLOAT32 = 4
-_ATTENTION_TEMP_FACTOR = 4
 _TOOL_MARKERS = ("run.json", "summary.json")
 _PARTIAL_DIRNAME = ".partial"
 _MANIFEST_GROUP_FIELDS = frozenset(
@@ -305,12 +304,12 @@ def resolve_sink_diagnostics(prep: Mapping[str, Any]) -> dict[str, Any]:
         field="prep.sink_diagnostics.save_full_attention",
     )
     merged["max_combined_tokens"] = _require_int(
-        int(merged["max_combined_tokens"]),
+        merged["max_combined_tokens"],
         field="prep.sink_diagnostics.max_combined_tokens",
         minimum=1,
     )
     merged["max_attention_bytes"] = _require_int(
-        int(merged["max_attention_bytes"]),
+        merged["max_attention_bytes"],
         field="prep.sink_diagnostics.max_attention_bytes",
         minimum=1,
     )
@@ -321,12 +320,12 @@ def resolve_sink_diagnostics(prep: Mapping[str, Any]) -> dict[str, Any]:
         merged["parity_rtol"], field="prep.sink_diagnostics.parity_rtol", minimum=0.0
     )
     merged["max_report_samples"] = _require_int(
-        int(merged["max_report_samples"]),
+        merged["max_report_samples"],
         field="prep.sink_diagnostics.max_report_samples",
         minimum=0,
     )
     merged["plot_dpi"] = _require_int(
-        int(merged["plot_dpi"]), field="prep.sink_diagnostics.plot_dpi", minimum=1
+        merged["plot_dpi"], field="prep.sink_diagnostics.plot_dpi", minimum=1
     )
     bins = _as_list(merged["length_bins"])
     parsed_bins = [
@@ -633,15 +632,24 @@ def _estimated_audio_len(encoder, num_fbank_frames: int) -> int:
 def _attention_work_bytes(
     batch: int, n_layers: int, n_heads: int, packed_l: int
 ) -> int:
-    return (
-        max(1, int(batch))
-        * max(1, int(n_layers))
-        * max(1, int(n_heads))
-        * max(0, int(packed_l))
-        * max(0, int(packed_l))
-        * _BYTES_PER_FLOAT32
-        * _ATTENTION_TEMP_FACTOR
-    )
+    return estimate_attention_workspace_bytes(batch, n_layers, n_heads, packed_l)
+
+
+def _hooked_layer_count(
+    capture_layers: Sequence[int], ablation_specs: Sequence[SinkAblationSpec]
+) -> int:
+    capture_set = set(capture_layers)
+    count = len(capture_set)
+    for spec in ablation_specs:
+        count = max(count, len(capture_set | set(spec.blocked_layers)))
+    return count
+
+
+def _record_fieldnames(group_field: str) -> list[str]:
+    fields = list(RECORDS_FIELDS)
+    if group_field not in fields:
+        fields.append(group_field)
+    return fields
 
 
 def _group_resource_ok(
@@ -714,6 +722,23 @@ def _partition_scoreable(
     if current:
         groups.append(current)
     return groups, skipped
+
+
+def _merge_parity_error(current: float, measured: float | None) -> float:
+    if measured is None:
+        return current
+    value = float(measured)
+    if not math.isfinite(value):
+        return value
+    if not math.isfinite(current):
+        return current
+    return max(current, value)
+
+
+def _json_parity_error(value: float, *, emit: bool) -> float | None:
+    if not emit or not math.isfinite(value):
+        return None
+    return value
 
 
 def _require_finite(value: Any, *, what: str, sample_id: str) -> float:
@@ -1415,10 +1440,13 @@ def _write_outputs(
     metric_rows: list[dict[str, str]],
     position_rows: list[dict[str, str]],
     pair_rows: list[dict[str, str]],
+    group_field: str = "condition",
 ) -> None:
     (output_dir / "traces").mkdir(parents=True, exist_ok=True)
     (output_dir / "figures").mkdir(parents=True, exist_ok=True)
-    _write_csv(output_dir / "records.csv", RECORDS_FIELDS, record_rows)
+    _write_csv(
+        output_dir / "records.csv", _record_fieldnames(group_field), record_rows
+    )
     _write_csv(output_dir / "attention_metrics.csv", METRICS_FIELDS, metric_rows)
     _write_csv(output_dir / "position_scores.csv", POSITION_FIELDS, position_rows)
     _write_csv(output_dir / "pairs.csv", PAIR_FIELDS, pair_rows)
@@ -1576,6 +1604,7 @@ def run_diagnose(cfg: DictConfig) -> dict:
         max_attention_bytes=int(sink["max_attention_bytes"]),
     )
     ablation_specs = expand_ablations(sink["ablations"], n_layers=n_layers)
+    n_hooked_layers = _hooked_layer_count(capture_layers, ablation_specs)
     ablation_catalog = [
         SinkAblationSpec(name="normal", blocked_layers=()),
         *ablation_specs,
@@ -1683,6 +1712,10 @@ def run_diagnose(cfg: DictConfig) -> dict:
             waveform_observer=_observer,
             include_augmented_duration=True,
         )
+        # Observer mutates a parent-process dict; worker processes would drop
+        # spectrograms and NPZ waveforms.
+        if num_workers > 0:
+            num_workers = 0
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -1704,8 +1737,8 @@ def run_diagnose(cfg: DictConfig) -> dict:
                 groups, skipped = _partition_scoreable(
                     pending,
                     capture_spec=capture_spec,
-                    n_capture_layers=max(1, len(capture_spec.layers)),
-                    n_capture_heads=max(1, len(capture_spec.heads)),
+                    n_capture_layers=n_hooked_layers,
+                    n_capture_heads=n_heads,
                 )
                 for prepared, reason in skipped:
                     outcomes[prepared.row.record_number - 2] = _skip_outcome(
@@ -1730,12 +1763,14 @@ def run_diagnose(cfg: DictConfig) -> dict:
                     except DiagnoseRunFailed as exc:
                         failed_message = str(exc)
                         status = "failed"
-                        if exc.max_parity_error is not None:
-                            max_parity_error = max(
-                                max_parity_error, float(exc.max_parity_error)
-                            )
+                        max_parity_error = _merge_parity_error(
+                            max_parity_error, exc.max_parity_error
+                        )
                         break
                     for prepared, sample in zip(group, diagnostics):
+                        max_parity_error = _merge_parity_error(
+                            max_parity_error, sample.max_parity_error
+                        )
                         _require_finite(
                             sample.normal_raw_logit,
                             what="raw logit",
@@ -1819,8 +1854,9 @@ def run_diagnose(cfg: DictConfig) -> dict:
         except DiagnoseRunFailed as exc:
             failed_message = str(exc)
             status = "failed"
-            if exc.max_parity_error is not None:
-                max_parity_error = max(max_parity_error, float(exc.max_parity_error))
+            max_parity_error = _merge_parity_error(
+                max_parity_error, exc.max_parity_error
+            )
         except Exception as exc:
             if isinstance(exc, SystemExit):
                 raise
@@ -1845,6 +1881,10 @@ def run_diagnose(cfg: DictConfig) -> dict:
         for row in outcome.record_rows:
             patched = dict(row)
             patched["report_selected"] = report_flag
+            if group_field not in RECORDS_FIELDS:
+                patched[group_field] = _group_value(
+                    outcome.prepared.row, group_field
+                )
             record_rows.append(patched)
         metric_rows.extend(outcome.metric_rows)
         position_rows.extend(outcome.position_rows)
@@ -1867,7 +1907,9 @@ def run_diagnose(cfg: DictConfig) -> dict:
         "num_skipped": num_skipped,
         "num_fail": num_fail,
         "num_unlabeled": num_unlabeled,
-        "max_parity_error": max_parity_error if num_success or status == "failed" else None,
+        "max_parity_error": _json_parity_error(
+            max_parity_error, emit=bool(num_success or status == "failed")
+        ),
         "pairs": _pair_stats(finalized),
         "group_metrics": _group_metrics(finalized, group_field=group_field),
         "batch_size": batch_size,
@@ -1971,6 +2013,7 @@ def run_diagnose(cfg: DictConfig) -> dict:
         metric_rows=metric_rows,
         position_rows=position_rows,
         pair_rows=pair_rows,
+        group_field=group_field,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False))
     if status != "complete":
