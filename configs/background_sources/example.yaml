@@ -1,0 +1,21 @@
+output_dir: /data/background
+seed: 2025
+sources:
+  - adapter: musan
+    id: musan
+    root: /data/musan
+    split_dir: /data/musan_split
+    eligible_ids_file: /data/curation/musan_eligible.list
+    split_policy: preserve
+  - adapter: dns
+    id: dns
+    root: /data/dns/noise
+    metadata: ""
+    eligible_ids_file: /data/curation/dns_eligible.list
+    split_policy: group_random
+  - adapter: fsd50k
+    id: fsd50k
+    root: /data/fsd50k
+    metadata: /data/fsd50k/metadata
+    eligible_ids_file: /data/curation/fsd50k_eligible.list
+    split_policy: preserve
