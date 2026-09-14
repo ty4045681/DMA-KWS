@@ -61,7 +61,7 @@ def test_same_recording_id_different_content_rejected():
         _record(audio_sha256=_sha("a"), relative_path="noise/a.wav"),
         _record(audio_sha256=_sha("b"), relative_path="noise/b.wav"),
     ]
-    with pytest.raises(ValueError, match="different content"):
+    with pytest.raises(ValueError, match=r"dataset_id 'musan'.+recording_id.+different content"):
         audit_split_isolation(records)
 
 
@@ -84,7 +84,7 @@ def test_same_group_id_across_splits_rejected():
             relative_path="val/r2.wav",
         ),
     ]
-    with pytest.raises(ValueError, match="group_id"):
+    with pytest.raises(ValueError, match=r"dataset_id 'musan'.+group_id"):
         audit_split_isolation(records)
 
 
@@ -109,7 +109,7 @@ def test_shared_origin_id_across_splits_rejected():
             relative_path="eval/2.wav",
         ),
     ]
-    with pytest.raises(ValueError, match="origin_id"):
+    with pytest.raises(ValueError, match=r"dataset_id 'fsd50k'.+origin_id"):
         audit_split_isolation(records)
 
 
@@ -143,7 +143,7 @@ def test_identical_audio_bytes_across_splits_rejected(tmp_path):
             audio_sha256=digest,
         ),
     ]
-    with pytest.raises(ValueError, match="identical audio bytes"):
+    with pytest.raises(ValueError, match=r"dataset_id 'musan'.+identical audio bytes"):
         audit_split_isolation(records)
 
 
@@ -180,9 +180,9 @@ def test_same_identity_with_relocated_mount_is_still_detected(tmp_path):
             audio_sha256=_sha("other"),
         ),
     ]
-    with pytest.raises(ValueError, match="group_id"):
+    with pytest.raises(ValueError, match=r"dataset_id 'musan'.+group_id"):
         audit_split_isolation(left)
-    with pytest.raises(ValueError, match="group_id"):
+    with pytest.raises(ValueError, match=r"dataset_id 'musan'.+group_id"):
         audit_split_isolation(right)
 
     filter_kwargs = {

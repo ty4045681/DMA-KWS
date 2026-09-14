@@ -379,6 +379,17 @@ def _effective_group_id(record: BackgroundRecord) -> str:
     return f"recording:{record.recording_id}"
 
 
+def _format_dataset_ids(records: Sequence[BackgroundRecord]) -> str:
+    dataset_ids = sorted(
+        {str(record.dataset_id) for record in records if str(record.dataset_id).strip()}
+    )
+    if not dataset_ids:
+        return ""
+    if len(dataset_ids) == 1:
+        return f"dataset_id {dataset_ids[0]!r} "
+    return f"dataset_id {dataset_ids!r} "
+
+
 def audit_split_isolation(
     records: Sequence[BackgroundRecord],
 ) -> IsolationAuditReport:
@@ -386,39 +397,56 @@ def audit_split_isolation(
     for record in records:
         by_recording_id.setdefault(record.recording_id, []).append(record)
     for recording_id, group in by_recording_id.items():
+        prefix = _format_dataset_ids(group)
         contents = {_record_content(item) for item in group}
         if len(contents) > 1:
-            raise ValueError(f"recording_id {recording_id!r} has different content")
+            raise ValueError(
+                f"{prefix}recording_id {recording_id!r} has different content"
+            )
         splits = {item.split for item in group}
         if len(group) > 1 and len(splits) == 1:
             raise ValueError(
-                f"recording_id {recording_id!r} is not unique within split "
+                f"{prefix}recording_id {recording_id!r} is not unique within split "
                 f"{next(iter(splits))!r}"
             )
         if len(splits) > 1:
             raise ValueError(
-                f"recording_id {recording_id!r} appears in multiple splits"
+                f"{prefix}recording_id {recording_id!r} appears in multiple splits; "
+                f"expected one split, got {sorted(splits)}"
             )
 
-    group_splits: dict[str, set[str]] = {}
-    origin_splits: dict[str, set[str]] = {}
-    sha_splits: dict[str, set[str]] = {}
+    group_records: dict[str, list[BackgroundRecord]] = {}
+    origin_records: dict[str, list[BackgroundRecord]] = {}
+    sha_records: dict[str, list[BackgroundRecord]] = {}
     for record in records:
-        group_splits.setdefault(_effective_group_id(record), set()).add(record.split)
+        group_records.setdefault(_effective_group_id(record), []).append(record)
         for origin_id in record.origin_ids:
-            origin_splits.setdefault(origin_id, set()).add(record.split)
+            origin_records.setdefault(origin_id, []).append(record)
         if record.audio_sha256:
-            sha_splits.setdefault(record.audio_sha256, set()).add(record.split)
+            sha_records.setdefault(record.audio_sha256, []).append(record)
 
-    for group_id, splits in group_splits.items():
+    for group_id, group in group_records.items():
+        splits = {item.split for item in group}
         if len(splits) > 1:
-            raise ValueError(f"group_id {group_id!r} appears in multiple splits")
-    for origin_id, splits in origin_splits.items():
+            raise ValueError(
+                f"{_format_dataset_ids(group)}group_id {group_id!r} appears in "
+                f"multiple splits; expected one split, got {sorted(splits)}"
+            )
+    for origin_id, group in origin_records.items():
+        splits = {item.split for item in group}
         if len(splits) > 1:
-            raise ValueError(f"origin_id {origin_id!r} appears in multiple splits")
-    for _digest, splits in sha_splits.items():
+            raise ValueError(
+                f"{_format_dataset_ids(group)}origin_id {origin_id!r} appears in "
+                f"multiple splits; expected one split, got {sorted(splits)}"
+            )
+    for digest, group in sha_records.items():
+        splits = {item.split for item in group}
         if len(splits) > 1:
-            raise ValueError("identical audio bytes appear in multiple splits")
+            raise ValueError(
+                f"{_format_dataset_ids(group)}identical audio bytes appear in "
+                f"multiple splits (audio_sha256={digest!r}); expected one split, "
+                f"got {sorted(splits)}"
+            )
 
     provenance_complete = all(record.provenance_complete for record in records)
     return IsolationAuditReport(

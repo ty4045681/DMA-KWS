@@ -481,6 +481,20 @@ def _normalize_background_negative_mode(value: object) -> str:
     return mode
 
 
+def _source_field_error(
+    source_id: object,
+    field: str,
+    *,
+    reason: str,
+    expected: str,
+    actual: object,
+) -> str:
+    return (
+        f"stage2.background_negative source id={source_id!r} field={field}: "
+        f"{reason}; expected {expected}, got {actual!r}"
+    )
+
+
 def _require_source_id(value: object) -> str:
     if not isinstance(value, str) or _SOURCE_ID_RE.fullmatch(value) is None:
         raise ValueError(
@@ -729,30 +743,55 @@ def validate_background_negative_config(cfg: Mapping[str, Any]) -> None:
             source_cache = str(source.cache_manifest or "").strip()
             if validation.enabled and not manifest:
                 raise ValueError(
-                    "stage2.background_negative.sources[].manifest is required "
-                    "when validation.enabled=true"
+                    _source_field_error(
+                        source.id,
+                        "manifest",
+                        reason="required when validation.enabled=true",
+                        expected="a non-empty path",
+                        actual=manifest,
+                    )
                 )
             if mode == "online":
                 if not manifest:
                     raise ValueError(
-                        "stage2.background_negative.sources[].manifest is "
-                        "required when mode=online"
+                        _source_field_error(
+                            source.id,
+                            "manifest",
+                            reason="required when mode=online",
+                            expected="a non-empty path",
+                            actual=manifest,
+                        )
                     )
                 if source_cache:
                     raise ValueError(
-                        "stage2.background_negative.sources[].cache_manifest "
-                        "must be empty when mode=online"
+                        _source_field_error(
+                            source.id,
+                            "cache_manifest",
+                            reason="must be empty when mode=online",
+                            expected="",
+                            actual=source_cache,
+                        )
                     )
             else:
                 if not manifest:
                     raise ValueError(
-                        "stage2.background_negative.sources[].manifest is "
-                        "required when mode=fbank_cache"
+                        _source_field_error(
+                            source.id,
+                            "manifest",
+                            reason="required when mode=fbank_cache",
+                            expected="a non-empty path",
+                            actual=manifest,
+                        )
                     )
                 if not source_cache:
                     raise ValueError(
-                        "stage2.background_negative.sources[].cache_manifest "
-                        "is required when mode=fbank_cache"
+                        _source_field_error(
+                            source.id,
+                            "cache_manifest",
+                            reason="required when mode=fbank_cache",
+                            expected="a non-empty path",
+                            actual=source_cache,
+                        )
                     )
         return
 

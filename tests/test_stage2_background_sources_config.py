@@ -226,15 +226,20 @@ def test_schema_and_dict_helper_raise_consistently_for_invalid_scalars(overrides
 
 def test_online_active_source_requires_manifest_and_empty_cache():
     _assert_schema_and_helper_raise(
-        _payload(mode="online", sources=[_source(manifest="")]),
-        r"sources\[\]\.manifest is required when mode=online",
+        _payload(mode="online", sources=[_source("musan", manifest="")]),
+        r"source id='musan'.+field=manifest.+required when mode=online",
     )
     _assert_schema_and_helper_raise(
         _payload(
             mode="online",
-            sources=[_source(cache_manifest="/data/musan/cache/manifest.json")],
+            sources=[
+                _source(
+                    "musan",
+                    cache_manifest="/data/musan/cache/manifest.json",
+                )
+            ],
         ),
-        r"sources\[\]\.cache_manifest must be empty when mode=online",
+        r"source id='musan'.+field=cache_manifest.+must be empty when mode=online",
     )
 
 
@@ -242,13 +247,22 @@ def test_fbank_cache_active_source_requires_manifest_and_cache():
     _assert_schema_and_helper_raise(
         _payload(
             mode="fbank_cache",
-            sources=[_source(manifest="", cache_manifest="/cache/manifest.json")],
+            sources=[
+                _source(
+                    "fsd50k",
+                    manifest="",
+                    cache_manifest="/cache/manifest.json",
+                )
+            ],
         ),
-        r"sources\[\]\.manifest is required when mode=fbank_cache",
+        r"source id='fsd50k'.+field=manifest.+required when mode=fbank_cache",
     )
     _assert_schema_and_helper_raise(
-        _payload(mode="fbank_cache", sources=[_source(cache_manifest="")]),
-        r"sources\[\]\.cache_manifest is required when mode=fbank_cache",
+        _payload(
+            mode="fbank_cache",
+            sources=[_source("dns_v5", cache_manifest="")],
+        ),
+        r"source id='dns_v5'.+field=cache_manifest.+required when mode=fbank_cache",
     )
 
 
@@ -256,10 +270,13 @@ def test_validation_enabled_requires_active_source_manifest():
     _assert_schema_and_helper_raise(
         _payload(
             mode="online",
-            sources=[_source("dns", weight=0.0, manifest=""), _source(manifest="")],
+            sources=[
+                _source("dns", weight=0.0, manifest=""),
+                _source("musan", manifest=""),
+            ],
             validation={"enabled": True, "samples_per_source": 256, "seed": 2025},
         ),
-        r"sources\[\]\.manifest is required when validation.enabled=true",
+        r"source id='musan'.+field=manifest.+required when validation.enabled=true",
     )
 
 
