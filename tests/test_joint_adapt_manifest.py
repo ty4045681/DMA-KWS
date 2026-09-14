@@ -327,3 +327,27 @@ def test_joint_cached_musan_detects_relocated_recording(tmp_path):
 def test_joint_musan_check_is_optional_without_eval_list():
     validate_background_eval_split(dict(enabled=True, mode="fbank_cache"), "")
     validate_background_eval_split(dict(enabled=False), "/nonexistent/eval.txt")
+
+
+def test_joint_identity_audit_runs_for_multisource_catalogs(tmp_path):
+    from dma_kws.stage2.joint_manifest import validate_background_sources_identity
+    from tests.test_stage2_background_identity import _write_source
+    from tests.test_stage2_background_sources import _online_config, _source_config
+
+    sources = []
+    for source_id in ("dns", "musan"):
+        sources.append(_source_config(source_id, _write_source(tmp_path, source_id), weight=1.0))
+    validate_background_sources_identity(_online_config(sources))
+
+
+def test_joint_new_mode_rejects_background_eval_list(tmp_path):
+    from dma_kws.stage2.background_identity import assert_background_eval_list_compatible
+    from tests.test_stage2_background_identity import _write_source
+    from tests.test_stage2_background_sources import _online_config, _source_config
+
+    manifest = _write_source(tmp_path, "dns")
+    with pytest.raises(ValueError, match="background_eval_list"):
+        assert_background_eval_list_compatible(
+            _online_config([_source_config("dns", manifest)]),
+            {"background_eval_list": str(tmp_path / "eval.list")},
+        )

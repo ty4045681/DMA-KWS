@@ -86,6 +86,70 @@ def test_joint_data_signature_binds_resolved_replay_and_tokenizer(tmp_path):
     assert initial != signature()
 
 
+def test_joint_data_signature_uses_v2_background_hash_for_multisource(tmp_path):
+    from dma_kws.stage2.adapt import _joint_data_signature
+    from dma_kws.stage2.background_identity import background_data_signature_hash, background_data_signature_payload
+    from tests.test_stage2_background_identity import _write_source
+    from tests.test_stage2_background_sources import _online_config, _source_config
+
+    parquet, dictionary = tmp_path / "pairs.parquet", tmp_path / "dict.txt"
+    parquet.write_bytes(b"pairs-v1")
+    dictionary.write_text("a 1\n")
+    wav_dir = tmp_path / "features"
+    wav_dir.mkdir()
+    dns = _write_source(tmp_path, "dns")
+    musan = _write_source(tmp_path, "musan")
+    background = _online_config(
+        [
+            _source_config("dns", dns, weight=0.4),
+            _source_config("musan", musan, weight=0.6),
+        ]
+    )
+    config = {
+        "adapt": {"keyword": "hello", "joint": {}, "mix_ratio": 0.5, "sample_lens": 32},
+        "stage2": {
+            "background_negative": background,
+            "parquet_file": str(parquet),
+            "wav_dir": str(wav_dir),
+            "negative_ratio": 1,
+            "hard_negative_ratio": 1,
+        },
+        "training": {"seed": 2025},
+        "fbank": {"num_mel_bins": 80, "dither": 0.0},
+    }
+    digest = _joint_data_signature(
+        config, {}, parquet_file=parquet, dict_path=dictionary, wav_dir=wav_dir
+    )
+    v2 = background_data_signature_hash(
+        background_data_signature_payload(background, fbank=config["fbank"], seed=2025)
+    )
+    heavier = dict(background)
+    heavier["sources"] = [
+        _source_config("dns", dns, weight=0.5),
+        _source_config("musan", musan, weight=0.5),
+    ]
+    config["stage2"]["background_negative"] = heavier
+    changed = _joint_data_signature(
+        config, {}, parquet_file=parquet, dict_path=dictionary, wav_dir=wav_dir
+    )
+    assert digest != changed
+    assert v2
+    relocated = _write_source(tmp_path / "mount", "dns")
+    relocated_musan = _write_source(tmp_path / "mount", "musan")
+    config["stage2"]["background_negative"] = _online_config(
+        [
+            _source_config("dns", relocated, weight=0.4),
+            _source_config("musan", relocated_musan, weight=0.6),
+        ]
+    )
+    assert (
+        _joint_data_signature(
+            config, {}, parquet_file=parquet, dict_path=dictionary, wav_dir=wav_dir
+        )
+        == digest
+    )
+
+
 @pytest.mark.parametrize("accumulation_steps", [1, 2])
 def test_lightning_joint_resume_replays_exact_suffix_and_optimizer(tmp_path, accumulation_steps):
     import pytorch_lightning as pl

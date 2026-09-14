@@ -346,6 +346,41 @@ def test_background_mode_json_contract_and_exact_crop_match(tmp_path):
     assert payload["batch_size"] == 2
 
 
+def test_cache_id_from_config_collects_per_source_identity():
+    from dma_kws.stage2.input_benchmark import background_benchmark_identity
+
+    payload = background_benchmark_identity(
+        {
+            "stage2": {
+                "background_negative": {
+                    "enabled": True,
+                    "mode": "fbank_cache",
+                    "audio_list_path": "",
+                    "cache_manifest": "",
+                    "sources": [
+                        {
+                            "id": "dns",
+                            "weight": 0.4,
+                            "manifest": "/data/background/dns/recordings.jsonl",
+                            "cache_manifest": "/data/background/dns/cache/manifest.json",
+                        },
+                        {
+                            "id": "musan",
+                            "weight": 0.6,
+                            "manifest": "/data/background/musan/recordings.jsonl",
+                            "cache_manifest": "/data/background/musan/cache/manifest.json",
+                        },
+                    ],
+                }
+            }
+        }
+    )
+    assert payload["background_mode"] == "fbank_cache"
+    assert [row["id"] for row in payload["background_sources"]] == ["dns", "musan"]
+    assert "musan" not in payload.get("mode", "loader")
+    assert payload.get("label") != "musan"
+
+
 def test_loader_mode_json_contract_on_tiny_parquet(tmp_path):
     from dma_kws.stage2.input_benchmark import run_input_benchmark
 

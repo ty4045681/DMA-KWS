@@ -340,6 +340,34 @@ def _load_tokenizer(config: dict[str, Any]):
     )
 
 
+def background_benchmark_identity(config: dict[str, Any]) -> dict[str, Any]:
+    """Mode and per-source identity for benchmark JSON (never labeled MUSAN mix)."""
+    background = (config.get("stage2") or {}).get("background_negative") or {}
+    sources = background.get("sources") or []
+    mode = str(background.get("mode") or "online").strip() or "online"
+    if sources:
+        from dma_kws.configs.schema import active_background_sources
+
+        active = active_background_sources(sources)
+        return {
+            "background_mode": mode,
+            "background_sources": [
+                {
+                    "id": source.id,
+                    "weight": float(source.weight),
+                    "manifest": source.manifest,
+                    "cache_manifest": source.cache_manifest,
+                }
+                for source in active
+            ],
+        }
+    return {
+        "background_mode": mode,
+        "audio_list_path": str(background.get("audio_list_path") or ""),
+        "cache_manifest": str(background.get("cache_manifest") or ""),
+    }
+
+
 def _cache_id_from_config(config: dict[str, Any], cache: Any | None = None) -> str | None:
     if cache is not None:
         return str(getattr(cache, "cache_id", "") or "") or None
@@ -470,7 +498,7 @@ def _base_payload(
     cache_id: str | None,
 ) -> dict[str, Any]:
     cuda_version = getattr(torch.version, "cuda", None)
-    return {
+    payload = {
         "mode": mode,
         "status": "ok",
         "git_commit": _git_commit(),
@@ -491,6 +519,8 @@ def _base_payload(
         "gpu_util": "unavailable",
         "process_rss_bytes": process_rss_bytes(),
     }
+    payload.update(background_benchmark_identity(config))
+    return payload
 
 
 def _finish_payload(

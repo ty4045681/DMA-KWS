@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import copy
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 import torchmetrics
 
 from dma_kws.config import resolve_stream_policy
@@ -24,10 +26,58 @@ from dma_kws.training.checkpoint_io import (
     extract_state_dict,
     stamp_qbyt_readout_version,
 )
-from dma_kws.training.distributed_metrics import ddp_global_mean_loss, sum_across_processes
+from dma_kws.stage2.background_identity import (
+    assert_background_resume_identity,
+    musan_metric_alias_allowed,
+)
+from dma_kws.stage2.joint_validation import background_clip_stats, format_background_val_metrics
+from dma_kws.training.distributed_metrics import (
+    ddp_global_mean_loss,
+    gather_variable_rows,
+    sum_across_processes,
+)
 from dma_kws.training.ddp import process_rank, rank_zero_print
 from dma_kws.training.scheduler import build_cosine_warmup_optimizer
 from dma_kws.training.score_diagnostics import BinaryScoreDiagnostics
+
+
+def grouped_background_source_totals(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    source_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    num_sources: int,
+) -> torch.Tensor:
+    """Per source: BCE sum, valid count, all draws, score sum; last row is batch totals."""
+    per_sample = F.binary_cross_entropy_with_logits(
+        logits, labels.float(), reduction="none"
+    )
+    scores = torch.sigmoid(logits.detach())
+    rows = []
+    for source in range(num_sources):
+        selected = source_ids == source
+        valid = selected & valid_mask.bool()
+        rows.append(
+            torch.stack(
+                (
+                    per_sample.detach()[valid].sum(),
+                    valid.sum().to(per_sample),
+                    selected.sum().to(per_sample),
+                    scores[selected].sum().to(per_sample),
+                )
+            )
+        )
+    extras = torch.stack(
+        (
+            per_sample.new_tensor(float(source_ids.numel())),
+            (source_ids >= 0).sum().to(per_sample),
+            per_sample.new_zeros(()),
+            per_sample.new_zeros(()),
+        )
+    )
+    rows.append(extras)
+    return torch.stack(rows).to(dtype=torch.float64)
 
 
 def assert_adapter_weights_loaded(model, missing_keys) -> None:
@@ -282,6 +332,11 @@ class Stage2LightningModule(pl.LightningModule):
             }
         )
         self._train_window_updates = 0
+        self._background_source_ids: tuple[str, ...] = ()
+        self._val_loader_roles: tuple[str, ...] | None = None
+        self._background_data_signature: str | None = None
+        self._background_val_scores: dict[str, list[torch.Tensor]] = {}
+        self._background_val_ids: dict[str, list[torch.Tensor]] = {}
 
     def _load_init_checkpoint(
         self,
@@ -432,6 +487,10 @@ class Stage2LightningModule(pl.LightningModule):
         checkpoint["checkpoint_kind"] = "stage2"
         checkpoint["config"] = copy.deepcopy(self._checkpoint_config)
         checkpoint["vocab_size"] = self._checkpoint_vocab_size
+        signature = getattr(self, "_background_data_signature", None)
+        if signature:
+            checkpoint["background_data_signature_version"] = 2
+            checkpoint["background_data_signature"] = signature
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         """Reject stale QbyT weights on both Lightning restore paths.
@@ -451,6 +510,11 @@ class Stage2LightningModule(pl.LightningModule):
             checkpoint,
             source="the Stage II checkpoint being restored",
             expected_alignment=self.qbyt_score,
+        )
+        assert_background_resume_identity(
+            checkpoint,
+            current_signature=getattr(self, "_background_data_signature", None),
+            current_config=self._checkpoint_config,
         )
 
     def forward(
@@ -753,9 +817,168 @@ class Stage2LightningModule(pl.LightningModule):
         for train_logger in self.trainer.loggers:
             train_logger.log_metrics(payload, step=int(self.global_step))
 
+    def configure_background_sources(self, source_ids: Sequence[str]) -> None:
+        """Record active source names for train/val metrics (sorted ids)."""
+        self._background_source_ids = tuple(str(item) for item in source_ids)
+        self._background_val_scores = {
+            source_id: [] for source_id in self._background_source_ids
+        }
+        self._background_val_ids = {
+            source_id: [] for source_id in self._background_source_ids
+        }
+
+    def set_val_loader_roles(self, roles: Sequence[str]) -> None:
+        self._val_loader_roles = tuple(roles)
+
+    def _log_background_source_stats(
+        self,
+        batch: dict[str, torch.Tensor],
+        logits: torch.Tensor,
+        utt_sample_mask: torch.Tensor,
+    ) -> None:
+        names = getattr(self, "_background_source_ids", ())
+        if not names:
+            return
+        if "label" not in batch:
+            return
+        source_ids = batch.get("background_source_id")
+        if source_ids is None:
+            source_ids = torch.full(
+                (batch["label"].shape[0],),
+                -1,
+                device=batch["label"].device,
+                dtype=torch.long,
+            )
+        stats = sum_across_processes(
+            grouped_background_source_totals(
+                logits,
+                batch["label"],
+                source_ids,
+                utt_sample_mask,
+                num_sources=len(names),
+            )
+        )
+        batch_size = stats[-1, 0]
+        background_total = stats[-1, 1]
+        nan = stats.new_tensor(float("nan"))
+
+        def _scalar(value: torch.Tensor) -> torch.Tensor:
+            return value.detach().to(dtype=torch.float32)
+
+        for index, name in enumerate(names):
+            bce_sum, valid_count, count, score_sum = stats[index]
+            prefix = f"train/background/{name}"
+            empty = count <= 0
+            self.log(f"{prefix}/count", _scalar(count), on_step=True, sync_dist=True)
+            self.log(
+                f"{prefix}/fraction_all",
+                _scalar(nan if empty else count / batch_size),
+                on_step=True,
+                sync_dist=True,
+            )
+            self.log(
+                f"{prefix}/fraction_background",
+                _scalar(nan if empty else count / background_total),
+                on_step=True,
+                sync_dist=True,
+            )
+            self.log(
+                f"{prefix}/utt_bce",
+                _scalar(nan if valid_count <= 0 else bce_sum / valid_count),
+                on_step=True,
+                sync_dist=True,
+            )
+            self.log(
+                f"{prefix}/score_mean",
+                _scalar(nan if empty else score_sum / count),
+                on_step=True,
+                sync_dist=True,
+            )
+
+    def _update_background_val(
+        self,
+        source_id: str,
+        logits: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+    ) -> None:
+        scores = torch.sigmoid(
+            logits * self._score_calibration_slope + self._score_calibration_bias
+        ).detach()
+        self._background_val_scores.setdefault(source_id, []).append(scores.reshape(-1).cpu())
+        sample_ids = batch.get("sample_id")
+        if sample_ids is None:
+            sample_ids = torch.arange(scores.numel(), device=scores.device)
+        self._background_val_ids.setdefault(source_id, []).append(
+            sample_ids.detach().reshape(-1).cpu()
+        )
+
+    def _gather_background_val_scores(
+        self, source_id: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        score_chunks = self._background_val_scores.get(source_id) or []
+        id_chunks = self._background_val_ids.get(source_id) or []
+        scores = (
+            torch.cat(score_chunks) if score_chunks else torch.empty(0, dtype=torch.float32)
+        )
+        sample_ids = (
+            torch.cat(id_chunks) if id_chunks else torch.empty(0, dtype=torch.float32)
+        )
+        if scores.numel() == 0:
+            rows = torch.zeros(0, 2, dtype=torch.float32)
+        else:
+            rows = torch.stack(
+                (scores.to(dtype=torch.float32), sample_ids.to(dtype=torch.float32)),
+                dim=1,
+            )
+        gathered = gather_variable_rows(rows)
+        if gathered.numel() == 0:
+            empty = torch.empty(0, dtype=torch.float32)
+            return empty, empty
+        return gathered[:, 0], gathered[:, 1]
+
+    def _log_background_val_metrics(self) -> None:
+        names = getattr(self, "_background_source_ids", ())
+        score_map = getattr(self, "_background_val_scores", {})
+        if not any(score_map.values()):
+            return
+        source_ids = list(names) or sorted(score_map)
+        per_source: dict[str, dict[str, float]] = {}
+        all_scores: list[torch.Tensor] = []
+        all_ids: list[torch.Tensor] = []
+        id_offset = 0
+        for source_id in source_ids:
+            scores, sample_ids = self._gather_background_val_scores(source_id)
+            stats = background_clip_stats(
+                scores,
+                threshold=self.deployment_threshold,
+                sample_ids=sample_ids if sample_ids.numel() else None,
+            )
+            per_source[source_id] = stats
+            if scores.numel():
+                all_scores.append(scores)
+                if sample_ids.numel():
+                    all_ids.append(sample_ids + id_offset)
+                id_offset += int(scores.numel()) + 1
+        overall = None
+        if all_scores:
+            overall = background_clip_stats(
+                torch.cat(all_scores),
+                threshold=self.deployment_threshold,
+                sample_ids=torch.cat(all_ids) if all_ids else None,
+            )
+        metrics = format_background_val_metrics(per_source, overall=overall)
+        if not musan_metric_alias_allowed(source_ids):
+            metrics.pop("val/musan_deploy_fpr", None)
+        for name, value in metrics.items():
+            self.log(name, value, sync_dist=True)
+        for source_id in source_ids:
+            self._background_val_scores[source_id] = []
+            self._background_val_ids[source_id] = []
+
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        total_loss, losses, _ = self._forward_train_losses(batch)
+        total_loss, losses, logits = self._forward_train_losses(batch)
         self._log_train_losses(total_loss, losses)
+        self._log_background_source_stats(batch, logits, losses["utt_sample_mask"])
         return total_loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
@@ -847,11 +1070,21 @@ class Stage2LightningModule(pl.LightningModule):
             )
         return diagnostics
 
-    def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> None:
+    def validation_step(
+        self,
+        batch: dict[str, torch.Tensor],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
         logits, _ = self(
             batch["feat"], batch["feat_lengths"], batch["anchor"]
         )
         labels = batch["label"].int()
+        roles = getattr(self, "_val_loader_roles", None)
+        role = roles[dataloader_idx] if roles else "libriphrase"
+        if role.startswith("background:"):
+            self._update_background_val(role.split(":", 1)[1], logits, batch)
+            return
         self._update_score_diagnostics(
             self.score_diagnostics,
             logits=logits,
@@ -874,6 +1107,7 @@ class Stage2LightningModule(pl.LightningModule):
         # Checkpoint-filename alias of val/auc; kept out of CSV/TensorBoard.
         self.log("val_auc", score_metrics["auc"], sync_dist=True, logger=False)
         self._log_train_window_metrics()
+        self._log_background_val_metrics()
 
         self.score_diagnostics.reset()
 

@@ -47,13 +47,19 @@ class _Replay:
         anchor = [100 + index] if anchor_seq is None else list(anchor_seq)
         positive = kind == "positive"
         query = anchor if positive else ([] if kind == "background" else [300])
-        return {
+        item = {
             "feat": torch.tensor([[float(index), rng.random()]]),
             "anchor_seq": torch.tensor(anchor),
             "query_seq": torch.tensor(query, dtype=torch.long),
             "label": torch.tensor(int(positive)),
             "seq_label": torch.tensor([int(positive)] * len(anchor)),
         }
+        if kind == "background":
+            item["background_source_id"] = 1 if rng.random() < 0.5 else 0
+            item["recording_id"] = f"src:{index}"
+        else:
+            item["background_source_id"] = -1
+        return item
 
 
 def _joint(**kwargs):
@@ -92,6 +98,8 @@ def test_background_target_and_generic_queries_have_empty_transcripts():
         assert item["label"].item() == 0
         assert item["query_seq"].numel() == 0
         assert not item["seq_label"].any()
+        assert int(item["background_source_id"]) in {0, 1}
+        assert item["domain_source"] == dataset.DOMAIN_BACKGROUND
 
 
 def test_replay_uses_full_anchor_pool_independently_of_epoch_length():

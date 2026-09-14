@@ -183,6 +183,44 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     train_dataloader = build_stage2_train_dataloader(config, train_dataset)
 
     val_dataloader = _build_val_dataloader(config, tokenizer)
+    val_roles = ["libriphrase"]
+    val_dataloaders: Any = val_dataloader
+    validation_cfg = (background_negative.get("validation") or {})
+    if validation_cfg.get("enabled"):
+        import random as random_mod
+
+        from torch.utils.data import DataLoader as _ValDataLoader
+
+        from dma_kws.config import fbank_kwargs, get_eval_fbank_config
+        from dma_kws.stage2.collate import test_collate_fn as _test_collate_fn
+        from dma_kws.stage2.joint_validation import build_background_validation_datasets
+
+        val_seed = int(validation_cfg.get("seed", 2025))
+        anchor_rng = random_mod.Random(val_seed)
+        anchor_index = anchor_rng.randrange(max(1, train_dataset.num_anchors))
+        anchor_seq = train_dataset._tokenize_phoneme_string(
+            train_dataset._ngram_g2p[anchor_index % train_dataset.num_anchors]
+        )
+        extra_loaders = []
+        for role, dataset in build_background_validation_datasets(
+            background_negative,
+            anchor_seq=anchor_seq,
+            fbank_kwargs=fbank_kwargs(get_eval_fbank_config(config)),
+        ):
+            num_workers = int((stage2.get("eval") or {}).get("num_workers", 0) or 0)
+            extra_loaders.append(
+                _ValDataLoader(
+                    dataset,
+                    batch_size=int((stage2.get("eval") or {}).get("batch_size", 32)),
+                    shuffle=False,
+                    num_workers=num_workers,
+                    collate_fn=_test_collate_fn,
+                    **build_loader_kwargs(num_workers, stage2.get("dataloader", {}) or {}),
+                )
+            )
+            val_roles.append(role)
+        if extra_loaders:
+            val_dataloaders = [val_dataloader, *extra_loaders]
 
     resume_checkpoint = args.resume_checkpoint or stage2.get("resume_checkpoint", "")
     init_checkpoint = args.init_checkpoint or stage2.get("init_checkpoint", "")
@@ -206,12 +244,24 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     )
 
     resume_payload = None
+    from dma_kws.stage2.background_identity import (
+        assert_background_resume_identity,
+        background_source_ids_from_sampler,
+        build_background_data_signature,
+    )
+
+    background_signature = build_background_data_signature(config)
     if resume_path is not None:
         resume_payload = torch.load(resume_path, map_location="cpu")
         assert_sequence_objective_matches(
             resume_payload,
             stage2,
             source=resume_path,
+        )
+        assert_background_resume_identity(
+            resume_payload,
+            current_signature=background_signature,
+            current_config=config,
         )
 
     run_context = build_run_context(
@@ -252,6 +302,12 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
             init_checkpoint=init_checkpoint or None,
         )
 
+    model.configure_background_sources(
+        background_source_ids_from_sampler(train_dataset._background_sampler)
+    )
+    model._background_data_signature = background_signature
+    model.set_val_loader_roles(val_roles)
+
     accelerator, devices = resolve_accelerator_and_devices(args.device, args.devices)
 
     if accelerator == "gpu":
@@ -280,6 +336,14 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
                 for key, value in background_paths.items()
                 if key != "background_audio_list"
             },
+            **(
+                {
+                    "background_data_signature_version": 2,
+                    "background_data_signature": background_signature,
+                }
+                if background_signature
+                else {}
+            ),
         },
     )
     for train_logger in loggers:
@@ -372,7 +436,7 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     trainer.fit(
         model,
         train_dataloaders=train_dataloader,
-        val_dataloaders=val_dataloader,
+        val_dataloaders=val_dataloaders,
         ckpt_path=resume_path,
     )
 
@@ -420,6 +484,14 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
                         "step": artifact_step,
                         "tokenizer_dict_path": str(dict_path),
                         "vocab_size": vocab_size,
+                        **(
+                            {
+                                "background_data_signature_version": 2,
+                                "background_data_signature": background_signature,
+                            }
+                            if background_signature
+                            else {}
+                        ),
                     },
                     alignment=model.qbyt_score,
                 ),

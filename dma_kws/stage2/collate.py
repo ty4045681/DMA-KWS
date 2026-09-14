@@ -76,6 +76,11 @@ def test_collate_fn(batch: list[dict]) -> dict:
             [int(item["sample_id"]) for item in batch],
             dtype=torch.long,
         )
+    if any("background_source_id" in item for item in batch):
+        out["background_source_id"] = torch.tensor(
+            [int(item.get("background_source_id", -1)) for item in batch],
+            dtype=torch.long,
+        )
     return out
 
 

@@ -1,0 +1,35 @@
+# @package _global_
+# Frozen Zipformer Stage II v4.1 multi-source backgrounds from fbank caches.
+# Hydra replaces lists, so every source repeats id/weight/manifest/cache.
+# Inherited top-level MUSAN paths stay empty. Run/log/checkpoint paths are
+# independent of both v41 and the online multisource overlay.
+#
+# Usage:
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_eps_softmin_v41_multisource_cached \
+#     --cfg job --resolve
+
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41_multisource
+  - _self_
+
+stage2:
+  background_negative:
+    mode: fbank_cache
+    audio_list_path: ""
+    cache_manifest: ""
+    sources:
+      - id: musan
+        weight: 0.4
+        manifest: ${paths.processed_root}/background/musan/recordings.jsonl
+        cache_manifest: ${paths.processed_root}/background/musan/cache/manifest.json
+      - id: dns
+        weight: 0.4
+        manifest: ${paths.processed_root}/background/dns/recordings.jsonl
+        cache_manifest: ${paths.processed_root}/background/dns/cache/manifest.json
+      - id: fsd50k
+        weight: 0.2
+        manifest: ${paths.processed_root}/background/fsd50k/recordings.jsonl
+        cache_manifest: ${paths.processed_root}/background/fsd50k/cache/manifest.json
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-eps-softmin-v41-multisource-cached
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-eps-softmin-v41-multisource-cached
+  run_name: icefall-zipformer-frozen-eps-softmin-v41-multisource-cached

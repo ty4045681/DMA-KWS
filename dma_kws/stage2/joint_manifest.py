@@ -295,3 +295,22 @@ def validate_background_eval_split(
             overlap.add(path)
     if overlap:
         raise ValueError(f"MUSAN train/eval source leakage: {sorted(overlap)[:5]}")
+
+
+def validate_background_sources_identity(background_cfg: Mapping[str, Any]) -> None:
+    """Audit train/val/test isolation for every active multi-source catalog."""
+    from dma_kws.configs.schema import active_background_sources
+    from dma_kws.data_prep.background_manifest import (
+        audit_split_isolation,
+        read_recordings_jsonl,
+    )
+
+    payload = dict(background_cfg or {})
+    active = active_background_sources(payload.get("sources") or [])
+    all_records = []
+    for source in active:
+        records = read_recordings_jsonl(source.manifest)
+        audit_split_isolation(records)
+        all_records.extend(records)
+    if all_records:
+        audit_split_isolation(all_records)

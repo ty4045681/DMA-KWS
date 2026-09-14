@@ -392,14 +392,36 @@ def _joint_data_signature(
     config: dict, manifests: dict[str, Path], *, parquet_file: Path, wav_dir: Path, dict_path: Path,
 ) -> str:
     """Bind full-state resumes to the same data and sampling policy."""
+    from dma_kws.stage2.background_identity import (
+        background_data_signature_hash,
+        background_data_signature_payload,
+        is_multisource_background,
+        legacy_background_payload,
+    )
+
     adapt, stage2 = config["adapt"], config["stage2"]
     bg = stage2.get("background_negative", {}) or {}
     files = {**manifests, "libri_parquet": Path(parquet_file), "tokenizer": Path(dict_path)}
-    for key, value in (
-        ("background_train", bg.get("audio_list_path")),
-        ("background_cache", bg.get("cache_manifest")),
-        ("background_eval", (adapt.get("joint") or {}).get("background_eval_list")),
-    ):
+    if is_multisource_background(bg):
+        background_for_payload = {
+            "background_data_signature_version": 2,
+            "background_data_signature": background_data_signature_hash(
+                background_data_signature_payload(
+                    bg,
+                    fbank=config.get("fbank"),
+                    seed=int((config.get("training") or {}).get("seed", 2025)),
+                )
+            ),
+        }
+        file_pairs = ()
+    else:
+        background_for_payload = legacy_background_payload(bg) if bg else bg
+        file_pairs = (
+            ("background_train", bg.get("audio_list_path")),
+            ("background_cache", bg.get("cache_manifest")),
+            ("background_eval", (adapt.get("joint") or {}).get("background_eval_list")),
+        )
+    for key, value in file_pairs:
         if value:
             files[key] = Path(value)
     digests = {}
@@ -415,7 +437,7 @@ def _joint_data_signature(
         "mix_ratio": adapt.get("mix_ratio", 0.5),
         "seed": config.get("training", {}).get("seed", 2025),
         "sample_lens": adapt.get("sample_lens"),
-        "background": bg,
+        "background": background_for_payload,
         "fbank": config.get("fbank"),
         "wav_dir": str(Path(wav_dir).resolve()),
         "keyword": adapt.get("keyword"),
@@ -637,18 +659,25 @@ class Stage2AdaptationModule(Stage2LightningModule):
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         total_loss, losses, logits = self._forward_train_losses(batch)
         self._log_train_losses(total_loss, losses)
+        self._log_background_source_stats(batch, logits, losses["utt_sample_mask"])
         source = batch.get("source")
         if source is not None:
             self._log_source_losses(
                 logits, batch["label"], source, losses["utt_sample_mask"]
             )
         if "domain_source" in batch:
+            from dma_kws.stage2.background_identity import musan_metric_alias_allowed
+
             stats = sum_across_processes(grouped_domain_bce_totals(
                 logits, batch["label"], batch["domain_source"], losses["utt_sample_mask"]
             ))
             total = stats[:, 2].sum()
+            alias = musan_metric_alias_allowed(
+                getattr(self, "_background_source_ids", ())
+            )
+            domain_names = ("lph", "real", "tts", "musan" if alias else "background")
             for name, (loss_sum, valid_count, count, positives) in zip(
-                ("lph", "real", "tts", "musan"), stats
+                domain_names, stats
             ):
                 nan = total.new_tensor(float("nan"))
                 for key, value in (
@@ -704,6 +733,37 @@ class Stage2AdaptationModule(Stage2LightningModule):
             batch["feat"], batch["feat_lengths"], batch["anchor"]
         )
         labels = batch["label"].int()
+        roles = getattr(self, "_val_loader_roles", None)
+        if roles is not None:
+            role = roles[dataloader_idx]
+            if role == "target":
+                diagnostics = self.target_score_diagnostics
+            elif role in {"lph", "libriphrase"}:
+                diagnostics = self.score_diagnostics
+            elif role == "tts":
+                diagnostics = self.joint_score_diagnostics["tts"]
+            elif role.startswith("background:"):
+                source_id = role.split(":", 1)[1]
+                self._update_background_val(source_id, logits, batch)
+                if source_id == "musan" and "musan" in self.joint_score_diagnostics:
+                    self._update_score_diagnostics(
+                        self.joint_score_diagnostics["musan"],
+                        logits=logits,
+                        labels=labels,
+                        sample_ids=batch.get("sample_id"),
+                    )
+                return
+            else:
+                raise ValueError(
+                    f"unknown val loader role {role!r} at dataloader_idx={dataloader_idx}"
+                )
+            self._update_score_diagnostics(
+                diagnostics,
+                logits=logits,
+                labels=labels,
+                sample_ids=batch.get("sample_id"),
+            )
+            return
 
         if dataloader_idx == 0:
             self._update_score_diagnostics(
@@ -766,6 +826,7 @@ class Stage2AdaptationModule(Stage2LightningModule):
                 self.log(f"val/{name}_utt_loss", metrics["log_loss"], sync_dist=True)
                 metric.reset()
         self._log_train_window_metrics()
+        self._log_background_val_metrics()
 
         self.target_score_diagnostics.reset()
         self.score_diagnostics.reset()
@@ -1272,16 +1333,29 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     joint = phase == "joint"
     joint_cfg = adapt.get("joint", {}) or {}
     joint_manifests = {}
+    background_negative = stage2.get("background_negative", {}) or {}
+    from dma_kws.stage2.background_identity import (
+        assert_background_eval_list_compatible,
+        assert_background_resume_identity,
+        background_source_ids_from_sampler,
+        build_background_data_signature,
+        is_multisource_background,
+    )
+    assert_background_eval_list_compatible(background_negative, joint_cfg)
     if joint:
         from dma_kws.stage2.joint_manifest import (
             validate_joint_manifests,
             validate_background_eval_split,
+            validate_background_sources_identity,
         )
         joint_manifests = validate_joint_manifests(adapt_paths["data_root"])
-        validate_background_eval_split(
-            stage2.get("background_negative", {}) or {},
-            joint_cfg.get("background_eval_list", ""),
-        )
+        if is_multisource_background(background_negative):
+            validate_background_sources_identity(background_negative)
+        else:
+            validate_background_eval_split(
+                background_negative,
+                joint_cfg.get("background_eval_list", ""),
+            )
     train_manifest = joint_manifests.get("real_train", adapt_paths["train_manifest"])
     eval_manifest = joint_manifests.get("real_eval", adapt_paths["eval_manifest"])
     if joint:
@@ -1334,6 +1408,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             )
 
     resume_payload = None
+    background_signature = build_background_data_signature(config)
     if resume_path is not None:
         resume_payload = torch.load(resume_path, map_location="cpu")
         _validate_adapt_checkpoint_method(resume_payload, expected=method)
@@ -1341,6 +1416,11 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             resume_payload,
             stage2,
             source=resume_path,
+        )
+        assert_background_resume_identity(
+            resume_payload,
+            current_signature=background_signature,
+            current_config=config,
         )
 
     run_context = build_run_context(
@@ -1486,6 +1566,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     )
     lph_val_loader = _build_val_dataloader(config, tokenizer)
     val_loaders = [target_val_loader, lph_val_loader]
+    val_roles = ["target", "lph"]
     if joint:
         lph_val_loader = DataLoader(
             lph_val_loader.dataset, batch_size=lph_val_loader.batch_size,
@@ -1508,6 +1589,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             collate_fn=test_collate_fn, **val_loader_kwargs,
         )
         val_loaders = [target_val_loader, lph_val_loader, tts_val_loader]
+        val_roles = ["target", "lph", "tts"]
         if joint_cfg.get("background_eval_list"):
             from dma_kws.stage2.joint_validation import BackgroundValidationDataset
             bg_val_dataset = BackgroundValidationDataset(
@@ -1524,8 +1606,32 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 sampler=JointEvalSampler(bg_val_dataset), num_workers=val_num_workers,
                 collate_fn=test_collate_fn, **val_loader_kwargs,
             ))
-        elif is_primary_process:
+            val_roles.append("background:musan")
+        elif is_primary_process and not (
+            (background_negative.get("validation") or {}).get("enabled")
+        ):
             reporter.warn("Joint MUSAN validation is disabled: set adapt.joint.background_eval_list to a held-out list")
+
+    if (background_negative.get("validation") or {}).get("enabled"):
+        from dma_kws.stage2.joint_validation import build_background_validation_datasets
+
+        for role, dataset in build_background_validation_datasets(
+            background_negative,
+            anchor_seq=keyword_dataset._anchor_seq,
+            fbank_kwargs=fbank_kwargs(get_eval_fbank_config(config)),
+        ):
+            val_loaders.append(
+                DataLoader(
+                    dataset,
+                    batch_size=int(adapt.get("val_batch_size", batch_size)),
+                    shuffle=False,
+                    sampler=JointEvalSampler(dataset) if joint else None,
+                    num_workers=val_num_workers,
+                    collate_fn=test_collate_fn,
+                    **val_loader_kwargs,
+                )
+            )
+            val_roles.append(role)
 
     mix_ratio = float(adapt.get("mix_ratio", 0.5))
     if is_primary_process:
@@ -1606,6 +1712,12 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             restoring_full_checkpoint=resume_path is not None,
         )
 
+    model.configure_background_sources(
+        background_source_ids_from_sampler(libri_dataset._background_sampler)
+    )
+    model._background_data_signature = background_signature
+    model.set_val_loader_roles(val_roles)
+
     if accelerator == "gpu":
         torch.set_float32_matmul_precision("high")
 
@@ -1627,6 +1739,14 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
             "checkpoint_dir": str(checkpoint_dir),
             **({"joint_sampling_weights": json.dumps(train_dataset.weights, sort_keys=True),
                 "joint_data_signature": train_dataloader.data_signature} if joint else {}),
+            **(
+                {
+                    "background_data_signature_version": 2,
+                    "background_data_signature": background_signature,
+                }
+                if background_signature
+                else {}
+            ),
         },
     )
     if is_primary_process:
