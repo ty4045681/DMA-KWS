@@ -9,6 +9,23 @@ functions, matching the scripts' "friendly SystemExit on ImportError" pattern.
 from __future__ import annotations
 
 
+def _load_audio_soundfile(path):
+    """Load a file with soundfile when torchaudio needs an optional decoder."""
+
+    try:
+        import numpy as np
+        import soundfile as sf
+        import torch
+    except ImportError as exc:
+        raise SystemExit(
+            "Missing soundfile. Install it with: pip install soundfile"
+        ) from exc
+
+    data, sr = sf.read(str(path), always_2d=True, dtype="float32")
+    waveform = torch.from_numpy(np.ascontiguousarray(data.T))
+    return waveform, int(sr)
+
+
 def load_audio(path, *, sample_rate: int):
     """Load ``path`` and return ``(waveform, sample_rate)`` as mono at ``sample_rate``.
 
@@ -22,7 +39,12 @@ def load_audio(path, *, sample_rate: int):
             "Missing torch/torchaudio. Install CUDA PyTorch on the remote training machine first."
         ) from exc
 
-    waveform, sr = torchaudio.load(path)
+    try:
+        waveform, sr = torchaudio.load(path)
+    except ImportError:
+        # torchaudio 2.10+ may route load() through torchcodec, which is not
+        # part of the core inference extras. Soundfile can still read WAV.
+        waveform, sr = _load_audio_soundfile(path)
     if waveform.size(0) > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     if sr != sample_rate:

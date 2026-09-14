@@ -32,7 +32,28 @@ __all__ = [
     "Stage2ClipRunner",
     "collate_clip_feature_batch",
     "parse_phoneme_sequence",
+    "resolve_clip_audio_padding_ms",
 ]
+
+
+def resolve_clip_audio_padding_ms(
+    prep: Mapping[str, Any],
+    stage2: Mapping[str, Any] | None = None,
+) -> tuple[int, int]:
+    """Resolve clip-eval waveform padding, matching ``eval_stage2_clips``.
+
+    Version 6 defaults to 160 ms per side via ``default_clip_padding_ms``;
+    other readout versions stay unpadded unless ``prep`` overrides a side.
+    """
+
+    from dma_kws.stage2.readout import default_clip_padding_ms
+
+    default = default_clip_padding_ms(stage2 or {})
+    left_padding_ms = int(prep.get("left_padding_ms", default))
+    right_padding_ms = int(prep.get("right_padding_ms", default))
+    if left_padding_ms < 0 or right_padding_ms < 0:
+        raise SystemExit("prep.left_padding_ms and prep.right_padding_ms must be >= 0")
+    return left_padding_ms, right_padding_ms
 
 
 def parse_phoneme_sequence(

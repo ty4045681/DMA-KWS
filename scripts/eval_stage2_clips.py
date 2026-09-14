@@ -56,7 +56,10 @@ from dma_kws.inference.manifest import load_keyword_set_manifest, load_manifest
 from dma_kws.pathing import resolve_dict_path
 from dma_kws.inference.metrics import summarize_labeled_results
 from dma_kws.inference.musan_mix import MusanWaveformMixer
-from dma_kws.inference.stage2_clip import Stage2ClipRunner
+from dma_kws.inference.stage2_clip import (
+    Stage2ClipRunner,
+    resolve_clip_audio_padding_ms as _resolve_audio_padding_ms,
+)
 from dma_kws.inference.stage2_reporting import (
     build_keyword_set_result_record as _keyword_set_result_record,
     build_result_record as _result_record,
@@ -65,9 +68,6 @@ from dma_kws.inference.stage2_reporting import (
 from dma_kws.inference.waveform_augmentation import WaveformAugmentationPipeline
 from dma_kws.training.device import resolve_accelerator
 from dma_kws.training.score_diagnostics import binary_score_diagnostics
-
-
-DEFAULT_PADDING_MS = 0
 
 
 def _metrics_record(record: dict) -> dict:
@@ -115,20 +115,6 @@ def _score_head_diagnostics(
             item = None
         result[name] = item
     return result
-
-
-def _resolve_audio_padding_ms(
-    prep: dict,
-    stage2: dict | None = None,
-) -> tuple[int, int]:
-    from dma_kws.stage2.readout import default_clip_padding_ms
-
-    default = default_clip_padding_ms(stage2 or {})
-    left_padding_ms = int(prep.get("left_padding_ms", default))
-    right_padding_ms = int(prep.get("right_padding_ms", default))
-    if left_padding_ms < 0 or right_padding_ms < 0:
-        raise SystemExit("prep.left_padding_ms and prep.right_padding_ms must be >= 0")
-    return left_padding_ms, right_padding_ms
 
 
 def run_eval(cfg: DictConfig) -> dict:

@@ -190,6 +190,26 @@ recursive: true
 manifest_format: auto
 label: ""
 
+# Pooling v4.1 sink-attention diagnostics for scripts/diagnose_qbyt_sink.py.
+# Other entries ignore this namespace. That entry merges these defaults and
+# rejects unknown keys. Use ++prep.sink_diagnostics when an old saved config
+# does not yet contain the block.
+sink_diagnostics:
+  mode: clips
+  capture_layers: all
+  capture_heads: all
+  save_traces: true
+  save_full_attention: false
+  ablations: [block_sink_all, block_sink_each_layer]
+  max_combined_tokens: 1024
+  max_attention_bytes: 268435456
+  parity_atol: 0.00001
+  parity_rtol: 0.0001
+  max_report_samples: 40
+  plot_dpi: 160
+  length_bins: [0, 100, 200, 400, 800]
+  group_field: condition
+
 recompute_distances:
   input_parquet: ""
   output_parquet: ""

@@ -1,7 +1,8 @@
 """Temporary-hook capture of pooling QbyT ``nn.MultiheadAttention`` weights.
 
 This module does not copy the Transformer forward and does not change QbyT
-parameters, buffers, or ``state_dict`` keys. Capture is CPU float32 eager only.
+parameters, buffers, or ``state_dict`` keys. Capture is eval float32 eager on
+the live module device (CPU or CUDA) with autocast disabled.
 """
 
 from __future__ import annotations
@@ -145,7 +146,7 @@ def capture_pooling_attention(
 ) -> list[SampleAttentionTrace]:
     """Run one pooling QbyT forward and slice per-sample attention traces."""
 
-    _require_eval_cpu_fp32(qbyt, speech, anchors)
+    _require_eval_fp32(qbyt, speech, anchors)
     if qbyt.sink_token is None:
         raise ValueError(
             "capture_pooling_attention requires a pooling QbyT with sink_token=True"
@@ -285,14 +286,12 @@ def capture_pooling_attention(
             _MODELS_IN_CAPTURE.discard(qbyt)
 
 
-def _require_eval_cpu_fp32(qbyt, speech, anchors) -> None:
+def _require_eval_fp32(qbyt, speech, anchors) -> None:
     if qbyt.training:
         raise RuntimeError(
             "capture_pooling_attention requires the model to already be in eval(); "
             "refusing to call eval() on a training-mode QbyT"
         )
-    if speech.device.type != "cpu" or anchors.device.type != "cpu":
-        raise ValueError("capture_pooling_attention supports CPU tensors only")
     if speech.dtype != torch.float32:
         raise ValueError(
             f"capture_pooling_attention requires float32 speech, got {speech.dtype}"
@@ -301,15 +300,31 @@ def _require_eval_cpu_fp32(qbyt, speech, anchors) -> None:
         param = next(qbyt.parameters())
     except StopIteration as exc:
         raise ValueError("capture_pooling_attention requires a parameterized QbyT") from exc
-    if param.device.type != "cpu" or param.dtype != torch.float32:
+    if param.dtype != torch.float32:
         raise ValueError(
-            "capture_pooling_attention requires a CPU float32 QbyT, got "
-            f"device={param.device} dtype={param.dtype}"
+            "capture_pooling_attention requires a float32 QbyT, got "
+            f"dtype={param.dtype}"
         )
-    if torch.is_autocast_enabled():
+    if speech.device != param.device or anchors.device != param.device:
+        raise ValueError(
+            "capture_pooling_attention requires speech and anchors on the QbyT "
+            f"device, got module={param.device} speech={speech.device} "
+            f"anchors={anchors.device}"
+        )
+    if _autocast_enabled():
         raise RuntimeError(
             "capture_pooling_attention does not support autocast; use FP32 eager"
         )
+
+
+def _autocast_enabled() -> bool:
+    if torch.is_autocast_enabled():
+        return True
+    try:
+        return bool(torch.is_autocast_enabled("cpu"))
+    except TypeError:
+        cpu_enabled = getattr(torch, "is_autocast_cpu_enabled", None)
+        return bool(callable(cpu_enabled) and cpu_enabled())
 
 
 def _matcher_geometry(qbyt) -> tuple[int, int]:
@@ -354,7 +369,7 @@ def _as_cpu_lengths(
     width: int,
     name: str,
 ) -> torch.Tensor:
-    tensor = torch.as_tensor(lengths, dtype=torch.long, device="cpu")
+    tensor = torch.as_tensor(lengths).detach().to(device="cpu", dtype=torch.long)
     if tensor.ndim != 1 or tensor.numel() != batch_size:
         raise ValueError(
             f"{name} must have shape ({batch_size},), got {tuple(tensor.shape)}"
