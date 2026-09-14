@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 import math
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -64,6 +65,21 @@ RUN_SCHEMA_VERSION = 1
 _BYTES_PER_FLOAT32 = 4
 _ATTENTION_TEMP_FACTOR = 4
 _TOOL_MARKERS = ("run.json", "summary.json")
+_PARTIAL_DIRNAME = ".partial"
+_MANIFEST_GROUP_FIELDS = frozenset(
+    {
+        "audio_path",
+        "keyword",
+        "label",
+        "keyword_phonemes",
+        "sample_id",
+        "condition",
+        "pair_id",
+        "keyword_spans",
+        "noise_spans",
+        "pronunciation_id",
+    }
+)
 
 SINK_DIAGNOSTICS_DEFAULTS: dict[str, Any] = {
     "mode": "clips",
@@ -168,9 +184,12 @@ class SampleOutcome:
     prepared: PreparedSample
     status: str
     skip_reason: str | None
-    diagnostics: SampleAttentionDiagnostics | None = None
-    conditions: list[SinkAblationResult] = field(default_factory=list)
+    normal_qbyt_score: float | None = None
+    normal_detected: bool | None = None
     trace_paths: dict[str, str] = field(default_factory=dict)
+    record_rows: list[dict[str, str]] = field(default_factory=list)
+    metric_rows: list[dict[str, str]] = field(default_factory=list)
+    position_rows: list[dict[str, str]] = field(default_factory=list)
 
 
 def resolve_diagnostic_batch_size(prep: Mapping[str, Any]) -> int:
@@ -500,6 +519,15 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
         path,
         json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
     )
+
+
+def _append_jsonl(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def _write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str, str]]) -> None:
@@ -888,6 +916,64 @@ def _scored_record(
     }
 
 
+def _materialize_scored_sample(
+    *,
+    run_id: str,
+    prepared: PreparedSample,
+    sample: SampleAttentionDiagnostics,
+    trace_paths: Mapping[str, str],
+) -> SampleOutcome:
+    """Copy scalars/CSV rows out of capture results and drop tensor handles."""
+
+    conditions = [sample.normal, *sample.ablations]
+    record_rows: list[dict[str, str]] = []
+    metric_rows: list[dict[str, str]] = []
+    position_rows: list[dict[str, str]] = []
+    for result in conditions:
+        record_rows.append(
+            _scored_record(
+                run_id=run_id,
+                prepared=prepared,
+                result=result,
+                trace_path=trace_paths.get(result.spec.name, ""),
+            )
+        )
+        metric_rows.extend(
+            _metrics_rows(
+                run_id=run_id,
+                sample_id=prepared.row.sample_id,
+                result=result,
+            )
+        )
+        position_rows.extend(
+            _position_rows(
+                run_id=run_id,
+                sample_id=prepared.row.sample_id,
+                result=result,
+                phonemes=prepared.phonemes,
+            )
+        )
+    outcome = SampleOutcome(
+        prepared=prepared,
+        status="ok",
+        skip_reason=None,
+        normal_qbyt_score=float(sample.normal_qbyt_score),
+        normal_detected=bool(sample.normal.detected),
+        trace_paths=dict(trace_paths),
+        record_rows=record_rows,
+        metric_rows=metric_rows,
+        position_rows=position_rows,
+    )
+    del conditions
+    return outcome
+
+
+def _persist_sample_partial(partial_dir: Path, outcome: SampleOutcome) -> None:
+    _append_jsonl(partial_dir / "records.jsonl", outcome.record_rows)
+    _append_jsonl(partial_dir / "attention_metrics.jsonl", outcome.metric_rows)
+    _append_jsonl(partial_dir / "position_scores.jsonl", outcome.position_rows)
+
+
 def _select_report_samples(
     outcomes: Sequence[SampleOutcome], *, max_report_samples: int
 ) -> set[str]:
@@ -906,12 +992,12 @@ def _select_report_samples(
         return True
 
     for outcome in outcomes:
-        if outcome.status != "ok" or outcome.diagnostics is None:
+        if outcome.status != "ok" or outcome.normal_detected is None:
             continue
         label = outcome.prepared.row.label
         if label is None:
             continue
-        if bool(outcome.diagnostics.normal.detected) != bool(label):
+        if bool(outcome.normal_detected) != bool(label):
             add(outcome.prepared.row.sample_id)
 
     groups: dict[str, list[SampleOutcome]] = {}
@@ -958,9 +1044,9 @@ def _pair_rows(outcomes: Sequence[SampleOutcome]) -> list[dict[str, str]]:
         reason = members[0].prepared.row.pair_reason
         normal_scores: dict[str, float | None] = {}
         for member in members:
-            if member.status == "ok" and member.diagnostics is not None:
+            if member.status == "ok" and member.normal_qbyt_score is not None:
                 normal_scores[member.prepared.row.sample_id] = float(
-                    member.diagnostics.normal_qbyt_score
+                    member.normal_qbyt_score
                 )
             else:
                 normal_scores[member.prepared.row.sample_id] = None
@@ -1037,25 +1123,35 @@ def _pair_stats(outcomes: Sequence[SampleOutcome]) -> dict[str, int]:
     }
 
 
+def _group_value(row: AttentionManifestRow, group_field: str) -> str:
+    """Return the grouping key for a validated row.
+
+    First-class diagnostic columns live on the row, not in ``extra_fields``.
+    Missing/empty values follow the condition default of ``\"unknown\"``.
+    """
+
+    if group_field == "label":
+        return "unlabeled" if row.label is None else str(int(row.label))
+    if group_field in _MANIFEST_GROUP_FIELDS:
+        value = getattr(row, group_field)
+    else:
+        value = row.extra_fields.get(group_field)
+    if value is None or value == "":
+        return "unknown"
+    if isinstance(value, (list, tuple, dict)):
+        return _csv_json(value)
+    return str(value)
+
+
 def _group_metrics(outcomes: Sequence[SampleOutcome], *, group_field: str) -> dict[str, Any]:
     buckets: dict[str, list[float]] = {}
     labeled: dict[str, int] = {}
     for outcome in outcomes:
-        if group_field == "condition":
-            key = outcome.prepared.row.condition
-        elif group_field == "label":
-            key = (
-                "unlabeled"
-                if outcome.prepared.row.label is None
-                else str(int(outcome.prepared.row.label))
-            )
-        else:
-            extra = outcome.prepared.row.extra_fields
-            key = str(extra.get(group_field, "unknown"))
-        if outcome.status != "ok" or outcome.diagnostics is None:
+        key = _group_value(outcome.prepared.row, group_field)
+        if outcome.status != "ok" or outcome.normal_qbyt_score is None:
             buckets.setdefault(key, [])
             continue
-        buckets.setdefault(key, []).append(float(outcome.diagnostics.normal_qbyt_score))
+        buckets.setdefault(key, []).append(float(outcome.normal_qbyt_score))
         if outcome.prepared.row.label is not None:
             labeled[key] = labeled.get(key, 0) + 1
     metrics = {}
@@ -1229,6 +1325,7 @@ def _write_outputs(
     _atomic_write_json(output_dir / "run.json", run_payload)
     _atomic_write_json(output_dir / "summary.json", summary)
     _write_report_html(output_dir / "report.html", run_id=run_id, summary=summary)
+    shutil.rmtree(output_dir / _PARTIAL_DIRNAME, ignore_errors=True)
 
 
 def run_diagnose(cfg: DictConfig) -> dict:
@@ -1417,8 +1514,11 @@ def run_diagnose(cfg: DictConfig) -> dict:
         raise SystemExit(str(exc)) from exc
 
     prepared_waveforms: dict[int, tuple[Any, int]] = {}
+    partial_dir = output_dir / _PARTIAL_DIRNAME
 
     def _observer(index: int, waveform, sample_rate: int) -> None:
+        if not sink["save_traces"]:
+            return
         prepared_waveforms[index] = (
             waveform.detach().cpu().contiguous().clone(),
             int(sample_rate),
@@ -1430,11 +1530,25 @@ def run_diagnose(cfg: DictConfig) -> dict:
     status = "complete"
 
     def _skip_outcome(prepared: PreparedSample, reason: str) -> SampleOutcome:
-        return SampleOutcome(
+        outcome = SampleOutcome(
             prepared=prepared,
             status="skipped",
             skip_reason=reason,
+            record_rows=[
+                _skipped_record(
+                    run_id=run_id,
+                    prepared=prepared,
+                    ablation=spec.name,
+                    blocked_layers=spec.blocked_layers,
+                    skip_reason=reason,
+                )
+                for spec in ablation_catalog
+            ],
         )
+        _persist_sample_partial(partial_dir, outcome)
+        prepared.feat = None
+        prepared_waveforms.pop(prepared.row.record_number - 2, None)
+        return outcome
 
     if prepared_by_index:
         from torch.utils.data import DataLoader
@@ -1526,11 +1640,10 @@ def run_diagnose(cfg: DictConfig) -> dict:
                                 what="qbyt_score",
                                 sample_id=prepared.row.sample_id,
                             )
+                        sample_index = prepared.row.record_number - 2
                         trace_paths: dict[str, str] = {}
                         if sink["save_traces"]:
-                            waveform_pack = prepared_waveforms.get(
-                                prepared.row.record_number - 2
-                            )
+                            waveform_pack = prepared_waveforms.get(sample_index)
                             for result in conditions:
                                 rel = (
                                     Path("traces")
@@ -1548,15 +1661,19 @@ def run_diagnose(cfg: DictConfig) -> dict:
                                 )
                                 _save_npz(output_dir / rel, payload)
                                 trace_paths[result.spec.name] = str(rel).replace("\\", "/")
-                        outcomes[prepared.row.record_number - 2] = SampleOutcome(
+                        outcome = _materialize_scored_sample(
+                            run_id=run_id,
                             prepared=prepared,
-                            status="ok",
-                            skip_reason=None,
-                            diagnostics=sample,
-                            conditions=conditions,
+                            sample=sample,
                             trace_paths=trace_paths,
                         )
+                        _persist_sample_partial(partial_dir, outcome)
+                        outcomes[sample_index] = outcome
                         prepared.feat = None
+                        prepared_waveforms.pop(sample_index, None)
+                        del conditions
+                        del sample
+                    del diagnostics
                     if status == "failed":
                         break
                 if status == "failed":
@@ -1587,44 +1704,12 @@ def run_diagnose(cfg: DictConfig) -> dict:
     position_rows: list[dict[str, str]] = []
     for outcome in finalized:
         report_flag = "true" if outcome.prepared.row.sample_id in selected else "false"
-        if outcome.status != "ok" or outcome.diagnostics is None:
-            reason = outcome.skip_reason or "skipped"
-            for spec in ablation_catalog:
-                row = _skipped_record(
-                    run_id=run_id,
-                    prepared=outcome.prepared,
-                    ablation=spec.name,
-                    blocked_layers=spec.blocked_layers,
-                    skip_reason=reason,
-                )
-                row["report_selected"] = report_flag
-                record_rows.append(row)
-            continue
-        for result in outcome.conditions:
-            trace_path = outcome.trace_paths.get(result.spec.name, "")
-            row = _scored_record(
-                run_id=run_id,
-                prepared=outcome.prepared,
-                result=result,
-                trace_path=trace_path,
-            )
-            row["report_selected"] = report_flag
-            record_rows.append(row)
-            metric_rows.extend(
-                _metrics_rows(
-                    run_id=run_id,
-                    sample_id=outcome.prepared.row.sample_id,
-                    result=result,
-                )
-            )
-            position_rows.extend(
-                _position_rows(
-                    run_id=run_id,
-                    sample_id=outcome.prepared.row.sample_id,
-                    result=result,
-                    phonemes=outcome.prepared.phonemes,
-                )
-            )
+        for row in outcome.record_rows:
+            patched = dict(row)
+            patched["report_selected"] = report_flag
+            record_rows.append(patched)
+        metric_rows.extend(outcome.metric_rows)
+        position_rows.extend(outcome.position_rows)
 
     pair_rows = _pair_rows(finalized)
     num_input = len(finalized)

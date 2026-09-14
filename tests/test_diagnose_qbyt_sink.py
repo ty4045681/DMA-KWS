@@ -659,3 +659,156 @@ def test_missing_audio_fails_the_run(tmp_path, monkeypatch, install_runner):
     )
     with pytest.raises(SystemExit, match="audio|not found|No such"):
         _run_diagnose(monkeypatch, _cfg(tmp_path, manifest=manifest))
+
+
+def test_group_value_reads_known_columns_not_only_extra_fields(tmp_path):
+    import scripts.diagnose_qbyt_sink as diagnose
+    from dma_kws.inference.manifest import load_manifest
+    from dma_kws.inference.qbyt_attention_manifest import (
+        validate_attention_manifest_rows,
+    )
+
+    manifest = _write_csv(
+        tmp_path / "groups.csv",
+        "audio_path,keyword,label,sample_id,condition,pair_id,pronunciation_id,note",
+        "a.wav,hey eva,1,clean_001,clean,p001,prA,keep-extra",
+        "b.wav,ok google,0,noisy_001,noisy,p001,prB,keep-extra",
+        "c.wav,hey eva,1,solo_001,clean,,,keep-extra",
+    )
+    rows = validate_attention_manifest_rows(load_manifest(manifest))
+    assert "keyword" not in rows[0].extra_fields
+    assert "pair_id" not in rows[0].extra_fields
+    assert rows[0].extra_fields["note"] == "keep-extra"
+    assert diagnose._group_value(rows[0], "keyword") == "hey eva"
+    assert diagnose._group_value(rows[1], "keyword") == "ok google"
+    assert diagnose._group_value(rows[0], "pair_id") == "p001"
+    assert diagnose._group_value(rows[0], "pronunciation_id") == "prA"
+    assert diagnose._group_value(rows[0], "sample_id") == "clean_001"
+    assert diagnose._group_value(rows[0], "condition") == "clean"
+    assert diagnose._group_value(rows[0], "label") == "1"
+    assert diagnose._group_value(rows[2], "pair_id") == "unknown"
+    assert diagnose._group_value(rows[0], "note") == "keep-extra"
+
+
+def test_group_field_keyword_and_pair_id_appear_in_summary(
+    tmp_path, monkeypatch, install_runner
+):
+    wav_a = _write_wav(tmp_path / "a.wav", 1.0)
+    wav_b = _write_wav(tmp_path / "b.wav", 1.0)
+    manifest = _write_csv(
+        tmp_path / "manifest.csv",
+        "audio_path,keyword,label,sample_id,condition,pair_id",
+        f"{wav_a.name},hey eva,1,clean_001,clean,p001",
+        f"{wav_b.name},ok google,0,other_001,noisy,p002",
+    )
+    keyword_summary = _run_diagnose(
+        monkeypatch,
+        _cfg(
+            tmp_path,
+            manifest=manifest,
+            output_dir=str(tmp_path / "by_keyword"),
+            sink=_sink_defaults(group_field="keyword", ablations=[]),
+        ),
+    )
+    assert set(keyword_summary["group_metrics"]) == {"hey eva", "ok google"}
+    assert all(entry["n"] == 1 for entry in keyword_summary["group_metrics"].values())
+    assert not (tmp_path / "by_keyword" / ".partial").exists()
+
+    pair_summary = _run_diagnose(
+        monkeypatch,
+        _cfg(
+            tmp_path,
+            manifest=manifest,
+            output_dir=str(tmp_path / "by_pair"),
+            sink=_sink_defaults(group_field="pair_id", ablations=[]),
+        ),
+    )
+    assert set(pair_summary["group_metrics"]) == {"p001", "p002"}
+
+
+def test_materialize_scored_sample_drops_capture_tensors():
+    import scripts.diagnose_qbyt_sink as diagnose
+    from dma_kws.inference.qbyt_attention_diagnostics import (
+        SampleAttentionDiagnostics,
+        SampleAttentionTrace,
+        SinkAblationResult,
+        SinkAblationSpec,
+    )
+    from dma_kws.inference.qbyt_attention_manifest import AttentionManifestRow
+
+    text_len, audio_len = 2, 3
+    trace = SampleAttentionTrace(
+        layer_ids=(0,),
+        head_ids=(0, 1),
+        audio_to_sink=torch.rand(1, 2, audio_len),
+        text_to_sink=torch.rand(1, 2, text_len),
+        text_to_audio=torch.rand(1, 2, text_len, audio_len),
+        position_logits=torch.tensor([0.2, -0.1]),
+        raw_logit=0.5,
+        text_length=text_len,
+        audio_length=audio_len,
+        sink_index=text_len,
+        row_sum_max_error=0.0,
+        padding_mass_max=0.0,
+    )
+    spec = SinkAblationSpec(name="normal")
+    result = SinkAblationResult(
+        spec=spec,
+        trace=trace,
+        raw_logit=0.5,
+        qbyt_score=0.6,
+        threshold=0.5,
+        detected=True,
+        delta_raw_logit=0.0,
+        delta_qbyt_score=0.0,
+        delta_position_logits=torch.zeros(text_len),
+    )
+    sample = SampleAttentionDiagnostics(
+        normal_raw_logit=0.5,
+        normal_qbyt_score=0.6,
+        threshold=0.5,
+        normal=result,
+        ablations=(),
+    )
+    row = AttentionManifestRow(
+        audio_path="/tmp/a.wav",
+        keyword="hey eva",
+        label=1,
+        keyword_phonemes=None,
+        phoneme_override=None,
+        sample_id="s1",
+        internal_sample_id="s1_abc",
+        condition="clean",
+        pair_id="p001",
+        keyword_spans=None,
+        noise_spans=None,
+        pronunciation_id="prA",
+        pair_status="ok",
+        pair_reason=None,
+        record_number=2,
+        extra_fields={},
+    )
+    prepared = diagnose.PreparedSample(
+        row=row,
+        raw_row={"audio_path": row.audio_path, "keyword": row.keyword},
+        phonemes=["HH", "EY1"],
+        token_ids=[1, 2],
+        query_id="[1,2]",
+        source_duration_sec=1.0,
+    )
+    outcome = diagnose._materialize_scored_sample(
+        run_id="run",
+        prepared=prepared,
+        sample=sample,
+        trace_paths={"normal": "traces/s1__normal.npz"},
+    )
+    assert not hasattr(outcome, "diagnostics") or outcome.__dict__.get("diagnostics") is None
+    assert outcome.conditions == [] if hasattr(outcome, "conditions") else True
+    assert "diagnostics" not in outcome.__dataclass_fields__
+    assert "conditions" not in outcome.__dataclass_fields__
+    assert outcome.normal_qbyt_score == pytest.approx(0.6)
+    assert outcome.normal_detected is True
+    assert outcome.record_rows[0]["ablation"] == "normal"
+    assert outcome.metric_rows
+    assert outcome.position_rows
+    assert all("audio_to_sink" not in row for row in outcome.record_rows)
