@@ -953,6 +953,7 @@ def _materialize_scored_sample(
     sample: SampleAttentionDiagnostics,
     trace_paths: Mapping[str, str],
     time_axis=None,
+    num_fbank_frames: int | None = None,
 ) -> SampleOutcome:
     """Copy scalars/CSV rows out of capture results and drop tensor handles."""
 
@@ -963,6 +964,8 @@ def _materialize_scored_sample(
     axis_payload: dict[str, Any] = {}
     if time_axis is not None:
         axis_payload = time_axis.as_dict()
+        if num_fbank_frames is not None:
+            axis_payload["num_fbank_frames"] = int(num_fbank_frames)
         if time_axis.status == "ok":
             _noise, _outside, intervals = noise_region_masks(
                 time_axis, prepared.row.noise_spans
@@ -1794,6 +1797,7 @@ def run_diagnose(cfg: DictConfig) -> dict:
                             sample=sample,
                             trace_paths=trace_paths,
                             time_axis=time_axis,
+                            num_fbank_frames=num_fbank,
                         )
                         _persist_sample_partial(partial_dir, outcome)
                         outcomes[sample_index] = outcome

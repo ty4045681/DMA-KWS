@@ -11,6 +11,7 @@ import pytest
 
 from dma_kws.inference.qbyt_attention_report import (
     FbankTimeSpec,
+    SampleTimeAxis,
     assemble_text_key_heatmap,
     build_sample_time_axis,
     fbank_frame_center_sec,
@@ -20,6 +21,8 @@ from dma_kws.inference.qbyt_attention_report import (
     pair_time_grids_comparable,
     region_stats,
     render_sink_attention_report,
+    _axis_for_sample,
+    _sample_title,
 )
 
 
@@ -353,9 +356,9 @@ def test_noise_span_union_and_empty_interval_is_missing_not_zero():
     stats_outside = region_stats(values, outside)
     assert stats_noise["query_count"] > 0
     assert stats_outside["query_count"] > 0
-    # Overlapping [0.05,0.12] and [0.08,0.15] must not double-count.
+    # Overlapping [0.05,0.12) and [0.08,0.15) must not double-count; end is exclusive.
     assert int(noise.sum()) == int(
-        ((axis.centers_source_sec >= 0.05) & (axis.centers_source_sec <= 0.15) & ~axis.is_padding).sum()
+        ((axis.centers_source_sec >= 0.05) & (axis.centers_source_sec < 0.15) & ~axis.is_padding).sum()
     )
     empty = next(item for item in intervals if item["end"] == 0.001)
     assert empty["valid_frame_count"] == 0
@@ -482,10 +485,14 @@ def _write_minimal_run(
             "keyword_spans": [[0.04, 0.12]],
             "noise_spans": [[0.0, 0.03]] if index % 2 else [],
             "time_axis_status": time_axis_status,
+            "num_fbank_frames": audio_length,
             "query_id": "[1,2]",
             "token_ids": [1, 2],
             "phonemes": ["HH", "EY1"],
         }
+        if time_axis_status != "ok":
+            samples_meta[sample_id]["centers_source_sec"] = []
+            samples_meta[sample_id]["status"] = "ok"
         for layer in (0, 1):
             for head in (0, 1):
                 metrics.append(
@@ -772,3 +779,193 @@ def test_cli_empty_and_skipped_still_write_html(tmp_path, monkeypatch, install_r
     skipped_html = (tmp_path / "skipped" / "report.html").read_text(encoding="utf-8")
     assert skipped_html
     assert "https://" not in skipped_html
+
+
+def test_span_inclusion_is_half_open_at_end():
+    n = 4
+    centers = np.array([0.05, 0.10, 0.15, 0.20])
+    axis = SampleTimeAxis(
+        status="ok",
+        method="test",
+        centers_source_sec=centers,
+        is_padding=np.zeros(n, dtype=bool),
+        is_left_padding=np.zeros(n, dtype=bool),
+        is_right_padding=np.zeros(n, dtype=bool),
+        fbank_support=np.stack([np.arange(n), np.arange(n)], axis=1),
+        encoder_frame_index=np.arange(n),
+        source_duration_sec=0.3,
+    )
+    noise, _outside, intervals = noise_region_masks(axis, ((0.05, 0.15),))
+    assert noise.tolist() == [True, True, False, False]
+    assert intervals[0]["valid_frame_count"] == 2
+
+
+def test_unavailable_stored_axis_is_not_rebuilt_from_run_encoder():
+    live = SampleTimeAxis.unavailable(8)
+    meta = live.as_dict()
+    meta["audio_length"] = 8
+    meta["time_axis_status"] = "unavailable"
+    meta["status"] = "ok"
+    meta["num_fbank_frames"] = 8
+    axis = _axis_for_sample(
+        "s1",
+        records=[{"audio_length": "8"}],
+        meta=meta,
+        encoder_map=inspect_encoder_time_map(_IdentityEncoder()),
+        fbank=_fbank(),
+        left_padding_ms=0,
+        right_padding_ms=0,
+        fallback_status="ok",
+    )
+    assert axis.status == "unavailable"
+    assert axis.encoder_frame_index.tolist() == list(range(8))
+
+    empty_centers = {
+        "centers_source_sec": [],
+        "status": "ok",
+        "audio_length": 8,
+        "num_fbank_frames": 99,
+    }
+    rebuilt = _axis_for_sample(
+        "s2",
+        records=[{"audio_length": "8"}],
+        meta=empty_centers,
+        encoder_map=inspect_encoder_time_map(_IdentityEncoder()),
+        fbank=_fbank(),
+        left_padding_ms=0,
+        right_padding_ms=0,
+        fallback_status="ok",
+    )
+    assert rebuilt.status == "unavailable"
+
+
+def test_sample_title_includes_phonemes_readout_and_threshold():
+    title = _sample_title(
+        {
+            "sample_id": "id_a",
+            "keyword": "hey eva",
+            "keyword_phonemes": "HH EY1 IY1 V AH0",
+            "condition": "clean",
+            "label": "1",
+            "qbyt_score": "0.6",
+            "threshold": "0.5",
+        },
+        {"readout_spec": '{"mode":"eps_softmin","sink_token":true,"version":4}'},
+    )
+    assert "id_a" in title
+    assert "hey eva" in title
+    assert "HH EY1 IY1 V AH0" in title
+    assert "clean" in title
+    assert "label=1" in title
+    assert "0.6" in title
+    assert "threshold=0.5" in title
+    assert "eps_softmin" in title
+
+
+def test_pair_delta_uses_internal_sample_id_when_trace_path_empty(tmp_path):
+    out = tmp_path / "pair_run"
+    partial = out / ".partial" / "traces"
+    partial.mkdir(parents=True)
+    waveform = np.zeros((1, 3200), dtype=np.float32)
+    audio_length = 20
+    samples = [
+        ("clean_001", "clean_xx", "clean"),
+        ("noisy_001", "noisy_yy", "noisy"),
+    ]
+    records = []
+    metrics = []
+    samples_meta = {}
+    for sample_id, internal, condition in samples:
+        _npz_trace(
+            partial / f"{internal}__normal.npz",
+            audio_length=audio_length,
+            waveform=waveform,
+        )
+        records.append(
+            _record(
+                sample_id=sample_id,
+                condition=condition,
+                pair_id="p001",
+                report_selected="true",
+                trace_path="",
+                audio_length=str(audio_length),
+                label="1",
+            )
+        )
+        samples_meta[sample_id] = {
+            "internal_sample_id": internal,
+            "source_duration_sec": 0.2,
+            "source_sample_rate": 16000,
+            "model_sample_rate": 16000,
+            "audio_length": audio_length,
+            "text_length": 2,
+            "keyword_spans": [],
+            "noise_spans": [[0.0, 0.03]] if condition == "noisy" else [],
+            "time_axis_status": "ok",
+            "num_fbank_frames": audio_length,
+            "query_id": "[1,2]",
+            "token_ids": [1, 2],
+            "phonemes": ["HH", "EY1"],
+        }
+        for layer in (0, 1):
+            for head in (0, 1):
+                metrics.append(
+                    {
+                        "run_id": "run_test",
+                        "sample_id": sample_id,
+                        "ablation": "normal",
+                        "layer": str(layer),
+                        "head": str(head),
+                        "region": "audio",
+                        "mean": "0.25",
+                        "min": "0.2",
+                        "max": "0.3",
+                        "query_count": str(audio_length),
+                        "key_count": "1",
+                        "row_sum_error": "0.0",
+                    }
+                )
+    run = _base_run_payload(
+        samples=samples_meta,
+        report_selected=["clean_001", "noisy_001"],
+        sink_diagnostics={
+            "max_report_samples": 40,
+            "plot_dpi": 72,
+            "length_bins": [0, 100, 200, 400, 800],
+            "group_field": "condition",
+            "save_traces": False,
+        },
+    )
+    pairs = [
+        {
+            "baseline_sample_id": "clean_001",
+            "variant_sample_id": "noisy_001",
+            "match_key": '{"keyword":"hey eva"}',
+            "pair_status": "ok",
+            "normal_score_delta": "0.0",
+            "time_grid_comparable": "true",
+            "pair_reason": "",
+        }
+    ]
+    summary = {
+        "status": "complete",
+        "run_id": "run_test",
+        "num_input": 2,
+        "num_success": 2,
+        "num_skipped": 0,
+        "num_fail": 0,
+        "num_unlabeled": 0,
+        "pairs": {"n_pair_ids": 1, "n_ok": 1},
+        "group_metrics": {},
+        "output_index": {"report_html": "report.html", "figures_dir": "figures"},
+    }
+    _write_csv(out / "records.csv", RECORDS_FIELDS, records)
+    _write_csv(out / "attention_metrics.csv", METRICS_FIELDS, metrics)
+    _write_csv(out / "position_scores.csv", POSITION_FIELDS, [])
+    _write_csv(out / "pairs.csv", PAIR_FIELDS, pairs)
+    (out / "run.json").write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+    (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    result = render_sink_attention_report(out)
+    deltas = list((out / "figures").rglob("pair_delta_*.png"))
+    assert deltas
+    assert not any("missing traces" in item for item in result["skipped_plots"])

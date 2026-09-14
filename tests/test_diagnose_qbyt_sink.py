@@ -649,6 +649,8 @@ def test_t14_csv_quoting_npz_json_finite_and_refuse_existing_output(
     assert run["time_axis_method"] != "pending"
     assert run["time_axis_status"] in {"ok", "unavailable"}
     assert run["time_axis"]["fbank"]["frame_shift_ms"] == 10.0
+    sample_meta = next(iter(run["samples"].values()))
+    assert sample_meta.get("num_fbank_frames")
     summary_json = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     json.dumps(summary_json, allow_nan=False)
     assert summary_json["status"] == "complete"

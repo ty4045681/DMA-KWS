@@ -181,11 +181,22 @@ class SampleTimeAxis:
     def from_dict(cls, payload: Mapping[str, Any] | None, *, audio_length: int = 0) -> "SampleTimeAxis":
         import numpy as np
 
-        if not payload or str(payload.get("status") or "") != "ok":
+        if not payload:
             return cls.unavailable(int(audio_length))
+        axis_status = str(
+            payload.get("time_axis_status") or payload.get("status") or ""
+        )
+        if axis_status != "ok":
+            return cls.unavailable(
+                int(audio_length),
+                method=str(payload.get("time_axis_method") or payload.get("method") or TIME_AXIS_UNAVAILABLE),
+            )
         centers = np.asarray(payload.get("centers_source_sec") or [], dtype=np.float64)
         if centers.size == 0:
-            return cls.unavailable(int(audio_length))
+            return cls.unavailable(
+                int(audio_length),
+                method=str(payload.get("time_axis_method") or payload.get("method") or TIME_AXIS_UNAVAILABLE),
+            )
         padding = np.asarray(payload.get("is_padding") or [False] * int(centers.size), dtype=bool)
         support = np.asarray(payload.get("fbank_support") or np.zeros((centers.size, 2)), dtype=np.int64)
         index = np.asarray(
@@ -447,7 +458,7 @@ def noise_region_masks(
             continue
         start = float(span[0])
         end = float(span[1])
-        in_span = valid & (centers >= start) & (centers <= end)
+        in_span = valid & _centers_in_span(centers, start, end)
         intervals.append(
             {
                 "start": start,
@@ -458,6 +469,12 @@ def noise_region_masks(
         noise |= in_span
     outside = valid & ~noise
     return noise, outside, intervals
+
+
+def _centers_in_span(centers, start: float, end: float):
+    """Manifest spans are half-open ``[start, end)``."""
+
+    return (centers >= float(start)) & (centers < float(end))
 
 
 def region_stats(values, mask) -> dict[str, Any]:
@@ -744,36 +761,20 @@ def _axis_for_sample(
     right_padding_ms: int,
     fallback_status: str,
 ) -> SampleTimeAxis:
-    import numpy as np
-
-    stored = meta.get("centers_source_sec")
+    del sample_id
     audio_length = _optional_int(
         meta.get("audio_length") or records[0].get("audio_length")
     ) or 0
-    if stored:
-        centers = np.asarray(stored, dtype=np.float64)
-        padding = np.asarray(meta.get("is_padding") or [False] * len(centers), dtype=bool)
-        support = np.asarray(meta.get("fbank_support") or np.zeros((0, 2)), dtype=np.int64)
-        status = str(meta.get("time_axis_status") or fallback_status)
-        if status == "ok" and centers.size:
-            return SampleTimeAxis(
-                status="ok",
-                method=str(meta.get("time_axis_method") or fallback_status),
-                centers_source_sec=centers,
-                is_padding=padding,
-                is_left_padding=np.asarray(
-                    meta.get("is_left_padding") or padding, dtype=bool
-                ),
-                is_right_padding=np.asarray(
-                    meta.get("is_right_padding") or np.zeros_like(padding), dtype=bool
-                ),
-                fbank_support=support if support.size else np.zeros((centers.size, 2), dtype=np.int64),
-                encoder_frame_index=np.arange(centers.size, dtype=np.int64),
-                left_padding_sec=float(meta.get("left_padding_sec") or left_padding_ms / 1000.0),
-                right_padding_sec=float(meta.get("right_padding_sec") or right_padding_ms / 1000.0),
-                source_duration_sec=float(meta.get("source_duration_sec") or 0.0),
-            )
-        return SampleTimeAxis.unavailable(audio_length)
+    stored_status = str(meta.get("time_axis_status") or "")
+    # An empty centers list is a stored unavailable axis, not a missing key.
+    # Do not rebuild from the run-level encoder map in that case.
+    if stored_status == TIME_AXIS_UNAVAILABLE or "centers_source_sec" in meta:
+        payload = dict(meta)
+        if stored_status:
+            payload["time_axis_status"] = stored_status
+        elif fallback_status:
+            payload.setdefault("time_axis_status", fallback_status)
+        return SampleTimeAxis.from_dict(payload, audio_length=audio_length)
     duration = float(meta.get("source_duration_sec") or 0.0)
     return build_sample_time_axis(
         audio_length=audio_length,
@@ -1010,8 +1011,7 @@ def _draw_sample_figures(
         axis=axis,
         dpi=dpi,
         written=written,
-        skipped=skipped,
-        meta=meta,
+        run=run,
     )
     if pair_note:
         skipped.append(pair_note)
@@ -1090,7 +1090,7 @@ def _draw_spectrogram(
     ax.set_xlabel("source time (s), prepared waveform")
     ax.set_ylabel("frequency (Hz)")
     title = _sample_title(sample_row, meta)
-    ax.set_title(title, fontsize=10)
+    ax.set_title(title, fontsize=8)
     for start, end, color, label in _span_overlays(meta):
         ax.axvspan(start, end, color=color, alpha=0.18, label=label)
     left = float(axis.left_padding_sec or 0.0)
@@ -1316,8 +1316,7 @@ def _draw_pair_delta(
     axis: SampleTimeAxis,
     dpi: int,
     written: list[dict[str, str]],
-    skipped: list[str],
-    meta: Mapping[str, Any],
+    run: Mapping[str, Any],
 ) -> str | None:
     import numpy as np
 
@@ -1353,14 +1352,8 @@ def _draw_pair_delta(
     if axis.status != "ok":
         return f"{sample_id}: pair attention delta skipped (time_axis unavailable)"
     other_rows = _sample_rows(records, partner)
-    other_internal = ""
-    # Prefer stored internal id via traces path.
-    for row in other_rows:
-        rel = row.get("trace_path") or ""
-        if rel:
-            other_internal = Path(rel).name.split("__")[0]
-            break
-    other_traces = _load_sample_traces(output_dir, partner, other_internal or partner, other_rows)
+    other_internal = _internal_id_for_sample(partner, run=run, sample_rows=other_rows)
+    other_traces = _load_sample_traces(output_dir, partner, other_internal, other_rows)
     self_trace = traces.get("normal")
     other_trace = other_traces.get("normal")
     if self_trace is None or other_trace is None:
@@ -1486,13 +1479,39 @@ def _span_overlays(meta: Mapping[str, Any]) -> list[tuple[float, float, str, str
     return overlays
 
 
+def _internal_id_for_sample(
+    sample_id: str,
+    *,
+    run: Mapping[str, Any],
+    sample_rows: Sequence[Mapping[str, str]],
+) -> str:
+    meta = (run.get("samples") or {}).get(sample_id) or {}
+    internal = str(meta.get("internal_sample_id") or "").strip()
+    if internal:
+        return internal
+    for row in sample_rows:
+        rel = row.get("trace_path") or ""
+        if rel:
+            return Path(rel).name.split("__")[0]
+    return sample_id
+
+
 def _sample_title(row: Mapping[str, str], meta: Mapping[str, Any]) -> str:
-    del meta
-    return (
-        f"{row.get('sample_id', '')} | {row.get('keyword', '')} | "
-        f"{row.get('condition', '')} | label={row.get('label', '') or 'unlabeled'} | "
-        f"score={row.get('qbyt_score', '')}"
+    phonemes = row.get("keyword_phonemes") or " ".join(
+        str(item) for item in (meta.get("phonemes") or [])
     )
+    readout = str(meta.get("readout_spec") or "")
+    line1 = (
+        f"{row.get('sample_id', '')} | {row.get('keyword', '')} | {phonemes} | "
+        f"condition={row.get('condition', '')} | "
+        f"label={row.get('label', '') or 'unlabeled'}"
+    )
+    line2 = (
+        f"score={row.get('qbyt_score', '')} threshold={row.get('threshold', '')}"
+    )
+    if readout:
+        line2 = f"{line2} | {readout}"
+    return f"{line1}\n{line2}"
 
 
 def _phonemes_for_sample(row, trace, meta) -> list[str]:
