@@ -84,7 +84,15 @@ def test_dataset_getitem_returns_expected_keys_and_seq_label_length(mock_npy_loa
 
     sample = dataset[0]
 
-    assert set(sample.keys()) == {"anchor_seq", "query_seq", "feat", "label", "seq_label"}
+    assert set(sample.keys()) == {
+        "anchor_seq",
+        "query_seq",
+        "feat",
+        "label",
+        "seq_label",
+        "background_source_id",
+    }
+    assert sample["background_source_id"] == -1
     assert sample["anchor_seq"].dtype == torch.long
     assert sample["query_seq"].dtype == torch.long
     assert sample["feat"].shape == (5, 80)

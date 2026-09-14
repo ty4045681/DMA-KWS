@@ -284,74 +284,16 @@ class LibriPhraseTrainDataset(Dataset):
             raise ValueError("stage2.background_negative must be a mapping")
         background_cfg = dict(background_negative or {})
         validate_background_negative_config(background_cfg)
-        if "mode" not in background_cfg or background_cfg["mode"] is None:
-            mode = "online"
-        else:
-            mode = str(background_cfg["mode"]).strip()
-        sources = background_cfg.get("sources") or []
-        if sources:
-            if bool(background_cfg.get("enabled", False)):
-                raise ValueError(
-                    "stage2.background_negative.sources is non-empty but "
-                    "build_background_sampler (MultiSourceBackgroundSampler) "
-                    "is not implemented"
-                )
-        elif bool(background_cfg.get("enabled", False)):
-            probability = float(background_cfg.get("probability", 0.25))
-            if mode == "fbank_cache":
-                cache_manifest = str(
-                    background_cfg.get("cache_manifest", "")
-                ).strip()
-                if not cache_manifest:
-                    raise ValueError(
-                        "stage2.background_negative.cache_manifest is required "
-                        "when mode=fbank_cache"
-                    )
-                if fbank_kwargs is not None and "dither" in fbank_kwargs:
-                    dither = fbank_kwargs["dither"]
-                    if float(dither) != 0.0:
-                        raise ValueError(
-                            "stage2.background_negative.mode=fbank_cache "
-                            f"requires fbank dither=0, got {dither!r}"
-                        )
-                from dma_kws.stage2.background_cache import BackgroundFeatureCache
+        if bool(background_cfg.get("enabled", False)):
+            from dma_kws.stage2.background_sources import build_background_sampler
 
-                self._background_sampler = BackgroundFeatureCache(
-                    cache_manifest,
-                    expected_fbank_kwargs=dict(fbank_kwargs or {}),
-                    duration_seconds_min=float(
-                        background_cfg.get("duration_seconds_min", 1.0)
-                    ),
-                    duration_seconds_max=float(
-                        background_cfg.get("duration_seconds_max", 3.0)
-                    ),
-                    audio_list_path=str(
-                        background_cfg.get("audio_list_path", "")
-                    ).strip(),
-                    max_open_shards=background_cfg.get("max_open_shards", 8),
-                )
-            else:
-                audio_list_path = str(
-                    background_cfg.get("audio_list_path", "")
-                ).strip()
-                if not audio_list_path:
-                    raise ValueError(
-                        "stage2.background_negative.audio_list_path is required when enabled"
-                    )
-
-                from dma_kws.stage2.features import TrainingBackgroundSampler
-
-                self._background_sampler = TrainingBackgroundSampler(
-                    audio_list_path=audio_list_path,
-                    duration_seconds_min=float(
-                        background_cfg.get("duration_seconds_min", 1.0)
-                    ),
-                    duration_seconds_max=float(
-                        background_cfg.get("duration_seconds_max", 3.0)
-                    ),
-                    fbank_kwargs=fbank_kwargs,
-                )
-            self._background_probability = probability
+            self._background_sampler = build_background_sampler(
+                background_cfg,
+                fbank_kwargs=fbank_kwargs,
+            )
+            self._background_probability = float(
+                background_cfg.get("probability", 0.25)
+            )
 
         max_entries, max_bytes = resolve_metadata_cache_limits(metadata_cache)
         self._metadata_cache = MetadataLRUCache(
@@ -370,6 +312,23 @@ class LibriPhraseTrainDataset(Dataset):
     @property
     def background_enabled(self) -> bool:
         return self._background_sampler is not None
+
+    def _draw_background(self) -> tuple[torch.Tensor, int, str, str | None]:
+        sampler = self._background_sampler
+        if sampler is None:
+            raise RuntimeError("Internal Stage II sample has no background sampler")
+        sample_fn = getattr(sampler, "sample", None)
+        if callable(sample_fn):
+            drawn = sample_fn(rng=self._rng)
+            recording_id = drawn.recording_id or ""
+            return (
+                drawn.feat,
+                int(drawn.background_source_id),
+                recording_id,
+                drawn.crop_id,
+            )
+        feat = sampler.extract(rng=self._rng)
+        return feat, 0, "", None
 
     def _load_metadata_array(self, path: str):
         key = ("npy", path)
@@ -509,6 +468,9 @@ class LibriPhraseTrainDataset(Dataset):
         label = 1
         query_wav: str | None = None
         background_feats: torch.Tensor | None = None
+        background_source_id = -1
+        recording_id = ""
+        crop_id: str | None = None
 
         if kind == "positive" or (kind is None and self._rng.random() < 0.5):
             query_wav = self.get_random_clips(self._clips_files[index])["audio_path"]
@@ -544,7 +506,9 @@ class LibriPhraseTrainDataset(Dataset):
                     query_seq,
                     mode=self.seq_label_mode,
                 )
-                background_feats = self._background_sampler.extract(rng=self._rng)
+                background_feats, background_source_id, recording_id, crop_id = (
+                    self._draw_background()
+                )
             else:
                 for _ in range(_MAX_CONTAINING_NEGATIVE_DRAWS):
                     query_wav, query_g2p = self._draw_negative(index)
@@ -590,7 +554,7 @@ class LibriPhraseTrainDataset(Dataset):
                 "labels must agree under keyword-occurrence semantics"
             )
 
-        return {
+        item = {
             "anchor_seq": torch.tensor(anchor_seq, dtype=torch.long),
             # The clip's own phoneme sequence, kept so the auxiliary CTC loss can
             # supervise the adapter trunk. For negatives this differs from the
@@ -599,7 +563,12 @@ class LibriPhraseTrainDataset(Dataset):
             "feat": feats,
             "label": torch.tensor(label, dtype=torch.long),
             "seq_label": torch.tensor(seq_label, dtype=torch.long),
+            "background_source_id": background_source_id,
         }
+        if background_feats is not None:
+            item["recording_id"] = recording_id
+            item["crop_id"] = crop_id
+        return item
 
 
 def _resolve_eval_fbank_path(

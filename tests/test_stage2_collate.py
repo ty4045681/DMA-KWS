@@ -29,6 +29,29 @@ def test_train_collate_fn_pads_feats_and_anchors():
     assert torch.equal(collated["label"], torch.tensor([1, 0]))
 
 
+def test_train_collate_fn_background_source_id_defaults_missing_and_keeps_zero():
+    batch = [
+        {
+            "anchor_seq": torch.tensor([1], dtype=torch.long),
+            "feat": torch.ones(2, 8),
+            "label": torch.tensor(0, dtype=torch.long),
+            "seq_label": torch.tensor([0], dtype=torch.long),
+            "background_source_id": 0,
+        },
+        {
+            "anchor_seq": torch.tensor([1, 2], dtype=torch.long),
+            "feat": torch.ones(3, 8),
+            "label": torch.tensor(1, dtype=torch.long),
+            "seq_label": torch.tensor([1, 1], dtype=torch.long),
+        },
+    ]
+
+    collated = train_collate_fn(batch)
+
+    assert collated["background_source_id"].dtype == torch.long
+    assert collated["background_source_id"].tolist() == [0, -1]
+
+
 def test_train_collate_fn_builds_seq_label_mask():
     batch = [
         {

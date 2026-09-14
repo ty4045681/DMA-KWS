@@ -204,13 +204,15 @@ def test_dataset_getitem_background_survives_deleted_audio_and_online_monkeypatc
     sample = dataset[0]
     assert sample["label"].item() == 0
     assert sample["query_seq"].numel() == 0
-    assert set(sample.keys()) == {
+    assert set(sample.keys()) >= {
         "anchor_seq",
         "query_seq",
         "feat",
         "label",
         "seq_label",
+        "background_source_id",
     }
+    assert int(sample["background_source_id"]) == 0
     assert sample["feat"].dtype == torch.float32
     assert sample["feat"].device.type == "cpu"
     assert sample["feat"].ndim == 2
@@ -274,7 +276,8 @@ def test_disabled_online_and_cached_dataset_construction(tmp_path, monkeypatch):
     )
     assert constructed["audio_list_path"] == "/background/musan.list"
     assert online._background_sampler is not None
-    assert not isinstance(online._background_sampler, BackgroundFeatureCache)
+    online_inner = getattr(online._background_sampler, "inner", online._background_sampler)
+    assert not isinstance(online_inner, BackgroundFeatureCache)
     monkeypatch.undo()
 
     cached = LibriPhraseTrainDataset(
@@ -291,8 +294,9 @@ def test_disabled_online_and_cached_dataset_construction(tmp_path, monkeypatch):
         },
         fbank_kwargs=built["expected_fbank_kwargs"],
     )
-    assert isinstance(cached._background_sampler, BackgroundFeatureCache)
-    assert not isinstance(cached._background_sampler, TrainingBackgroundSampler)
+    cached_inner = getattr(cached._background_sampler, "inner", cached._background_sampler)
+    assert isinstance(cached_inner, BackgroundFeatureCache)
+    assert not isinstance(cached_inner, TrainingBackgroundSampler)
     cached._background_sampler.close()
 
 

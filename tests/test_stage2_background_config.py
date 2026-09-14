@@ -417,28 +417,49 @@ def test_dataset_empty_sources_keeps_legacy_online_sampler(monkeypatch):
     }
 
 
-def test_dataset_enabled_nonempty_sources_raises_missing_factory(monkeypatch):
+def test_dataset_enabled_nonempty_sources_uses_build_background_sampler(monkeypatch):
     monkeypatch.setattr(
         "dma_kws.stage2.features.TrainingBackgroundSampler",
         _MustNotConstructSampler,
     )
-    with pytest.raises(
-        ValueError,
-        match="build_background_sampler \\(MultiSourceBackgroundSampler\\)",
-    ):
-        _make_dataset(
-            background_negative={
-                "enabled": True,
-                "mode": "online",
-                "audio_list_path": "",
-                "cache_manifest": "",
-                "probability": 0.25,
-                "sources": [
-                    {
-                        "id": "musan",
-                        "weight": 1.0,
-                        "manifest": "/unused/recordings.jsonl",
-                    }
-                ],
-            }
-        )
+    constructed = {}
+
+    class _FakeMultiSource:
+        def sample(self, *, rng):
+            raise AssertionError("factory construction is under test")
+
+        def run_record_fields(self):
+            return {}
+
+        def close(self):
+            return None
+
+    def _fake_factory(config, *, fbank_kwargs):
+        constructed["sources"] = list(config.get("sources") or [])
+        constructed["fbank_kwargs"] = fbank_kwargs
+        return _FakeMultiSource()
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.background_sources.build_background_sampler",
+        _fake_factory,
+    )
+    dataset = _make_dataset(
+        background_negative={
+            "enabled": True,
+            "mode": "online",
+            "audio_list_path": "",
+            "cache_manifest": "",
+            "probability": 0.25,
+            "sources": [
+                {
+                    "id": "musan",
+                    "weight": 1.0,
+                    "manifest": "/unused/recordings.jsonl",
+                }
+            ],
+        },
+        fbank_kwargs={"dither": 0.0},
+    )
+    assert isinstance(dataset._background_sampler, _FakeMultiSource)
+    assert constructed["sources"][0]["id"] == "musan"
+    assert constructed["fbank_kwargs"] == {"dither": 0.0}
