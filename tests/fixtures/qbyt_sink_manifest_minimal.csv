@@ -1,0 +1,4 @@
+audio_path,keyword,label
+audio/clean_001.wav,hey eva,1
+audio/noise_001.wav,hey eva,0
+audio/unlabeled_001.wav,hey eva,

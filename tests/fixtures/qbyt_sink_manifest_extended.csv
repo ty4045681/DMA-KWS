@@ -1,0 +1,5 @@
+audio_path,keyword,label,sample_id,condition,pair_id,keyword_spans,noise_spans
+audio/clean_001.wav,hey eva,1,clean_001,clean,p001,"[[0.8,1.6]]",[]
+audio/noisy_001.wav,hey eva,1,noisy_001,noisy,p001,"[[0.8,1.6]]","[[0.5,2.0]]"
+audio/noise_001.wav,hey eva,0,noise_001,noise_only,,,"[[0.0,2.0]]"
+audio/speech_001.wav,hey eva,0,speech_001,unrelated_speech,,,
