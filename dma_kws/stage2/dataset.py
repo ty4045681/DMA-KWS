@@ -14,6 +14,7 @@ import torch
 import torch.utils.data
 from torch.utils.data import Dataset
 
+from dma_kws.configs.schema import validate_background_negative_config
 from dma_kws.g2p import make_g2p, text_to_phonemes
 from dma_kws.stage2.metadata_cache import (
     MetadataLRUCache,
@@ -282,50 +283,21 @@ class LibriPhraseTrainDataset(Dataset):
         ):
             raise ValueError("stage2.background_negative must be a mapping")
         background_cfg = dict(background_negative or {})
-        allowed_background_keys = {
-            "enabled",
-            "probability",
-            "audio_list_path",
-            "duration_seconds_min",
-            "duration_seconds_max",
-            "mode",
-            "cache_manifest",
-            "max_open_shards",
-        }
-        unknown_background_keys = sorted(
-            set(background_cfg) - allowed_background_keys
-        )
-        if unknown_background_keys:
-            raise ValueError(
-                "Unknown stage2.background_negative fields: "
-                + ", ".join(unknown_background_keys)
-            )
+        validate_background_negative_config(background_cfg)
         if "mode" not in background_cfg or background_cfg["mode"] is None:
             mode = "online"
         else:
             mode = str(background_cfg["mode"]).strip()
-        if mode not in {"online", "fbank_cache"}:
-            raise ValueError(
-                "stage2.background_negative.mode must be 'online' or "
-                f"'fbank_cache', got {background_cfg.get('mode')!r}"
-            )
-        if "max_open_shards" in background_cfg:
-            max_open_shards = background_cfg["max_open_shards"]
-            if (
-                isinstance(max_open_shards, bool)
-                or not isinstance(max_open_shards, int)
-                or max_open_shards < 1
-            ):
+        sources = background_cfg.get("sources") or []
+        if sources:
+            if bool(background_cfg.get("enabled", False)):
                 raise ValueError(
-                    "stage2.background_negative.max_open_shards must be a "
-                    f"positive int, got {max_open_shards!r}"
+                    "stage2.background_negative.sources is non-empty but "
+                    "build_background_sampler (MultiSourceBackgroundSampler) "
+                    "is not implemented"
                 )
-        if bool(background_cfg.get("enabled", False)):
+        elif bool(background_cfg.get("enabled", False)):
             probability = float(background_cfg.get("probability", 0.25))
-            if not 0.0 <= probability <= 1.0:
-                raise ValueError(
-                    "Stage II background negative probability must be between 0 and 1"
-                )
             if mode == "fbank_cache":
                 cache_manifest = str(
                     background_cfg.get("cache_manifest", "")
