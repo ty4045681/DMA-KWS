@@ -362,6 +362,20 @@ def test_strict_resume_rejects_source_weight_and_legacy_to_multisource(tmp_path)
     )
 
 
+def test_new_mode_joint_val_warning_does_not_mention_background_eval_list():
+    from dma_kws.stage2.background_identity import (
+        joint_background_validation_disabled_message,
+    )
+
+    message = joint_background_validation_disabled_message(
+        {"sources": [{"id": "dns", "weight": 1.0, "manifest": "x.jsonl"}]}
+    )
+    assert "background_eval_list" not in message
+    assert "stage2.background_negative.validation" in message
+    legacy = joint_background_validation_disabled_message({"sources": []})
+    assert "background_eval_list" in legacy
+
+
 def test_background_eval_list_conflicts_with_nonempty_sources():
     with pytest.raises(ValueError, match="background_eval_list"):
         assert_background_eval_list_compatible(

@@ -55,6 +55,22 @@ def legacy_background_payload(background: Mapping[str, Any] | None) -> dict[str,
     return {key: payload[key] for key in LEGACY_BACKGROUND_KEYS if key in payload}
 
 
+def joint_background_validation_disabled_message(
+    background_cfg: Mapping[str, Any] | None,
+) -> str:
+    """Hint for joint runs that skipped held-out background validation."""
+    if is_multisource_background(background_cfg):
+        return (
+            "Joint background validation is disabled: set "
+            "stage2.background_negative.validation.enabled=true for per-source "
+            "held-out crops"
+        )
+    return (
+        "Joint MUSAN validation is disabled: set "
+        "adapt.joint.background_eval_list to a held-out list"
+    )
+
+
 def assert_background_eval_list_compatible(
     background_cfg: Mapping[str, Any] | None,
     joint_cfg: Mapping[str, Any] | None,

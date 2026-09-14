@@ -121,6 +121,46 @@ def test_background_val_collate_keeps_sample_id_for_dedup(tmp_path, monkeypatch)
     assert "background_source_id" in batch
 
 
+def test_update_background_val_does_not_copy_scores_to_cpu(monkeypatch):
+    from dma_kws.stage2.module import Stage2LightningModule
+
+    cpu_calls: list[tuple[int, ...]] = []
+    real_cpu = torch.Tensor.cpu
+
+    def tracking_cpu(self):
+        cpu_calls.append(tuple(self.shape))
+        return real_cpu(self)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", tracking_cpu)
+    captured: dict[str, torch.device] = {}
+
+    def fake_gather(rows):
+        captured["device"] = rows.device
+        return rows.clone()
+
+    monkeypatch.setattr("dma_kws.stage2.module.gather_variable_rows", fake_gather)
+
+    module = Stage2LightningModule.__new__(Stage2LightningModule)
+    torch.nn.Module.__init__(module)
+    module._score_calibration_slope = 1.0
+    module._score_calibration_bias = 0.0
+    module._background_val_scores = {}
+    module._background_val_ids = {}
+    module.register_parameter("_probe", torch.nn.Parameter(torch.zeros(1)))
+    module._device = torch.device("cpu")
+    logits = torch.tensor([0.0, 1.5])
+    module._update_background_val(
+        "dns",
+        logits,
+        {"sample_id": torch.tensor([0, 1])},
+    )
+    assert cpu_calls == []
+    stored = module._background_val_scores["dns"][0]
+    assert stored.device == logits.device
+    module._gather_background_val_scores("dns")
+    assert captured["device"] == module.device
+
+
 def test_legacy_single_loader_validation_step_still_uses_integer_dispatch():
     from dma_kws.stage2.adapt import Stage2LoraAdaptationModule
     from dma_kws.training.score_diagnostics import BinaryScoreDiagnostics

@@ -904,32 +904,37 @@ class Stage2LightningModule(pl.LightningModule):
         scores = torch.sigmoid(
             logits * self._score_calibration_slope + self._score_calibration_bias
         ).detach()
-        self._background_val_scores.setdefault(source_id, []).append(scores.reshape(-1).cpu())
+        scores = scores.reshape(-1)
+        self._background_val_scores.setdefault(source_id, []).append(scores)
         sample_ids = batch.get("sample_id")
         if sample_ids is None:
             sample_ids = torch.arange(scores.numel(), device=scores.device)
         self._background_val_ids.setdefault(source_id, []).append(
-            sample_ids.detach().reshape(-1).cpu()
+            sample_ids.detach().reshape(-1).to(device=scores.device)
         )
 
     def _gather_background_val_scores(
         self, source_id: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = self.device
         score_chunks = self._background_val_scores.get(source_id) or []
         id_chunks = self._background_val_ids.get(source_id) or []
         scores = (
-            torch.cat(score_chunks) if score_chunks else torch.empty(0, dtype=torch.float32)
+            torch.cat(score_chunks)
+            if score_chunks
+            else torch.empty(0, dtype=torch.float32, device=device)
         )
         sample_ids = (
-            torch.cat(id_chunks) if id_chunks else torch.empty(0, dtype=torch.float32)
+            torch.cat(id_chunks)
+            if id_chunks
+            else torch.empty(0, dtype=torch.float32, device=device)
         )
+        scores = scores.to(device=device, dtype=torch.float32)
+        sample_ids = sample_ids.to(device=device, dtype=torch.float32)
         if scores.numel() == 0:
-            rows = torch.zeros(0, 2, dtype=torch.float32)
+            rows = torch.zeros(0, 2, dtype=torch.float32, device=device)
         else:
-            rows = torch.stack(
-                (scores.to(dtype=torch.float32), sample_ids.to(dtype=torch.float32)),
-                dim=1,
-            )
+            rows = torch.stack((scores, sample_ids), dim=1)
         gathered = gather_variable_rows(rows)
         if gathered.numel() == 0:
             empty = torch.empty(0, dtype=torch.float32)

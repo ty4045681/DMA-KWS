@@ -1340,6 +1340,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         background_source_ids_from_sampler,
         build_background_data_signature,
         is_multisource_background,
+        joint_background_validation_disabled_message,
     )
     assert_background_eval_list_compatible(background_negative, joint_cfg)
     if joint:
@@ -1610,7 +1611,9 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
         elif is_primary_process and not (
             (background_negative.get("validation") or {}).get("enabled")
         ):
-            reporter.warn("Joint MUSAN validation is disabled: set adapt.joint.background_eval_list to a held-out list")
+            reporter.warn(
+                joint_background_validation_disabled_message(background_negative)
+            )
 
     if (background_negative.get("validation") or {}).get("enabled"):
         from dma_kws.stage2.joint_validation import build_background_validation_datasets
