@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 import csv
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Protocol
 import wave
@@ -25,6 +26,9 @@ FSD50K_DEV_AUDIO = "FSD50K.dev_audio"
 FSD50K_EVAL_AUDIO = "FSD50K.eval_audio"
 FSD50K_GROUND_TRUTH = "FSD50K.ground_truth"
 FSD50K_METADATA = "FSD50K.metadata"
+FSD50K_DEV_CLIPS_JSON = "dev_clips_info_FSD50K.json"
+FSD50K_EVAL_CLIPS_JSON = "eval_clips_info_FSD50K.json"
+FSD50K_CLIP_REQUIRED = ("uploader", "license")
 MUSAN_TRAIN_LIST = "train_background.list"
 MUSAN_EVAL_LIST = "eval_musan.list"
 
@@ -45,6 +49,33 @@ class SourceImportConfig:
 class SourceAdapter(Protocol):
     def discover(self, config: SourceImportConfig) -> Iterable[BackgroundRecord]:
         ...
+
+
+def source_field_error(
+    source_id: str,
+    field: str,
+    *,
+    reason: str,
+    expected: str,
+    actual: object,
+    file: str | Path | None = None,
+) -> ValueError:
+    location = f"source id={source_id!r} field={field}"
+    if file is not None:
+        location += f" file={file}"
+    return ValueError(
+        f"{location}: {reason}; expected {expected}, got {actual!r}"
+    )
+
+
+def _valid_sha256(value: str) -> bool:
+    if len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
 
 
 def get_source_adapter(name: str) -> SourceAdapter:
@@ -136,18 +167,30 @@ def _load_path_list(path: Path) -> list[Path]:
     return files
 
 
-def _read_csv_rows(path: Path, required: Sequence[str]) -> list[dict[str, str]]:
+def _read_csv_rows(
+    path: Path, required: Sequence[str], *, source_id: str
+) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         if not reader.fieldnames:
-            raise ValueError(
-                f"{path}: missing required columns: {', '.join(required)}"
+            raise source_field_error(
+                source_id,
+                required[0] if required else "columns",
+                reason=f"missing required columns: {', '.join(required)}",
+                expected=", ".join(required),
+                actual="",
+                file=path,
             )
         fieldnames = [name.lstrip("\ufeff").strip() for name in reader.fieldnames]
         missing = [name for name in required if name not in fieldnames]
         if missing:
-            raise ValueError(
-                f"{path}: missing required columns: {', '.join(missing)}"
+            raise source_field_error(
+                source_id,
+                missing[0],
+                reason=f"missing required columns: {', '.join(missing)}",
+                expected=", ".join(required),
+                actual=", ".join(fieldnames),
+                file=path,
             )
         rows: list[dict[str, str]] = []
         for raw in reader:
@@ -157,6 +200,45 @@ def _read_csv_rows(path: Path, required: Sequence[str]) -> list[dict[str, str]]:
             }
             rows.append(row)
         return rows
+
+
+def _load_fsd50k_clip_info(path: Path, *, source_id: str) -> dict[str, dict[str, str]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise source_field_error(
+            source_id,
+            "metadata",
+            reason="clip info JSON must be a dict keyed by fname",
+            expected="a JSON object mapping fname to clip metadata",
+            actual=type(payload).__name__,
+            file=path,
+        )
+    clips: dict[str, dict[str, str]] = {}
+    for fname, info in payload.items():
+        if not isinstance(info, Mapping):
+            raise source_field_error(
+                source_id,
+                "metadata",
+                reason=f"clip info for fname {fname!r} must be a mapping",
+                expected="keys uploader and license",
+                actual=type(info).__name__,
+                file=path,
+            )
+        missing = [name for name in FSD50K_CLIP_REQUIRED if name not in info]
+        if missing:
+            raise source_field_error(
+                source_id,
+                missing[0],
+                reason=f"missing required columns: {', '.join(missing)}",
+                expected=", ".join(FSD50K_CLIP_REQUIRED),
+                actual=", ".join(str(key) for key in info),
+                file=path,
+            )
+        clips[str(fname)] = {
+            "license": str(info.get("license") or "").strip(),
+            "uploader": str(info.get("uploader") or "").strip(),
+        }
+    return clips
 
 
 def _first_existing(candidates: Sequence[Path], *, label: str) -> Path:
@@ -205,14 +287,24 @@ class MusanSourceAdapter:
                 try:
                     split = membership[item.path.resolve()]
                 except KeyError as exc:
-                    raise ValueError(
-                        f"MUSAN recording not present in split_dir lists: {item.relative_path}"
+                    raise source_field_error(
+                        config.id,
+                        "split_dir",
+                        reason="MUSAN recording not present in split_dir lists",
+                        expected="a member of train_background.list or eval_musan.list",
+                        actual=item.relative_path,
+                        file=split_dir,
                     ) from exc
             _frames, _sample_rate, channels, _duration = probe_audio(item.path)
             digest = sha256_file(item.path)
-            if not digest:
-                raise ValueError(
-                    f"empty audio_sha256 from adapter musan recording {item.relative_path}"
+            if not _valid_sha256(digest):
+                raise source_field_error(
+                    config.id,
+                    "audio_sha256",
+                    reason="empty or invalid audio_sha256 from adapter",
+                    expected="64 hex characters",
+                    actual=digest,
+                    file=item.path,
                 )
             native_id = item.relative_path
             records.append(
@@ -245,18 +337,33 @@ class DnsSourceAdapter:
         sidecar: dict[str, dict[str, str]] = {}
         if config.metadata:
             meta_path = Path(config.metadata).expanduser()
-            if meta_path.is_file():
-                for row in _read_csv_rows(meta_path, required=("relative_path",)):
-                    sidecar[row["relative_path"]] = row
+            if not meta_path.is_file():
+                raise source_field_error(
+                    config.id,
+                    "metadata",
+                    reason="configured DNS metadata sidecar is missing or not a file",
+                    expected="an existing sidecar CSV file",
+                    actual=str(meta_path),
+                    file=meta_path,
+                )
+            for row in _read_csv_rows(
+                meta_path, required=("relative_path",), source_id=config.id
+            ):
+                sidecar[row["relative_path"]] = row
 
         records: list[BackgroundRecord] = []
         for path in _iter_audio_files(root):
             relative_path = path.relative_to(root).as_posix()
             _frames, sample_rate, channels, duration_seconds = probe_audio(path)
             digest = sha256_file(path)
-            if not digest:
-                raise ValueError(
-                    f"empty audio_sha256 from adapter dns recording {relative_path}"
+            if not _valid_sha256(digest):
+                raise source_field_error(
+                    config.id,
+                    "audio_sha256",
+                    reason="empty or invalid audio_sha256 from adapter",
+                    expected="64 hex characters",
+                    actual=digest,
+                    file=path,
                 )
             extra = sidecar.get(relative_path, {})
             group_token = extra.get("group_id") or relative_path
@@ -284,7 +391,14 @@ class DnsSourceAdapter:
                 )
             )
         if not records:
-            raise ValueError(f"No supported audio found under DNS noise root: {root}")
+            raise source_field_error(
+                config.id,
+                "root",
+                reason="no supported audio found under DNS noise root",
+                expected="audio files under the configured noise root",
+                actual=str(root),
+                file=root,
+            )
         return records
 
 
@@ -321,24 +435,16 @@ class Fsd50kSourceAdapter:
             label="FSD50K.ground_truth/eval.csv",
         )
         dev_clips = _first_existing(
-            [directory / "dev_clips.csv" for directory in clips_candidates],
-            label="FSD50K.metadata/dev_clips.csv",
+            [directory / FSD50K_DEV_CLIPS_JSON for directory in clips_candidates],
+            label="FSD50K.metadata/dev_clips_info_FSD50K.json",
         )
         eval_clips = _first_existing(
-            [directory / "eval_clips.csv" for directory in clips_candidates],
-            label="FSD50K.metadata/eval_clips.csv",
+            [directory / FSD50K_EVAL_CLIPS_JSON for directory in clips_candidates],
+            label="FSD50K.metadata/eval_clips_info_FSD50K.json",
         )
 
-        clip_meta = {
-            row["fname"]: row
-            for row in _read_csv_rows(
-                dev_clips, required=("fname", "username", "license")
-            )
-        }
-        for row in _read_csv_rows(
-            eval_clips, required=("fname", "username", "license")
-        ):
-            clip_meta[row["fname"]] = row
+        clip_meta = _load_fsd50k_clip_info(dev_clips, source_id=config.id)
+        clip_meta.update(_load_fsd50k_clip_info(eval_clips, source_id=config.id))
 
         records: list[BackgroundRecord] = []
         records.extend(
@@ -377,7 +483,7 @@ class Fsd50kSourceAdapter:
         force_split: str | None,
     ) -> list[BackgroundRecord]:
         records: list[BackgroundRecord] = []
-        for row in _read_csv_rows(csv_path, required=required):
+        for row in _read_csv_rows(csv_path, required=required, source_id=config.id):
             fname = row["fname"]
             if force_split is not None:
                 split = force_split
@@ -386,15 +492,24 @@ class Fsd50kSourceAdapter:
                 if split == "eval":
                     split = "test"
             if split not in {"train", "val", "test"}:
-                raise ValueError(
-                    f"{csv_path}: fname {fname!r} has invalid split {split!r}"
+                raise source_field_error(
+                    config.id,
+                    "split",
+                    reason=f"fname {fname!r} has invalid split",
+                    expected="train, val, or test",
+                    actual=split,
+                    file=csv_path,
                 )
-            meta = clip_meta.get(fname)
+            meta = clip_meta.get(str(fname))
             if meta is None:
-                raise ValueError(
-                    f"FSD50K clip metadata missing username/license for fname {fname!r}"
+                raise source_field_error(
+                    config.id,
+                    "metadata",
+                    reason=f"clip info missing for fname {fname!r}",
+                    expected="an entry in dev_clips_info_FSD50K.json or eval_clips_info_FSD50K.json",
+                    actual=fname,
                 )
-            username = meta.get("username", "")
+            uploader = meta.get("uploader", "")
             license_id = meta.get("license", "")
             wav_name = _audio_basename(fname)
             relative_path = f"{audio_dir}/{wav_name}"
@@ -403,12 +518,17 @@ class Fsd50kSourceAdapter:
                 raise FileNotFoundError(f"FSD50K audio not found: {audio_path}")
             _frames, sample_rate, channels, duration_seconds = probe_audio(audio_path)
             digest = sha256_file(audio_path)
-            if not digest:
-                raise ValueError(
-                    f"empty audio_sha256 from adapter fsd50k recording {fname}"
+            if not _valid_sha256(digest):
+                raise source_field_error(
+                    config.id,
+                    "audio_sha256",
+                    reason="empty or invalid audio_sha256 from adapter",
+                    expected="64 hex characters",
+                    actual=digest,
+                    file=audio_path,
                 )
             native_id = Path(fname).stem if Path(fname).suffix else fname
-            group_token = f"uploader:{username}" if username else native_id
+            group_token = f"uploader:{uploader}" if uploader else native_id
             origin_ids = (f"freesound:{native_id}",)
             records.append(
                 BackgroundRecord(
@@ -451,4 +571,5 @@ __all__ = [
     "SourceImportConfig",
     "get_source_adapter",
     "probe_audio",
+    "source_field_error",
 ]

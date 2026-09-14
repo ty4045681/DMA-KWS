@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 from pathlib import Path
 import struct
 import wave
@@ -64,6 +65,29 @@ def _write_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) ->
         for row in rows:
             writer.writerow(row)
     return path
+
+
+def _write_json(path: Path, payload: object) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def _fsd_clip_info(*, uploader: str, license_id: str) -> dict[str, object]:
+    return {
+        "description": "fixture clip",
+        "license": license_id,
+        "tags": ["fixture"],
+        "title": "fixture",
+        "uploader": uploader,
+    }
+
+
+def _assert_source_error(message: str, source_id: str, field: str) -> None:
+    assert f"source id={source_id!r}" in message
+    assert f"field={field}" in message
+    assert "expected" in message
+    assert "got" in message
 
 
 def _build_musan_tree(root: Path) -> dict[str, Path]:
@@ -141,19 +165,17 @@ def _build_fsd50k_tree(root: Path, *, eval_fields: list[str] | None = None) -> d
     eval_fields = eval_fields or ["fname", "labels", "mids"]
     eval_row = {"fname": "2001", "labels": "Rain", "mids": "/m/rain", "split": "train"}
     _write_csv(gt / "eval.csv", [{key: eval_row[key] for key in eval_fields}], eval_fields)
-    _write_csv(
-        meta / "dev_clips.csv",
-        [
-            {"fname": "1001", "username": "alice", "license": "CC-BY-4.0"},
-            {"fname": "1002", "username": "bob", "license": "CC0"},
-            {"fname": "1003", "username": "carol", "license": "CC-BY-4.0"},
-        ],
-        ["fname", "username", "license"],
+    _write_json(
+        meta / "dev_clips_info_FSD50K.json",
+        {
+            "1001": _fsd_clip_info(uploader="alice", license_id="CC-BY-4.0"),
+            "1002": _fsd_clip_info(uploader="bob", license_id="CC0"),
+            "1003": _fsd_clip_info(uploader="carol", license_id="CC-BY-4.0"),
+        },
     )
-    _write_csv(
-        meta / "eval_clips.csv",
-        [{"fname": "2001", "username": "dave", "license": "CC-BY-NC-4.0"}],
-        ["fname", "username", "license"],
+    _write_json(
+        meta / "eval_clips_info_FSD50K.json",
+        {"2001": _fsd_clip_info(uploader="dave", license_id="CC-BY-NC-4.0")},
     )
     return audio
 
@@ -232,7 +254,7 @@ def test_dns_adapter_walks_noise_root_only_and_groups_per_recording(tmp_path):
     assert all(record.background_eligible is False for record in records)
 
 
-def test_fsd50k_adapter_reads_official_csv_schema(tmp_path):
+def test_fsd50k_adapter_reads_official_clip_info_json(tmp_path):
     root = tmp_path / "fsd50k"
     audio = _build_fsd50k_tree(root)
     records = list(
@@ -283,6 +305,7 @@ def test_fsd50k_missing_required_columns_lists_names(tmp_path):
                 )
             )
         )
+    _assert_source_error(str(caught.value), "fsd50k", "labels")
     assert "labels" in str(caught.value)
 
 
@@ -555,15 +578,17 @@ def test_cli_help_documents_metadata_layouts():
         "labels",
         "split",
         "FSD50K.metadata",
-        "dev_clips.csv",
-        "eval_clips.csv",
-        "username",
+        "dev_clips_info_FSD50K.json",
+        "eval_clips_info_FSD50K.json",
+        "uploader",
         "license",
         "FSD50K.dev_audio",
         "music/",
         "noise root",
     ):
         assert token in help_text
+    assert "dev_clips.csv" not in help_text
+    assert "username" not in help_text
 
 
 def test_cli_safe_yaml_prepares_sources(tmp_path):
@@ -595,6 +620,162 @@ def test_cli_safe_yaml_prepares_sources(tmp_path):
     records = read_recordings_jsonl(output_dir / "dns" / RECORDINGS_JSONL_NAME)
     assert len(records) == 4
     assert {record.split for record in records} == {"train", "val", "test"}
+
+
+def test_dns_metadata_non_file_is_not_a_silent_fallback(tmp_path):
+    tree = tmp_path / "dns"
+    _build_dns_tree(tree)
+    missing = tmp_path / "missing-sidecar.csv"
+    with pytest.raises(ValueError) as caught:
+        list(
+            DnsSourceAdapter().discover(
+                SourceImportConfig(
+                    adapter="dns",
+                    id="dns",
+                    root=str(tree / "noise"),
+                    metadata=str(missing),
+                    split_policy="group_random",
+                )
+            )
+        )
+    _assert_source_error(str(caught.value), "dns", "metadata")
+    assert str(missing) in str(caught.value)
+
+    directory = tmp_path / "not-a-file"
+    directory.mkdir()
+    with pytest.raises(ValueError) as caught_dir:
+        list(
+            DnsSourceAdapter().discover(
+                SourceImportConfig(
+                    adapter="dns",
+                    id="dns",
+                    root=str(tree / "noise"),
+                    metadata=str(directory),
+                    split_policy="group_random",
+                )
+            )
+        )
+    _assert_source_error(str(caught_dir.value), "dns", "metadata")
+
+
+def test_prepare_errors_include_source_id_field_expected_got(tmp_path, monkeypatch):
+    musan_root = tmp_path / "musan"
+    files = _build_musan_tree(musan_root)
+    split_dir = _musan_split_dir(musan_root, files, tmp_path / "musan_split")
+    (split_dir / "train_background.list").write_text(
+        f"{files['noise_0'].resolve()}\n{files['noise_1'].resolve()}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError) as musan_caught:
+        list(
+            MusanSourceAdapter().discover(
+                SourceImportConfig(
+                    adapter="musan",
+                    id="musan",
+                    root=str(musan_root),
+                    split_dir=str(split_dir),
+                    split_policy="preserve",
+                )
+            )
+        )
+    _assert_source_error(str(musan_caught.value), "musan", "split_dir")
+
+    empty_noise = tmp_path / "empty-noise"
+    empty_noise.mkdir()
+    with pytest.raises(ValueError) as dns_caught:
+        list(
+            DnsSourceAdapter().discover(
+                SourceImportConfig(
+                    adapter="dns",
+                    id="dns",
+                    root=str(empty_noise),
+                    split_policy="group_random",
+                )
+            )
+        )
+    _assert_source_error(str(dns_caught.value), "dns", "root")
+
+    fsd_root = tmp_path / "fsd-ok"
+    _build_fsd50k_tree(fsd_root)
+    with pytest.raises(ValueError) as allow_caught:
+        prepare_background_sources(
+            PrepareBackgroundConfig(
+                output_dir=tmp_path / "missing-allow",
+                seed=2025,
+                sources=(
+                    SourceImportConfig(
+                        adapter="fsd50k",
+                        id="fsd50k",
+                        root=str(fsd_root),
+                        metadata=str(fsd_root / "FSD50K.metadata"),
+                        eligible_ids_file=str(tmp_path / "no-such-allow.list"),
+                        split_policy="preserve",
+                    ),
+                ),
+            )
+        )
+    _assert_source_error(str(allow_caught.value), "fsd50k", "eligible_ids_file")
+
+    from dma_kws.data_prep import background_adapters as adapters_mod
+
+    monkeypatch.setattr(adapters_mod, "sha256_file", lambda _path: "")
+    hash_root = tmp_path / "dns-hash"
+    _write_wav(hash_root / "a.wav", marker=1)
+    with pytest.raises(ValueError) as hash_caught:
+        list(
+            DnsSourceAdapter().discover(
+                SourceImportConfig(
+                    adapter="dns",
+                    id="dns",
+                    root=str(hash_root),
+                    split_policy="group_random",
+                )
+            )
+        )
+    _assert_source_error(str(hash_caught.value), "dns", "audio_sha256")
+
+
+def test_musan_preserve_carve_keeps_only_eligible_train_group(tmp_path):
+    root = tmp_path / "musan"
+    music = _write_wav(root / "music" / "fma" / "music-a.wav", marker=11)
+    noise = _write_wav(root / "noise" / "free-sound" / "noise-0.wav", marker=21)
+    speech = _write_wav(root / "speech" / "us-gov" / "speech-0.wav", marker=31)
+    (root / "music" / "fma" / "ANNOTATIONS").write_text(
+        f"{music.name} genre N artist-a\n",
+        encoding="utf-8",
+    )
+    split_dir = tmp_path / "split"
+    _write_list(
+        split_dir / "train_background.list",
+        [str(music.resolve()), str(noise.resolve())],
+    )
+    _write_list(split_dir / "eval_musan.list", [str(speech.resolve())])
+    allow = _write_list(tmp_path / "allow.list", ["noise/free-sound/noise-0.wav"])
+    output_dir = tmp_path / "out"
+    prepare_background_sources(
+        PrepareBackgroundConfig(
+            output_dir=output_dir,
+            seed=2025,
+            sources=(
+                SourceImportConfig(
+                    adapter="musan",
+                    id="musan",
+                    root=str(root),
+                    split_dir=str(split_dir),
+                    eligible_ids_file=str(allow),
+                    split_policy="preserve",
+                ),
+            ),
+        )
+    )
+    records = _by_id(read_recordings_jsonl(output_dir / "musan" / RECORDINGS_JSONL_NAME))
+    eligible = records["musan:noise/free-sound/noise-0.wav"]
+    ineligible = records["musan:music/fma/music-a.wav"]
+    assert eligible.background_eligible is True
+    assert eligible.split == "train"
+    assert ineligible.background_eligible is False
+    assert ineligible.split == "val"
+    assert records["musan:speech/us-gov/speech-0.wav"].split == "test"
 
 
 def test_example_yaml_matches_plan_contract():

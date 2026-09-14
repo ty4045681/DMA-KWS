@@ -46,8 +46,8 @@ FSD50K expected layout:
     dev.csv  columns: fname, labels, split
     eval.csv columns: fname, labels
   Clip metadata under <metadata> or <root>/FSD50K.metadata:
-    dev_clips.csv  columns: fname, username, license
-    eval_clips.csv columns: fname, username, license
+    dev_clips_info_FSD50K.json  dict keyed by fname with uploader, license
+    eval_clips_info_FSD50K.json dict keyed by fname with uploader, license
   Official eval is mapped to test and is never reshuffled into train.
 """
 

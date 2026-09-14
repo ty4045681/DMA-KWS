@@ -16,6 +16,7 @@ from typing import Any
 from dma_kws.data_prep.background_adapters import (
     SourceImportConfig,
     get_source_adapter,
+    source_field_error,
 )
 from dma_kws.data_prep.background_manifest import (
     CATALOG_JSON_NAME,
@@ -107,7 +108,9 @@ def prepare_background_sources(config: PrepareBackgroundConfig) -> PrepareResult
         discovered = list(adapter.discover(source))
         records = _normalize_records(discovered, source)
         records, dropped = _apply_category_prefilter(records, source)
-        eligible_ids, eligible_digest = _load_eligible_ids(source.eligible_ids_file)
+        eligible_ids, eligible_digest = _load_eligible_ids(
+            source.eligible_ids_file, source_id=source.id
+        )
         records = _apply_eligibility(records, eligible_ids)
         records = _assign_splits(records, source=source, seed=config.seed)
         require_eligible_train_records(records, source_id=source.id)
@@ -271,9 +274,13 @@ def _normalize_records(
                 f"dataset_id {record.dataset_id!r} does not match source id {source.id!r}"
             )
         if not record.audio_sha256 or len(record.audio_sha256) != 64:
-            raise ValueError(
-                f"empty audio_sha256 from adapter {source.adapter} recording "
-                f"{record.recording_id}"
+            raise source_field_error(
+                source.id,
+                "audio_sha256",
+                reason="empty or invalid audio_sha256 from adapter",
+                expected="64 hex characters",
+                actual=record.audio_sha256,
+                file=record.audio_path or record.recording_id,
             )
         resolve_relative_path(record.relative_path, root=root)
         group_id = record.group_id.strip() or f"{source.id}:{record.recording_id}"
@@ -304,12 +311,19 @@ def _apply_category_prefilter(
     return kept, dropped
 
 
-def _load_eligible_ids(path: str) -> tuple[set[str], str]:
+def _load_eligible_ids(path: str, *, source_id: str) -> tuple[set[str], str]:
     if not path:
         return set(), ""
     eligible_path = Path(path).expanduser()
     if not eligible_path.is_file():
-        raise FileNotFoundError(f"eligible_ids_file not found: {eligible_path}")
+        raise source_field_error(
+            source_id,
+            "eligible_ids_file",
+            reason="eligible_ids_file not found",
+            expected="an existing allowlist file",
+            actual=str(eligible_path),
+            file=eligible_path,
+        )
     digest = sha256_file(eligible_path)
     ids: set[str] = set()
     for line in eligible_path.read_text(encoding="utf-8").splitlines():
@@ -374,7 +388,9 @@ def _assign_splits(
             and "train" in splits
             and "val" not in splits
         ):
-            return _carve_val_from_train(records, seed=seed)
+            return _carve_val_from_train(
+                records, seed=seed, source_id=source.id
+            )
         return list(records)
     if source.split_policy == "group_random":
         return _group_random_split(records, seed=seed, source_id=source.id)
@@ -385,7 +401,7 @@ def _assign_splits(
 
 
 def _carve_val_from_train(
-    records: Sequence[BackgroundRecord], *, seed: int
+    records: Sequence[BackgroundRecord], *, seed: int, source_id: str
 ) -> list[BackgroundRecord]:
     grouped: dict[str, list[BackgroundRecord]] = defaultdict(list)
     for record in records:
@@ -397,17 +413,56 @@ def _carve_val_from_train(
     ]
     if len(train_groups) < 2:
         return list(records)
-    ordered = sorted(
-        train_groups, key=lambda group_id: (_stable_digest(seed, group_id), group_id)
+    eligible_groups = [
+        group_id
+        for group_id in train_groups
+        if any(item.background_eligible is True for item in grouped[group_id])
+    ]
+    ineligible_groups = [
+        group_id for group_id in train_groups if group_id not in set(eligible_groups)
+    ]
+    n_val = max(
+        1, int(round(len(train_groups) * (SPLIT_RATIOS[1] / (1.0 - SPLIT_RATIOS[2]))))
     )
-    n_val = max(1, int(round(len(ordered) * (SPLIT_RATIOS[1] / (1.0 - SPLIT_RATIOS[2])))))
-    if n_val >= len(ordered):
+    if n_val >= len(train_groups):
         n_val = 1
-    val_groups = set(ordered[-n_val:])
+    ordered_ineligible = sorted(
+        ineligible_groups,
+        key=lambda group_id: (_stable_digest(seed, group_id), group_id),
+    )
+    ordered_eligible = sorted(
+        eligible_groups,
+        key=lambda group_id: (_stable_digest(seed, group_id), group_id),
+    )
+    val_groups: list[str] = []
+    for group_id in ordered_ineligible:
+        if len(val_groups) >= n_val:
+            break
+        val_groups.append(group_id)
+    remaining_eligible = list(ordered_eligible)
+    for group_id in ordered_eligible:
+        if len(val_groups) >= n_val:
+            break
+        if len(remaining_eligible) <= 1:
+            break
+        val_groups.append(group_id)
+        remaining_eligible.remove(group_id)
+    remaining_eligible_after = [
+        group_id for group_id in eligible_groups if group_id not in set(val_groups)
+    ]
+    if eligible_groups and not remaining_eligible_after:
+        raise source_field_error(
+            source_id,
+            "split_policy",
+            reason="val carve would leave no eligible train recordings",
+            expected="at least one eligible train group after carving val",
+            actual=0,
+        )
+    if not val_groups:
+        return list(records)
+    val_set = set(val_groups)
     return [
-        replace(record, split="val")
-        if _group_id(record) in val_groups
-        else record
+        replace(record, split="val") if _group_id(record) in val_set else record
         for record in records
     ]
 
@@ -555,14 +610,25 @@ def _raw_metadata_hashes(
         if meta.is_file():
             candidates.append((meta.name, meta))
         elif meta.is_dir():
-            for name in ("dev.csv", "eval.csv", "dev_clips.csv", "eval_clips.csv"):
+            for name in (
+                "dev.csv",
+                "eval.csv",
+                "dev_clips_info_FSD50K.json",
+                "eval_clips_info_FSD50K.json",
+            ):
                 candidates.append((name, meta / name))
     root = Path(source.root).expanduser()
     for name, rel in (
         ("dev.csv", Path("FSD50K.ground_truth") / "dev.csv"),
         ("eval.csv", Path("FSD50K.ground_truth") / "eval.csv"),
-        ("dev_clips.csv", Path("FSD50K.metadata") / "dev_clips.csv"),
-        ("eval_clips.csv", Path("FSD50K.metadata") / "eval_clips.csv"),
+        (
+            "dev_clips_info_FSD50K.json",
+            Path("FSD50K.metadata") / "dev_clips_info_FSD50K.json",
+        ),
+        (
+            "eval_clips_info_FSD50K.json",
+            Path("FSD50K.metadata") / "eval_clips_info_FSD50K.json",
+        ),
     ):
         candidates.append((name, root / rel))
     for key, path in candidates:
