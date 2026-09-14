@@ -1337,6 +1337,7 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
     from dma_kws.stage2.background_identity import (
         assert_background_eval_list_compatible,
         assert_background_resume_identity,
+        audit_background_sources_at_train_start,
         background_source_ids_from_sampler,
         build_background_data_signature,
         is_multisource_background,
@@ -1357,6 +1358,8 @@ def run_stage2_adaptation(config: dict[str, Any], args: Stage2AdaptArgs) -> dict
                 background_negative,
                 joint_cfg.get("background_eval_list", ""),
             )
+    else:
+        audit_background_sources_at_train_start(background_negative)
     train_manifest = joint_manifests.get("real_train", adapt_paths["train_manifest"])
     eval_manifest = joint_manifests.get("real_eval", adapt_paths["eval_manifest"])
     if joint:

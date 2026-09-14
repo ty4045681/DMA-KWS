@@ -24,6 +24,7 @@ from dma_kws.stage2.background_identity import (
     BACKGROUND_DATA_SIGNATURE_VERSION,
     assert_background_eval_list_compatible,
     assert_background_resume_identity,
+    audit_background_sources_at_train_start,
     background_data_signature_hash,
     background_data_signature_payload,
     is_multisource_background,
@@ -114,6 +115,35 @@ def _write_source(
     )
     write_catalog(catalog_dir / CATALOG_JSON_NAME, catalog)
     return manifest
+
+
+def _write_records(root: Path, source_id: str, records: list[Any]) -> Path:
+    catalog_dir = root / "catalog" / source_id
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    manifest = catalog_dir / "recordings.jsonl"
+    write_recordings_jsonl(manifest, records)
+    return manifest
+
+
+def _overlapping_background(tmp_path: Path, *, enabled: bool = True) -> dict[str, Any]:
+    shared = "ab" * 32
+    sources = []
+    for source_id, shared_split in (("dns", "train"), ("musan", "val")):
+        records = [
+            _record(
+                dataset_id=source_id,
+                recording_id=f"{source_id}:{split}",
+                audio_path=tmp_path / source_id / f"{split}.wav",
+                split=split,
+                audio_sha256=(
+                    shared if split == shared_split else f"{source_id}:{split}".ljust(64, "0")[:64]
+                ),
+                group_id=f"{source_id}:group:{split}",
+            )
+            for split in ("train", "val", "test")
+        ]
+        sources.append(_source_config(source_id, _write_records(tmp_path, source_id, records)))
+    return _online_config(sources, enabled=enabled)
 
 
 def _legacy_bg(list_path: str) -> dict[str, Any]:
@@ -424,3 +454,33 @@ def test_multisource_overlays_empty_inherited_paths_and_isolate_outputs():
         not source["cache_manifest"]
         for source in online["stage2"]["background_negative"]["sources"]
     )
+
+
+def test_train_start_audit_rejects_overlapping_active_catalogs(tmp_path):
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"dataset_id \['dns', 'musan'\].*identical audio bytes"
+            r".*expected one split, got \['train', 'val'\]"
+        ),
+    ):
+        audit_background_sources_at_train_start(_overlapping_background(tmp_path))
+
+
+def test_train_start_audit_skips_empty_sources_and_disabled(tmp_path, monkeypatch):
+    from dma_kws.stage2 import joint_manifest
+
+    audit_background_sources_at_train_start(
+        _overlapping_background(tmp_path, enabled=False)
+    )
+
+    called: list[Any] = []
+    monkeypatch.setattr(
+        joint_manifest,
+        "validate_background_sources_identity",
+        lambda cfg: called.append(cfg),
+    )
+    audit_background_sources_at_train_start({"enabled": True, "sources": []})
+    audit_background_sources_at_train_start({"enabled": True})
+    audit_background_sources_at_train_start(_legacy_bg("noise.list"))
+    assert called == []

@@ -178,6 +178,14 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     background_negative = stage2.get("background_negative", {}) or {}
     if not isinstance(background_negative, dict):
         raise ValueError("stage2.background_negative must be a mapping")
+    from dma_kws.stage2.background_identity import (
+        assert_background_resume_identity,
+        audit_background_sources_at_train_start,
+        background_source_ids_from_sampler,
+        build_background_data_signature,
+    )
+
+    audit_background_sources_at_train_start(background_negative)
 
     train_dataset = build_stage2_train_dataset(config, tokenizer)
     train_dataloader = build_stage2_train_dataloader(config, train_dataset)
@@ -244,12 +252,6 @@ def run_stage2_training(config: dict[str, Any], args: Stage2TrainArgs) -> None:
     )
 
     resume_payload = None
-    from dma_kws.stage2.background_identity import (
-        assert_background_resume_identity,
-        background_source_ids_from_sampler,
-        build_background_data_signature,
-    )
-
     background_signature = build_background_data_signature(config)
     if resume_path is not None:
         resume_payload = torch.load(resume_path, map_location="cpu")

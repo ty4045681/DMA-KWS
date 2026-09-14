@@ -43,6 +43,24 @@ def is_multisource_background(config: Mapping[str, Any] | None) -> bool:
     return bool(sources)
 
 
+def audit_background_sources_at_train_start(
+    background_cfg: Mapping[str, Any] | None,
+) -> None:
+    """Merge-audit active catalogs when multi-source background training is on.
+
+    ``enabled=false`` and empty ``sources`` (legacy) skip catalog I/O. Overlaps
+    raise; they are not dropped.
+    """
+    payload = dict(background_cfg or {})
+    if not bool(payload.get("enabled", False)):
+        return
+    if not is_multisource_background(payload):
+        return
+    from dma_kws.stage2.joint_manifest import validate_background_sources_identity
+
+    validate_background_sources_identity(payload)
+
+
 def musan_metric_alias_allowed(source_ids: Sequence[str]) -> bool:
     """Legacy ``musan`` aliases apply only to empty/legacy or single-MUSAN runs."""
     names = [str(item) for item in source_ids]
