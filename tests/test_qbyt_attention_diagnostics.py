@@ -1,4 +1,6 @@
-"""T01–T04: real pooling QbyT attention capture, no mocked weights."""
+"""T01–T08: real pooling QbyT attention capture and sink-key ablation."""
+
+import inspect
 
 import pytest
 import torch
@@ -10,8 +12,12 @@ from qbyt.pooling import QbyT
 from dma_kws.inference.qbyt_attention_diagnostics import (
     AttentionCaptureSpec,
     SinkAblationSpec,
+    assert_pooling_sink_attention_compatible,
     capture_pooling_attention,
+    _clone_and_block_sink_key,
 )
+from dma_kws.stage2.readout import QbyTAlignmentSpec, QbyTScoreSpec
+from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
 
 
 EMBED_DIM = 64
@@ -435,19 +441,42 @@ def test_training_model_raises_without_switching_eval():
     assert model.training is True
 
 
-def test_nonempty_blocked_layers_raises_until_ablation_task():
+def test_empty_keyword_and_zero_audio_are_rejected():
     model = _pooling_qbyt()
     text, audio = _sample(3, 5, seed=8)
     speech, anchors, speech_lengths, anchor_lengths = _pack([text], [audio])
-    with pytest.raises(ValueError, match="blocked_layers"):
+    with pytest.raises(ValueError, match="empty keyword"):
         capture_pooling_attention(
             model,
             speech,
             anchors,
             speech_lengths,
+            torch.zeros_like(anchor_lengths),
+            capture_spec=_spec(),
+            ablation_spec=_normal(),
+        )
+    empty_audio = torch.zeros(1, 0, ENCODER_DIM)
+    empty_speech_lengths = torch.zeros(1, dtype=torch.long)
+    with pytest.raises(ValueError, match="T == 0|unscorable"):
+        capture_pooling_attention(
+            model,
+            empty_audio,
+            anchors,
+            empty_speech_lengths,
             anchor_lengths,
             capture_spec=_spec(),
             ablation_spec=SinkAblationSpec(name="block_sink_all", blocked_layers=(0, 1)),
+        )
+    query = torch.zeros(1, 1, EMBED_DIM)
+    with pytest.raises(ValueError, match="every remaining key"):
+        _clone_and_block_sink_key(
+            query=query,
+            attn_mask=None,
+            key_padding_mask=query.new_zeros(1, 1),
+            text_lens=[0],
+            audio_lens=[0],
+            num_heads=4,
+            batch_first=True,
         )
 
 
@@ -589,3 +618,413 @@ def test_nested_capture_on_same_model_raises():
     for layer in model.phone_matchor.layers:
         assert not layer.self_attn._forward_pre_hooks
         assert not layer.self_attn._forward_hooks
+
+
+SINK_COL_ATOL = 1e-6
+
+
+def _pooling_score_spec(**kwargs):
+    payload = {
+        "mode": "eps_softmin",
+        "temperature": 1.0,
+        "sink_token": True,
+        "text_position": "learned",
+        "audio_position": "relative_bias",
+    }
+    payload.update(kwargs)
+    return QbyTScoreSpec(version=4, value=QbyTReadoutConfig(**payload))
+
+
+def _block(name, *layers):
+    return SinkAblationSpec(name=name, blocked_layers=tuple(layers))
+
+
+def _sink_column(trace):
+    assert trace.full_attention is not None
+    return trace.full_attention[:, :, :, trace.sink_index]
+
+
+@pytest.mark.parametrize(
+    "text_position,audio_position",
+    [
+        ("learned", "relative_bias"),
+        ("sinusoidal", "sinusoidal"),
+    ],
+)
+def test_t05_block_sink_all_and_layer_i(text_position, audio_position):
+    model = _pooling_qbyt(text_position=text_position, audio_position=audio_position)
+    short_text, short_audio = _sample(4, 7, seed=21)
+    long_text, long_audio = _sample(6, 11, seed=22)
+    speech, anchors, speech_lengths, anchor_lengths = _pack(
+        [short_text, long_text],
+        [short_audio, long_audio],
+    )
+    spec = _spec(save_full_attention=True)
+    normal = capture_pooling_attention(
+        model,
+        speech,
+        anchors,
+        speech_lengths,
+        anchor_lengths,
+        capture_spec=spec,
+        ablation_spec=_normal(),
+    )
+    blocked_all = capture_pooling_attention(
+        model,
+        speech,
+        anchors,
+        speech_lengths,
+        anchor_lengths,
+        capture_spec=spec,
+        ablation_spec=_block("block_sink_all", 0, 1),
+    )
+    blocked_layer0 = capture_pooling_attention(
+        model,
+        speech,
+        anchors,
+        speech_lengths,
+        anchor_lengths,
+        capture_spec=spec,
+        ablation_spec=_block("block_sink_layer_0", 0),
+    )
+    blocked_layer1 = capture_pooling_attention(
+        model,
+        speech,
+        anchors,
+        speech_lengths,
+        anchor_lengths,
+        capture_spec=spec,
+        ablation_spec=_block("block_sink_layer_1", 1),
+    )
+
+    for traces in (blocked_all, blocked_layer0, blocked_layer1):
+        for trace in traces:
+            assert trace.row_sum_max_error < ROW_SUM_ATOL
+            assert trace.padding_mass_max < PADDING_MASS_ATOL
+
+    for trace in blocked_all:
+        sink_col = _sink_column(trace)
+        assert torch.all(sink_col.abs() < SINK_COL_ATOL)
+        torch.testing.assert_close(
+            trace.text_to_sink,
+            torch.zeros_like(trace.text_to_sink),
+            atol=SINK_COL_ATOL,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            trace.audio_to_sink,
+            torch.zeros_like(trace.audio_to_sink),
+            atol=SINK_COL_ATOL,
+            rtol=0.0,
+        )
+
+    for trace in blocked_layer0:
+        assert torch.all(_sink_column(trace)[0].abs() < SINK_COL_ATOL)
+        torch.testing.assert_close(
+            trace.audio_to_sink[0],
+            torch.zeros_like(trace.audio_to_sink[0]),
+            atol=SINK_COL_ATOL,
+            rtol=0.0,
+        )
+        # Downstream layer 1 may change because layer 0 representations changed.
+        # Do not require it to match normal; only the blocked layer is forced.
+
+    for index, trace in enumerate(blocked_layer1):
+        assert torch.all(_sink_column(trace)[1].abs() < SINK_COL_ATOL)
+        torch.testing.assert_close(
+            trace.audio_to_sink[0],
+            normal[index].audio_to_sink[0],
+            atol=PARITY_ATOL,
+            rtol=PARITY_RTOL,
+        )
+        torch.testing.assert_close(
+            trace.text_to_sink[0],
+            normal[index].text_to_sink[0],
+            atol=PARITY_ATOL,
+            rtol=PARITY_RTOL,
+        )
+
+
+def test_t06_mask_clone_restore_and_other_batch_rows_unpolluted():
+    model = _pooling_qbyt()
+    snapshot = _clone_state(model)
+    short_text, short_audio = _sample(3, 6, seed=31)
+    long_text, long_audio = _sample(8, 12, seed=32)
+    speech, anchors, speech_lengths, anchor_lengths = _pack(
+        [short_text, long_text],
+        [short_audio, long_audio],
+    )
+    spec = _spec(save_full_attention=True)
+    first_normal = capture_pooling_attention(
+        model,
+        speech,
+        anchors,
+        speech_lengths,
+        anchor_lengths,
+        capture_spec=spec,
+        ablation_spec=_normal(),
+    )
+
+    layer1_masks = []
+
+    def _watch_layer1(_module, args, kwargs):
+        bound = inspect.signature(_module.forward).bind_partial(*args, **kwargs)
+        attn_mask = bound.arguments.get("attn_mask")
+        if attn_mask is not None:
+            layer1_masks.append(attn_mask.detach().clone())
+        return args, kwargs
+
+    watch = model.phone_matchor.layers[1].self_attn.register_forward_pre_hook(
+        _watch_layer1, with_kwargs=True
+    )
+    try:
+        blocked_layer0 = capture_pooling_attention(
+            model,
+            speech,
+            anchors,
+            speech_lengths,
+            anchor_lengths,
+            capture_spec=spec,
+            ablation_spec=_block("block_sink_layer_0", 0),
+        )
+        blocked_all = capture_pooling_attention(
+            model,
+            speech,
+            anchors,
+            speech_lengths,
+            anchor_lengths,
+            capture_spec=spec,
+            ablation_spec=_block("block_sink_all", 0, 1),
+        )
+    finally:
+        watch.remove()
+
+    assert layer1_masks, "layer 1 should still receive the shared attn_mask"
+    n_heads = 4
+    short_u = int(anchor_lengths[0])
+    long_u = int(anchor_lengths[1])
+    shared = layer1_masks[0]
+    # Shared mask passed to the unblocked layer must not have been filled with
+    # -inf on the sink columns; that would mean the original attn_bias was
+    # mutated in place.
+    assert not torch.isneginf(shared[0:n_heads, :, short_u]).all()
+    assert not torch.isneginf(shared[n_heads : 2 * n_heads, :, long_u]).all()
+
+    second_normal = capture_pooling_attention(
+        model,
+        speech,
+        anchors,
+        speech_lengths,
+        anchor_lengths,
+        capture_spec=spec,
+        ablation_spec=_normal(),
+    )
+    for first, second in zip(first_normal, second_normal):
+        torch.testing.assert_close(
+            first.audio_to_sink, second.audio_to_sink, atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            first.text_to_sink, second.text_to_sink, atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            first.text_to_audio, second.text_to_audio, atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            first.full_attention, second.full_attention, atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            first.position_logits, second.position_logits, atol=0.0, rtol=0.0
+        )
+        assert first.raw_logit == second.raw_logit
+
+    short_trace, long_trace = blocked_all
+    assert torch.all(_sink_column(short_trace).abs() < SINK_COL_ATOL)
+    assert torch.all(_sink_column(long_trace).abs() < SINK_COL_ATOL)
+    # The longer sample's key at the shorter sample's sink index is a text key,
+    # not its sink. Blocking sample 0 must not zero that column on sample 1.
+    long_at_short_sink = long_trace.full_attention[:, :, :, short_u]
+    assert not torch.allclose(
+        long_at_short_sink,
+        torch.zeros_like(long_at_short_sink),
+        atol=SINK_COL_ATOL,
+        rtol=0.0,
+    )
+    # Unblocked layer 1 during block_sink_layer_0 must still have sink mass;
+    # an in-place edit of the shared bias would force it to zero as well.
+    layer1_sink = _sink_column(blocked_layer0[0])[1]
+    assert not torch.allclose(
+        layer1_sink, torch.zeros_like(layer1_sink), atol=SINK_COL_ATOL, rtol=0.0
+    )
+    _assert_state_bitwise_equal(model, snapshot)
+
+
+def test_t07_lifecycle_ablation_hooks_fastpath_and_exceptions(monkeypatch):
+    model = _pooling_qbyt()
+    text, audio = _sample(4, 6, seed=41)
+    speech, anchors, speech_lengths, anchor_lengths = _pack([text], [audio])
+    spec = _spec(layers=(0, 1), heads=(0, 1))
+    ablation = _block("block_sink_all", 0, 1)
+    existing_hits = []
+
+    def _existing(_module, _args, _output):
+        existing_hits.append(1)
+
+    attn0 = model.phone_matchor.layers[0].self_attn
+    existing = attn0.register_forward_hook(_existing)
+    before_pre = [set(layer.self_attn._forward_pre_hooks) for layer in model.phone_matchor.layers]
+    before_fwd = [set(layer.self_attn._forward_hooks) for layer in model.phone_matchor.layers]
+    try:
+        assert torch.backends.mha.get_fastpath_enabled() is True
+        capture_pooling_attention(
+            model,
+            speech,
+            anchors,
+            speech_lengths,
+            anchor_lengths,
+            capture_spec=spec,
+            ablation_spec=ablation,
+        )
+        assert torch.backends.mha.get_fastpath_enabled() is True
+        assert existing_hits == [1]
+        for layer_id, layer in enumerate(model.phone_matchor.layers):
+            assert set(layer.self_attn._forward_pre_hooks) == before_pre[layer_id]
+            assert set(layer.self_attn._forward_hooks) == before_fwd[layer_id]
+
+        torch.backends.mha.set_fastpath_enabled(False)
+        try:
+            capture_pooling_attention(
+                model,
+                speech,
+                anchors,
+                speech_lengths,
+                anchor_lengths,
+                capture_spec=spec,
+                ablation_spec=ablation,
+            )
+            assert torch.backends.mha.get_fastpath_enabled() is False
+        finally:
+            torch.backends.mha.set_fastpath_enabled(True)
+
+        def _boom(_module, _args, _output):
+            raise RuntimeError("forward boom")
+
+        boom = model.phone_matchor.layers[1].self_attn.register_forward_hook(_boom)
+        try:
+            with pytest.raises(RuntimeError, match="forward boom"):
+                capture_pooling_attention(
+                    model,
+                    speech,
+                    anchors,
+                    speech_lengths,
+                    anchor_lengths,
+                    capture_spec=spec,
+                    ablation_spec=ablation,
+                )
+        finally:
+            boom.remove()
+        assert torch.backends.mha.get_fastpath_enabled() is True
+        for layer_id, layer in enumerate(model.phone_matchor.layers):
+            assert set(layer.self_attn._forward_pre_hooks) == before_pre[layer_id]
+            assert set(layer.self_attn._forward_hooks) == before_fwd[layer_id]
+
+        import dma_kws.inference.qbyt_attention_diagnostics as diagnostics
+
+        def _save_boom(**_kwargs):
+            raise RuntimeError("save boom")
+
+        monkeypatch.setattr(diagnostics, "_assemble_traces", _save_boom)
+        with pytest.raises(RuntimeError, match="save boom"):
+            capture_pooling_attention(
+                model,
+                speech,
+                anchors,
+                speech_lengths,
+                anchor_lengths,
+                capture_spec=spec,
+                ablation_spec=ablation,
+            )
+        monkeypatch.undo()
+        assert torch.backends.mha.get_fastpath_enabled() is True
+        for layer_id, layer in enumerate(model.phone_matchor.layers):
+            assert set(layer.self_attn._forward_pre_hooks) == before_pre[layer_id]
+            assert set(layer.self_attn._forward_hooks) == before_fwd[layer_id]
+
+        attn1 = model.phone_matchor.layers[1].self_attn
+        original_register = attn1.register_forward_pre_hook
+
+        def _install_boom(*args, **kwargs):
+            raise RuntimeError("install boom")
+
+        attn1.register_forward_pre_hook = _install_boom
+        try:
+            with pytest.raises(RuntimeError, match="install boom"):
+                capture_pooling_attention(
+                    model,
+                    speech,
+                    anchors,
+                    speech_lengths,
+                    anchor_lengths,
+                    capture_spec=spec,
+                    ablation_spec=ablation,
+                )
+        finally:
+            attn1.register_forward_pre_hook = original_register
+        assert torch.backends.mha.get_fastpath_enabled() is True
+        for layer_id, layer in enumerate(model.phone_matchor.layers):
+            assert set(layer.self_attn._forward_pre_hooks) == before_pre[layer_id]
+            assert set(layer.self_attn._forward_hooks) == before_fwd[layer_id]
+        assert existing.id in attn0._forward_hooks
+    finally:
+        existing.remove()
+
+
+def test_t08_unsupported_spec_no_sink_mismatch_and_state_unchanged():
+    model = _pooling_qbyt()
+    snapshot = _clone_state(model)
+    text, audio = _sample(4, 7, seed=51)
+    speech, anchors, speech_lengths, anchor_lengths = _pack([text], [audio])
+    capture_pooling_attention(
+        model,
+        speech,
+        anchors,
+        speech_lengths,
+        anchor_lengths,
+        capture_spec=_spec(save_full_attention=True),
+        ablation_spec=_block("block_sink_all", 0, 1),
+    )
+    _assert_state_bitwise_equal(model, snapshot)
+
+    compatible = _pooling_score_spec()
+    assert_pooling_sink_attention_compatible(model, compatible)
+
+    with pytest.raises(ValueError, match="version"):
+        assert_pooling_sink_attention_compatible(
+            model,
+            QbyTScoreSpec(version=7, value=QbyTAlignmentSpec()),
+        )
+    with pytest.raises(ValueError, match="sink"):
+        assert_pooling_sink_attention_compatible(
+            model,
+            _pooling_score_spec(sink_token=False),
+        )
+
+    no_sink = _pooling_qbyt()
+    no_sink.sink_token = None
+    with pytest.raises(ValueError, match="sink"):
+        assert_pooling_sink_attention_compatible(no_sink, compatible)
+
+    mismatch = _pooling_qbyt()
+    mismatch.readout_mode = "eps_mean"
+    with pytest.raises(ValueError, match="mismatch|eps_softmin"):
+        assert_pooling_sink_attention_compatible(mismatch, compatible)
+
+    with pytest.raises(ValueError, match="range"):
+        capture_pooling_attention(
+            model,
+            speech,
+            anchors,
+            speech_lengths,
+            anchor_lengths,
+            capture_spec=_spec(),
+            ablation_spec=_block("block_sink_layer_9", 9),
+        )

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import math
 from contextlib import contextmanager
-from typing import Any, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
+
+if TYPE_CHECKING:
+    from dma_kws.inference.qbyt_attention_diagnostics import SampleAttentionDiagnostics
 
 _AMP_DTYPES = {
     "fp16": "float16",
@@ -539,6 +542,155 @@ class Stage2Verifier:
                 anchor_lengths,
                 ablations=DEFAULT_ABLATIONS if ablations is None else ablations,
             )
+
+    def attention_diagnostics(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+        *,
+        capture_spec,
+        ablations,
+        parity_atol=1e-5,
+        parity_rtol=1e-4,
+    ) -> list[SampleAttentionDiagnostics]:
+        """Capture pooling attention and sink-key ablations from one encoder pass.
+
+        Ablated ``qbyt_score`` values are 原校准变换后的干预分数: the same
+        calibrator and threshold applied after intervention, not a claim that
+        the intervened score remains calibrated. EPS position scores come from
+        ``final_pos_fc`` via the capture traces.
+        """
+
+        from dma_kws.inference.keyword_set import require_qbyt_threshold
+        from dma_kws.inference.qbyt_attention_diagnostics import (
+            SampleAttentionDiagnostics,
+            SinkAblationResult,
+            SinkAblationSpec,
+            assert_attention_capture_parity,
+            assert_pooling_sink_attention_compatible,
+            capture_pooling_attention,
+        )
+
+        if self.amp is not None:
+            raise RuntimeError(
+                "attention_diagnostics requires eval FP32; mixed precision "
+                f"(amp={self.amp!r}) is unsupported"
+            )
+        qbyt = self._model.qbyt
+        assert_pooling_sink_attention_compatible(qbyt, getattr(self, "qbyt_score", None))
+        if not feats:
+            return []
+
+        torch = self._torch
+        threshold = require_qbyt_threshold(
+            dict(getattr(self, "_demo_cfg", {}) or {}).get("qbyt_threshold", 0.5),
+            field="demo.qbyt_threshold",
+        )
+        padded_feats, feat_lengths, anchors, anchor_lengths = self._pad_clip_batch(
+            feats, keyword_ids_batch
+        )
+        with torch.no_grad():
+            speech, encoder_lens = self._model.encode_for_qbyt(
+                padded_feats, feat_lengths
+            )
+            encoder_lens = encoder_lens.to(dtype=torch.long)
+            if bool((encoder_lens <= 0).any()):
+                raise ValueError(
+                    "encoder valid frames T == 0 is unscorable for sink-key "
+                    "attention diagnostics"
+                )
+            baseline_logits, _, baseline_details = qbyt.forward_with_readout_details(
+                speech,
+                anchors,
+                speech_lengths=encoder_lens,
+                text_lengths=anchor_lengths,
+            )
+            if baseline_details.position_logits is None:
+                raise ValueError(
+                    "attention_diagnostics requires an EPS readout with "
+                    "final_pos_fc position logits"
+                )
+            normal_spec = SinkAblationSpec(name="normal")
+            normal_traces = capture_pooling_attention(
+                qbyt,
+                speech,
+                anchors,
+                encoder_lens,
+                anchor_lengths,
+                capture_spec=capture_spec,
+                ablation_spec=normal_spec,
+            )
+            assert_attention_capture_parity(
+                normal_traces,
+                logits=baseline_logits,
+                position_logits=baseline_details.position_logits,
+                atol=parity_atol,
+                rtol=parity_rtol,
+            )
+            ablation_runs = []
+            for spec in ablations:
+                ablation_runs.append(
+                    (
+                        spec,
+                        capture_pooling_attention(
+                            qbyt,
+                            speech,
+                            anchors,
+                            encoder_lens,
+                            anchor_lengths,
+                            capture_spec=capture_spec,
+                            ablation_spec=spec,
+                        ),
+                    )
+                )
+
+        results: list[SampleAttentionDiagnostics] = []
+        for index, normal_trace in enumerate(normal_traces):
+            normal_raw = float(normal_trace.raw_logit)
+            normal_score = float(self._calibrator.predict_one(normal_raw))
+            zero_delta = torch.zeros_like(normal_trace.position_logits)
+            normal_result = SinkAblationResult(
+                spec=normal_spec,
+                trace=normal_trace,
+                raw_logit=normal_raw,
+                qbyt_score=normal_score,
+                threshold=threshold,
+                detected=normal_score >= threshold,
+                delta_raw_logit=0.0,
+                delta_qbyt_score=0.0,
+                delta_position_logits=zero_delta,
+            )
+            ablated_results: list[SinkAblationResult] = []
+            for spec, traces in ablation_runs:
+                trace = traces[index]
+                raw_logit = float(trace.raw_logit)
+                qbyt_score = float(self._calibrator.predict_one(raw_logit))
+                ablated_results.append(
+                    SinkAblationResult(
+                        spec=spec,
+                        trace=trace,
+                        raw_logit=raw_logit,
+                        qbyt_score=qbyt_score,
+                        threshold=threshold,
+                        detected=qbyt_score >= threshold,
+                        delta_raw_logit=raw_logit - normal_raw,
+                        delta_qbyt_score=qbyt_score - normal_score,
+                        delta_position_logits=(
+                            trace.position_logits - normal_trace.position_logits
+                        ),
+                    )
+                )
+            results.append(
+                SampleAttentionDiagnostics(
+                    normal_raw_logit=normal_raw,
+                    normal_qbyt_score=normal_score,
+                    threshold=threshold,
+                    normal=normal_result,
+                    ablations=tuple(ablated_results),
+                )
+            )
+        del padded_feats, feat_lengths, anchors, anchor_lengths, speech, encoder_lens
+        return results
 
     def decode_phoneme_feats(self, feats: Sequence) -> list[list[int]]:
         """Greedily decode phoneme ids from full-clip fbank features.

@@ -10,6 +10,8 @@ from dma_kws.inference.score_calibration import PositiveAffineCalibrator
 from dma_kws.inference.stage2_verifier import Stage2Verifier
 from dma_kws.stage1.candidates import KeywordCandidate
 from dma_kws.stage2.fbank import FbankExtractor
+from dma_kws.stage2.readout import QbyTScoreSpec
+from dma_kws.stage2.readout_pooling import QbyTReadoutConfig
 
 
 class _FakeStage2Model:
@@ -363,3 +365,219 @@ def test_stage2_verifier_rejects_empty_keyword_ids():
 
     with pytest.raises(ValueError, match="non-empty"):
         verifier.score_clip_feats([torch.zeros(3, 80)], [[]])
+
+
+_ATTENTION_ENCODER_DIM = 48
+
+
+class _CountingEncodeModel(torch.nn.Module):
+    def __init__(self, qbyt):
+        super().__init__()
+        self.qbyt = qbyt
+        self.encode_calls = 0
+
+    def encode_for_qbyt(self, feats, feat_lengths):
+        self.encode_calls += 1
+        return feats, feat_lengths
+
+    def forward(self, feats, feat_lengths, anchors, anchor_lengths):
+        speech, encoder_lens = self.encode_for_qbyt(feats, feat_lengths)
+        logits, _extra = self.qbyt(
+            speech,
+            anchors,
+            speech_lengths=encoder_lens,
+            text_lengths=anchor_lengths,
+        )
+        return logits
+
+
+def _attention_qbyt(*, sink_token=True, readout_mode="eps_softmin"):
+    from qbyt.pooling import QbyT
+
+    torch.manual_seed(0)
+    return QbyT(
+        encoder_output_size=_ATTENTION_ENCODER_DIM,
+        num_embeds=73,
+        embed_dim=64,
+        post_num_layers=2,
+        readout_mode=readout_mode,
+        sink_token=sink_token,
+        text_position="learned",
+        audio_position="relative_bias",
+    ).eval()
+
+
+def _attention_score_spec(**kwargs):
+    payload = {
+        "mode": "eps_softmin",
+        "temperature": 1.0,
+        "sink_token": True,
+        "text_position": "learned",
+        "audio_position": "relative_bias",
+    }
+    payload.update(kwargs)
+    return QbyTScoreSpec(version=4, value=QbyTReadoutConfig(**payload))
+
+
+def _build_attention_verifier(qbyt=None, *, amp=None, threshold=0.5, slope=2.0, bias=-1.0):
+    qbyt = _attention_qbyt() if qbyt is None else qbyt
+    verifier = Stage2Verifier.__new__(Stage2Verifier)
+    verifier._torch = torch
+    verifier._device = torch.device("cpu")
+    verifier._amp = amp
+    verifier._demo_cfg = {"qbyt_threshold": threshold}
+    verifier._calibrator = PositiveAffineCalibrator(slope=slope, bias=bias)
+    verifier._model = _CountingEncodeModel(qbyt)
+    verifier.qbyt_score = _attention_score_spec()
+    return verifier
+
+
+def test_t08_attention_diagnostics_rejects_unsupported_amp_and_spec():
+    from dma_kws.inference.qbyt_attention_diagnostics import AttentionCaptureSpec
+
+    feats = [torch.randn(9, _ATTENTION_ENCODER_DIM)]
+    keywords = [[3, 4, 5]]
+    spec = AttentionCaptureSpec(layers=(0, 1), heads=(0, 1, 2, 3))
+    ablations = []
+
+    amp_verifier = _build_attention_verifier(amp="fp16")
+    with pytest.raises(RuntimeError, match="FP32|amp"):
+        amp_verifier.attention_diagnostics(
+            feats, keywords, capture_spec=spec, ablations=ablations
+        )
+
+    no_sink = _build_attention_verifier(_attention_qbyt(sink_token=False))
+    with pytest.raises(ValueError, match="sink"):
+        no_sink.attention_diagnostics(
+            feats, keywords, capture_spec=spec, ablations=ablations
+        )
+
+    mismatch = _build_attention_verifier(_attention_qbyt(readout_mode="eps_mean"))
+    with pytest.raises(ValueError, match="mismatch|eps_softmin"):
+        mismatch.attention_diagnostics(
+            feats, keywords, capture_spec=spec, ablations=ablations
+        )
+
+    version = _build_attention_verifier()
+    version.qbyt_score = QbyTScoreSpec(version=7, value=version.qbyt_score.value)
+    with pytest.raises(ValueError, match="version"):
+        version.attention_diagnostics(
+            feats, keywords, capture_spec=spec, ablations=ablations
+        )
+
+
+def test_t09_attention_diagnostics_reuses_encoder_and_preserves_score_api(monkeypatch):
+    from dma_kws.inference.qbyt_attention_diagnostics import (
+        AttentionCaptureSpec,
+        AttentionParityError,
+        SinkAblationSpec,
+    )
+    from dma_kws.inference.score_calibration import sigmoid
+
+    verifier = _build_attention_verifier(threshold=0.4, slope=2.0, bias=-1.0)
+    snapshot = {
+        key: tensor.detach().clone()
+        for key, tensor in verifier._model.qbyt.state_dict().items()
+    }
+    feats = [
+        torch.randn(8, _ATTENTION_ENCODER_DIM),
+        torch.randn(11, _ATTENTION_ENCODER_DIM),
+    ]
+    keywords = [[3, 5, 7], [4, 6, 8, 9]]
+    capture_spec = AttentionCaptureSpec(layers=(0, 1), heads=(0, 1, 2, 3))
+    ablations = [
+        SinkAblationSpec(name="block_sink_all", blocked_layers=(0, 1)),
+        SinkAblationSpec(name="block_sink_layer_0", blocked_layers=(0,)),
+    ]
+
+    assert verifier._model.encode_calls == 0
+    diagnostics = verifier.attention_diagnostics(
+        feats,
+        keywords,
+        capture_spec=capture_spec,
+        ablations=ablations,
+    )
+    assert verifier._model.encode_calls == 1
+    assert len(diagnostics) == 2
+
+    threshold = 0.4
+    for sample in diagnostics:
+        assert sample.threshold == threshold
+        assert sample.normal_raw_logit == pytest.approx(sample.normal.raw_logit)
+        assert sample.normal_qbyt_score == pytest.approx(sample.normal.qbyt_score)
+        expected_score = float(sigmoid(2.0 * sample.normal_raw_logit - 1.0))
+        assert sample.normal_qbyt_score == pytest.approx(expected_score)
+        assert sample.normal.delta_raw_logit == pytest.approx(0.0)
+        assert sample.normal.delta_qbyt_score == pytest.approx(0.0)
+        assert torch.equal(
+            sample.normal.delta_position_logits,
+            torch.zeros_like(sample.normal.delta_position_logits),
+        )
+        assert sample.normal.detected is (sample.normal_qbyt_score >= threshold)
+        assert len(sample.ablations) == 2
+        for ablated in sample.ablations:
+            expected_ablated = float(sigmoid(2.0 * ablated.raw_logit - 1.0))
+            assert ablated.qbyt_score == pytest.approx(expected_ablated)
+            assert ablated.delta_raw_logit == pytest.approx(
+                ablated.raw_logit - sample.normal_raw_logit
+            )
+            assert ablated.delta_qbyt_score == pytest.approx(
+                ablated.qbyt_score - sample.normal_qbyt_score
+            )
+            if ablated.raw_logit != sample.normal_raw_logit:
+                assert (ablated.delta_raw_logit > 0) is (
+                    ablated.raw_logit > sample.normal_raw_logit
+                )
+            assert ablated.detected is (ablated.qbyt_score >= threshold)
+            torch.testing.assert_close(
+                ablated.delta_position_logits,
+                ablated.trace.position_logits - sample.normal.trace.position_logits,
+                atol=0.0,
+                rtol=0.0,
+            )
+        assert sample.ablations[0].spec.name == "block_sink_all"
+        assert not torch.allclose(
+            torch.as_tensor(sample.ablations[0].raw_logit),
+            torch.as_tensor(sample.normal_raw_logit),
+        )
+
+    current = verifier._model.qbyt.state_dict()
+    assert current.keys() == snapshot.keys()
+    for key, tensor in current.items():
+        assert torch.equal(tensor, snapshot[key]), key
+
+    scored = verifier.score_clip_feats_with_logits(feats, keywords)
+    assert isinstance(scored, list)
+    assert len(scored) == 2
+    assert all(isinstance(item, tuple) and len(item) == 2 for item in scored)
+    calibrated = verifier.score_clip_feats(feats, keywords)
+    assert isinstance(calibrated, list)
+    assert calibrated == [item[1] for item in scored]
+    assert verifier._model.encode_calls == 3
+
+    import dma_kws.inference.qbyt_attention_diagnostics as diagnostics_mod
+
+    real_capture = diagnostics_mod.capture_pooling_attention
+
+    def _shifted_capture(*args, **kwargs):
+        traces = real_capture(*args, **kwargs)
+        ablation_spec = kwargs.get("ablation_spec")
+        if ablation_spec is not None and not ablation_spec.blocked_layers:
+            first = traces[0]
+            traces[0] = type(first)(
+                **{
+                    **first.__dict__,
+                    "raw_logit": first.raw_logit + 1.0,
+                }
+            )
+        return traces
+
+    monkeypatch.setattr(diagnostics_mod, "capture_pooling_attention", _shifted_capture)
+    with pytest.raises(AttentionParityError, match="sample 0"):
+        verifier.attention_diagnostics(
+            feats,
+            keywords,
+            capture_spec=capture_spec,
+            ablations=ablations,
+        )
+    assert verifier._model.encode_calls == 4
