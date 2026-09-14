@@ -237,6 +237,7 @@ def _sink_defaults(**overrides) -> dict:
         "plot_dpi": 160,
         "length_bins": [0, 100, 200, 400, 800],
         "group_field": "condition",
+        "synthetic_fixture": False,
     }
     payload.update(overrides)
     return payload
@@ -307,6 +308,7 @@ def test_sink_diagnostics_defaults_do_not_change_other_prep_keys():
     assert sink["max_report_samples"] == 40
     assert sink["group_field"] == "condition"
     assert list(sink["length_bins"]) == [0, 100, 200, 400, 800]
+    assert sink["synthetic_fixture"] is False
 
 
 def test_t10_normal_rows_match_eval_stage2_clips_scoring_path(
@@ -657,9 +659,51 @@ def test_t14_csv_quoting_npz_json_finite_and_refuse_existing_output(
     html = (out / "report.html").read_text(encoding="utf-8")
     assert "hey, eva" not in html or "&" in html or "hey, eva" in html
     assert "<script src=\"https://" not in html
+    assert "合成 fixture" not in html
+    assert run["synthetic_fixture"] is False
+    assert summary_json["synthetic_fixture"] is False
+    assert "banner" not in run
+    assert "banner" not in summary_json
 
     with pytest.raises(SystemExit, match="output"):
         _run_diagnose(monkeypatch, cfg)
+
+
+def test_synthetic_fixture_stamps_json_and_html_banner(
+    tmp_path, monkeypatch, install_runner
+):
+    from dma_kws.inference.qbyt_attention_report import SYNTHETIC_FIXTURE_BANNER
+
+    wav = _write_wav(tmp_path / "clip.wav", 1.0)
+    manifest = _write_csv(
+        tmp_path / "manifest.csv",
+        "audio_path,keyword,label",
+        f"{wav.name},hey eva,1",
+    )
+    summary = _run_diagnose(
+        monkeypatch,
+        _cfg(
+            tmp_path,
+            manifest=manifest,
+            sink=_sink_defaults(synthetic_fixture=True, ablations=[]),
+        ),
+    )
+    assert summary["status"] == "complete"
+    assert summary["synthetic_fixture"] is True
+    assert summary["banner"] == SYNTHETIC_FIXTURE_BANNER
+    out = tmp_path / "out"
+    run = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    summary_json = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    html = (out / "report.html").read_text(encoding="utf-8")
+    assert run["synthetic_fixture"] is True
+    assert run["banner"] == SYNTHETIC_FIXTURE_BANNER
+    assert run["sink_diagnostics"]["synthetic_fixture"] is True
+    assert summary_json["synthetic_fixture"] is True
+    assert summary_json["banner"] == SYNTHETIC_FIXTURE_BANNER
+    assert SYNTHETIC_FIXTURE_BANNER in html
+    assert 'class="synthetic-banner"' in html
+    assert "Not a trained-model conclusion" in html
+    assert "sink learned to reject noise" in html
 
 
 def test_missing_audio_fails_the_run(tmp_path, monkeypatch, install_runner):

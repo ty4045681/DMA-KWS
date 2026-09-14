@@ -11,6 +11,7 @@ import pytest
 
 from dma_kws.inference.qbyt_attention_report import (
     FbankTimeSpec,
+    SYNTHETIC_FIXTURE_BANNER,
     SampleTimeAxis,
     assemble_text_key_heatmap,
     build_sample_time_axis,
@@ -608,6 +609,7 @@ def test_html_escapes_csv_text_and_is_offline(tmp_path):
     assert 'src="figures/' in html or "src='figures/" in html
     assert "absorbs noise" not in html.lower()
     assert "sink attention > 0.5" not in html
+    assert SYNTHETIC_FIXTURE_BANNER not in html
     assert result["status"] in {"complete", "generated"}
     figures = list((out / "figures").rglob("*.png"))
     assert figures
@@ -615,6 +617,25 @@ def test_html_escapes_csv_text_and_is_offline(tmp_path):
     spec = next(path for path in figures if "spectrogram" in path.name)
     assert audio_heat.stat().st_size > 0
     assert spec.stat().st_size > 0
+
+
+def test_synthetic_fixture_flag_renders_visible_html_banner(tmp_path):
+    out = _write_minimal_run(tmp_path)
+    run_path = out / "run.json"
+    summary_path = out / "summary.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    run["synthetic_fixture"] = True
+    summary["synthetic_fixture"] = True
+    summary["banner"] = SYNTHETIC_FIXTURE_BANNER
+    run_path.write_text(json.dumps(run, indent=2) + "\n", encoding="utf-8")
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    render_sink_attention_report(out)
+    html = (out / "report.html").read_text(encoding="utf-8")
+    assert html.index(SYNTHETIC_FIXTURE_BANNER) < html.index("<h1>")
+    assert 'class="synthetic-banner"' in html
+    assert "Not a trained-model conclusion" in html
+    assert SYNTHETIC_FIXTURE_BANNER in html
 
 
 def test_unavailable_time_axis_separates_frame_axis_from_waveform_time(tmp_path):

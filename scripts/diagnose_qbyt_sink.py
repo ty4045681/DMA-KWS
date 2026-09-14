@@ -50,6 +50,7 @@ from dma_kws.inference.qbyt_attention_manifest import (
 )
 from dma_kws.inference.qbyt_attention_report import (
     FbankTimeSpec,
+    SYNTHETIC_FIXTURE_BANNER,
     SampleTimeAxis,
     build_sample_time_axis,
     extra_region_metric_rows,
@@ -106,6 +107,7 @@ SINK_DIAGNOSTICS_DEFAULTS: dict[str, Any] = {
     "plot_dpi": 160,
     "length_bins": [0, 100, 200, 400, 800],
     "group_field": "condition",
+    "synthetic_fixture": False,
 }
 
 RECORDS_FIELDS = [
@@ -341,6 +343,10 @@ def resolve_sink_diagnostics(prep: Mapping[str, Any]) -> dict[str, Any]:
     merged["group_field"] = str(merged["group_field"] or "condition").strip() or "condition"
     merged["ablations"] = [str(item) for item in _as_list(merged["ablations"])]
     merged["mode"] = str(merged["mode"] or "").strip()
+    merged["synthetic_fixture"] = _require_bool(
+        merged["synthetic_fixture"],
+        field="prep.sink_diagnostics.synthetic_fixture",
+    )
     return merged
 
 
@@ -1949,6 +1955,12 @@ def run_diagnose(cfg: DictConfig) -> dict:
         "num_workers": num_workers,
         "report_selected": sorted(selected),
     }
+    synthetic = bool(sink["synthetic_fixture"])
+    run_payload["synthetic_fixture"] = synthetic
+    summary["synthetic_fixture"] = synthetic
+    if synthetic:
+        run_payload["banner"] = SYNTHETIC_FIXTURE_BANNER
+        summary["banner"] = SYNTHETIC_FIXTURE_BANNER
 
     _write_outputs(
         output_dir=output_dir,

@@ -209,6 +209,8 @@ sink_diagnostics:
   plot_dpi: 160
   length_bins: [0, 100, 200, 400, 800]
   group_field: condition
+  # When true, stamp run.json/summary.json/HTML with 合成 fixture / 非训练模型结论.
+  synthetic_fixture: false
 
 recompute_distances:
   input_parquet: ""

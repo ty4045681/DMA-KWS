@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 __all__ = [
     "EncoderTimeMap",
     "FbankTimeSpec",
+    "SYNTHETIC_FIXTURE_BANNER",
     "SampleTimeAxis",
     "assemble_text_key_heatmap",
     "build_sample_time_axis",
@@ -37,6 +38,8 @@ __all__ = [
     "render_sink_attention_report",
     "serialize_encoder_time_map",
 ]
+
+SYNTHETIC_FIXTURE_BANNER = "合成 fixture / 非训练模型结论"
 
 
 _MAX_FRAME_SEARCH = 10_000
@@ -1525,6 +1528,18 @@ def _phonemes_for_sample(row, trace, meta) -> list[str]:
     return []
 
 
+def _is_synthetic_fixture(run: Mapping[str, Any], summary: Mapping[str, Any]) -> bool:
+    for payload in (run, summary):
+        if not isinstance(payload, Mapping):
+            continue
+        if _truthy(payload.get("synthetic_fixture")):
+            return True
+        sink = payload.get("sink_diagnostics")
+        if isinstance(sink, Mapping) and _truthy(sink.get("synthetic_fixture")):
+            return True
+    return False
+
+
 def _build_html(
     *,
     run: Mapping[str, Any],
@@ -1541,7 +1556,12 @@ def _build_html(
     group_field: str,
 ) -> str:
     run_id = str(run.get("run_id") or summary.get("run_id") or "")
-    title = html_escape(f"QbyT sink diagnostics {run_id}")
+    synthetic = _is_synthetic_fixture(run, summary)
+    title = html_escape(
+        f"{SYNTHETIC_FIXTURE_BANNER} — QbyT sink diagnostics {run_id}"
+        if synthetic
+        else f"QbyT sink diagnostics {run_id}"
+    )
     num_input = int(summary.get("num_input") or len(sample_ids))
     num_selected = len(selected_ids)
     readout = run.get("qbyt_readout") or {}
@@ -1684,9 +1704,23 @@ def _build_html(
             ".sample-panel.active{display:block;}",
             ".text-heatmap{display:none;}",
             ".text-heatmap.active{display:block;}",
+            ".synthetic-banner{background:#fff3cd;border:3px solid #b8860b;color:#4a3500;"
+            "padding:0.9rem 1rem;font-weight:700;font-size:1.35rem;margin:0 0 0.6rem;}",
+            ".synthetic-banner-note{background:#fff8e1;border:1px solid #e0c36a;"
+            "padding:0.6rem 1rem;margin:0 0 1.2rem;}",
             "</style>",
             "</head>",
             "<body>",
+            *(
+                [
+                    f'<div class="synthetic-banner" role="status">{html_escape(SYNTHETIC_FIXTURE_BANNER)}</div>',
+                    "<p class=\"synthetic-banner-note\">Synthetic fixture. Not a trained-model "
+                    "conclusion. Do not treat these scores as evidence that sink learned to "
+                    "reject noise.</p>",
+                ]
+                if synthetic
+                else []
+            ),
             "<h1>QbyT sink attention diagnostics</h1>",
             f"<p>run_id: {html_escape(run_id)}</p>",
             f"<p>status: {status}</p>",
