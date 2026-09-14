@@ -317,26 +317,11 @@ def test_legacy_adapter_sample_does_not_draw_rng_twice():
     assert after_sample == after_extract
 
 
-def test_fbank_cache_with_nonempty_sources_raises_not_yet_wired():
-    with pytest.raises(
-        ValueError,
-        match=r"fbank_cache.*non-empty sources.*not yet wired.*CachedBackgroundSource",
-    ):
-        build_background_sampler(
-            _online_config(
-                [
-                    _source_config(
-                        "musan",
-                        "/data/musan/recordings.jsonl",
-                        cache_manifest="/data/musan/cache/manifest.json",
-                    )
-                ],
-                mode="fbank_cache",
-            ),
-            fbank_kwargs={"dither": 0.0},
-        )
-    with pytest.raises(ValueError, match="not yet wired"):
+def test_cached_background_source_is_not_a_stub():
+    with pytest.raises((TypeError, ValueError)) as excinfo:
         CachedBackgroundSource()
+    if excinfo.type is ValueError:
+        assert "not yet wired" not in str(excinfo.value)
 
 
 def test_single_positive_weight_source_does_not_consume_source_selection_rng():

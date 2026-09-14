@@ -1,9 +1,12 @@
-"""Pre-generate the Stage II background fbank crop cache (format v1).
+"""Pre-generate the Stage II background fbank crop cache (format v1 and v2).
 
-Build writes a finite library of K waveform-crop fbank features per MUSAN
-train-background recording. Crops are drawn with
-``SHA256(seed, source_id, crop_ordinal)`` RNGs and materialized through the T1
+Build writes a finite library of K waveform-crop fbank features per train
+background recording. Crops are drawn with
+``SHA256(seed, recording_id, crop_ordinal)`` RNGs and materialized through the T1
 crop contract, then extracted with the composed training fbank.
+
+``--split-dir`` keeps the MUSAN v1 layout. ``--source-manifest`` emits v2 from a
+generic catalog and caches only eligible train recordings.
 
 Checksum policy:
 
@@ -39,6 +42,19 @@ import numpy as np
 import torch
 
 from dma_kws.config import compose_config, config_to_dict, fbank_kwargs, get_fbank_config
+from dma_kws.data_prep.background_manifest import (
+    CATALOG_JSON_NAME,
+    audit_split_isolation,
+    background_record_from_mapping,
+    build_catalog,
+    catalog_to_mapping,
+    read_catalog,
+    read_recordings_jsonl,
+    require_eligible_train_records,
+    semantic_catalog_hash,
+    semantic_record_payload,
+    train_catalog_hash,
+)
 from dma_kws.stage2.background_sampling import (
     BackgroundCropSpec,
     draw_crop_spec,
@@ -49,6 +65,10 @@ from dma_kws.stage2.fbank import FbankExtractor
 
 
 FORMAT_VERSION = 1
+FORMAT_VERSION_V1 = 1
+FORMAT_VERSION_V2 = 2
+SUPPORTED_FORMAT_VERSIONS = frozenset({FORMAT_VERSION_V1, FORMAT_VERSION_V2})
+CROP_POLICY_VERSION = 1
 DEFAULT_EXPERIMENT = "icefall_zipformer_stage2_eps_softmin_v41"
 DEFAULT_CROPS_PER_RECORDING = 128
 DEFAULT_SEED = 2025
@@ -81,6 +101,21 @@ CROP_DTYPE = np.dtype(
         ("num_frames", np.int32),
     ]
 )
+CROP_DTYPE_V2 = np.dtype(
+    [
+        ("crop_id", np.int64),
+        ("recording_index", np.int32),
+        ("ordinal", np.int32),
+        ("duration_seconds", np.float64),
+        ("read_start_frame", np.int64),
+        ("read_num_frames", np.int64),
+        ("target_num_samples", np.int64),
+        ("final_offset", np.int64),
+        ("shard_index", np.int32),
+        ("frame_offset", np.int64),
+        ("num_frames", np.int32),
+    ]
+)
 
 _WORKER_FBANK_KWARGS: dict[str, Any] | None = None
 _WORKER_EXTRACTOR: FbankExtractor | None = None
@@ -97,6 +132,25 @@ class SourceJob:
     duration_seconds_min: float
     duration_seconds_max: float
     feature_dim: int
+    dataset_id: str = ""
+    relative_path: str = ""
+
+
+@dataclass(frozen=True)
+class Stage2BackgroundBuildPlan:
+    format_version: int
+    dataset_id: str
+    fbank: Mapping[str, Any]
+    duration_min: float
+    duration_max: float
+    crops_per_recording: int
+    seed: int
+    workers: int
+    shard_size_mib: int
+    feature_dim: int
+    crop_policy_version: int
+    semantic_catalog_hash: str
+    train_catalog_hash: str
 
 
 @dataclass(frozen=True)
@@ -457,7 +511,7 @@ def _extract_source_crops(
         source_index=job.source_index,
         source_id=job.source_id,
         list_entry=job.list_entry,
-        relative_path=job.source_id,
+        relative_path=job.relative_path or job.source_id,
         sample_rate=int(source.sample_rate),
         num_frames=int(source.num_frames),
         channels=int(source.channels),
@@ -717,6 +771,233 @@ def _check_digest(path: Path, expected_sha256: str, expected_size: int) -> None:
         )
 
 
+def _verify_v2_cache(cache_dir: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    manifest_path = cache_dir / MANIFEST_NAME
+    dataset_id = str(manifest.get("dataset_id") or "")
+    if not dataset_id:
+        raise ValueError(
+            f"dataset_id='' path={manifest_path} field=dataset_id; expected a "
+            f"non-empty dataset id, got {manifest.get('dataset_id')!r}"
+        )
+    if manifest.get("split_role") != "train":
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={manifest_path} field=split_role; "
+            f"expected 'train', got {manifest.get('split_role')!r}"
+        )
+    if manifest.get("dtype") != "float32":
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={manifest_path} field=dtype; "
+            f"expected 'float32', got {manifest.get('dtype')!r}"
+        )
+    expected_id = _cache_id_for(manifest)
+    stamped = manifest.get("cache_id")
+    if stamped != expected_id:
+        raise ValueError(
+            f"dataset_id={dataset_id!r} cache_id={stamped!r} path={manifest_path} "
+            f"field=cache_id; expected {expected_id!r}, got {stamped!r}"
+        )
+    stored_fbank = manifest.get("fbank")
+    if not isinstance(stored_fbank, Mapping):
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={manifest_path} field=fbank; "
+            f"expected a mapping, got {type(stored_fbank).__name__}"
+        )
+    if float(stored_fbank.get("dither", 0.0)) != 0.0:
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={manifest_path} field=fbank.dither; "
+            f"expected 0, got {stored_fbank.get('dither')!r}"
+        )
+
+    recordings_spec = manifest.get("recordings")
+    crops_spec = manifest.get("crops")
+    shard_specs = manifest.get("shards")
+    if not isinstance(recordings_spec, Mapping) or not isinstance(crops_spec, Mapping):
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={manifest_path} field=recordings/crops; "
+            "expected file records"
+        )
+    if not isinstance(shard_specs, list) or not shard_specs:
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={manifest_path} field=shards; "
+            "expected a non-empty list"
+        )
+
+    recordings_path = cache_dir / str(recordings_spec["path"])
+    crops_path = cache_dir / str(crops_spec["path"])
+    _check_digest(
+        recordings_path,
+        str(recordings_spec["sha256"]),
+        int(recordings_spec["size"]),
+    )
+    _check_digest(crops_path, str(crops_spec["sha256"]), int(crops_spec["size"]))
+
+    feature_dim = int(manifest["feature_dim"])
+    crops = np.load(crops_path, allow_pickle=False)
+    if getattr(crops.dtype, "names", None) != CROP_DTYPE_V2.names:
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={crops_path} field=crops.dtype; "
+            f"expected {CROP_DTYPE_V2.names!r}, got {crops.dtype.names!r}"
+        )
+    if int(manifest["num_crops"]) != len(crops):
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={crops_path} field=num_crops; "
+            f"expected {manifest['num_crops']}, got {len(crops)}"
+        )
+
+    seen_shard_names: list[str] = []
+    for shard_spec in shard_specs:
+        if not isinstance(shard_spec, Mapping):
+            raise ValueError(
+                f"dataset_id={dataset_id!r} path={manifest_path} field=shards; "
+                "expected mappings"
+            )
+        shard_path = cache_dir / str(shard_spec["path"])
+        seen_shard_names.append(shard_path.name)
+        _check_digest(shard_path, str(shard_spec["sha256"]), int(shard_spec["size"]))
+        array = np.load(shard_path, mmap_mode="r", allow_pickle=False)
+        if array.dtype != np.float32 or array.ndim != 2:
+            raise ValueError(
+                f"dataset_id={dataset_id!r} path={shard_path} field=dtype/shape; "
+                f"expected float32 [frames, dim], got dtype={array.dtype} shape={array.shape}"
+            )
+        if int(array.shape[1]) != feature_dim:
+            raise ValueError(
+                f"dataset_id={dataset_id!r} path={shard_path} field=feature_dim; "
+                f"expected {feature_dim}, got {array.shape[1]}"
+            )
+        if int(array.shape[0]) != int(shard_spec["num_frames"]):
+            raise ValueError(
+                f"dataset_id={dataset_id!r} path={shard_path} field=num_frames; "
+                f"expected {shard_spec['num_frames']}, got {array.shape[0]}"
+            )
+        if not array.flags["C_CONTIGUOUS"]:
+            raise ValueError(
+                f"dataset_id={dataset_id!r} path={shard_path} field=contiguous; "
+                "expected C-contiguous, got False"
+            )
+        if not bool(np.isfinite(array).all()):
+            raise ValueError(
+                f"dataset_id={dataset_id!r} path={shard_path} field=values; "
+                "expected finite fbank, got non-finite"
+            )
+
+    on_disk = sorted(path.name for path in cache_dir.glob("features-*.npy"))
+    if on_disk != sorted(seen_shard_names):
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={cache_dir} field=shards; "
+            f"expected {seen_shard_names}, got {on_disk}"
+        )
+
+    by_shard: dict[int, list[np.void]] = {}
+    for row in crops:
+        by_shard.setdefault(int(row["shard_index"]), []).append(row)
+    for shard_index, shard_spec in enumerate(shard_specs):
+        rows = sorted(
+            by_shard.get(shard_index, []),
+            key=lambda row: int(row["frame_offset"]),
+        )
+        cursor = 0
+        for row in rows:
+            offset = int(row["frame_offset"])
+            frames = int(row["num_frames"])
+            if frames < 1:
+                raise ValueError(
+                    f"dataset_id={dataset_id!r} recording_index={int(row['recording_index'])} "
+                    f"path={crops_path} field=num_frames; expected >= 1, got {frames}"
+                )
+            if offset != cursor:
+                raise ValueError(
+                    f"dataset_id={dataset_id!r} path={crops_path} field=frame_offset; "
+                    f"expected {cursor}, got {offset}"
+                )
+            cursor += frames
+        if cursor != int(shard_spec["num_frames"]):
+            raise ValueError(
+                f"dataset_id={dataset_id!r} path={cache_dir / str(shard_spec['path'])} "
+                f"field=indexed_frames; expected {shard_spec['num_frames']}, got {cursor}"
+            )
+
+    recordings = _read_jsonl(recordings_path)
+    if len(recordings) != int(manifest["num_sources"]):
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={recordings_path} field=num_sources; "
+            f"expected {manifest['num_sources']}, got {len(recordings)}"
+        )
+    expected_ids: list[str] = []
+    for index, record in enumerate(recordings):
+        recording_id = str(record.get("recording_id") or "")
+        if not recording_id:
+            raise ValueError(
+                f"dataset_id={dataset_id!r} path={recordings_path} field=recording_id; "
+                f"expected a full string, got {record.get('recording_id')!r}"
+            )
+        if int(record.get("recording_index", -1)) != index:
+            raise ValueError(
+                f"dataset_id={dataset_id!r} recording_id={recording_id!r} "
+                f"path={recordings_path} field=recording_index; expected {index}, "
+                f"got {record.get('recording_index')!r}"
+            )
+        start = int(record["crop_start"])
+        count = int(record["crop_count"])
+        expected_ids.append(recording_id)
+        slice_rows = crops[start : start + count]
+        if len(slice_rows) != count:
+            raise ValueError(
+                f"dataset_id={dataset_id!r} recording_id={recording_id!r} "
+                f"path={recordings_path} field=crop window; expected {count} rows, "
+                f"got {len(slice_rows)}"
+            )
+        if any(int(row["recording_index"]) != index for row in slice_rows):
+            raise ValueError(
+                f"dataset_id={dataset_id!r} recording_id={recording_id!r} "
+                f"path={recordings_path} field=recording_index; crop rows mismatch"
+            )
+        if [int(row["ordinal"]) for row in slice_rows] != list(range(count)):
+            raise ValueError(
+                f"dataset_id={dataset_id!r} recording_id={recording_id!r} "
+                f"path={recordings_path} field=ordinal; expected 0..K-1"
+            )
+    if expected_ids != sorted(expected_ids):
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={recordings_path} field=recording_id; "
+            "expected recordings.jsonl sorted by recording_id"
+        )
+
+    snapshot = manifest.get("train_snapshot")
+    if not isinstance(snapshot, list) or len(snapshot) != len(recordings):
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={manifest_path} field=train_snapshot; "
+            f"expected {len(recordings)} records, got "
+            f"{0 if not isinstance(snapshot, list) else len(snapshot)}"
+        )
+    snapshot_records = [background_record_from_mapping(item) for item in snapshot]
+    computed_train = train_catalog_hash(snapshot_records)
+    stamped_train = str(manifest.get("train_catalog_hash") or "")
+    if computed_train != stamped_train:
+        raise ValueError(
+            f"dataset_id={dataset_id!r} cache_id={stamped!r} path={manifest_path} "
+            f"field=train_catalog_hash; expected {computed_train!r}, got {stamped_train!r}"
+        )
+    snapshot_ids = [record.recording_id for record in snapshot_records]
+    if snapshot_ids != expected_ids:
+        raise ValueError(
+            f"dataset_id={dataset_id!r} path={manifest_path} field=train members; "
+            f"expected {expected_ids!r}, got {snapshot_ids!r}"
+        )
+    audit_split_isolation(snapshot_records)
+
+    return {
+        "ok": True,
+        "output_dir": str(cache_dir),
+        "cache_id": str(stamped),
+        "format_version": FORMAT_VERSION_V2,
+        "num_sources": int(manifest["num_sources"]),
+        "num_crops": int(manifest["num_crops"]),
+        "num_shards": len(shard_specs),
+        "K": int(manifest["K"]),
+    }
+
+
 def verify_stage2_background_cache(output_dir: str | Path) -> dict[str, Any]:
     """Re-hash index and shards and check shapes/offsets/finite values."""
     cache_dir = Path(output_dir).expanduser().resolve()
@@ -726,10 +1007,17 @@ def verify_stage2_background_cache(output_dir: str | Path) -> dict[str, Any]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError(f"manifest.json must be a mapping: {manifest_path}")
-    if int(manifest.get("format_version", -1)) != FORMAT_VERSION:
+    try:
+        version = int(manifest.get("format_version", -1))
+    except (TypeError, ValueError):
+        version = -1
+    if version not in SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(
-            f"Unsupported background cache format_version={manifest.get('format_version')!r}"
+            f"Unsupported background cache format_version="
+            f"{manifest.get('format_version')!r}"
         )
+    if version == FORMAT_VERSION_V2:
+        return _verify_v2_cache(cache_dir, manifest)
     if manifest.get("split_role") != "train":
         raise ValueError(
             f"Background cache split_role must be 'train', got {manifest.get('split_role')!r}"
@@ -1031,9 +1319,338 @@ def _write_cache(
     return manifest
 
 
+def _catalog_snapshot_payload(catalog: Any) -> dict[str, Any]:
+    payload = catalog_to_mapping(catalog)
+    payload.pop("root", None)
+    return payload
+
+
+def _write_cache_v2(
+    staging: Path,
+    *,
+    jobs: Sequence[SourceJob],
+    train_records: Sequence[Any],
+    catalog: Any,
+    workers: int,
+    fbank_params: Mapping[str, Any],
+    feature_dim: int,
+    shard_size_mib: int,
+    experiment: str,
+    overrides: Sequence[str],
+    seed: int,
+    crops_per_recording: int,
+    duration_min: float,
+    duration_max: float,
+    source_manifest: Path,
+) -> dict[str, Any]:
+    writer = _ShardWriter(
+        staging,
+        feature_dim=feature_dim,
+        max_frames=_max_frames_per_shard(shard_size_mib, feature_dim),
+    )
+    crop_rows = np.empty(len(jobs) * crops_per_recording, dtype=CROP_DTYPE_V2)
+    recordings_path = staging / RECORDINGS_NAME
+    records_by_id = {record.recording_id: record for record in train_records}
+    crop_id = 0
+    with recordings_path.open("w", encoding="utf-8", newline="\n") as handle:
+        for result in _iter_source_results(
+            jobs, workers=workers, fbank_params=fbank_params
+        ):
+            catalog_record = records_by_id[result.source_id]
+            crop_start = crop_id
+            record = {
+                "audio_sha256": catalog_record.audio_sha256,
+                "background_eligible": True,
+                "categories": list(catalog_record.categories),
+                "channels": result.channels,
+                "content_sha256": result.content_sha256,
+                "crop_count": len(result.specs),
+                "crop_start": crop_start,
+                "duration_seconds": catalog_record.duration_seconds,
+                "eligibility_basis": catalog_record.eligibility_basis,
+                "group_id": catalog_record.group_id,
+                "license_id": catalog_record.license_id,
+                "num_frames": result.num_frames,
+                "origin_ids": list(catalog_record.origin_ids),
+                "provenance_complete": catalog_record.provenance_complete,
+                "recording_id": catalog_record.recording_id,
+                "recording_index": result.source_index,
+                "relative_path": catalog_record.relative_path,
+                "sample_rate": result.sample_rate,
+            }
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            for ordinal, spec, features in zip(
+                range(len(result.specs)), result.specs, result.features
+            ):
+                shard_index, frame_offset = writer.add(features)
+                row = crop_rows[crop_id]
+                row["crop_id"] = crop_id
+                row["recording_index"] = result.source_index
+                row["ordinal"] = ordinal
+                row["duration_seconds"] = spec.duration_seconds
+                row["read_start_frame"] = spec.read_start_frame
+                row["read_num_frames"] = spec.read_num_frames
+                row["target_num_samples"] = spec.target_num_samples
+                row["final_offset"] = spec.final_offset
+                row["shard_index"] = shard_index
+                row["frame_offset"] = frame_offset
+                row["num_frames"] = int(features.shape[0])
+                crop_id += 1
+        handle.flush()
+        os.fsync(handle.fileno())
+    shard_records = writer.close()
+    if crop_id != len(crop_rows):
+        raise RuntimeError(f"Wrote {crop_id} crops, expected {len(crop_rows)}")
+    if not shard_records:
+        raise RuntimeError("Background cache produced no feature shards")
+
+    crops_path = staging / CROPS_NAME
+    _save_npy(crops_path, crop_rows)
+    recordings_record = _file_record(recordings_path, relative_name=RECORDINGS_NAME)
+    crops_record = _file_record(crops_path, relative_name=CROPS_NAME)
+    normalized_fbank = _normalize_fbank(fbank_params)
+    ordered_train = tuple(sorted(train_records, key=lambda item: item.recording_id))
+    train_snapshot = [semantic_record_payload(record) for record in ordered_train]
+    manifest: dict[str, Any] = {
+        "catalog": _catalog_snapshot_payload(catalog),
+        "crop_policy_version": CROP_POLICY_VERSION,
+        "crops": crops_record,
+        "crops_per_recording": crops_per_recording,
+        "dataset_id": catalog.dataset_id,
+        "dependency_versions": _dependency_versions(),
+        "dtype": "float32",
+        "duration_seconds_max": duration_max,
+        "duration_seconds_min": duration_min,
+        "experiment": experiment,
+        "fbank": normalized_fbank,
+        "feature_dim": feature_dim,
+        "feature_lib": {
+            "extractor": "dma_kws.stage2.fbank.FbankExtractor",
+            "backend": normalized_fbank.get("backend"),
+        },
+        "format_version": FORMAT_VERSION_V2,
+        "K": crops_per_recording,
+        "num_crops": len(crop_rows),
+        "num_sources": len(jobs),
+        "overrides": list(overrides),
+        "recordings": recordings_record,
+        "semantic_catalog_hash": catalog.semantic_catalog_hash,
+        "shard_size_mib": shard_size_mib,
+        "shards": shard_records,
+        "split_role": "train",
+        "seed": seed,
+        "train_catalog_hash": train_catalog_hash(ordered_train),
+        "train_snapshot": train_snapshot,
+        "build": {
+            "built_at": datetime.now(timezone.utc).isoformat(),
+            "source_manifest": str(source_manifest),
+            "workers": workers,
+        },
+    }
+    manifest["cache_id"] = _cache_id_for(manifest)
+    _write_text(
+        staging / MANIFEST_NAME,
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    return manifest
+
+
+def _load_source_catalog(source_manifest: Path):
+    if not source_manifest.is_file():
+        raise FileNotFoundError(
+            f"field=source_manifest; expected an existing recordings.jsonl, "
+            f"got {str(source_manifest)!r}"
+        )
+    records = read_recordings_jsonl(source_manifest)
+    if not records:
+        raise ValueError(
+            f"path={source_manifest} field=recordings; expected at least one "
+            "catalog recording, got 0"
+        )
+    dataset_ids = sorted({record.dataset_id for record in records if record.dataset_id})
+    if len(dataset_ids) != 1:
+        raise ValueError(
+            f"path={source_manifest} field=dataset_id; expected a single dataset "
+            f"id, got {dataset_ids!r}"
+        )
+    dataset_id = dataset_ids[0]
+    mismatched = next(
+        (record for record in records if record.dataset_id != dataset_id),
+        None,
+    )
+    if mismatched is not None:
+        raise ValueError(
+            f"dataset_id={dataset_id!r} recording_id={mismatched.recording_id!r} "
+            f"path={source_manifest} field=dataset_id; expected {dataset_id!r}, "
+            f"got {mismatched.dataset_id!r}"
+        )
+    catalog_path = source_manifest.parent / CATALOG_JSON_NAME
+    if catalog_path.is_file():
+        catalog = read_catalog(catalog_path)
+        if catalog.dataset_id != dataset_id:
+            raise ValueError(
+                f"dataset_id={dataset_id!r} path={catalog_path} field=dataset_id; "
+                f"expected {dataset_id!r}, got {catalog.dataset_id!r}"
+            )
+        recomputed = semantic_catalog_hash(
+            records,
+            filter_policy_version=catalog.filter_policy_version,
+            filter_policy_hash=catalog.filter_policy_hash,
+            split_seed=catalog.split_seed,
+            split_rules=catalog.split_rules,
+        )
+        if catalog.semantic_catalog_hash != recomputed:
+            raise ValueError(
+                f"dataset_id={dataset_id!r} path={catalog_path} "
+                f"field=semantic_catalog_hash; expected {recomputed!r}, "
+                f"got {catalog.semantic_catalog_hash!r}"
+            )
+    else:
+        catalog = build_catalog(
+            dataset_id=dataset_id,
+            root=str(source_manifest.parent),
+            records=records,
+            recordings_path=source_manifest,
+        )
+    isolation = audit_split_isolation(records)
+    eligible = require_eligible_train_records(records, source_id=dataset_id)
+    ordered = tuple(sorted(eligible, key=lambda item: item.recording_id))
+    return catalog, records, ordered, isolation
+
+
+def _resolved_record_audio(record: Any, *, manifest_path: Path) -> Path:
+    audio_path = Path(record.audio_path)
+    if not audio_path.is_absolute():
+        audio_path = manifest_path.parent / audio_path
+    if not audio_path.is_file():
+        raise FileNotFoundError(
+            f"dataset_id={record.dataset_id!r} recording_id={record.recording_id!r} "
+            f"field=audio_path; expected an accessible audio file, got {str(audio_path)!r}"
+        )
+    return audio_path.resolve()
+
+
+def _prepare_v2_from_manifest(
+    *,
+    source_manifest: Path,
+    destination: Path,
+    experiment: str,
+    overrides: Sequence[str],
+    crops_per_recording: int,
+    seed: int,
+    workers: int,
+    shard_size_mib: int,
+) -> dict[str, Any]:
+    override_list = [str(item) for item in overrides]
+    composed = config_to_dict(compose_config(experiment, override_list))
+    fbank_params = _normalize_fbank(fbank_kwargs(get_fbank_config(composed)))
+    if float(fbank_params["dither"]) != 0.0:
+        raise ValueError(
+            "fbank_cache v2 accepts dither=0 only; composed fbank dither is "
+            f"{fbank_params['dither']!r}. Pass an experiment with dither=0 "
+            "(do not silently zero it)."
+        )
+    duration_min, duration_max = _duration_bounds(composed)
+    feature_dim = int(fbank_params["num_mel_bins"])
+    catalog, _all_records, train_records, _isolation = _load_source_catalog(
+        source_manifest
+    )
+    plan = Stage2BackgroundBuildPlan(
+        format_version=FORMAT_VERSION_V2,
+        dataset_id=catalog.dataset_id,
+        fbank=fbank_params,
+        duration_min=duration_min,
+        duration_max=duration_max,
+        crops_per_recording=crops_per_recording,
+        seed=seed,
+        workers=workers,
+        shard_size_mib=shard_size_mib,
+        feature_dim=feature_dim,
+        crop_policy_version=CROP_POLICY_VERSION,
+        semantic_catalog_hash=catalog.semantic_catalog_hash,
+        train_catalog_hash=train_catalog_hash(train_records),
+    )
+    if destination.exists():
+        raise FileExistsError(
+            f"Refusing to overwrite an existing Stage II background cache: {destination}"
+        )
+    jobs = [
+        SourceJob(
+            source_index=index,
+            source_id=record.recording_id,
+            path=str(_resolved_record_audio(record, manifest_path=source_manifest)),
+            list_entry=record.relative_path,
+            seed=plan.seed,
+            crops_per_recording=plan.crops_per_recording,
+            duration_seconds_min=plan.duration_min,
+            duration_seconds_max=plan.duration_max,
+            feature_dim=plan.feature_dim,
+            dataset_id=plan.dataset_id,
+            relative_path=record.relative_path,
+        )
+        for index, record in enumerate(train_records)
+    ]
+    _print_capacity_plan(
+        num_sources=len(jobs),
+        crops_per_recording=plan.crops_per_recording,
+        fbank=plan.fbank,
+        duration_min=plan.duration_min,
+        duration_max=plan.duration_max,
+        config=composed,
+    )
+    for job in jobs:
+        try:
+            probe_source_info(job.path, source_id=job.source_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"dataset_id={job.dataset_id!r} recording_id={job.source_id!r} "
+                f"path={job.path}: Could not read background source"
+            ) from exc
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(dir=destination.parent, prefix=f".{destination.name}.")
+    )
+    try:
+        _write_cache_v2(
+            staging,
+            jobs=jobs,
+            train_records=train_records,
+            catalog=catalog,
+            workers=plan.workers,
+            fbank_params=plan.fbank,
+            feature_dim=plan.feature_dim,
+            shard_size_mib=plan.shard_size_mib,
+            experiment=str(experiment),
+            overrides=override_list,
+            seed=plan.seed,
+            crops_per_recording=plan.crops_per_recording,
+            duration_min=plan.duration_min,
+            duration_max=plan.duration_max,
+            source_manifest=source_manifest,
+        )
+        verify_stage2_background_cache(staging)
+        os.replace(staging, destination)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+    manifest = json.loads((destination / MANIFEST_NAME).read_text(encoding="utf-8"))
+    return {
+        "output_dir": str(destination),
+        "cache_id": manifest["cache_id"],
+        "format_version": FORMAT_VERSION_V2,
+        "num_sources": manifest["num_sources"],
+        "num_crops": manifest["num_crops"],
+        "num_shards": len(manifest["shards"]),
+        "K": manifest["K"],
+    }
+
+
 def prepare_stage2_background(
     *,
-    split_dir: str | Path,
+    split_dir: str | Path | None = None,
+    source_manifest: str | Path | None = None,
     output_dir: str | Path,
     experiment: str = DEFAULT_EXPERIMENT,
     overrides: Sequence[str] = (),
@@ -1043,7 +1660,7 @@ def prepare_stage2_background(
     shard_size_mib: int = DEFAULT_SHARD_SIZE_MIB,
     verify_only: bool = False,
 ) -> dict[str, Any]:
-    """Build or verify a format-v1 Stage II background fbank crop cache."""
+    """Build or verify a Stage II background fbank crop cache (v1 or v2)."""
     crops_per_recording = _require_int(
         crops_per_recording, field="crops_per_recording", minimum=1
     )
@@ -1054,6 +1671,24 @@ def prepare_stage2_background(
     destination = Path(output_dir).expanduser().resolve()
     if verify_only:
         return verify_stage2_background_cache(destination)
+
+    if source_manifest is not None and split_dir is not None:
+        raise ValueError("split_dir and source_manifest are mutually exclusive")
+    if source_manifest is not None:
+        return _prepare_v2_from_manifest(
+            source_manifest=Path(source_manifest).expanduser().resolve(),
+            destination=destination,
+            experiment=str(experiment),
+            overrides=overrides,
+            crops_per_recording=crops_per_recording,
+            seed=seed,
+            workers=workers,
+            shard_size_mib=shard_size_mib,
+        )
+    if split_dir is None:
+        raise ValueError(
+            "split_dir is required for format v1 unless verify_only or source_manifest"
+        )
 
     split_root = Path(split_dir).expanduser().resolve()
     override_list = [str(item) for item in overrides]
@@ -1176,11 +1811,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Pre-generate the Stage II background fbank crop cache."
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
         "--split-dir",
         type=Path,
-        required=True,
-        help="Existing MUSAN split directory (split.json + train/eval lists)",
+        default=None,
+        help="Existing MUSAN split directory (split.json + train/eval lists); emits v1",
+    )
+    source.add_argument(
+        "--source-manifest",
+        type=Path,
+        default=None,
+        help="Generic recordings.jsonl catalog; emits v2 eligible-train cache",
     )
     parser.add_argument(
         "--output-dir",
@@ -1234,8 +1876,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     args = build_parser().parse_args(argv)
+    if (
+        not args.verify_only
+        and args.split_dir is None
+        and args.source_manifest is None
+    ):
+        raise ValueError(
+            "one of --split-dir or --source-manifest is required unless --verify-only"
+        )
     summary = prepare_stage2_background(
         split_dir=args.split_dir,
+        source_manifest=args.source_manifest,
         output_dir=args.output_dir,
         experiment=args.experiment,
         overrides=tuple(args.override or ()),

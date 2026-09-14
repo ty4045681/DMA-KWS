@@ -465,6 +465,15 @@ def eligible_train_records(
     )
 
 
+def train_catalog_hash(records: Sequence[BackgroundRecord]) -> str:
+    eligible = sorted(
+        eligible_train_records(records),
+        key=lambda item: item.recording_id,
+    )
+    payload = [semantic_record_payload(record) for record in eligible]
+    return hashlib.sha256(canonical_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
 def require_eligible_train_records(
     records: Sequence[BackgroundRecord], *, source_id: str
 ) -> tuple[BackgroundRecord, ...]:

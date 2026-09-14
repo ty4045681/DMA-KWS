@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ from dma_kws.data_prep.background_manifest import (
     read_catalog,
     read_recordings_jsonl,
     require_eligible_train_records,
+    train_catalog_hash,
 )
 from dma_kws.stage2.background_sampling import (
     draw_crop_spec,
@@ -94,6 +96,27 @@ class LegacyBackgroundSamplerAdapter:
             close()
 
 
+class _BoundedLRU:
+    def __init__(self, max_entries: int = 128) -> None:
+        self.max_entries = max(1, int(max_entries))
+        self._items: OrderedDict[str, Any] = OrderedDict()
+
+    def get(self, key: str):
+        value = self._items.get(key)
+        if value is not None:
+            self._items.move_to_end(key)
+        return value
+
+    def put(self, key: str, value: Any) -> None:
+        self._items[key] = value
+        self._items.move_to_end(key)
+        while len(self._items) > self.max_entries:
+            self._items.popitem(last=False)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+
 class OnlineBackgroundSource:
     """Uniform-over-recordings online crop for one catalog source."""
 
@@ -118,7 +141,7 @@ class OnlineBackgroundSource:
         self._fbank_kwargs = dict(fbank_kwargs or {})
         self._background_source_id = int(background_source_id)
         self._fbank_extractor: FbankExtractor | None = None
-        self._source_info_cache: dict[str, Any] = {}
+        self._source_info_cache = _BoundedLRU()
 
     def _fbank(self) -> FbankExtractor:
         if self._fbank_extractor is None:
@@ -131,7 +154,7 @@ class OnlineBackgroundSource:
         if cached is not None:
             return cached
         info = probe_source_info(path, source_id=source_id)
-        self._source_info_cache[key] = info
+        self._source_info_cache.put(key, info)
         return info
 
     def sample(self, *, rng: random.Random) -> BackgroundSample:
@@ -168,36 +191,199 @@ class OnlineBackgroundSource:
         self._fbank_extractor = None
         self._source_info_cache.clear()
 
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_fbank_extractor"] = None
+        return state
+
+
+def _adapt_v1_cache_members(
+    *,
+    source_id: str,
+    cache_ids: Sequence[str],
+    train_records: Sequence[Any],
+    cache_id: str,
+    cache_manifest: Path,
+) -> tuple[str, ...]:
+    by_key: dict[str, Any] = {}
+    prefix = f"{source_id}:"
+    for record in train_records:
+        keys = {record.recording_id, record.relative_path}
+        if record.recording_id.startswith(prefix):
+            keys.add(record.recording_id[len(prefix) :])
+        for key in keys:
+            if not key:
+                continue
+            previous = by_key.get(key)
+            if previous is not None and previous.recording_id != record.recording_id:
+                raise ValueError(
+                    f"dataset_id={source_id!r} cache_id={cache_id!r} "
+                    f"path={cache_manifest} field=train members; expected unique "
+                    f"v1 mapping keys, got {key!r} for {previous.recording_id!r} "
+                    f"and {record.recording_id!r}"
+                )
+            by_key[key] = record
+    mapped: list[str] = []
+    unmapped_cache: list[str] = []
+    used: set[str] = set()
+    for cache_source_id in cache_ids:
+        record = by_key.get(cache_source_id)
+        if record is None:
+            unmapped_cache.append(cache_source_id)
+            continue
+        mapped.append(record.recording_id)
+        used.add(record.recording_id)
+    train_ids = {record.recording_id for record in train_records}
+    extra_train = sorted(train_ids - used)
+    if (
+        unmapped_cache
+        or extra_train
+        or len(mapped) != len(cache_ids)
+        or len(used) != len(train_ids)
+    ):
+        raise ValueError(
+            f"dataset_id={source_id!r} cache_id={cache_id!r} path={cache_manifest} "
+            "field=train members; expected 1:1 mapping between v1 cache source_ids "
+            f"and imported eligible train recording_ids, got cache={list(cache_ids)!r} "
+            f"train={sorted(train_ids)!r} unmapped_cache={unmapped_cache!r} "
+            f"extra_train={extra_train!r}"
+        )
+    return tuple(mapped)
+
+
+def _align_cache_recording_ids(
+    *,
+    source_id: str,
+    cache: Any,
+    train_records: Sequence[Any],
+    cache_manifest: Path,
+) -> tuple[str, ...]:
+    train_ids = [record.recording_id for record in train_records]
+    cache_ids = list(cache.recording_ids)
+    if cache.format_version == 2:
+        if cache.dataset_id and cache.dataset_id != source_id:
+            raise ValueError(
+                f"dataset_id={source_id!r} cache_id={cache.cache_id!r} "
+                f"path={cache_manifest} field=dataset_id; expected {source_id!r}, "
+                f"got {cache.dataset_id!r}"
+            )
+        if cache_ids != train_ids:
+            raise ValueError(
+                f"dataset_id={source_id!r} cache_id={cache.cache_id!r} "
+                f"path={cache_manifest} field=train members; expected {train_ids!r}, "
+                f"got {cache_ids!r}"
+            )
+        if cache.train_catalog_hash:
+            expected = train_catalog_hash(train_records)
+            if cache.train_catalog_hash != expected:
+                raise ValueError(
+                    f"dataset_id={source_id!r} cache_id={cache.cache_id!r} "
+                    f"path={cache_manifest} field=train_catalog_hash; expected "
+                    f"{expected!r}, got {cache.train_catalog_hash!r}"
+                )
+        return tuple(cache_ids)
+    if cache.format_version != 1:
+        raise ValueError(
+            f"dataset_id={source_id!r} cache_id={cache.cache_id!r} "
+            f"path={cache_manifest} field=format_version; expected 1 or 2, "
+            f"got {cache.format_version!r}"
+        )
+    return _adapt_v1_cache_members(
+        source_id=source_id,
+        cache_ids=cache_ids,
+        train_records=train_records,
+        cache_id=cache.cache_id,
+        cache_manifest=cache_manifest,
+    )
+
 
 class CachedBackgroundSource:
-    """Cache v2 strategy; Task 4 fills the reader."""
+    """Uniform-over-recordings reader for a v1 or v2 fbank crop cache."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise ValueError(
-            "stage2.background_negative.mode=fbank_cache with non-empty sources "
-            "is not yet wired (CachedBackgroundSource)"
+    def __init__(
+        self,
+        *,
+        source_id: str,
+        manifest_path: str | Path,
+        cache_manifest: str | Path,
+        records: Sequence[Any],
+        duration_seconds_min: float,
+        duration_seconds_max: float,
+        expected_fbank_kwargs: Mapping[str, Any],
+        background_source_id: int,
+        shard_store: Any | None = None,
+    ) -> None:
+        from dma_kws.stage2.background_cache import BackgroundFeatureCache
+
+        if not records:
+            raise ValueError(
+                f"dataset_id={source_id!r} field=train; expected eligible train "
+                "recordings, got 0"
+            )
+        cache_path = Path(cache_manifest)
+        cache = BackgroundFeatureCache(
+            cache_path,
+            expected_fbank_kwargs=expected_fbank_kwargs,
+            duration_seconds_min=duration_seconds_min,
+            duration_seconds_max=duration_seconds_max,
+            shard_store=shard_store,
         )
+        try:
+            ordered = tuple(sorted(records, key=lambda item: item.recording_id))
+            recording_ids = _align_cache_recording_ids(
+                source_id=source_id,
+                cache=cache,
+                train_records=ordered,
+                cache_manifest=cache_path,
+            )
+        except Exception:
+            cache.close()
+            raise
+        self.source_id = source_id
+        self.manifest_path = Path(manifest_path)
+        self._cache = cache
+        self._recording_ids = recording_ids
+        self._background_source_id = int(background_source_id)
 
     def sample(self, *, rng: random.Random) -> BackgroundSample:
-        raise ValueError(
-            "stage2.background_negative.mode=fbank_cache with non-empty sources "
-            "is not yet wired (CachedBackgroundSource)"
+        crop_id, source_index, _ordinal = self._cache.draw_crop_index(rng=rng)
+        feat = self._cache.read_crop(crop_id)
+        return BackgroundSample(
+            feat=feat,
+            background_source_id=self._background_source_id,
+            recording_id=self._recording_ids[source_index],
+            crop_id=str(crop_id),
         )
+
+    def extract(self, *, rng: random.Random) -> torch.Tensor:
+        return self.sample(rng=rng).feat
 
     def run_record_fields(self) -> dict[str, Any]:
-        raise ValueError(
-            "stage2.background_negative.mode=fbank_cache with non-empty sources "
-            "is not yet wired (CachedBackgroundSource)"
-        )
+        return {
+            "background_source_id": self.source_id,
+            "background_manifest": str(self.manifest_path),
+            "background_cache_manifest": str(self._cache.manifest_path),
+            "background_cache_id": self._cache.cache_id,
+            "background_cache_format_version": int(self._cache.format_version),
+            "background_recording_count": len(self._recording_ids),
+        }
 
     def close(self) -> None:
-        return None
+        cache = getattr(self, "_cache", None)
+        if cache is not None:
+            cache.close()
 
 
 class MultiSourceBackgroundSampler:
     """Weighted source draw, then one inner ``sample()``. No probability gate."""
 
-    def __init__(self, sources: Sequence[tuple[str, float, Any]]) -> None:
+    def __init__(
+        self,
+        sources: Sequence[tuple[str, float, Any]],
+        *,
+        shard_store: Any | None = None,
+        mode: str = "online",
+    ) -> None:
         by_id: dict[str, tuple[float, Any]] = {}
         for source_id, weight, sampler in sources:
             if source_id in by_id:
@@ -218,6 +404,8 @@ class MultiSourceBackgroundSampler:
             normalize_source_weights([by_id[source_id][0] for source_id in ordered_ids])
         )
         self._samplers = tuple(by_id[source_id][1] for source_id in ordered_ids)
+        self._shard_store = shard_store
+        self._mode = str(mode)
 
     def sample(self, *, rng: random.Random) -> BackgroundSample:
         index = select_weighted_source_index(self._weights, rng)
@@ -234,7 +422,7 @@ class MultiSourceBackgroundSampler:
 
     def run_record_fields(self) -> dict[str, Any]:
         fields: dict[str, Any] = {
-            "background_mode": "online",
+            "background_mode": self._mode,
             "background_source_ids": list(self._source_ids),
             "background_source_weights": list(self._weights),
             "background_source_index": dict(self._index),
@@ -253,9 +441,15 @@ class MultiSourceBackgroundSampler:
             close = getattr(sampler, "close", None)
             if callable(close):
                 close()
+        store = self._shard_store
+        self._shard_store = None
+        if store is not None:
+            close_store = getattr(store, "close", None)
+            if callable(close_store):
+                close_store()
 
 
-def _load_online_records(source: Any) -> tuple[Any, ...]:
+def _load_source_records(source: Any, *, require_audio: bool) -> tuple[Any, ...]:
     source_id = source.id
     manifest = Path(str(source.manifest or "")).expanduser()
     if not manifest.is_file():
@@ -279,16 +473,17 @@ def _load_online_records(source: Any) -> tuple[Any, ...]:
         assert_catalog_source_id(read_catalog(catalog_path), source_id)
     eligible = require_eligible_train_records(records, source_id=source_id)
     ordered = tuple(sorted(eligible, key=lambda item: item.recording_id))
-    for record in ordered:
-        audio_path = Path(record.audio_path)
-        if not audio_path.is_absolute():
-            audio_path = manifest.parent / audio_path
-        if not audio_path.is_file():
-            raise FileNotFoundError(
-                f"source id={source_id!r} recording_id={record.recording_id!r} "
-                f"field=audio_path; expected an accessible audio file, got "
-                f"{str(audio_path)!r}"
-            )
+    if require_audio:
+        for record in ordered:
+            audio_path = Path(record.audio_path)
+            if not audio_path.is_absolute():
+                audio_path = manifest.parent / audio_path
+            if not audio_path.is_file():
+                raise FileNotFoundError(
+                    f"source id={source_id!r} recording_id={record.recording_id!r} "
+                    f"field=audio_path; expected an accessible audio file, got "
+                    f"{str(audio_path)!r}"
+                )
     return ordered
 
 
@@ -353,18 +548,49 @@ def build_background_sampler(
     sources = payload.get("sources") or []
     mode = str(payload.get("mode") or "online").strip() or "online"
     if sources:
-        if mode == "fbank_cache":
-            raise ValueError(
-                "stage2.background_negative.mode=fbank_cache with non-empty "
-                "sources is not yet wired (CachedBackgroundSource)"
-            )
         active = active_background_sources(sources)
         index = background_source_batch_index([source.id for source in active])
         duration_min = float(payload.get("duration_seconds_min", 1.0))
         duration_max = float(payload.get("duration_seconds_max", 3.0))
-        built: list[tuple[str, float, BackgroundSampler]] = []
+        if mode == "fbank_cache":
+            from dma_kws.stage2.background_cache import ShardStore
+
+            fbank = dict(fbank_kwargs or {})
+            if "dither" in fbank and float(fbank["dither"]) != 0.0:
+                raise ValueError(
+                    "stage2.background_negative.mode=fbank_cache "
+                    f"requires fbank dither=0, got {fbank['dither']!r}"
+                )
+            store = ShardStore(max_open_shards=payload.get("max_open_shards", 8))
+            built: list[tuple[str, float, BackgroundSampler]] = []
+            try:
+                for source in active:
+                    records = _load_source_records(source, require_audio=False)
+                    inner = CachedBackgroundSource(
+                        source_id=source.id,
+                        manifest_path=source.manifest,
+                        cache_manifest=source.cache_manifest,
+                        records=records,
+                        duration_seconds_min=duration_min,
+                        duration_seconds_max=duration_max,
+                        expected_fbank_kwargs=fbank,
+                        background_source_id=index[source.id],
+                        shard_store=store,
+                    )
+                    built.append((source.id, float(source.weight), inner))
+            except Exception:
+                for _source_id, _weight, sampler in built:
+                    close = getattr(sampler, "close", None)
+                    if callable(close):
+                        close()
+                store.close()
+                raise
+            return MultiSourceBackgroundSampler(
+                built, shard_store=store, mode="fbank_cache"
+            )
+        built = []
         for source in active:
-            records = _load_online_records(source)
+            records = _load_source_records(source, require_audio=True)
             inner = OnlineBackgroundSource(
                 source_id=source.id,
                 manifest_path=source.manifest,
@@ -375,5 +601,5 @@ def build_background_sampler(
                 background_source_id=index[source.id],
             )
             built.append((source.id, float(source.weight), inner))
-        return MultiSourceBackgroundSampler(built)
+        return MultiSourceBackgroundSampler(built, mode="online")
     return _build_legacy_sampler(payload, fbank_kwargs=fbank_kwargs)
