@@ -91,12 +91,20 @@ class EncoderTimeMap:
     kind: str
     subsampling_rate: int = 1
     right_context: int = 0
+    offset: int = 0
+    stride: int = 1
+    receptive_field: int = 1
     lookup: tuple[int, ...] | None = None
 
     def output_frames(self, num_input_frames: int) -> int:
         n = int(num_input_frames)
         if n <= 0:
             return 0
+        if self.stride >= 1 and self.receptive_field >= 1:
+            needed = int(self.offset) + int(self.receptive_field)
+            if n < needed:
+                return 0
+            return (n - needed) // int(self.stride) + 1
         if self.kind == "identity":
             return n
         if self.kind == "wenet":
@@ -128,6 +136,9 @@ class EncoderTimeMap:
             "kind": self.kind,
             "subsampling_rate": int(self.subsampling_rate),
             "right_context": int(self.right_context),
+            "offset": int(self.offset),
+            "stride": int(self.stride),
+            "receptive_field": int(self.receptive_field),
         }
         if self.lookup is not None:
             payload["output_frames_lookup"] = [int(v) for v in self.lookup]
@@ -256,10 +267,22 @@ def inspect_encoder_time_map(encoder) -> EncoderTimeMap | None:
         return None
     if any(value < 0 for value in values):
         return None
+
+    def _output_fn(num_input_frames: int) -> int:
+        return int(encoder_output_frames(encoder, num_input_frames))
+
+    geometry = _fit_regular_geometry(_output_fn)
+    if geometry is None:
+        return None
+    offset, stride, receptive_field = geometry
+
     if all(int(encoder_output_frames(encoder, n)) == n for n in probes):
         return EncoderTimeMap(
             method="kaldi_fbank_center+identity_output_frames",
             kind="identity",
+            offset=offset,
+            stride=stride,
+            receptive_field=receptive_field,
         )
 
     embed = getattr(encoder, "embed", None)
@@ -270,12 +293,19 @@ def inspect_encoder_time_map(encoder) -> EncoderTimeMap | None:
         for n in probes:
             span = n - int(right_context) - 1
             expected.append(0 if span < 0 else span // int(rate) + 1)
-        if values == expected:
+        if (
+            values == expected
+            and stride == int(rate)
+            and receptive_field == int(right_context) + 1
+        ):
             return EncoderTimeMap(
                 method="kaldi_fbank_center+wenet_embed",
                 kind="wenet",
                 subsampling_rate=int(rate),
                 right_context=int(right_context),
+                offset=offset,
+                stride=stride,
+                receptive_field=receptive_field,
             )
 
     try:
@@ -294,18 +324,21 @@ def inspect_encoder_time_map(encoder) -> EncoderTimeMap | None:
             return EncoderTimeMap(
                 method="kaldi_fbank_center+icefall_zipformer",
                 kind="icefall",
+                offset=offset,
+                stride=stride,
+                receptive_field=receptive_field,
             )
     except Exception:
         pass
 
-    lookup_cap = max(max(probes), 2048)
-    lookup = [0]
-    for n in range(1, lookup_cap + 1):
-        lookup.append(int(encoder_output_frames(encoder, n)))
     return EncoderTimeMap(
-        method="kaldi_fbank_center+declared_output_frames",
-        kind="lookup",
-        lookup=tuple(lookup),
+        method="kaldi_fbank_center+regular_subsampling",
+        kind="regular",
+        subsampling_rate=stride,
+        right_context=receptive_field - 1,
+        offset=offset,
+        stride=stride,
+        receptive_field=receptive_field,
     )
 
 
@@ -339,15 +372,18 @@ def encoder_time_map_from_json(payload: Mapping[str, Any] | None) -> EncoderTime
         kind=kind,
         subsampling_rate=int(payload.get("subsampling_rate") or 1),
         right_context=int(payload.get("right_context") or 0),
+        offset=int(payload.get("offset") or 0),
+        stride=int(payload.get("stride") or 1),
+        receptive_field=int(payload.get("receptive_field") or 1),
         lookup=lookup_t,
     )
 
 
-def _min_input_for_output(time_map: EncoderTimeMap, min_out: int) -> int:
+def _min_input_reaching(output_fn, min_out: int) -> int:
     if min_out <= 0:
         return 0
     n = 1
-    while time_map.output_frames(n) < min_out:
+    while int(output_fn(n)) < min_out:
         n += 1
         if n > _MAX_FRAME_SEARCH:
             raise ValueError(
@@ -356,12 +392,53 @@ def _min_input_for_output(time_map: EncoderTimeMap, min_out: int) -> int:
     return n
 
 
+def _min_input_for_output(time_map: EncoderTimeMap, min_out: int) -> int:
+    return _min_input_reaching(time_map.output_frames, min_out)
+
+
+def _fit_regular_geometry(output_fn) -> tuple[int, int, int] | None:
+    """Fit offset=0, constant stride, and overlapping receptive field.
+
+    ``last_i`` is the last fbank index needed to emit output ``i``. For a
+    regular strided convolution that starts at input 0, ``last_i = i * stride
+    + rf - 1``. Using newly-added frames between outputs as the support would
+    drop the overlapping receptive field.
+    """
+
+    lasts: list[int] = []
+    try:
+        for index in range(6):
+            lasts.append(_min_input_reaching(output_fn, index + 1) - 1)
+    except ValueError:
+        pass
+    if len(lasts) < 2:
+        return None
+    stride = lasts[1] - lasts[0]
+    if stride < 1:
+        return None
+    offset = 0
+    receptive_field = lasts[0] - offset + 1
+    if receptive_field < 1:
+        return None
+    for index, last in enumerate(lasts):
+        expected = offset + index * stride + receptive_field - 1
+        if last != expected:
+            return None
+        if int(output_fn(last + 1)) != index + 1:
+            return None
+        if int(output_fn(last)) != index:
+            return None
+    return offset, stride, receptive_field
+
+
 def _fbank_support(time_map: EncoderTimeMap, encoder_index: int) -> tuple[int, int]:
-    last = _min_input_for_output(time_map, encoder_index + 1) - 1
-    if encoder_index <= 0:
-        first = 0
-    else:
-        first = _min_input_for_output(time_map, encoder_index)
+    stride = int(time_map.stride)
+    receptive_field = int(time_map.receptive_field)
+    offset = int(time_map.offset)
+    if stride < 1 or receptive_field < 1:
+        raise ValueError("encoder time map is missing stride/receptive_field")
+    first = offset + int(encoder_index) * stride
+    last = first + receptive_field - 1
     if last < first:
         last = first
     return int(first), int(last)
@@ -385,6 +462,8 @@ def build_sample_time_axis(
     if t_count <= 0 or encoder_map is None or fbank is None:
         return SampleTimeAxis.unavailable(max(t_count, 0))
     try:
+        if int(encoder_map.stride) < 1 or int(encoder_map.receptive_field) < 1:
+            return SampleTimeAxis.unavailable(t_count)
         if num_fbank_frames is not None:
             predicted = encoder_map.output_frames(int(num_fbank_frames))
             if predicted != t_count:
@@ -842,7 +921,8 @@ def _draw_group_figures(
         path = figures_dir / filename
         fig, ax = plt.subplots(figsize=(8, 4.5), constrained_layout=True)
         labels = list(usable)
-        ax.boxplot([usable[key] for key in labels], tick_labels=labels)
+        ax.boxplot([usable[key] for key in labels])
+        ax.set_xticklabels(labels)
         ax.set_ylabel(ylabel)
         ax.set_title(title)
         ax.tick_params(axis="x", rotation=30)

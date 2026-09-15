@@ -322,6 +322,56 @@ def test_wenet_subsampling_covers_frontend_offset_and_right_crop():
     assert axis.centers_source_sec[0] != pytest.approx(0.0)
 
 
+class _TwoLayerStrideConvEncoder:
+    """Two conv layers, kernel=3 stride=2: RF=7, hop=4."""
+
+    def output_frames(self, num_input_frames: int) -> int:
+        n = int(num_input_frames)
+        layer1 = 0 if n < 3 else (n - 3) // 2 + 1
+        if layer1 < 3:
+            return 0
+        return (layer1 - 3) // 2 + 1
+
+
+class _IrregularOutputEncoder:
+    def output_frames(self, num_input_frames: int) -> int:
+        n = int(num_input_frames)
+        if n < 4:
+            return 0
+        if n < 10:
+            return 1
+        if n < 11:
+            return 2
+        return 3
+
+
+def test_strided_conv_middle_frame_center_and_noise_span_hit():
+    time_map = inspect_encoder_time_map(_TwoLayerStrideConvEncoder())
+    assert time_map is not None
+    axis = build_sample_time_axis(
+        audio_length=3,
+        encoder_map=time_map,
+        fbank=_fbank(),
+        left_padding_ms=0,
+        right_padding_ms=0,
+        source_duration_sec=0.16,
+        num_fbank_frames=15,
+    )
+    assert axis.status == "ok"
+    assert tuple(int(v) for v in axis.fbank_support[0]) == (0, 6)
+    assert tuple(int(v) for v in axis.fbank_support[1]) == (4, 10)
+    assert tuple(int(v) for v in axis.fbank_support[2]) == (8, 14)
+    assert axis.centers_source_sec[1] == pytest.approx(0.0825)
+    noise, _outside, intervals = noise_region_masks(axis, ((0.080, 0.090),))
+    assert int(noise.sum()) == 1
+    assert intervals[0]["valid_frame_count"] == 1
+    assert bool(noise[1])
+
+
+def test_irregular_subsampling_marks_time_axis_unavailable():
+    assert inspect_encoder_time_map(_IrregularOutputEncoder()) is None
+
+
 def test_unverified_encoder_is_unavailable_and_keeps_frame_axis():
     assert inspect_encoder_time_map(_BareEncoder()) is None
     axis = build_sample_time_axis(
@@ -645,6 +695,24 @@ def test_unavailable_time_axis_separates_frame_axis_from_waveform_time(tmp_path)
     assert "encoder_frame_index" in html
     assert "unavailable" in html
     assert "independent" in html.lower() or "separate" in html.lower() or "frame axis" in html.lower()
+
+
+def test_group_boxplot_supports_matplotlib_38_without_tick_labels(tmp_path, monkeypatch):
+    import matplotlib.axes
+
+    real_boxplot = matplotlib.axes.Axes.boxplot
+
+    def boxplot_38(self, *args, **kwargs):
+        if "tick_labels" in kwargs:
+            raise TypeError(
+                "boxplot() got an unexpected keyword argument 'tick_labels'"
+            )
+        return real_boxplot(self, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "boxplot", boxplot_38)
+    out = _write_minimal_run(tmp_path, n_samples=2)
+    render_sink_attention_report(out)
+    assert (out / "figures" / "s_audio_by_condition.png").is_file()
 
 
 def test_group_boxplots_use_extra_group_field_column(tmp_path):

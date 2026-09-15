@@ -1,8 +1,10 @@
+import csv
 from pathlib import Path
 
 import pytest
 
 from dma_kws.inference.manifest import load_manifest
+from dma_kws.inference import qbyt_attention_manifest as manifest_mod
 from dma_kws.inference.qbyt_attention_manifest import validate_attention_manifest_rows
 
 
@@ -269,6 +271,63 @@ def test_pair_groups_by_keyword_and_phoneme_override_not_csv_order(tmp_path):
     assert rows[1].pair_status == "inconsistent_keyword_or_phonemes"
     assert rows[0].pair_status == "inconsistent_keyword_or_phonemes"
     assert rows[2].pair_status == "inconsistent_keyword_or_phonemes"
+
+
+def test_pair_treats_space_separated_and_json_phonemes_as_equivalent(tmp_path):
+    manifest_path = tmp_path / "equiv.csv"
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            ["audio_path", "keyword", "keyword_phonemes", "condition", "pair_id"]
+        )
+        writer.writerow(
+            ["clean.wav", "hey eva", "HH EY1 IY1 V AH0", "clean", "p1"]
+        )
+        writer.writerow(
+            [
+                "noisy.wav",
+                "hey eva",
+                '["HH", "EY1", "IY1", "V", "AH0"]',
+                "noisy",
+                "p1",
+            ]
+        )
+    rows = validate_attention_manifest_rows(load_manifest(manifest_path))
+    assert {row.pair_status for row in rows} == {"ok"}
+
+
+def test_pair_status_uses_enrolled_token_sequences_not_raw_override_text():
+    manifest_path_rows = [
+        {
+            "audio_path": "/tmp/clean.wav",
+            "keyword": "hey eva",
+            "keyword_phonemes": "HH EY1 IY1 V AH0",
+            "condition": "clean",
+            "pair_id": "p1",
+        },
+        {
+            "audio_path": "/tmp/noisy.wav",
+            "keyword": "hey eva",
+            "keyword_phonemes": '["HH", "EY1", "IY1", "V", "AH0"]',
+            "condition": "noisy",
+            "pair_id": "p1",
+        },
+    ]
+    validated = validate_attention_manifest_rows(manifest_path_rows)
+    assign_pair_status_from_identities = manifest_mod.assign_pair_status_from_identities
+    tokens = ((3, 4, 5), (3, 4, 5))
+    identities = [
+        (row.keyword, tokens[index]) for index, row in enumerate(validated)
+    ]
+    updated = assign_pair_status_from_identities(validated, identities)
+    assert {row.pair_status for row in updated} == {"ok"}
+    mismatched = assign_pair_status_from_identities(
+        validated,
+        [(validated[0].keyword, (3, 4, 5)), (validated[1].keyword, (9, 8, 7))],
+    )
+    assert {row.pair_status for row in mismatched} == {
+        "inconsistent_keyword_or_phonemes"
+    }
 
 
 def test_auto_ids_respect_first_record_number():

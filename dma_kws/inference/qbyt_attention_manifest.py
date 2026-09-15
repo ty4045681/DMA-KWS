@@ -12,12 +12,13 @@ import json
 import math
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 
 __all__ = [
     "AttentionManifestRow",
+    "assign_pair_status_from_identities",
     "validate_attention_manifest_rows",
 ]
 
@@ -350,13 +351,27 @@ def _internal_sample_id(sample_id: str, used: set[str]) -> str:
     return candidate
 
 
-def _override_key(value: object | None) -> object | None:
-    if isinstance(value, list):
-        return tuple(value)
-    return value
+def _phoneme_pair_identity(item: Mapping[str, Any]) -> object:
+    override = item.get("phoneme_override")
+    if override is None:
+        return (item["keyword"], None)
+    from dma_kws.inference.stage2_clip import parse_phoneme_sequence
+
+    phones = parse_phoneme_sequence(
+        override,
+        field_name=f"Manifest row {item['record_number']} keyword_phonemes",
+    )
+    return (item["keyword"], tuple(phones))
 
 
-def _assign_pair_status(parsed: list[dict[str, Any]]) -> None:
+def _assign_pair_status(
+    parsed: list[dict[str, Any]],
+    identities: Sequence[object] | None = None,
+) -> None:
+    if identities is None:
+        identities = [_phoneme_pair_identity(item) for item in parsed]
+    if len(identities) != len(parsed):
+        raise ValueError("pair identities must align with rows")
     groups: dict[str, list[int]] = defaultdict(list)
     for index, item in enumerate(parsed):
         pair_id = item["pair_id"]
@@ -364,14 +379,11 @@ def _assign_pair_status(parsed: list[dict[str, Any]]) -> None:
             groups[pair_id].append(index)
 
     for pair_id, indices in groups.items():
-        keys = {
-            (parsed[index]["keyword"], _override_key(parsed[index]["phoneme_override"]))
-            for index in indices
-        }
+        keys = {identities[index] for index in indices}
         if len(keys) > 1:
             status = PAIR_INCONSISTENT
             reason = (
-                f"pair_id {pair_id!r} has inconsistent keyword or phoneme override"
+                f"pair_id {pair_id!r} has inconsistent keyword or phoneme sequence"
             )
         else:
             n_clean = sum(parsed[index]["condition"] == "clean" for index in indices)
@@ -387,3 +399,29 @@ def _assign_pair_status(parsed: list[dict[str, Any]]) -> None:
         for index in indices:
             parsed[index]["pair_status"] = status
             parsed[index]["pair_reason"] = reason
+
+
+def assign_pair_status_from_identities(
+    rows: Sequence[AttentionManifestRow],
+    identities: Sequence[object],
+) -> list[AttentionManifestRow]:
+    """Recompute pair_status after shared phoneme parse / enrollment."""
+
+    if len(identities) != len(rows):
+        raise ValueError("pair identities must align with rows")
+    parsed = [
+        {
+            "pair_id": row.pair_id,
+            "condition": row.condition,
+            "keyword": row.keyword,
+            "record_number": row.record_number,
+            "pair_status": PAIR_OK,
+            "pair_reason": None,
+        }
+        for row in rows
+    ]
+    _assign_pair_status(parsed, identities=identities)
+    return [
+        replace(row, pair_status=item["pair_status"], pair_reason=item["pair_reason"])
+        for row, item in zip(rows, parsed)
+    ]

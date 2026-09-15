@@ -47,6 +47,7 @@ from dma_kws.inference.qbyt_attention_manifest import (
     PAIR_MULTIPLE_CLEAN,
     PAIR_OK,
     AttentionManifestRow,
+    assign_pair_status_from_identities,
     validate_attention_manifest_rows,
 )
 from dma_kws.inference.qbyt_attention_report import (
@@ -1451,8 +1452,17 @@ def _write_outputs(
     _write_csv(output_dir / "position_scores.csv", POSITION_FIELDS, position_rows)
     _write_csv(output_dir / "pairs.csv", PAIR_FIELDS, pair_rows)
     _atomic_write_json(output_dir / "run.json", run_payload)
+    try:
+        _write_report_html(output_dir / "report.html", run_id=run_id, summary=summary)
+    except Exception as exc:
+        failed = dict(summary)
+        failed["status"] = "failed"
+        render_error = f"report render failed: {exc}"
+        previous = failed.get("error")
+        failed["error"] = f"{previous}; {render_error}" if previous else render_error
+        _atomic_write_json(output_dir / "summary.json", failed)
+        raise SystemExit(failed["error"]) from exc
     _atomic_write_json(output_dir / "summary.json", summary)
-    _write_report_html(output_dir / "report.html", run_id=run_id, summary=summary)
     shutil.rmtree(output_dir / _PARTIAL_DIRNAME, ignore_errors=True)
 
 
@@ -1662,6 +1672,17 @@ def run_diagnose(cfg: DictConfig) -> dict:
             )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+
+    if prepared_by_index:
+        updated_rows = assign_pair_status_from_identities(
+            [item.row for item in prepared_by_index],
+            [
+                (item.row.keyword, tuple(item.token_ids))
+                for item in prepared_by_index
+            ],
+        )
+        for prepared, row in zip(prepared_by_index, updated_rows):
+            prepared.row = row
 
     prepared_waveforms: dict[int, tuple[Any, int]] = {}
     partial_dir = output_dir / _PARTIAL_DIRNAME

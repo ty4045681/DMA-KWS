@@ -851,6 +851,75 @@ def test_extra_group_field_is_copied_onto_records_and_group_pngs(
     assert (tmp_path / "out" / "figures" / "s_audio_by_variant.png").is_file()
 
 
+def test_equivalent_phoneme_formats_pair_after_enrollment(
+    tmp_path, monkeypatch, install_runner
+):
+    clean = _write_wav(tmp_path / "clean.wav", 1.0)
+    noisy = _write_wav(tmp_path / "noisy.wav", 1.0)
+    manifest = tmp_path / "equiv.csv"
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "audio_path",
+                "keyword",
+                "keyword_phonemes",
+                "condition",
+                "pair_id",
+                "label",
+            ]
+        )
+        writer.writerow(
+            [clean.name, "hey eva", "HH EY1 IY1 V AH0", "clean", "p1", "1"]
+        )
+        writer.writerow(
+            [
+                noisy.name,
+                "hey eva",
+                '["HH", "EY1", "IY1", "V", "AH0"]',
+                "noisy",
+                "p1",
+                "1",
+            ]
+        )
+    summary = _run_diagnose(monkeypatch, _cfg(tmp_path, manifest=manifest))
+    assert summary["status"] == "complete"
+    assert summary["pairs"]["n_ok"] == 1
+    assert summary["pairs"]["n_inconsistent"] == 0
+    pairs = _read_csv(tmp_path / "out" / "pairs.csv")
+    assert {row["pair_status"] for row in pairs} == {"ok"}
+    ok = next(row for row in pairs if row["pair_status"] == "ok")
+    assert ok["baseline_sample_id"]
+    assert ok["variant_sample_id"]
+
+
+def test_report_render_failure_marks_summary_failed_and_keeps_records(
+    tmp_path, monkeypatch, install_runner
+):
+    import scripts.diagnose_qbyt_sink as diagnose
+
+    wav = _write_wav(tmp_path / "a.wav", 1.0)
+    manifest = _write_csv(
+        tmp_path / "manifest.csv",
+        "audio_path,keyword,label",
+        f"{wav.name},hey eva,1",
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("injected render failure")
+
+    monkeypatch.setattr(diagnose, "render_sink_attention_report", _boom)
+    with pytest.raises((SystemExit, RuntimeError), match="injected render failure"):
+        _run_diagnose(monkeypatch, _cfg(tmp_path, manifest=manifest))
+    out = tmp_path / "out"
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert "injected render failure" in str(summary.get("error", ""))
+    assert (out / "records.csv").is_file()
+    assert (out / "run.json").is_file()
+    assert not (out / "report.html").exists()
+
+
 def test_materialize_scored_sample_drops_capture_tensors():
     import scripts.diagnose_qbyt_sink as diagnose
     from dma_kws.inference.qbyt_attention_diagnostics import (

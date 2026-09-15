@@ -40,7 +40,7 @@ audio/noisy_001.wav,hey eva,1,noisy_001,noisy,p001,"[[0.8,1.6]]","[[0.5,2.0]]"
 audio/noise_001.wav,hey eva,0,noise_001,noise_only,,,"[[0.0,2.0]]"
 ```
 
-`pair_id` 规则：同组须 keyword（及显式 phoneme override）一致，且恰好一个 `condition=clean` 基准，可有多个 noisy 变体。缺 clean、多个 clean、或 keyword/phoneme 不一致时写入 `pair_status` / `pair_reason`，单样本诊断仍继续。不要用 CSV 行序猜配对。
+`pair_id` 规则：完成共享音素解析和注册后，按 `pair_id` + keyword + 实际 token 序列 分组。空格分隔 ARPAbet 与 JSON 数组若解析为同一音素序列，视为同一发音。同组须恰好一个 `condition=clean` 基准，可有多个 noisy 变体。缺 clean、多个 clean、或 keyword/token 不一致时写入 `pair_status` / `pair_reason`，单样本诊断仍继续。不要用 CSV 行序猜配对。
 
 `prep.keyword_eval.mode=any` **不支持**（明确报错）。本工具只接受 `per_row`：每行一个关键词与一条有效发音。
 
