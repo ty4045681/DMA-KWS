@@ -52,6 +52,10 @@ def test_default_compose_uses_online_background_and_metadata_cache_caps():
     assert background["mode"] == "online"
     assert background["cache_manifest"] == ""
     assert background["max_open_shards"] == 8
+    assert background["sources"] == []
+    assert background["validation"]["enabled"] is False
+    assert background["validation"]["samples_per_source"] == 256
+    assert background["validation"]["seed"] == 2025
     assert metadata["max_entries"] == 128
     assert metadata["max_bytes"] == 33554432
 
@@ -74,6 +78,10 @@ def test_old_yaml_without_new_fields_still_fills_schema_defaults(tmp_path):
     assert background["mode"] == "online"
     assert background["cache_manifest"] == ""
     assert background["max_open_shards"] == 8
+    assert background["sources"] == []
+    assert background["validation"]["enabled"] is False
+    assert background["validation"]["samples_per_source"] == 256
+    assert background["validation"]["seed"] == 2025
     assert metadata["max_entries"] == 128
     assert metadata["max_bytes"] == 33554432
 
@@ -344,3 +352,114 @@ def test_background_negative_schema_rejects_unknown_mode():
 def test_dataset_still_rejects_unknown_background_field():
     with pytest.raises(ValueError, match="Unknown stage2.background_negative fields"):
         _make_dataset(background_negative={"enabled": False, "typo": True})
+
+
+def test_dataset_accepts_sources_and_validation_keys_when_disabled(monkeypatch):
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.TrainingBackgroundSampler",
+        _MustNotConstructSampler,
+    )
+    dataset = _make_dataset(
+        background_negative={
+            "enabled": False,
+            "mode": "online",
+            "audio_list_path": "",
+            "cache_manifest": "",
+            "sources": [
+                {
+                    "id": "musan",
+                    "weight": 1.0,
+                    "manifest": "/unused/recordings.jsonl",
+                }
+            ],
+            "validation": {
+                "enabled": False,
+                "samples_per_source": 256,
+                "seed": 2025,
+            },
+        }
+    )
+
+    assert dataset._background_sampler is None
+    assert dataset._background_probability == 0.0
+
+
+def test_dataset_empty_sources_keeps_legacy_online_sampler(monkeypatch):
+    constructed = {}
+
+    class _FakeSampler:
+        def __init__(self, **kwargs):
+            constructed.update(kwargs)
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.TrainingBackgroundSampler",
+        _FakeSampler,
+    )
+    dataset = _make_dataset(
+        background_negative={
+            "enabled": True,
+            "probability": 0.25,
+            "audio_list_path": "/background/musan.list",
+            "duration_seconds_min": 1.0,
+            "duration_seconds_max": 3.0,
+            "sources": [],
+            "validation": {"enabled": False, "samples_per_source": 256, "seed": 2025},
+        },
+        fbank_kwargs={"dither": 0.0},
+    )
+
+    assert dataset._background_sampler is not None
+    assert constructed == {
+        "audio_list_path": "/background/musan.list",
+        "duration_seconds_min": 1.0,
+        "duration_seconds_max": 3.0,
+        "fbank_kwargs": {"dither": 0.0},
+    }
+
+
+def test_dataset_enabled_nonempty_sources_uses_build_background_sampler(monkeypatch):
+    monkeypatch.setattr(
+        "dma_kws.stage2.features.TrainingBackgroundSampler",
+        _MustNotConstructSampler,
+    )
+    constructed = {}
+
+    class _FakeMultiSource:
+        def sample(self, *, rng):
+            raise AssertionError("factory construction is under test")
+
+        def run_record_fields(self):
+            return {}
+
+        def close(self):
+            return None
+
+    def _fake_factory(config, *, fbank_kwargs):
+        constructed["sources"] = list(config.get("sources") or [])
+        constructed["fbank_kwargs"] = fbank_kwargs
+        return _FakeMultiSource()
+
+    monkeypatch.setattr(
+        "dma_kws.stage2.background_sources.build_background_sampler",
+        _fake_factory,
+    )
+    dataset = _make_dataset(
+        background_negative={
+            "enabled": True,
+            "mode": "online",
+            "audio_list_path": "",
+            "cache_manifest": "",
+            "probability": 0.25,
+            "sources": [
+                {
+                    "id": "musan",
+                    "weight": 1.0,
+                    "manifest": "/unused/recordings.jsonl",
+                }
+            ],
+        },
+        fbank_kwargs={"dither": 0.0},
+    )
+    assert isinstance(dataset._background_sampler, _FakeMultiSource)
+    assert constructed["sources"][0]["id"] == "musan"
+    assert constructed["fbank_kwargs"] == {"dither": 0.0}

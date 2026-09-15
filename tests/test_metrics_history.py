@@ -113,9 +113,13 @@ def test_best_tracking_excludes_thresholds_counts_and_score_quantiles():
     assert tracks_best_metric("val/auc")
     assert tracks_best_metric("val/tpr_at_fpr_1e-3")
     assert tracks_best_metric("val/deploy_fpr")
+    assert tracks_best_metric("val/background/dns/clip_fpr")
     assert not tracks_best_metric("val/eer_threshold")
     assert not tracks_best_metric("val/score_neg_p95")
     assert not tracks_best_metric("val/num_positive")
+    assert not tracks_best_metric("train/background/dns/count")
+    assert not tracks_best_metric("val/background/dns/score_p95")
+    assert not tracks_best_metric("val/background/dns/score_max")
 
     best: dict[str, float] = {}
     updated = update_best_metrics(
@@ -382,6 +386,23 @@ def test_collect_hparams_stage1_uses_max_train_steps():
     assert hparams["max_epochs"] == 1
     assert hparams["batch_size_per_gpu"] == 4
     assert "seq_target_mode" not in hparams
+
+
+def test_numeric_callback_metrics_keeps_background_source_keys():
+    metrics = numeric_callback_metrics(
+        {
+            "val_auc": 0.9,
+            "train/background/dns/count": 4,
+            "train/background/dns/fraction_all": 0.2,
+            "val/background/overall/clip_fpr": 0.1,
+            "val/background/musan/score_p99": 0.8,
+        }
+    )
+    assert "val_auc" not in metrics
+    assert metrics["train/background/dns/count"] == 4
+    assert metrics["train/background/dns/fraction_all"] == 0.2
+    assert metrics["val/background/overall/clip_fpr"] == 0.1
+    assert metrics["val/background/musan/score_p99"] == 0.8
 
 
 def test_build_run_record_layout():

@@ -40,6 +40,17 @@ def train_collate_fn(batch: list[dict]) -> dict:
         out["source"] = torch.tensor([int(item["source"]) for item in batch])
     if "domain_source" in batch[0]:
         out["domain_source"] = torch.tensor([int(item["domain_source"]) for item in batch])
+    out["background_source_id"] = torch.tensor(
+        [int(item.get("background_source_id", -1)) for item in batch],
+        dtype=torch.long,
+    )
+    if any("recording_id" in item for item in batch):
+        out["recording_id"] = [
+            "" if item.get("recording_id") is None else str(item.get("recording_id", ""))
+            for item in batch
+        ]
+    if any("crop_id" in item for item in batch):
+        out["crop_id"] = [item.get("crop_id") for item in batch]
     return out
 
 
@@ -63,6 +74,11 @@ def test_collate_fn(batch: list[dict]) -> dict:
     if "sample_id" in batch[0]:
         out["sample_id"] = torch.tensor(
             [int(item["sample_id"]) for item in batch],
+            dtype=torch.long,
+        )
+    if any("background_source_id" in item for item in batch):
+        out["background_source_id"] = torch.tensor(
+            [int(item.get("background_source_id", -1)) for item in batch],
             dtype=torch.long,
         )
     return out

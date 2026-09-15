@@ -1,0 +1,35 @@
+# @package _global_
+# Frozen Zipformer Stage II v4.1 with weighted MUSAN / DNS / FSD50K online
+# background negatives. Architecture, readout, loss, and optimizer stay
+# identical to icefall_zipformer_stage2_eps_softmin_v41. Inherited MUSAN
+# list/cache paths are emptied because a non-empty sources list forbids them.
+#
+# Usage:
+#   python scripts/train_stage2_qbyt.py +experiment=icefall_zipformer_stage2_eps_softmin_v41_multisource \
+#     stage2.freeze_encoder=true
+
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41
+  - _self_
+
+stage2:
+  background_negative:
+    mode: online
+    audio_list_path: ""
+    cache_manifest: ""
+    sources:
+      - id: musan
+        weight: 0.4
+        manifest: ${paths.processed_root}/background/musan/recordings.jsonl
+        cache_manifest: ""
+      - id: dns
+        weight: 0.4
+        manifest: ${paths.processed_root}/background/dns/recordings.jsonl
+        cache_manifest: ""
+      - id: fsd50k
+        weight: 0.2
+        manifest: ${paths.processed_root}/background/fsd50k/recordings.jsonl
+        cache_manifest: ""
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-eps-softmin-v41-multisource
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-eps-softmin-v41-multisource
+  run_name: icefall-zipformer-frozen-eps-softmin-v41-multisource

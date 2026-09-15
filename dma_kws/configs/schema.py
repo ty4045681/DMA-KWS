@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+import math
+import re
+from typing import Any
 
 from hydra.core.config_store import ConfigStore
 
@@ -432,10 +436,35 @@ class Stage2NoiseAugmentationConfig:
     snr_db_max: float = 20.0
 
 
+_SOURCE_ID_RE = re.compile(r"^[a-z0-9_]+$")
+_BACKGROUND_NEGATIVE_KEYS = frozenset(
+    {
+        "enabled",
+        "probability",
+        "audio_list_path",
+        "duration_seconds_min",
+        "duration_seconds_max",
+        "mode",
+        "cache_manifest",
+        "max_open_shards",
+        "sources",
+        "validation",
+    }
+)
+_SOURCE_KEYS = frozenset({"id", "weight", "manifest", "cache_manifest"})
+_VALIDATION_KEYS = frozenset({"enabled", "samples_per_source", "seed"})
+
+
 def _require_int(value: object, *, field: str, minimum: int) -> int:
     """Reject ``bool`` (a subclass of ``int``) and values below ``minimum``."""
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{field} must be an int >= {minimum}, got {value!r}")
+    return value
+
+
+def _require_positive_int(value: object, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field} must be a positive int, got {value!r}")
     return value
 
 
@@ -452,6 +481,367 @@ def _normalize_background_negative_mode(value: object) -> str:
     return mode
 
 
+def _source_field_error(
+    source_id: object,
+    field: str,
+    *,
+    reason: str,
+    expected: str,
+    actual: object,
+) -> str:
+    return (
+        f"stage2.background_negative source id={source_id!r} field={field}: "
+        f"{reason}; expected {expected}, got {actual!r}"
+    )
+
+
+def _require_source_id(value: object) -> str:
+    if not isinstance(value, str) or _SOURCE_ID_RE.fullmatch(value) is None:
+        raise ValueError(
+            "stage2.background_negative.sources[].id must match [a-z0-9_]+, "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _require_weight(value: object) -> float:
+    field = "stage2.background_negative.sources[].weight"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a finite non-negative real, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0:
+        raise ValueError(f"{field} must be a finite non-negative real, got {value!r}")
+    return number
+
+
+def _require_probability(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "stage2.background_negative.probability must be a finite real in "
+            f"[0, 1], got {value!r}"
+        )
+    number = float(value)
+    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+        raise ValueError(
+            "Stage II background negative probability must be between 0 and 1"
+        )
+    return number
+
+
+def _require_duration_bounds(
+    duration_min: object, duration_max: object
+) -> tuple[float, float]:
+    if isinstance(duration_min, bool) or isinstance(duration_max, bool):
+        raise ValueError("stage2.background_negative duration bounds must be finite")
+    try:
+        parsed_min = float(duration_min)
+        parsed_max = float(duration_max)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "stage2.background_negative duration bounds must be finite"
+        ) from exc
+    if not math.isfinite(parsed_min) or not math.isfinite(parsed_max):
+        raise ValueError("stage2.background_negative duration bounds must be finite")
+    if parsed_min <= 0.0:
+        raise ValueError(
+            "stage2.background_negative.duration_seconds_min must be positive"
+        )
+    if parsed_min > parsed_max:
+        raise ValueError(
+            "stage2.background_negative.duration_seconds_min must be <= "
+            "duration_seconds_max"
+        )
+    return parsed_min, parsed_max
+
+
+def _coerce_source(value: object) -> "Stage2BackgroundSourceConfig":
+    if isinstance(value, Stage2BackgroundSourceConfig):
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError("stage2.background_negative.sources[] must be a mapping")
+    payload = dict(value)
+    unknown = sorted(set(payload) - _SOURCE_KEYS)
+    if unknown:
+        raise ValueError(
+            "Unknown stage2.background_negative.sources[] fields: "
+            + ", ".join(unknown)
+        )
+    if "id" not in payload:
+        raise ValueError("stage2.background_negative.sources[].id is required")
+    if "weight" not in payload:
+        raise ValueError("stage2.background_negative.sources[].weight is required")
+    return Stage2BackgroundSourceConfig(
+        id=payload["id"],
+        weight=payload["weight"],
+        manifest=str(payload.get("manifest", "") or ""),
+        cache_manifest=str(payload.get("cache_manifest", "") or ""),
+    )
+
+
+def _coerce_validation(value: object) -> "Stage2BackgroundValidationConfig":
+    if value is None:
+        return Stage2BackgroundValidationConfig()
+    if isinstance(value, Stage2BackgroundValidationConfig):
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError("stage2.background_negative.validation must be a mapping")
+    payload = dict(value)
+    unknown = sorted(set(payload) - _VALIDATION_KEYS)
+    if unknown:
+        raise ValueError(
+            "Unknown stage2.background_negative.validation fields: "
+            + ", ".join(unknown)
+        )
+    return Stage2BackgroundValidationConfig(
+        enabled=bool(payload.get("enabled", False)),
+        samples_per_source=payload.get("samples_per_source", 256),
+        seed=payload.get("seed", 2025),
+    )
+
+
+def _source_as_mapping(value: object) -> dict[str, Any]:
+    source = _coerce_source(value)
+    return {
+        "id": source.id,
+        "weight": source.weight,
+        "manifest": source.manifest,
+        "cache_manifest": source.cache_manifest,
+    }
+
+
+def _validation_as_mapping(value: object) -> dict[str, Any]:
+    validation = _coerce_validation(value)
+    return {
+        "enabled": validation.enabled,
+        "samples_per_source": validation.samples_per_source,
+        "seed": validation.seed,
+    }
+
+
+def _background_negative_as_mapping(cfg: Mapping[str, Any] | object) -> dict[str, Any]:
+    if isinstance(cfg, Mapping):
+        payload = dict(cfg)
+    else:
+        payload = {
+            "enabled": getattr(cfg, "enabled", False),
+            "probability": getattr(cfg, "probability", 0.25),
+            "audio_list_path": getattr(cfg, "audio_list_path", ""),
+            "duration_seconds_min": getattr(cfg, "duration_seconds_min", 1.0),
+            "duration_seconds_max": getattr(cfg, "duration_seconds_max", 3.0),
+            "mode": getattr(cfg, "mode", "online"),
+            "cache_manifest": getattr(cfg, "cache_manifest", ""),
+            "max_open_shards": getattr(cfg, "max_open_shards", 8),
+            "sources": getattr(cfg, "sources", []),
+            "validation": getattr(cfg, "validation", None),
+        }
+    sources = payload.get("sources") or []
+    payload["sources"] = [
+        _source_as_mapping(item) if not isinstance(item, Mapping) else dict(item)
+        for item in sources
+    ]
+    if "validation" in payload or not isinstance(cfg, Mapping):
+        validation = payload.get("validation")
+        if validation is not None and not isinstance(validation, Mapping):
+            payload["validation"] = _validation_as_mapping(validation)
+    return payload
+
+
+def normalize_source_weights(weights: Sequence[float]) -> list[float]:
+    """Return ``p_i = w_i / sum(w)`` for finite non-negative weights."""
+    values = [_require_weight(weight) for weight in weights]
+    total = sum(values)
+    if total <= 0.0:
+        raise ValueError(
+            "stage2.background_negative.sources must include at least one "
+            "source with weight > 0"
+        )
+    return [value / total for value in values]
+
+
+def active_background_sources(
+    sources: Sequence[Mapping[str, Any] | Stage2BackgroundSourceConfig],
+) -> list[Stage2BackgroundSourceConfig]:
+    """Positive-weight sources sorted by ``id``; zero-weight sources stay inactive."""
+    active: list[Stage2BackgroundSourceConfig] = []
+    for item in sources:
+        source = _coerce_source(item)
+        if isinstance(source.weight, bool) or not isinstance(source.weight, (int, float)):
+            raise ValueError(
+                "stage2.background_negative.sources[].weight must be a finite "
+                f"non-negative real, got {source.weight!r}"
+            )
+        if float(source.weight) > 0.0:
+            active.append(source)
+    return sorted(active, key=lambda item: item.id)
+
+
+def background_source_batch_index(active_ids: Sequence[str]) -> dict[str, int]:
+    """Map sorted active source ids to stable batch integers."""
+    return {source_id: index for index, source_id in enumerate(sorted(active_ids))}
+
+
+def validate_background_negative_config(cfg: Mapping[str, Any]) -> None:
+    """Structural checks shared by the schema dataclass and Dataset."""
+    if not isinstance(cfg, Mapping):
+        raise ValueError("stage2.background_negative must be a mapping")
+    payload = _background_negative_as_mapping(cfg)
+    unknown = sorted(set(payload) - _BACKGROUND_NEGATIVE_KEYS)
+    if unknown:
+        raise ValueError(
+            "Unknown stage2.background_negative fields: " + ", ".join(unknown)
+        )
+
+    mode = _normalize_background_negative_mode(payload.get("mode"))
+    if "max_open_shards" in payload:
+        _require_positive_int(
+            payload["max_open_shards"],
+            field="stage2.background_negative.max_open_shards",
+        )
+    _require_probability(payload.get("probability", 0.25))
+    _require_duration_bounds(
+        payload.get("duration_seconds_min", 1.0),
+        payload.get("duration_seconds_max", 3.0),
+    )
+
+    validation = _coerce_validation(payload.get("validation"))
+    sources_raw = payload.get("sources") or []
+    if isinstance(sources_raw, (str, bytes)) or not isinstance(sources_raw, Sequence):
+        raise ValueError("stage2.background_negative.sources must be a list")
+    sources = [_coerce_source(item) for item in sources_raw]
+
+    seen_ids: set[str] = set()
+    for source in sources:
+        source_id = _require_source_id(source.id)
+        if source_id in seen_ids:
+            raise ValueError(
+                f"duplicate stage2.background_negative source id: {source_id!r}"
+            )
+        seen_ids.add(source_id)
+        _require_weight(source.weight)
+
+    if sources:
+        audio_list_path = str(payload.get("audio_list_path", "") or "").strip()
+        cache_manifest = str(payload.get("cache_manifest", "") or "").strip()
+        if audio_list_path:
+            raise ValueError(
+                "stage2.background_negative.audio_list_path must be empty "
+                "when sources is non-empty"
+            )
+        if cache_manifest:
+            raise ValueError(
+                "stage2.background_negative.cache_manifest must be empty "
+                "when sources is non-empty"
+            )
+        active = active_background_sources(sources)
+        if not active:
+            raise ValueError(
+                "stage2.background_negative.sources must include at least one "
+                "source with weight > 0"
+            )
+        for source in active:
+            manifest = str(source.manifest or "").strip()
+            source_cache = str(source.cache_manifest or "").strip()
+            if validation.enabled and not manifest:
+                raise ValueError(
+                    _source_field_error(
+                        source.id,
+                        "manifest",
+                        reason="required when validation.enabled=true",
+                        expected="a non-empty path",
+                        actual=manifest,
+                    )
+                )
+            if mode == "online":
+                if not manifest:
+                    raise ValueError(
+                        _source_field_error(
+                            source.id,
+                            "manifest",
+                            reason="required when mode=online",
+                            expected="a non-empty path",
+                            actual=manifest,
+                        )
+                    )
+                if source_cache:
+                    raise ValueError(
+                        _source_field_error(
+                            source.id,
+                            "cache_manifest",
+                            reason="must be empty when mode=online",
+                            expected="",
+                            actual=source_cache,
+                        )
+                    )
+            else:
+                if not manifest:
+                    raise ValueError(
+                        _source_field_error(
+                            source.id,
+                            "manifest",
+                            reason="required when mode=fbank_cache",
+                            expected="a non-empty path",
+                            actual=manifest,
+                        )
+                    )
+                if not source_cache:
+                    raise ValueError(
+                        _source_field_error(
+                            source.id,
+                            "cache_manifest",
+                            reason="required when mode=fbank_cache",
+                            expected="a non-empty path",
+                            actual=source_cache,
+                        )
+                    )
+        return
+
+    if not bool(payload.get("enabled", False)):
+        return
+    if mode == "fbank_cache":
+        cache_manifest = str(payload.get("cache_manifest", "") or "").strip()
+        if not cache_manifest:
+            raise ValueError(
+                "stage2.background_negative.cache_manifest is required "
+                "when mode=fbank_cache"
+            )
+        return
+    audio_list_path = str(payload.get("audio_list_path", "") or "").strip()
+    if not audio_list_path:
+        raise ValueError(
+            "stage2.background_negative.audio_list_path is required when enabled"
+        )
+
+
+@dataclass
+class Stage2BackgroundSourceConfig:
+    """One weighted background source in a multi-source Stage II config."""
+
+    id: str
+    weight: float
+    manifest: str = ""
+    cache_manifest: str = ""
+
+
+@dataclass
+class Stage2BackgroundValidationConfig:
+    """Optional per-source background development-set sampling."""
+
+    enabled: bool = False
+    samples_per_source: int = 256
+    seed: int = 2025
+
+    def __post_init__(self) -> None:
+        self.samples_per_source = _require_positive_int(
+            self.samples_per_source,
+            field="stage2.background_negative.validation.samples_per_source",
+        )
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise ValueError(
+                "stage2.background_negative.validation.seed must be an int, "
+                f"got {self.seed!r}"
+            )
+
+
 @dataclass
 class Stage2BackgroundNegativeConfig:
     """Optional pure music/noise/ambient negatives for Stage-II training."""
@@ -466,14 +856,20 @@ class Stage2BackgroundNegativeConfig:
     mode: str = "online"
     cache_manifest: str = ""
     max_open_shards: int = 8
+    sources: list[Stage2BackgroundSourceConfig] = field(default_factory=list)
+    validation: Stage2BackgroundValidationConfig = field(
+        default_factory=Stage2BackgroundValidationConfig
+    )
 
     def __post_init__(self) -> None:
+        validate_background_negative_config(_background_negative_as_mapping(self))
         self.mode = _normalize_background_negative_mode(self.mode)
-        self.max_open_shards = _require_int(
+        self.max_open_shards = _require_positive_int(
             self.max_open_shards,
             field="stage2.background_negative.max_open_shards",
-            minimum=1,
         )
+        self.sources = [_coerce_source(item) for item in self.sources]
+        self.validation = _coerce_validation(self.validation)
 
 
 @dataclass

@@ -1,4 +1,4 @@
-"""Mmap reader for the Stage II background fbank crop cache (format v1).
+"""Mmap reader for the Stage II background fbank crop cache (format v1 and v2).
 
 Training-start checks are intentionally lighter than ``--verify-only``: this
 module validates manifest identity, recordings/index digests, shard
@@ -23,7 +23,10 @@ import torch
 
 from dma_kws.data_prep.stage2_background import (
     CROP_DTYPE,
-    FORMAT_VERSION,
+    CROP_DTYPE_V2,
+    FORMAT_VERSION_V1,
+    FORMAT_VERSION_V2,
+    SUPPORTED_FORMAT_VERSIONS,
     _cache_id_for,
     _normalize_fbank,
 )
@@ -100,8 +103,63 @@ def _close_mmap(array: np.ndarray) -> None:
         pass
 
 
+class ShardStore:
+    """Worker-local mmap LRU keyed by ``(cache_id, shard_index)``."""
+
+    def __init__(self, max_open_shards: int) -> None:
+        self.max_open_shards = _require_max_open_shards(max_open_shards)
+        self._open: OrderedDict[tuple[str, int], np.ndarray] = OrderedDict()
+        self._pid = os.getpid()
+
+    @property
+    def open_count(self) -> int:
+        return len(self._open)
+
+    def get(self, cache_id: str, shard_index: int, path: Path) -> np.ndarray:
+        self._ensure_pid()
+        key = (str(cache_id), int(shard_index))
+        cached = self._open.get(key)
+        if cached is not None:
+            self._open.move_to_end(key)
+            return cached
+        shard_path = Path(path)
+        if not shard_path.is_file():
+            raise FileNotFoundError(shard_path)
+        while len(self._open) >= self.max_open_shards:
+            _evicted_key, evicted = self._open.popitem(last=False)
+            if os.getpid() == self._pid:
+                _close_mmap(evicted)
+        array = np.load(shard_path, mmap_mode="r", allow_pickle=False)
+        self._open[key] = array
+        return array
+
+    def close(self) -> None:
+        maps = list(self._open.values())
+        self._open.clear()
+        if os.getpid() == self._pid:
+            for array in maps:
+                _close_mmap(array)
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_open"] = OrderedDict()
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._open = OrderedDict()
+        self._pid = os.getpid()
+
+    def _ensure_pid(self) -> None:
+        pid = os.getpid()
+        if pid == self._pid:
+            return
+        self._open = OrderedDict()
+        self._pid = pid
+
+
 class BackgroundFeatureCache:
-    """Lazy mmap LRU over a format-v1 background crop cache."""
+    """Lazy mmap LRU over a format-v1/v2 background crop cache."""
 
     def __init__(
         self,
@@ -112,8 +170,10 @@ class BackgroundFeatureCache:
         duration_seconds_max,
         audio_list_path="",
         max_open_shards=8,
+        shard_store=None,
     ) -> None:
         self.max_open_shards = _require_max_open_shards(max_open_shards)
+        self._shard_store = shard_store
         self._open_shards: OrderedDict[int, np.ndarray] = OrderedDict()
         self._pid = os.getpid()
         self.manifest_path = Path(manifest_path).expanduser()
@@ -151,7 +211,11 @@ class BackgroundFeatureCache:
         if not isinstance(manifest, dict):
             raise ValueError(f"manifest.json must be a mapping: {manifest_path}")
 
-        if int(manifest.get("format_version", -1)) != FORMAT_VERSION:
+        try:
+            version = int(manifest.get("format_version", -1))
+        except (TypeError, ValueError):
+            version = -1
+        if version not in SUPPORTED_FORMAT_VERSIONS:
             raise ValueError(
                 f"Unsupported background cache format_version="
                 f"{manifest.get('format_version')!r} in {manifest_path}"
@@ -160,6 +224,10 @@ class BackgroundFeatureCache:
             raise ValueError(
                 f"Background cache split_role must be 'train', got "
                 f"{manifest.get('split_role')!r} in {manifest_path}"
+            )
+        if version == FORMAT_VERSION_V2 and not str(manifest.get("dataset_id") or "").strip():
+            raise ValueError(
+                f"v2 background cache missing dataset_id in {manifest_path}"
             )
         expected_id = _cache_id_for(manifest)
         stamped = manifest.get("cache_id")
@@ -256,7 +324,10 @@ class BackgroundFeatureCache:
                 f"{num_sources}: {recordings_path}"
             )
         crops = np.load(crops_path, allow_pickle=False)
-        if getattr(crops.dtype, "names", None) != CROP_DTYPE.names:
+        expected_crop_names = (
+            CROP_DTYPE.names if version == FORMAT_VERSION_V1 else CROP_DTYPE_V2.names
+        )
+        if getattr(crops.dtype, "names", None) != expected_crop_names:
             raise ValueError(
                 f"crops.npy dtype fields are {crops.dtype.names!r} in {crops_path}"
             )
@@ -347,7 +418,16 @@ class BackgroundFeatureCache:
             crop_starts[index] = start
             crop_counts[index] = count
             list_entries.append(str(record.get("list_entry", "")))
-            source_ids.append(str(record.get("source_id", "")))
+            if version == FORMAT_VERSION_V2:
+                recording_id = str(record.get("recording_id") or "")
+                if not recording_id:
+                    raise ValueError(
+                        f"recordings.jsonl missing recording_id at index {index}: "
+                        f"{recordings_path}"
+                    )
+                source_ids.append(recording_id)
+            else:
+                source_ids.append(str(record.get("source_id", "")))
 
         audio_list = str(audio_list_path or "").strip()
         if audio_list:
@@ -368,13 +448,17 @@ class BackgroundFeatureCache:
         num_frames_arr.setflags(write=False)
 
         self.cache_id = str(stamped)
-        self.format_version = FORMAT_VERSION
+        self.format_version = version
+        self.dataset_id = str(manifest.get("dataset_id") or "")
+        self.semantic_catalog_hash = str(manifest.get("semantic_catalog_hash") or "")
+        self.train_catalog_hash = str(manifest.get("train_catalog_hash") or "")
         self.num_crops = num_crops
         self.num_sources = num_sources
         self.feature_dim = feature_dim
         self.K = k
         self.seed = seed
         self.fbank = dict(stored_fbank)
+        self.recording_ids = tuple(source_ids)
         self._shard_paths = tuple(shard_paths)
         self._shard_frames = tuple(shard_frames)
         self._crop_starts = crop_starts
@@ -439,12 +523,16 @@ class BackgroundFeatureCache:
             "background_fbank": dict(self.fbank),
         }
 
-    def extract(self, *, rng: random.Random) -> torch.Tensor:
+    def draw_crop_index(self, *, rng: random.Random) -> tuple[int, int, int]:
         if not isinstance(rng, random.Random):
             raise TypeError("BackgroundFeatureCache.extract requires the caller rng")
         source_index = rng.randrange(self.num_sources)
         ordinal = rng.randrange(int(self._crop_counts[source_index]))
         crop_id = int(self._crop_starts[source_index]) + int(ordinal)
+        return crop_id, source_index, ordinal
+
+    def extract(self, *, rng: random.Random) -> torch.Tensor:
+        crop_id, _source_index, _ordinal = self.draw_crop_index(rng=rng)
         return self.read_crop(crop_id)
 
     def read_crop(self, crop_id: int) -> torch.Tensor:
@@ -509,6 +597,10 @@ class BackgroundFeatureCache:
         self._pid = pid
 
     def _shard_mmap(self, shard_index: int) -> np.ndarray:
+        if self._shard_store is not None:
+            return self._shard_store.get(
+                self.cache_id, shard_index, self._shard_paths[shard_index]
+            )
         self._ensure_pid()
         cached = self._open_shards.get(shard_index)
         if cached is not None:

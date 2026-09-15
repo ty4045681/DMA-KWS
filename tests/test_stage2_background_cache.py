@@ -204,13 +204,15 @@ def test_dataset_getitem_background_survives_deleted_audio_and_online_monkeypatc
     sample = dataset[0]
     assert sample["label"].item() == 0
     assert sample["query_seq"].numel() == 0
-    assert set(sample.keys()) == {
+    assert set(sample.keys()) >= {
         "anchor_seq",
         "query_seq",
         "feat",
         "label",
         "seq_label",
+        "background_source_id",
     }
+    assert int(sample["background_source_id"]) == 0
     assert sample["feat"].dtype == torch.float32
     assert sample["feat"].device.type == "cpu"
     assert sample["feat"].ndim == 2
@@ -274,7 +276,8 @@ def test_disabled_online_and_cached_dataset_construction(tmp_path, monkeypatch):
     )
     assert constructed["audio_list_path"] == "/background/musan.list"
     assert online._background_sampler is not None
-    assert not isinstance(online._background_sampler, BackgroundFeatureCache)
+    online_inner = getattr(online._background_sampler, "inner", online._background_sampler)
+    assert not isinstance(online_inner, BackgroundFeatureCache)
     monkeypatch.undo()
 
     cached = LibriPhraseTrainDataset(
@@ -291,8 +294,9 @@ def test_disabled_online_and_cached_dataset_construction(tmp_path, monkeypatch):
         },
         fbank_kwargs=built["expected_fbank_kwargs"],
     )
-    assert isinstance(cached._background_sampler, BackgroundFeatureCache)
-    assert not isinstance(cached._background_sampler, TrainingBackgroundSampler)
+    cached_inner = getattr(cached._background_sampler, "inner", cached._background_sampler)
+    assert isinstance(cached_inner, BackgroundFeatureCache)
+    assert not isinstance(cached_inner, TrainingBackgroundSampler)
     cached._background_sampler.close()
 
 
@@ -643,5 +647,242 @@ def test_cache_init_does_not_open_feature_mmaps(tmp_path, monkeypatch):
         cache.read_crop(0)
         mmap_loads = [item for item in loads if item[1] == "r"]
         assert mmap_loads
+    finally:
+        cache.close()
+
+
+def _build_v2_cache(tmp_path: Path, *, dataset_id: str = "dns", **overrides) -> dict:
+    from dma_kws.data_prep.stage2_background import prepare_stage2_background
+    from tests.test_prepare_stage2_background import (
+        _make_generic_catalog,
+        _prepare_v2_kwargs,
+    )
+
+    layout = _make_generic_catalog(tmp_path, dataset_id=dataset_id)
+    output_dir = tmp_path / f"cache-{dataset_id}"
+    kwargs = _prepare_v2_kwargs(layout["manifest"], output_dir)
+    kwargs.update(overrides)
+    prepare_stage2_background(**kwargs)
+    args = _composed_cache_args()
+    return {
+        "layout": layout,
+        "output_dir": output_dir,
+        "manifest_path": output_dir / "manifest.json",
+        **args,
+    }
+
+
+def test_v1_and_v2_caches_are_readable_unknown_version_and_bad_hash_fail(tmp_path):
+    from dma_kws.data_prep.stage2_background import _cache_id_for, verify_stage2_background_cache
+    from dma_kws.stage2.background_cache import BackgroundFeatureCache
+
+    v1 = _build_cache(tmp_path / "v1")
+    v2 = _build_v2_cache(tmp_path / "v2")
+    cache_v1 = _open_cache(v1)
+    cache_v2 = _open_cache(v2)
+    try:
+        assert cache_v1.format_version == 1
+        assert cache_v2.format_version == 2
+        assert cache_v1.read_crop(0).shape[1] == cache_v2.read_crop(0).shape[1]
+        verify_stage2_background_cache(v1["output_dir"])
+        verify_stage2_background_cache(v2["output_dir"])
+    finally:
+        cache_v1.close()
+        cache_v2.close()
+
+    unknown = tmp_path / "unknown"
+    shutil.copytree(v2["output_dir"], unknown)
+    manifest = _load_manifest(unknown / "manifest.json")
+    manifest["format_version"] = 99
+    manifest["cache_id"] = _cache_id_for(manifest)
+    (unknown / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="format_version"):
+        BackgroundFeatureCache(
+            unknown / "manifest.json",
+            expected_fbank_kwargs=v2["expected_fbank_kwargs"],
+            duration_seconds_min=v2["duration_seconds_min"],
+            duration_seconds_max=v2["duration_seconds_max"],
+        )
+    with pytest.raises(ValueError, match="format_version"):
+        verify_stage2_background_cache(unknown)
+
+    bad_hash = tmp_path / "bad-hash"
+    shutil.copytree(v2["output_dir"], bad_hash)
+    manifest = _load_manifest(bad_hash / "manifest.json")
+    manifest["cache_id"] = "0" * 64
+    (bad_hash / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="cache_id"):
+        BackgroundFeatureCache(
+            bad_hash / "manifest.json",
+            expected_fbank_kwargs=v2["expected_fbank_kwargs"],
+            duration_seconds_min=v2["duration_seconds_min"],
+            duration_seconds_max=v2["duration_seconds_max"],
+        )
+
+
+def test_v2_out_of_range_index_and_long_recording_id_roundtrip(tmp_path):
+    from dma_kws.data_prep.stage2_background import prepare_stage2_background
+    from tests.test_prepare_stage2_background import (
+        _make_generic_catalog,
+        _prepare_v2_kwargs,
+    )
+
+    layout = _make_generic_catalog(tmp_path, long_id_chars=1500)
+    output_dir = tmp_path / "cache-long"
+    prepare_stage2_background(**_prepare_v2_kwargs(layout["manifest"], output_dir))
+    built = {
+        "manifest_path": output_dir / "manifest.json",
+        **_composed_cache_args(),
+        "output_dir": output_dir,
+    }
+    cache = _open_cache(built)
+    try:
+        recordings = [
+            json.loads(line)
+            for line in (output_dir / "recordings.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert recordings[0]["recording_id"] == layout["train_ids"][0]
+        assert len(recordings[0]["recording_id"]) > 1024
+        feat = cache.read_crop(0)
+        assert feat.dtype == torch.float32
+        with pytest.raises(ValueError, match="out of range"):
+            cache.read_crop(cache.num_crops)
+        with pytest.raises(ValueError, match="out of range"):
+            cache.read_crop(-1)
+    finally:
+        cache.close()
+
+    crops_path = output_dir / "crops.npy"
+    crops = np.load(crops_path, allow_pickle=False)
+    crop_id = int(crops[0]["crop_id"])
+    crops[0]["shard_index"] = 10**6
+    np.save(crops_path, crops, allow_pickle=False)
+    digest, size = _file_digest(crops_path)
+    manifest = _load_manifest(output_dir / "manifest.json")
+    manifest["crops"]["sha256"] = digest
+    manifest["crops"]["size"] = size
+    _restamp_manifest(output_dir, manifest)
+    with pytest.raises(ValueError, match=str(crop_id)):
+        cache = _open_cache(built)
+        cache.close()
+
+
+def test_shared_shard_store_caps_total_open_shards_and_survives_eviction(tmp_path, monkeypatch):
+    from dma_kws.stage2.background_cache import BackgroundFeatureCache, ShardStore
+
+    monkeypatch.setattr(
+        "dma_kws.data_prep.stage2_background._max_frames_per_shard",
+        lambda *_args, **_kwargs: 1,
+    )
+    built = [
+        _build_v2_cache(tmp_path / f"src-{index}", dataset_id=f"ds{index}")
+        for index in range(3)
+    ]
+    store = ShardStore(max_open_shards=2)
+    caches = [
+        BackgroundFeatureCache(
+            item["manifest_path"],
+            expected_fbank_kwargs=item["expected_fbank_kwargs"],
+            duration_seconds_min=item["duration_seconds_min"],
+            duration_seconds_max=item["duration_seconds_max"],
+            shard_store=store,
+        )
+        for item in built
+    ]
+    try:
+        high_water = 0
+        tensors = []
+        clones = []
+        for cache in caches:
+            for crop_id in range(cache.num_crops):
+                tensor = cache.read_crop(crop_id)
+                tensors.append(tensor)
+                clones.append(tensor.clone())
+                high_water = max(high_water, store.open_count)
+                assert len(cache._open_shards) == 0
+        assert high_water <= 2
+        assert store.open_count <= 2
+        assert torch.equal(tensors[0], clones[0])
+        tensors[0].add_(2.0)
+        assert not torch.equal(tensors[0], clones[0])
+        torch.testing.assert_close(clones[0], caches[0].read_crop(0))
+        caches[0].close()
+        still = caches[1].read_crop(0)
+        assert still.dtype == torch.float32
+        assert torch.equal(tensors[-1], clones[-1])
+    finally:
+        for cache in caches:
+            cache.close()
+        store.close()
+
+
+def test_shard_store_pickle_spawn_and_pid_switch_drop_open_handles(tmp_path):
+    from dma_kws.stage2.background_cache import BackgroundFeatureCache, ShardStore
+
+    built = _build_v2_cache(tmp_path)
+    store = ShardStore(max_open_shards=2)
+    cache = BackgroundFeatureCache(
+        built["manifest_path"],
+        expected_fbank_kwargs=built["expected_fbank_kwargs"],
+        duration_seconds_min=built["duration_seconds_min"],
+        duration_seconds_max=built["duration_seconds_max"],
+        shard_store=store,
+    )
+    try:
+        first = cache.read_crop(0)
+        assert store.open_count >= 1
+        store_state = store.__getstate__()
+        assert dict(store_state["_open"]) == {}
+        cache_state = cache.__getstate__()
+        assert dict(cache_state["_open_shards"]) == {}
+        payload = pickle.dumps((cache, store))
+        restored_cache, restored_store = pickle.loads(payload)
+        try:
+            assert restored_store.open_count == 0
+            assert len(restored_cache._open_shards) == 0
+            again = restored_cache.read_crop(0)
+            assert again.dtype == torch.float32
+            torch.testing.assert_close(again, first)
+        finally:
+            restored_cache.close()
+            restored_store.close()
+
+        store._pid = -12345
+        after_fork = cache.read_crop(0)
+        assert after_fork.dtype == torch.float32
+        assert store.open_count >= 1
+
+        ctx = multiprocessing.get_context("spawn")
+        queue = ctx.Queue()
+        proc = ctx.Process(
+            target=_spawn_extract_from_pickle,
+            args=(pickle.dumps(cache), 11, queue),
+        )
+        proc.start()
+        result = queue.get(timeout=60)
+        proc.join(timeout=60)
+        assert proc.exitcode == 0
+        assert result["dtype"] == "torch.float32"
+        assert result["device"] == "cpu"
+        assert result["shape"][1] == int(built["expected_fbank_kwargs"]["num_mel_bins"])
+    finally:
+        cache.close()
+        store.close()
+
+
+def test_default_cache_keeps_local_lru_without_shared_store(tmp_path):
+    built = _build_cache(tmp_path)
+    cache = _open_cache(built, max_open_shards=2)
+    try:
+        cache.read_crop(0)
+        assert len(cache._open_shards) == 1
+        assert getattr(cache, "_shard_store", None) is None
     finally:
         cache.close()
