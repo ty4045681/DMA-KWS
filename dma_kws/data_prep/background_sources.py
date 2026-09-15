@@ -434,23 +434,31 @@ def _carve_val_from_train(
         eligible_groups,
         key=lambda group_id: (_stable_digest(seed, group_id), group_id),
     )
-    val_groups: list[str] = []
+    if len(eligible_groups) < 2:
+        raise source_field_error(
+            source_id,
+            "split_policy",
+            reason="not enough eligible groups to populate both train and val",
+            expected="at least 2 eligible groups",
+            actual=len(eligible_groups),
+        )
+    val_eligible_n = min(n_val, len(ordered_eligible) - 1)
+    val_groups = list(ordered_eligible[:val_eligible_n])
+    remaining = n_val - len(val_groups)
     for group_id in ordered_ineligible:
-        if len(val_groups) >= n_val:
+        if remaining <= 0:
             break
         val_groups.append(group_id)
-    remaining_eligible = list(ordered_eligible)
-    for group_id in ordered_eligible:
-        if len(val_groups) >= n_val:
-            break
-        if len(remaining_eligible) <= 1:
+        remaining -= 1
+    for group_id in ordered_eligible[val_eligible_n:]:
+        if remaining <= 0:
             break
         val_groups.append(group_id)
-        remaining_eligible.remove(group_id)
+        remaining -= 1
     remaining_eligible_after = [
         group_id for group_id in eligible_groups if group_id not in set(val_groups)
     ]
-    if eligible_groups and not remaining_eligible_after:
+    if not remaining_eligible_after:
         raise source_field_error(
             source_id,
             "split_policy",
@@ -641,7 +649,9 @@ def _write_split_list(
     path: Path, records: Sequence[BackgroundRecord], split: str
 ) -> None:
     lines = sorted(
-        record.audio_path for record in records if record.split == split
+        record.audio_path
+        for record in records
+        if record.split == split and record.background_eligible is True
     )
     path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 

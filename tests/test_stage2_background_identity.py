@@ -27,6 +27,7 @@ from dma_kws.stage2.background_identity import (
     audit_background_sources_at_train_start,
     background_data_signature_hash,
     background_data_signature_payload,
+    build_background_data_signature,
     is_multisource_background,
 )
 from tests.test_stage2_background_sources import _online_config, _source_config
@@ -345,6 +346,40 @@ def test_multisource_signature_changes_with_weight_content_and_policy(tmp_path):
         )
         != base_hash
     )
+
+
+def test_disabled_multisource_signature_does_not_read_manifests_and_differs_from_enabled(
+    tmp_path,
+):
+    manifest = _write_source(tmp_path, "dns")
+    enabled = _online_config([_source_config("dns", manifest)])
+    missing = tmp_path / "missing.jsonl"
+    disabled = _online_config(
+        [_source_config("dns", missing)],
+        enabled=False,
+    )
+    config_enabled = {"stage2": {"background_negative": enabled}, "training": {"seed": 2025}}
+    config_disabled = {
+        "stage2": {"background_negative": disabled},
+        "training": {"seed": 2025},
+    }
+    enabled_hash = build_background_data_signature(config_enabled)
+    disabled_hash = build_background_data_signature(config_disabled)
+    assert enabled_hash is not None
+    assert disabled_hash is not None
+    assert enabled_hash != disabled_hash
+    payload = background_data_signature_payload(disabled, seed=2025)
+    assert payload["enabled"] is False
+    assert "sources" not in payload
+    with pytest.raises((SystemExit, ValueError), match="signature"):
+        assert_background_resume_identity(
+            {
+                "background_data_signature_version": BACKGROUND_DATA_SIGNATURE_VERSION,
+                "background_data_signature": enabled_hash,
+            },
+            current_signature=disabled_hash,
+            current_config=config_disabled,
+        )
 
 
 def test_strict_resume_rejects_source_weight_and_legacy_to_multisource(tmp_path):

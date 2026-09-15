@@ -847,3 +847,50 @@ def test_verify_only_does_not_open_source_audio_and_unknown_version_fails(
     )
     with pytest.raises(ValueError, match="format_version"):
         verify_stage2_background_cache(output_dir)
+
+
+def test_prepare_v2_rejects_audio_that_no_longer_matches_catalog_hash(tmp_path):
+    from dma_kws.data_prep.stage2_background import prepare_stage2_background
+
+    layout = _make_generic_catalog(tmp_path)
+    shutil.copyfile(layout["wavs"]["clip-val"], layout["wavs"]["clip-a"])
+    with pytest.raises(ValueError, match=r"audio_sha256|content_sha256"):
+        prepare_stage2_background(
+            **_prepare_v2_kwargs(layout["manifest"], tmp_path / "cache-mismatch")
+        )
+    assert not (tmp_path / "cache-mismatch").exists()
+
+
+def test_verify_v2_rejects_cache_when_content_hash_disagrees_with_snapshot(
+    tmp_path,
+):
+    from dma_kws.data_prep.stage2_background import (
+        _cache_id_for,
+        prepare_stage2_background,
+        verify_stage2_background_cache,
+    )
+
+    layout = _make_generic_catalog(tmp_path)
+    output_dir = tmp_path / "cache-hash"
+    prepare_stage2_background(**_prepare_v2_kwargs(layout["manifest"], output_dir))
+    rows = _load_recordings(output_dir)
+    rows[0]["content_sha256"] = "c" * 64
+    recordings_path = output_dir / "recordings.jsonl"
+    recordings_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    payload = recordings_path.read_bytes()
+    manifest = _load_manifest(output_dir)
+    manifest["recordings"] = {
+        **manifest["recordings"],
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size": len(payload),
+    }
+    manifest["cache_id"] = _cache_id_for(manifest)
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"content_sha256|audio_sha256"):
+        verify_stage2_background_cache(output_dir)

@@ -26,6 +26,8 @@ from dma_kws.data_prep.background_manifest import (
 )
 from dma_kws.data_prep.background_sources import (
     PrepareBackgroundConfig,
+    _carve_val_from_train,
+    _write_split_list,
     prepare_background_sources,
 )
 from dma_kws.data_prep.musan_split import discover_musan_recordings
@@ -750,7 +752,10 @@ def test_musan_preserve_carve_keeps_only_eligible_train_group(tmp_path):
         [str(music.resolve()), str(noise.resolve())],
     )
     _write_list(split_dir / "eval_musan.list", [str(speech.resolve())])
-    allow = _write_list(tmp_path / "allow.list", ["noise/free-sound/noise-0.wav"])
+    allow = _write_list(
+        tmp_path / "allow.list",
+        ["noise/free-sound/noise-0.wav", "music/fma/music-a.wav"],
+    )
     output_dir = tmp_path / "out"
     prepare_background_sources(
         PrepareBackgroundConfig(
@@ -769,13 +774,170 @@ def test_musan_preserve_carve_keeps_only_eligible_train_group(tmp_path):
         )
     )
     records = _by_id(read_recordings_jsonl(output_dir / "musan" / RECORDINGS_JSONL_NAME))
-    eligible = records["musan:noise/free-sound/noise-0.wav"]
-    ineligible = records["musan:music/fma/music-a.wav"]
-    assert eligible.background_eligible is True
-    assert eligible.split == "train"
-    assert ineligible.background_eligible is False
-    assert ineligible.split == "val"
+    noise_rec = records["musan:noise/free-sound/noise-0.wav"]
+    music_rec = records["musan:music/fma/music-a.wav"]
+    assert noise_rec.background_eligible is True
+    assert music_rec.background_eligible is True
+    splits = {noise_rec.split, music_rec.split}
+    assert splits == {"train", "val"}
     assert records["musan:speech/us-gov/speech-0.wav"].split == "test"
+    lists_text = "".join(
+        (output_dir / "musan" / f"{split}.list").read_text(encoding="utf-8")
+        for split in ("train", "val", "test")
+    )
+    assert str(music.resolve()) in lists_text
+    assert str(noise.resolve()) in lists_text
+    assert str(speech.resolve()) not in lists_text
+
+
+def test_carve_val_keeps_eligible_groups_on_both_splits_when_enough():
+    from dataclasses import replace
+
+    from dma_kws.data_prep.background_manifest import background_record_from_mapping
+
+    template = background_record_from_mapping(
+        {
+            "schema_version": 1,
+            "dataset_id": "musan",
+            "recording_id": "musan:0",
+            "relative_path": "0.wav",
+            "audio_path": "/tmp/0.wav",
+            "group_id": "musan:0",
+            "origin_ids": ["musan:0"],
+            "split": "train",
+            "categories": ["noise"],
+            "background_eligible": True,
+            "eligibility_basis": "allowlist",
+            "duration_seconds": 1.0,
+            "sample_rate": 8000,
+            "channels": 1,
+            "audio_sha256": "a" * 64,
+            "license_id": "cc0",
+            "provenance_complete": True,
+        }
+    )
+    records = [
+        replace(
+            template,
+            recording_id=f"musan:{index}",
+            group_id=f"musan:{index}",
+            relative_path=f"{index}.wav",
+            audio_path=f"/tmp/{index}.wav",
+            origin_ids=(f"musan:{index}",),
+            background_eligible=index < 8,
+        )
+        for index in range(10)
+    ]
+    carved = _carve_val_from_train(records, seed=2025, source_id="musan")
+    val_eligible = sum(
+        record.split == "val" and record.background_eligible is True for record in carved
+    )
+    train_eligible = sum(
+        record.split == "train" and record.background_eligible is True
+        for record in carved
+    )
+    assert val_eligible >= 1
+    assert train_eligible >= 1
+
+
+def test_carve_val_reports_when_too_few_eligible_groups_for_both_splits():
+    from dataclasses import replace
+
+    from dma_kws.data_prep.background_manifest import background_record_from_mapping
+
+    template = background_record_from_mapping(
+        {
+            "schema_version": 1,
+            "dataset_id": "musan",
+            "recording_id": "musan:0",
+            "relative_path": "0.wav",
+            "audio_path": "/tmp/0.wav",
+            "group_id": "musan:0",
+            "origin_ids": ["musan:0"],
+            "split": "train",
+            "categories": ["noise"],
+            "background_eligible": True,
+            "eligibility_basis": "allowlist",
+            "duration_seconds": 1.0,
+            "sample_rate": 8000,
+            "channels": 1,
+            "audio_sha256": "a" * 64,
+            "license_id": "cc0",
+            "provenance_complete": True,
+        }
+    )
+    records = [
+        replace(
+            template,
+            recording_id=f"musan:{index}",
+            group_id=f"musan:{index}",
+            relative_path=f"{index}.wav",
+            audio_path=f"/tmp/{index}.wav",
+            origin_ids=(f"musan:{index}",),
+            background_eligible=index == 0,
+        )
+        for index in range(2)
+    ]
+    with pytest.raises(ValueError, match=r"eligible group"):
+        _carve_val_from_train(records, seed=2025, source_id="musan")
+
+
+def test_split_lists_omit_ineligible_recordings(tmp_path):
+    from dma_kws.data_prep.background_manifest import background_record_from_mapping
+
+    rejected = tmp_path / "speech-skip.wav"
+    accepted = tmp_path / "noise.wav"
+    rejected.write_bytes(b"skip")
+    accepted.write_bytes(b"keep")
+    records = [
+        background_record_from_mapping(
+            {
+                "schema_version": 1,
+                "dataset_id": "dns",
+                "recording_id": "dns:keep",
+                "relative_path": "noise.wav",
+                "audio_path": str(accepted),
+                "group_id": "dns:keep",
+                "origin_ids": ["dns:keep"],
+                "split": "train",
+                "categories": ["noise"],
+                "background_eligible": True,
+                "eligibility_basis": "allowlist",
+                "duration_seconds": 1.0,
+                "sample_rate": 8000,
+                "channels": 1,
+                "audio_sha256": "a" * 64,
+                "license_id": "cc0",
+                "provenance_complete": True,
+            }
+        ),
+        background_record_from_mapping(
+            {
+                "schema_version": 1,
+                "dataset_id": "dns",
+                "recording_id": "dns:skip",
+                "relative_path": "speech-skip.wav",
+                "audio_path": str(rejected),
+                "group_id": "dns:skip",
+                "origin_ids": ["dns:skip"],
+                "split": "train",
+                "categories": ["speech"],
+                "background_eligible": False,
+                "eligibility_basis": "excluded",
+                "duration_seconds": 1.0,
+                "sample_rate": 8000,
+                "channels": 1,
+                "audio_sha256": "b" * 64,
+                "license_id": "cc0",
+                "provenance_complete": True,
+            }
+        ),
+    ]
+    out = tmp_path / "train.list"
+    _write_split_list(out, records, "train")
+    text = out.read_text(encoding="utf-8")
+    assert str(accepted) in text
+    assert str(rejected) not in text
 
 
 def test_example_yaml_matches_plan_contract():

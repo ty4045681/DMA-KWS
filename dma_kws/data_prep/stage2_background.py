@@ -134,6 +134,7 @@ class SourceJob:
     feature_dim: int
     dataset_id: str = ""
     relative_path: str = ""
+    expected_audio_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -490,6 +491,13 @@ def _extract_source_crops(
             f"Could not read background source {job.source_id}: {path}"
         ) from exc
     content_sha256, _size = _sha256_file(path)
+    expected = str(job.expected_audio_sha256 or "").strip()
+    if expected and content_sha256 != expected:
+        raise ValueError(
+            f"dataset_id={job.dataset_id!r} recording_id={job.source_id!r} "
+            f"path={path} field=audio_sha256; expected catalog hash {expected!r}, "
+            f"got file content_sha256 {content_sha256!r}"
+        )
     specs: list[BackgroundCropSpec] = []
     features: list[np.ndarray] = []
     for ordinal in range(job.crops_per_recording):
@@ -937,6 +945,14 @@ def _verify_v2_cache(cache_dir: Path, manifest: Mapping[str, Any]) -> dict[str, 
                 f"path={recordings_path} field=recording_index; expected {index}, "
                 f"got {record.get('recording_index')!r}"
             )
+        content_sha256 = str(record.get("content_sha256") or "")
+        audio_sha256 = str(record.get("audio_sha256") or "")
+        if not content_sha256 or content_sha256 != audio_sha256:
+            raise ValueError(
+                f"dataset_id={dataset_id!r} recording_id={recording_id!r} "
+                f"path={recordings_path} field=content_sha256; "
+                f"expected catalog audio_sha256 {audio_sha256!r}, got {content_sha256!r}"
+            )
         start = int(record["crop_start"])
         count = int(record["crop_count"])
         expected_ids.append(recording_id)
@@ -984,6 +1000,17 @@ def _verify_v2_cache(cache_dir: Path, manifest: Mapping[str, Any]) -> dict[str, 
             f"dataset_id={dataset_id!r} path={manifest_path} field=train members; "
             f"expected {expected_ids!r}, got {snapshot_ids!r}"
         )
+    for cache_row, snapshot_record in zip(recordings, snapshot_records):
+        snapshot_hash = str(snapshot_record.audio_sha256 or "")
+        content_sha256 = str(cache_row.get("content_sha256") or "")
+        audio_sha256 = str(cache_row.get("audio_sha256") or "")
+        if content_sha256 != snapshot_hash or audio_sha256 != snapshot_hash:
+            raise ValueError(
+                f"dataset_id={dataset_id!r} recording_id={snapshot_record.recording_id!r} "
+                f"path={recordings_path} field=audio_sha256; "
+                f"expected snapshot hash {snapshot_hash!r}, "
+                f"got audio_sha256={audio_sha256!r} content_sha256={content_sha256!r}"
+            )
     audit_split_isolation(snapshot_records)
 
     return {
@@ -1357,6 +1384,15 @@ def _write_cache_v2(
             jobs, workers=workers, fbank_params=fbank_params
         ):
             catalog_record = records_by_id[result.source_id]
+            catalog_hash = str(catalog_record.audio_sha256 or "")
+            if result.content_sha256 != catalog_hash:
+                raise ValueError(
+                    f"dataset_id={catalog.dataset_id!r} "
+                    f"recording_id={catalog_record.recording_id!r} "
+                    f"path={result.list_entry} field=audio_sha256; "
+                    f"expected catalog hash {catalog_hash!r}, "
+                    f"got file content_sha256 {result.content_sha256!r}"
+                )
             crop_start = crop_id
             record = {
                 "audio_sha256": catalog_record.audio_sha256,
@@ -1587,6 +1623,7 @@ def _prepare_v2_from_manifest(
             feature_dim=plan.feature_dim,
             dataset_id=plan.dataset_id,
             relative_path=record.relative_path,
+            expected_audio_sha256=str(record.audio_sha256 or ""),
         )
         for index, record in enumerate(train_records)
     ]

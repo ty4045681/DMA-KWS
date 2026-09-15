@@ -72,8 +72,10 @@ Output (atomic; refuses to overwrite `output_dir`):
   fsd50k/...
 ```
 
-`.list` files are for inspection and old tools. Training identity is
-`recordings.jsonl` + sibling `catalog.json`.
+`.list` files are for inspection and old tools; they contain only
+`background_eligible=true` recordings for that split. Rejected clips stay in
+`recordings.jsonl` / `catalog.json`. Training identity is those two files, not
+the lists.
 
 ## Cache CLI
 
@@ -82,8 +84,8 @@ Output (atomic; refuses to overwrite `output_dir`):
 | Flag | Format | Input |
 | --- | --- | --- |
 | `--split-dir` | v1 MUSAN cache | existing `split.json` + train/eval lists |
-| `--source-manifest` | v2 | generic `recordings.jsonl`; caches eligible **train** only |
-| `--verify-only` | either | `--output-dir` only; does not need split/manifest or original WAV |
+| `--source-manifest` | v2 | generic `recordings.jsonl`; caches eligible **train** only. Build fails if the file bytes no longer match `audio_sha256` in the catalog. |
+| `--verify-only` | either | `--output-dir` only; does not need split/manifest or original WAV. v2 also checks cache `content_sha256`, catalog `audio_sha256`, and the train snapshot agree. |
 
 ```bash
 .venv/bin/python scripts/prepare_stage2_background.py \
@@ -188,8 +190,10 @@ cache-only machine; enabled validation always crops from original val audio.
   that transcode near-duplicates are absent.
 - **Validation needs original audio.** `validation.enabled=true` requires
   eligible val waveforms on disk, even if training is cached.
-- **Strict resume.** Source, weight, policy, fbank, probability, or catalog
-  identity changes cannot resume. Legacy ↔ multi-source is also a new run.
+- **Strict resume.** Source, weight, policy, fbank, probability, `enabled`, or
+  catalog identity changes cannot resume. Disabling background with `sources`
+  still set does not open manifests; the v2 signature still changes. Legacy ↔
+  multi-source is also a new run.
 
 ## CPU fixture (do not duplicate)
 

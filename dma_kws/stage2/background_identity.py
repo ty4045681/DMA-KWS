@@ -146,12 +146,42 @@ def background_data_signature_payload(
     fbank: Mapping[str, Any] | None = None,
     seed: int = 2025,
 ) -> dict[str, Any]:
-    """Version-2 semantic payload. Locators and mount points are omitted."""
+    """Version-2 semantic payload. Locators and mount points are omitted.
+
+    ``enabled=false`` records the switch and source ids/weights without
+    opening manifests or caches.
+    """
     payload = dict(background_cfg or {})
+    enabled = bool(payload.get("enabled", False))
     active = active_background_sources(payload.get("sources") or [])
     index = background_source_batch_index([source.id for source in active])
     mode = str(payload.get("mode") or "online").strip() or "online"
     validation = dict(payload.get("validation") or {})
+    weight_sum = sum(float(item.weight) for item in active) or 1.0
+    base: dict[str, Any] = {
+        "background_data_signature_version": BACKGROUND_DATA_SIGNATURE_VERSION,
+        "enabled": enabled,
+        "mode": mode,
+        "probability": float(payload.get("probability", 0.25)),
+        "duration_seconds_min": float(payload.get("duration_seconds_min", 1.0)),
+        "duration_seconds_max": float(payload.get("duration_seconds_max", 3.0)),
+        "crop_policy_version": int(CROP_POLICY_VERSION),
+        "sampling_policy_version": SAMPLING_POLICY_VERSION,
+        "fbank": _canonical_fbank(fbank),
+        "seed": int(seed),
+        "source_id_index": dict(index),
+        "source_ids": [source.id for source in active],
+        "normalized_weights": {
+            source.id: float(source.weight) / weight_sum for source in active
+        },
+        "validation": {
+            "enabled": bool(validation.get("enabled", False)),
+            "samples_per_source": int(validation.get("samples_per_source", 256)),
+            "seed": int(validation.get("seed", 2025)),
+        },
+    }
+    if not enabled:
+        return base
     sources: list[dict[str, Any]] = []
     for source in active:
         records = read_recordings_jsonl(source.manifest)
@@ -189,24 +219,8 @@ def background_data_signature_payload(
             else None,
         }
         sources.append(entry)
-    return {
-        "background_data_signature_version": BACKGROUND_DATA_SIGNATURE_VERSION,
-        "mode": mode,
-        "probability": float(payload.get("probability", 0.25)),
-        "duration_seconds_min": float(payload.get("duration_seconds_min", 1.0)),
-        "duration_seconds_max": float(payload.get("duration_seconds_max", 3.0)),
-        "crop_policy_version": int(CROP_POLICY_VERSION),
-        "sampling_policy_version": SAMPLING_POLICY_VERSION,
-        "fbank": _canonical_fbank(fbank),
-        "seed": int(seed),
-        "source_id_index": dict(index),
-        "validation": {
-            "enabled": bool(validation.get("enabled", False)),
-            "samples_per_source": int(validation.get("samples_per_source", 256)),
-            "seed": int(validation.get("seed", 2025)),
-        },
-        "sources": sources,
-    }
+    base["sources"] = sources
+    return base
 
 
 def background_data_signature_hash(payload: Mapping[str, Any]) -> str:
