@@ -126,6 +126,8 @@ sink_diagnostics:
 - **EPS `position_logits`** 与消融相对 normal 的 delta。
 - **ablation_scores**：normal / `block_sink_all` / 各单层屏蔽后的 `qbyt_score`。消融分数 = **原校准变换后的干预分数**（同一校准器与阈值作用在干预后的 raw logit）。这不声称干预后分数「仍已校准」。
 
+时间轴使用前端的**名义帧中心**，不是上下文编码器的完整感受野，也不是学习权重加权的时间定位。Wenet 使用 `embed.subsampling_rate/right_context` 声明；Icefall Zipformer 校验三层卷积和末级两帧聚合结构，完整聚合对应 fbank 支撑宽度 11、步长 4，末尾重复补齐的单帧对应宽度 9。`output_frames()` 只校验输出长度，不用于反推感受野；未声明或不匹配的结构降级为 `encoder_frame_index`。实现见 [时间映射](../dma_kws/inference/qbyt_attention_report.py)。旧版本生成的时间轴和区域统计需要重新运行诊断才能修正。
+
 配对图仅在 `pair_status=ok` 且时间网格可比较时画 attention 差值；否则只比标量。`max_report_samples` 只限制重型单样本图，不删 `records.csv` 行。
 
 高 sink attention ≠ 抑噪成功；`delta_raw_logit > 0` 只说明切断 sink 读取后分数上升，不能单独推断机制。
@@ -149,6 +151,8 @@ sink_diagnostics:
 ```
 
 `run.json` 含 schema、git、manifest/checkpoint SHA256、字典与校准器指纹、resolved 配置、readout spec、padding、device/dtype、展开后的 capture/ablation、时间轴方法、limits 等。对照 baseline 时按 `manifest_record_number`（或等价记录身份）对齐 `records.csv` 的 `ablation=normal` 行与 `eval_stage2_clips` 的 `results.jsonl`，不要只按 `audio_path` join。
+
+HTML 渲染直接使用本次运行摘要；渲染成功后才写入最终 `summary.json`，并保留 `figures` 与 `num_report_selected`。渲染失败会记录 `status=failed` 和错误原因，并保留 CSV、`run.json` 及 `.partial/`。入口返回值、JSON 和 HTML 的样本计数保持一致；实现见 [输出写入](../scripts/diagnose_qbyt_sink.py)。
 
 ## 资源限制
 

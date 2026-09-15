@@ -42,7 +42,6 @@ __all__ = [
 SYNTHETIC_FIXTURE_BANNER = "合成 fixture / 非训练模型结论"
 
 
-_MAX_FRAME_SEARCH = 10_000
 _LOG_FLOOR = 1e-6
 TIME_AXIS_UNAVAILABLE = "unavailable"
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -100,11 +99,6 @@ class EncoderTimeMap:
         n = int(num_input_frames)
         if n <= 0:
             return 0
-        if self.stride >= 1 and self.receptive_field >= 1:
-            needed = int(self.offset) + int(self.receptive_field)
-            if n < needed:
-                return 0
-            return (n - needed) // int(self.stride) + 1
         if self.kind == "identity":
             return n
         if self.kind == "wenet":
@@ -254,92 +248,72 @@ def fbank_frame_center_sec(
 
 
 def inspect_encoder_time_map(encoder) -> EncoderTimeMap | None:
-    """Return a verified fbank→encoder mapping, or ``None`` if unverifiable."""
+    """Return nominal frontend centers from a declared, supported geometry.
+
+    Output lengths validate the geometry; they cannot identify it. In
+    particular, ceil downsampling can emit an incomplete group on short input.
+    These centers describe the frontend grid, not the contextual encoder's
+    full receptive field or a learned attention-weighted timestamp.
+    """
 
     if encoder is None:
         return None
     from dma_kws.nn import encoder_output_frames
+    from dma_kws.stage2.icefall_encoder import IcefallZipformerEncoder
 
-    probes = (1, 2, 3, 4, 7, 8, 9, 11, 15, 16, 32)
+    candidate = None
+    if isinstance(encoder, IcefallZipformerEncoder):
+        # The supported frontend has temporal (kernel, stride, padding)
+        # (3,1,0), (3,2,0), (3,1,0): RF=9, hop=2. Zipformer then
+        # groups two adjacent frames: nominal RF=11, hop=4. Its symmetric
+        # ConvNeXt/context layers do not change this nominal grid.
+        import torch.nn as nn
+
+        conv = getattr(getattr(encoder, "encoder_embed", None), "conv", None)
+        layers = [] if conv is None else [
+            layer for layer in conv.modules() if isinstance(layer, nn.Conv2d)
+        ]
+        geometry = [
+            (layer.kernel_size[0], layer.stride[0], layer.padding[0], layer.dilation[0])
+            for layer in layers
+        ]
+        downsample = getattr(getattr(encoder, "encoder", None), "downsample_output", None)
+        if geometry != [(3, 1, 0, 1), (3, 2, 0, 1), (3, 1, 0, 1)]:
+            return None
+        if getattr(downsample, "downsample", None) != 2:
+            return None
+        candidate = EncoderTimeMap(
+            method="kaldi_fbank_center+icefall_zipformer_conv_pair_centers",
+            kind="icefall",
+            subsampling_rate=4,
+            right_context=10,
+            stride=4,
+            receptive_field=11,
+        )
+    else:
+        embed = getattr(encoder, "embed", None)
+        rate = getattr(embed, "subsampling_rate", None)
+        right_context = getattr(embed, "right_context", None)
+        if rate is None or right_context is None:
+            return None
+        if int(rate) < 1 or int(right_context) < 0:
+            return None
+        candidate = EncoderTimeMap(
+            method="kaldi_fbank_center+wenet_embed",
+            kind="wenet",
+            subsampling_rate=int(rate),
+            right_context=int(right_context),
+            stride=int(rate),
+            receptive_field=int(right_context) + 1,
+        )
+
     try:
-        values = [int(encoder_output_frames(encoder, n)) for n in probes]
+        for n in (*range(1, 65), 127, 128, 257):
+            if int(encoder_output_frames(encoder, n)) != candidate.output_frames(n):
+                return None
     except (TypeError, ValueError):
         return None
-    if any(value < 0 for value in values):
-        return None
-
-    def _output_fn(num_input_frames: int) -> int:
-        return int(encoder_output_frames(encoder, num_input_frames))
-
-    geometry = _fit_regular_geometry(_output_fn)
-    if geometry is None:
-        return None
-    offset, stride, receptive_field = geometry
-
-    if all(int(encoder_output_frames(encoder, n)) == n for n in probes):
-        return EncoderTimeMap(
-            method="kaldi_fbank_center+identity_output_frames",
-            kind="identity",
-            offset=offset,
-            stride=stride,
-            receptive_field=receptive_field,
-        )
-
-    embed = getattr(encoder, "embed", None)
-    rate = getattr(embed, "subsampling_rate", None)
-    right_context = getattr(embed, "right_context", None)
-    if rate is not None and right_context is not None:
-        expected = []
-        for n in probes:
-            span = n - int(right_context) - 1
-            expected.append(0 if span < 0 else span // int(rate) + 1)
-        if (
-            values == expected
-            and stride == int(rate)
-            and receptive_field == int(right_context) + 1
-        ):
-            return EncoderTimeMap(
-                method="kaldi_fbank_center+wenet_embed",
-                kind="wenet",
-                subsampling_rate=int(rate),
-                right_context=int(right_context),
-                offset=offset,
-                stride=stride,
-                receptive_field=receptive_field,
-            )
-
-    try:
-        from dma_kws.stage2.icefall_encoder import (
-            OUTPUT_DOWNSAMPLING_FACTOR,
-            embed_output_frames,
-        )
-
-        icefall = []
-        for n in probes:
-            subsampled = embed_output_frames(n)
-            icefall.append(
-                0 if subsampled <= 0 else (subsampled + 1) // OUTPUT_DOWNSAMPLING_FACTOR
-            )
-        if values == icefall:
-            return EncoderTimeMap(
-                method="kaldi_fbank_center+icefall_zipformer",
-                kind="icefall",
-                offset=offset,
-                stride=stride,
-                receptive_field=receptive_field,
-            )
-    except Exception:
-        pass
-
-    return EncoderTimeMap(
-        method="kaldi_fbank_center+regular_subsampling",
-        kind="regular",
-        subsampling_rate=stride,
-        right_context=receptive_field - 1,
-        offset=offset,
-        stride=stride,
-        receptive_field=receptive_field,
-    )
+    return candidate
 
 
 def serialize_encoder_time_map(
@@ -379,59 +353,11 @@ def encoder_time_map_from_json(payload: Mapping[str, Any] | None) -> EncoderTime
     )
 
 
-def _min_input_reaching(output_fn, min_out: int) -> int:
-    if min_out <= 0:
-        return 0
-    n = 1
-    while int(output_fn(n)) < min_out:
-        n += 1
-        if n > _MAX_FRAME_SEARCH:
-            raise ValueError(
-                f"encoder output_frames does not reach {min_out} within {_MAX_FRAME_SEARCH}"
-            )
-    return n
-
-
-def _min_input_for_output(time_map: EncoderTimeMap, min_out: int) -> int:
-    return _min_input_reaching(time_map.output_frames, min_out)
-
-
-def _fit_regular_geometry(output_fn) -> tuple[int, int, int] | None:
-    """Fit offset=0, constant stride, and overlapping receptive field.
-
-    ``last_i`` is the last fbank index needed to emit output ``i``. For a
-    regular strided convolution that starts at input 0, ``last_i = i * stride
-    + rf - 1``. Using newly-added frames between outputs as the support would
-    drop the overlapping receptive field.
-    """
-
-    lasts: list[int] = []
-    try:
-        for index in range(6):
-            lasts.append(_min_input_reaching(output_fn, index + 1) - 1)
-    except ValueError:
-        pass
-    if len(lasts) < 2:
-        return None
-    stride = lasts[1] - lasts[0]
-    if stride < 1:
-        return None
-    offset = 0
-    receptive_field = lasts[0] - offset + 1
-    if receptive_field < 1:
-        return None
-    for index, last in enumerate(lasts):
-        expected = offset + index * stride + receptive_field - 1
-        if last != expected:
-            return None
-        if int(output_fn(last + 1)) != index + 1:
-            return None
-        if int(output_fn(last)) != index:
-            return None
-    return offset, stride, receptive_field
-
-
-def _fbank_support(time_map: EncoderTimeMap, encoder_index: int) -> tuple[int, int]:
+def _fbank_support(
+    time_map: EncoderTimeMap,
+    encoder_index: int,
+    num_fbank_frames: int | None = None,
+) -> tuple[int, int]:
     stride = int(time_map.stride)
     receptive_field = int(time_map.receptive_field)
     offset = int(time_map.offset)
@@ -439,6 +365,16 @@ def _fbank_support(time_map: EncoderTimeMap, encoder_index: int) -> tuple[int, i
         raise ValueError("encoder time map is missing stride/receptive_field")
     first = offset + int(encoder_index) * stride
     last = first + receptive_field - 1
+    if time_map.kind == "icefall":
+        if num_fbank_frames is None:
+            raise ValueError("Icefall pair centers require the input frame count")
+        from dma_kws.stage2.icefall_encoder import embed_output_frames
+
+        # SimpleDownsample repeats the last embedding for an odd length.
+        # That final singleton has RF=9, not the RF=11 of a complete pair.
+        embedded = embed_output_frames(num_fbank_frames)
+        if embedded % 2 == 1 and encoder_index == embedded // 2:
+            last -= 2
     if last < first:
         last = first
     return int(first), int(last)
@@ -470,7 +406,7 @@ def build_sample_time_axis(
                 return SampleTimeAxis.unavailable(t_count)
         supports = np.zeros((t_count, 2), dtype=np.int64)
         for index in range(t_count):
-            supports[index] = _fbank_support(encoder_map, index)
+            supports[index] = _fbank_support(encoder_map, index, num_fbank_frames)
     except (TypeError, ValueError):
         return SampleTimeAxis.unavailable(t_count)
 
@@ -695,8 +631,13 @@ def render_sink_attention_report(
     output_dir: str | Path,
     *,
     encoder=None,
+    summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Write ``report.html`` and ``figures/`` from a finished run directory."""
+    """Render a run, using an in-memory summary or an existing finished summary.
+
+    With an explicit summary, the caller owns final persistence. Standalone
+    rerendering still reads and enriches the existing summary.json.
+    """
 
     output_dir = Path(output_dir)
     run_path = output_dir / "run.json"
@@ -704,7 +645,10 @@ def render_sink_attention_report(
     if not run_path.is_file():
         raise FileNotFoundError(f"run.json not found in {output_dir}")
     run = _load_json(run_path)
-    summary = _load_json(summary_path) if summary_path.is_file() else {}
+    persist_summary = summary is None
+    summary = dict(summary) if summary is not None else (
+        _load_json(summary_path) if summary_path.is_file() else {}
+    )
     records = _read_csv(output_dir / "records.csv")
     metrics = _read_csv(output_dir / "attention_metrics.csv")
     positions = _read_csv(output_dir / "position_scores.csv")
@@ -824,7 +768,7 @@ def render_sink_attention_report(
         "time_axis_status": time_axis_status,
         "time_axis_method": time_axis_method,
     }
-    if summary_path.is_file():
+    if persist_summary and summary_path.is_file():
         summary = dict(summary)
         summary["figures"] = figure_index
         summary["num_report_selected"] = len(selected_ids)

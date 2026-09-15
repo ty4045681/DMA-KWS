@@ -1320,9 +1320,9 @@ def _write_report_html(
     *,
     run_id: str,
     summary: Mapping[str, Any],
-) -> None:
-    del run_id, summary
-    render_sink_attention_report(path.parent)
+) -> dict[str, Any]:
+    del run_id
+    return render_sink_attention_report(path.parent, summary=summary)
 
 
 def _is_resource_error(exc: BaseException) -> bool:
@@ -1453,7 +1453,9 @@ def _write_outputs(
     _write_csv(output_dir / "pairs.csv", PAIR_FIELDS, pair_rows)
     _atomic_write_json(output_dir / "run.json", run_payload)
     try:
-        _write_report_html(output_dir / "report.html", run_id=run_id, summary=summary)
+        report = _write_report_html(
+            output_dir / "report.html", run_id=run_id, summary=summary
+        )
     except Exception as exc:
         failed = dict(summary)
         failed["status"] = "failed"
@@ -1462,6 +1464,8 @@ def _write_outputs(
         failed["error"] = f"{previous}; {render_error}" if previous else render_error
         _atomic_write_json(output_dir / "summary.json", failed)
         raise SystemExit(failed["error"]) from exc
+    summary["figures"] = report["figures"]
+    summary["num_report_selected"] = report["num_selected"]
     _atomic_write_json(output_dir / "summary.json", summary)
     shutil.rmtree(output_dir / _PARTIAL_DIRNAME, ignore_errors=True)
 

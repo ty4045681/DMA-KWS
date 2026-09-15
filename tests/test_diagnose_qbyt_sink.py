@@ -80,6 +80,10 @@ class _ProjEncoder(nn.Module):
     def __init__(self, in_dim: int = 80, out_dim: int = ENCODER_DIM) -> None:
         super().__init__()
         self.proj = nn.Linear(in_dim, out_dim)
+        # Declare the known identity time grid of this projection fixture.
+        self.embed = nn.Identity()
+        self.embed.subsampling_rate = 1
+        self.embed.right_context = 0
 
     def output_frames(self, num_input_frames: int) -> int:
         return int(num_input_frames)
@@ -918,6 +922,7 @@ def test_report_render_failure_marks_summary_failed_and_keeps_records(
     assert (out / "records.csv").is_file()
     assert (out / "run.json").is_file()
     assert not (out / "report.html").exists()
+    assert (out / ".partial").is_dir()
 
 
 def test_materialize_scored_sample_drops_capture_tensors():
@@ -1006,3 +1011,28 @@ def test_materialize_scored_sample_drops_capture_tensors():
     assert outcome.metric_rows
     assert outcome.position_rows
     assert all("audio_to_sink" not in row for row in outcome.record_rows)
+
+
+def test_successful_run_keeps_html_json_and_returned_summary_consistent(
+    tmp_path, monkeypatch, install_runner
+):
+    wav = _write_wav(tmp_path / "a.wav", 0.2)
+    manifest = _write_csv(
+        tmp_path / "manifest.csv", "audio_path,keyword,label",
+        f"{wav.name},hey eva,1", f"{wav.name},hey eva,",
+    )
+    summary = _run_diagnose(
+        monkeypatch, _cfg(tmp_path, manifest=manifest,
+                         sink=_sink_defaults(ablations=[], max_report_samples=1)),
+    )
+    out = tmp_path / "out"
+    persisted = json.loads((out / "summary.json").read_text())
+    html = (out / "report.html").read_text()
+    assert persisted == summary
+    assert summary["num_success"] == 2
+    assert summary["num_unlabeled"] == 1
+    assert "<p>status: complete</p>" in html
+    assert "input samples: 2, success: 2, skipped: 0, unlabeled: 1" in html
+    assert summary["num_report_selected"] == 1
+    assert summary["figures"]
+    assert not (out / ".partial").exists()

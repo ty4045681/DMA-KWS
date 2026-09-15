@@ -91,6 +91,9 @@ PAIR_FIELDS = [
 
 
 class _IdentityEncoder:
+    # This fixture explicitly declares a frame-preserving frontend.
+    embed = type("Embed", (), {"subsampling_rate": 1, "right_context": 0})()
+
     def output_frames(self, num_input_frames: int) -> int:
         return int(num_input_frames)
 
@@ -324,6 +327,8 @@ def test_wenet_subsampling_covers_frontend_offset_and_right_crop():
 
 class _TwoLayerStrideConvEncoder:
     """Two conv layers, kernel=3 stride=2: RF=7, hop=4."""
+
+    embed = type("Embed", (), {"subsampling_rate": 4, "right_context": 6})()
 
     def output_frames(self, num_input_frames: int) -> int:
         n = int(num_input_frames)
@@ -853,7 +858,9 @@ def test_selection_is_deterministic_in_run_json(tmp_path, monkeypatch, install_r
     assert run["time_axis_method"] != "pending"
     assert run["time_axis_status"] in {"ok", "unavailable"}
     if run["time_axis_status"] == "ok":
-        assert "identity" in run["time_axis_method"] or "encoder_output_frames" in run["time_axis_method"]
+        assert run["time_axis_method"] == "kaldi_fbank_center+wenet_embed"
+        assert run["time_axis"]["encoder"]["stride"] == 1
+        assert run["time_axis"]["encoder"]["receptive_field"] == 1
     figures = list((out / "figures").rglob("*.png"))
     assert figures
     assert (out / "report.html").is_file()
@@ -1075,3 +1082,87 @@ def test_pair_delta_uses_internal_sample_id_when_trace_path_empty(tmp_path):
     deltas = list((out / "figures").rglob("pair_delta_*.png"))
     assert deltas
     assert not any("missing traces" in item for item in result["skipped_plots"])
+
+
+@pytest.mark.parametrize("num_frames", [9, 10, 11, 12, 25, 26, 27, 28])
+def test_icefall_nominal_centers_match_conv_and_pair_support(num_frames):
+    import torch
+    from torch import nn
+    from dma_kws.stage2.icefall_encoder import IcefallZipformerEncoder
+    from dma_kws.inference.qbyt_attention_report import (
+        encoder_time_map_from_json, serialize_encoder_time_map,
+    )
+
+    # Actual temporal kernels/strides from Icefall Conv2dSubsampling, followed
+    # by SimpleDownsample's pair grouping and repeat-last boundary behavior.
+    embed = nn.Module()
+    embed.conv = nn.Sequential(
+        nn.Conv2d(1, 1, 3, padding=(0, 1), bias=False),
+        nn.Conv2d(1, 1, 3, stride=2, bias=False),
+        nn.Conv2d(1, 1, 3, stride=(1, 2), bias=False),
+    )
+    core = nn.Module()
+    core.downsample_output = nn.Module()
+    core.downsample_output.downsample = 2
+    encoder = IcefallZipformerEncoder(embed, core, output_dim=1)
+    time_map = inspect_encoder_time_map(encoder)
+    assert time_map is not None
+    assert time_map.kind == "icefall"
+    time_map = encoder_time_map_from_json(serialize_encoder_time_map(time_map))
+    for parameter in embed.parameters():
+        nn.init.ones_(parameter)
+    x = torch.ones(1, 1, num_frames, 32, requires_grad=True)
+    y = embed.conv(x).mean(dim=-1)
+    if y.shape[-1] % 2:
+        y = torch.cat((y, y[..., -1:]), dim=-1)
+    y = y.reshape(1, 1, -1, 2).mean(dim=-1)
+    axis = build_sample_time_axis(
+        audio_length=y.shape[-1], encoder_map=time_map, fbank=_fbank(),
+        left_padding_ms=0, right_padding_ms=0, source_duration_sec=1.0,
+        num_fbank_frames=num_frames,
+    )
+    assert axis.status == "ok"
+    for index in range(y.shape[-1]):
+        grad = torch.autograd.grad(y[0, 0, index], x, retain_graph=True)[0]
+        support = grad.abs().sum(dim=(0, 1, 3)).nonzero().flatten().tolist()
+        assert tuple(axis.fbank_support[index]) == (support[0], support[-1])
+        center = ((support[0] + support[-1]) * 0.5 * 10 + 12.5) / 1000
+        assert axis.centers_source_sec[index] == pytest.approx(center)
+    if num_frames == 25:
+        assert tuple(axis.fbank_support[2]) == (8, 18)
+        assert axis.centers_source_sec[2] == pytest.approx(0.1425)
+        noise, _, _ = noise_region_masks(axis, ((0.140, 0.150),))
+        assert noise.tolist() == [False, False, True, False, False]
+    # The same length formula with a changed frontend is not verified.
+    embed.conv[0] = nn.Conv2d(1, 1, 5)
+    assert inspect_encoder_time_map(encoder) is None
+
+
+@pytest.mark.parametrize("kind", ["identity", "strided", "icefall"])
+def test_output_lengths_without_declared_geometry_are_unavailable(kind):
+    from dma_kws.stage2.icefall_encoder import IcefallZipformerEncoder
+
+    class LengthsOnly:
+        def output_frames(self, n):
+            if kind == "identity":
+                return n
+            if kind == "icefall":
+                return IcefallZipformerEncoder.output_frames(self, n)
+            return max(0, (n - 7) // 4 + 1)
+
+    assert inspect_encoder_time_map(LengthsOnly()) is None
+
+
+def test_explicit_report_summary_overrides_disk_without_persisting(tmp_path):
+    out = _write_minimal_run(tmp_path)
+    summary_path = out / "summary.json"
+    original = summary_path.read_bytes()
+    summary = {"status": "failed", "num_input": 7, "num_success": 3,
+               "num_skipped": 4, "num_unlabeled": 2}
+    report = render_sink_attention_report(out, summary=summary)
+    html = (out / "report.html").read_text()
+    assert "<p>status: failed</p>" in html
+    assert "input samples: 7, success: 3, skipped: 4, unlabeled: 2" in html
+    assert summary_path.read_bytes() == original
+    assert report["figures"]
+    assert "figures" not in summary
