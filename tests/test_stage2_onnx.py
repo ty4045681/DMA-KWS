@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,21 @@ class _FakeQbyT(torch.nn.Module):
 class _FakeEncoder(torch.nn.Identity):
     def output_frames(self, num_input_frames: int) -> int:
         return num_input_frames
+
+
+class _ScriptedDouble(torch.nn.Module):
+    def forward(self, value):
+        return value * 2.0
+
+
+class _PythonParentWithScriptedChild(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.child = torch.jit.script(_ScriptedDouble())
+        self.projection = torch.nn.Linear(3, 3)
+
+    def forward(self, value):
+        return self.projection(self.child(value))
 
 
 class _FakeStage2(torch.nn.Module):
@@ -211,6 +227,108 @@ def test_non_v4_readout_is_rejected():
         )
 
 
+def _loaded_fake_model(tmp_path, *, encoder_type="conformer"):
+    config = _config()
+    config["stage1"]["encoder_type"] = encoder_type
+    return stage2_onnx.LoadedStage2Model(
+        source=tmp_path / "unused.pt",
+        payload={},
+        config=config,
+        model=_FakeStage2().eval(),
+        qbyt_score=_score_spec(),
+        stream_policy=StreamPolicy(backend=encoder_type, enabled=False),
+        vocab_size=8,
+    )
+
+
+def test_prepare_model_for_onnx_skips_non_icefall(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        stage2_onnx,
+        "_load_icefall_onnx_converter",
+        lambda: pytest.fail("converter must not load for conformer"),
+    )
+
+    assert stage2_onnx._prepare_model_for_onnx(_loaded_fake_model(tmp_path)) is None
+
+
+def test_prepare_model_for_onnx_uses_icefall_onnx_conversion(monkeypatch, tmp_path):
+    loaded = _loaded_fake_model(tmp_path, encoder_type="icefall_zipformer")
+    calls = []
+
+    def fake_converter(model, **kwargs):
+        calls.append((model, kwargs))
+        return model
+
+    monkeypatch.setattr(
+        stage2_onnx,
+        "_load_icefall_onnx_converter",
+        lambda: fake_converter,
+    )
+
+    preparation = stage2_onnx._prepare_model_for_onnx(loaded)
+
+    assert preparation == "icefall.convert_scaled_to_non_scaled(is_onnx=True)"
+    assert calls == [(loaded.model, {"inplace": True, "is_onnx": True})]
+    assert loaded.model.training is False
+
+
+def test_prepare_model_for_onnx_preserves_streaming_chunk_convolution(
+    monkeypatch,
+    tmp_path,
+):
+    class FakeChunkCausalDepthwiseConv1d(torch.nn.Module):
+        def forward(self, value):
+            return value
+
+    loaded = _loaded_fake_model(tmp_path, encoder_type="icefall_zipformer")
+    chunk_module = FakeChunkCausalDepthwiseConv1d()
+    loaded.model.encoder = torch.nn.Sequential(chunk_module)
+    loaded = replace(
+        loaded,
+        stream_policy=StreamPolicy(
+            backend="icefall_zipformer",
+            enabled=True,
+            chunk_size=16,
+            left_context_frames=64,
+        ),
+    )
+
+    def fake_converter(model, **_kwargs):
+        model.encoder[0] = torch.nn.Identity()
+        return model
+
+    monkeypatch.setitem(
+        fake_converter.__globals__,
+        "ChunkCausalDepthwiseConv1d",
+        FakeChunkCausalDepthwiseConv1d,
+    )
+    monkeypatch.setattr(
+        stage2_onnx,
+        "_load_icefall_onnx_converter",
+        lambda: fake_converter,
+    )
+
+    preparation = stage2_onnx._prepare_model_for_onnx(loaded)
+
+    assert loaded.model.encoder[0] is chunk_module
+    assert preparation.endswith("preserve_chunk_convolution=true")
+
+
+def test_prepare_model_for_onnx_rejects_non_inplace_converter_result(
+    monkeypatch,
+    tmp_path,
+):
+    loaded = _loaded_fake_model(tmp_path, encoder_type="icefall_zipformer")
+    monkeypatch.setattr(
+        stage2_onnx,
+        "_load_icefall_onnx_converter",
+        lambda: (lambda *_args, **_kwargs: _FakeStage2()),
+    )
+
+    with pytest.raises(Stage2OnnxExportError, match="returned a different model"):
+        stage2_onnx._prepare_model_for_onnx(loaded)
+
+
 def test_export_orchestration_is_atomic_and_writes_manifest(monkeypatch, tmp_path):
     source = tmp_path / "stage2.pt"
     _write_fake_pt(source)
@@ -253,6 +371,7 @@ def test_export_orchestration_is_atomic_and_writes_manifest(monkeypatch, tmp_pat
     assert manifest["schema_version"] == 1
     assert manifest["model"]["qbyt_readout_version"] == 4
     assert manifest["model"]["qbyt_family"] == "pooling"
+    assert manifest["export"]["model_preparation"] is None
     assert manifest["verification"]["onnxruntime_cpu"] is True
     assert set(manifest["artifacts"]) == {"stage2_encoder.onnx", "qbyt.onnx"}
     assert not list(output_dir.glob(".*.tmp*"))
@@ -325,6 +444,35 @@ def test_real_legacy_export_and_onnx_checker(tmp_path):
         assert {
             entry.key: entry.value for entry in exported.metadata_props
         }["dma_kws.artifact_kind"] == plan.kind
+
+
+def test_real_legacy_export_pretraces_scripted_submodules(tmp_path):
+    onnx = pytest.importorskip("onnx")
+    model = _PythonParentWithScriptedChild().eval()
+    value = torch.randn(2, 3)
+    plan = stage2_onnx.OnnxGraphPlan(
+        kind="scripted_probe",
+        filename="scripted_probe.onnx",
+        module=model,
+        args=(value,),
+        input_names=("value",),
+        output_names=("output",),
+        dynamic_axes={"value": {0: "batch"}, "output": {0: "batch"}},
+        dynamic_bounds={"batch": (1, None)},
+    )
+    destination = tmp_path / plan.filename
+
+    stage2_onnx._export_graph(
+        plan,
+        destination,
+        opset_version=17,
+        exporter="legacy",
+        dynamic_batch=True,
+    )
+    stage2_onnx._stamp_and_check_onnx(onnx, destination, {})
+
+    exported = onnx.load(destination, load_external_data=False)
+    assert exported.graph.input[0].type.tensor_type.shape.dim[0].dim_param == "batch"
 
 
 @pytest.mark.parametrize("dynamic_batch", [False, True])

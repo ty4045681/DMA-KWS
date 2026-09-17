@@ -8,8 +8,10 @@ graph is also available for integrations that prefer a single call.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
+import sys
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -276,6 +278,123 @@ def _validate_export_options(
         )
 
 
+def _load_icefall_onnx_converter():
+    """Load Icefall's recipe-local ONNX module converter.
+
+    The GigaSpeech KWS recipe commonly symlinks ``scaling.py`` from the
+    LibriSpeech Zipformer recipe without symlinking ``scaling_converter.py``.
+    Resolve both locations instead of relying on an ambient ``PYTHONPATH``.
+    """
+
+    from dma_kws.pathing import ensure_icefall_on_path
+
+    try:
+        recipe = ensure_icefall_on_path()
+    except SystemExit as exc:
+        raise Stage2OnnxExportError(str(exc)) from exc
+    scaling_path = (recipe / "scaling.py").resolve()
+    candidates = (
+        recipe / "scaling_converter.py",
+        scaling_path.with_name("scaling_converter.py"),
+    )
+    source = next((path for path in candidates if path.is_file()), None)
+    if source is None:
+        searched = ", ".join(str(path) for path in candidates)
+        raise Stage2OnnxExportError(
+            "Icefall scaling_converter.py is required for Zipformer ONNX export; "
+            f"searched: {searched}"
+        )
+
+    module_name = "_dma_kws_icefall_scaling_converter"
+    module = sys.modules.get(module_name)
+    if (
+        module is None
+        or Path(getattr(module, "__file__", "")).resolve() != source.resolve()
+    ):
+        spec = importlib.util.spec_from_file_location(module_name, source)
+        if spec is None or spec.loader is None:
+            raise Stage2OnnxExportError(
+                f"Could not load Icefall ONNX converter from {source}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exc:
+            sys.modules.pop(module_name, None)
+            raise Stage2OnnxExportError(
+                f"Could not import Icefall ONNX converter from {source}: {exc}"
+            ) from exc
+
+    converter = getattr(module, "convert_scaled_to_non_scaled", None)
+    if not callable(converter):
+        raise Stage2OnnxExportError(
+            f"Icefall converter {source} has no convert_scaled_to_non_scaled()"
+        )
+    return converter
+
+
+def _prepare_model_for_onnx(loaded: LoadedStage2Model) -> str | None:
+    """Apply backend-specific, semantics-preserving ONNX graph rewrites."""
+
+    encoder_type = str(
+        loaded.config["stage1"].get("encoder_type", "conformer")
+    ).lower()
+    if encoder_type != "icefall_zipformer":
+        return None
+
+    converter = _load_icefall_onnx_converter()
+    preserve_chunk_convolution = bool(
+        getattr(loaded.stream_policy, "enabled", False)
+        and int(getattr(loaded.stream_policy, "chunk_size", -1)) > 0
+    )
+    chunk_modules: list[tuple[str, torch.nn.Module]] = []
+    if preserve_chunk_convolution:
+        chunk_type = converter.__globals__.get("ChunkCausalDepthwiseConv1d")
+        if not isinstance(chunk_type, type):
+            raise Stage2OnnxExportError(
+                "Icefall ONNX converter does not expose "
+                "ChunkCausalDepthwiseConv1d; cannot preserve the checkpoint's "
+                "chunked evaluation semantics"
+            )
+        chunk_modules = [
+            (name, module)
+            for name, module in loaded.model.named_modules()
+            if name and isinstance(module, chunk_type)
+        ]
+    try:
+        converted = converter(loaded.model, inplace=True, is_onnx=True)
+    except Exception as exc:
+        raise Stage2OnnxExportError(
+            "Icefall Zipformer ONNX preparation failed while converting scaled "
+            f"modules: {exc}"
+        ) from exc
+    if converted is not loaded.model:
+        raise Stage2OnnxExportError(
+            "Icefall convert_scaled_to_non_scaled(inplace=True) returned a different model"
+        )
+    # Icefall's ONNX converter scripts SimpleDownsample (required for causal
+    # inputs whose time length is not divisible by the stack downsampling
+    # factor), but it also replaces every chunk convolution with a full-context
+    # implementation.  Restore those modules for fixed chunked checkpoints so
+    # export keeps the same eval operating point instead of silently changing
+    # 16/64-style models to non-streaming inference.
+    for name, module in chunk_modules:
+        if "." in name:
+            parent_name, child_name = name.rsplit(".", maxsplit=1)
+            parent = loaded.model.get_submodule(parent_name)
+        else:
+            parent, child_name = loaded.model, name
+        setattr(parent, child_name, module)
+    loaded.model.eval()
+    if preserve_chunk_convolution:
+        return (
+            "icefall.convert_scaled_to_non_scaled(is_onnx=True), "
+            "preserve_chunk_convolution=true"
+        )
+    return "icefall.convert_scaled_to_non_scaled(is_onnx=True)"
+
+
 def _dummy_inputs(
     loaded: LoadedStage2Model,
     *,
@@ -519,6 +638,28 @@ def _export_graph(
     exporter: ExporterKind,
     dynamic_batch: bool,
 ) -> None:
+    export_module = plan.module
+    if exporter == "legacy" and any(
+        isinstance(module, torch.jit.ScriptModule)
+        for module in plan.module.modules()
+    ):
+        # Icefall's ONNX preparation scripts SimpleDownsample and compact
+        # positional encodings.  Feeding a Python parent with scripted children
+        # directly to torch.onnx.export fails with "not part of the active
+        # trace"; Icefall's own exporter first traces the complete wrapper.
+        try:
+            # Scripted Icefall blocks feed ordinary Conv modules whose parameters
+            # still require gradients. inference_mode creates tensors those Conv
+            # modules cannot save, even while tracing an eval model; no_grad has
+            # the desired export behavior without that restriction.
+            with torch.no_grad():
+                export_module = torch.jit.trace(plan.module, plan.args)
+        except Exception as exc:
+            raise Stage2OnnxExportError(
+                f"Failed to pre-trace {plan.kind} graph after Icefall ONNX "
+                f"preparation: {exc}"
+            ) from exc
+
     kwargs: dict[str, Any] = {
         "input_names": list(plan.input_names),
         "output_names": list(plan.output_names),
@@ -547,7 +688,7 @@ def _export_graph(
     try:
         with torch.inference_mode():
             torch.onnx.export(
-                plan.module,
+                export_module,
                 plan.args,
                 str(destination),
                 **kwargs,
@@ -819,6 +960,7 @@ def _build_manifest(
     feature_frames: int,
     anchor_tokens: int,
     include_sequence_logits: bool,
+    model_preparation: str | None,
     verification: Mapping[str, float],
     calibration: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -857,6 +999,7 @@ def _build_manifest(
                 "anchor_tokens": anchor_tokens,
             },
             "include_sequence_logits": bool(include_sequence_logits),
+            "model_preparation": model_preparation,
         },
         "model": {
             "encoder_type": str(stage1.get("encoder_type", "conformer")),
@@ -929,6 +1072,7 @@ def export_stage2_onnx(
 
     onnx_module = _require_onnx_dependencies(exporter=exporter, verify=verify)
     calibration = _calibration_manifest(calibration_path)
+    model_preparation = _prepare_model_for_onnx(loaded)
     dummy = _dummy_inputs(
         loaded,
         batch_size=int(batch_size),
@@ -1012,6 +1156,7 @@ def export_stage2_onnx(
             feature_frames=int(feature_frames),
             anchor_tokens=int(anchor_tokens),
             include_sequence_logits=include_sequence_logits,
+            model_preparation=model_preparation,
             verification=verification,
             calibration=calibration,
         )
