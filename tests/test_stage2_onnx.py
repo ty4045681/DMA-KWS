@@ -277,12 +277,41 @@ def test_prepare_model_for_onnx_preserves_streaming_chunk_convolution(
     tmp_path,
 ):
     class FakeChunkCausalDepthwiseConv1d(torch.nn.Module):
-        def forward(self, value):
+        def forward(self, value, chunk_size=-1):
+            del chunk_size
             return value
+
+    class FakeConvolutionModule(torch.nn.Module):
+        def __init__(self, chunk):
+            super().__init__()
+            self.depthwise_conv = chunk
+
+    class FakeLayer(torch.nn.Module):
+        def __init__(self, chunk):
+            super().__init__()
+            self.conv_module1 = FakeConvolutionModule(chunk)
+
+    class FakeStack(torch.nn.Module):
+        def __init__(self, chunk):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([FakeLayer(chunk)])
+
+    class FakeZipformer(torch.nn.Module):
+        def __init__(self, chunk):
+            super().__init__()
+            self.encoders = torch.nn.ModuleList([FakeStack(chunk)])
+            self.downsampling_factor = (1,)
+            self.encoder_dim = (2,)
+            self.downsample_output = torch.nn.Identity()
+
+    class FakeIcefallEncoder(torch.nn.Module):
+        def __init__(self, chunk):
+            super().__init__()
+            self.encoder = FakeZipformer(chunk)
 
     loaded = _loaded_fake_model(tmp_path, encoder_type="icefall_zipformer")
     chunk_module = FakeChunkCausalDepthwiseConv1d()
-    loaded.model.encoder = torch.nn.Sequential(chunk_module)
+    loaded.model.encoder = FakeIcefallEncoder(chunk_module)
     loaded = replace(
         loaded,
         stream_policy=StreamPolicy(
@@ -294,7 +323,9 @@ def test_prepare_model_for_onnx_preserves_streaming_chunk_convolution(
     )
 
     def fake_converter(model, **_kwargs):
-        model.encoder[0] = torch.nn.Identity()
+        model.encoder.encoder.encoders[0].layers[
+            0
+        ].conv_module1.depthwise_conv = torch.nn.Identity()
         return model
 
     monkeypatch.setitem(
@@ -310,8 +341,13 @@ def test_prepare_model_for_onnx_preserves_streaming_chunk_convolution(
 
     preparation = stage2_onnx._prepare_model_for_onnx(loaded)
 
-    assert loaded.model.encoder[0] is chunk_module
-    assert preparation.endswith("preserve_chunk_convolution=true")
+    zipformer = loaded.model.encoder.encoder
+    assert isinstance(zipformer, stage2_onnx._FixedChunkZipformer2)
+    adapted = zipformer.module.encoders[0].layers[0].conv_module1.depthwise_conv
+    assert isinstance(adapted, stage2_onnx._FixedChunkDepthwiseConv1d)
+    assert adapted.module is chunk_module
+    assert adapted.chunk_size == 16
+    assert preparation.endswith("fixed_chunk_policy=16/64")
 
 
 def test_prepare_model_for_onnx_rejects_non_inplace_converter_result(
@@ -327,6 +363,60 @@ def test_prepare_model_for_onnx_rejects_non_inplace_converter_result(
 
     with pytest.raises(Stage2OnnxExportError, match="returned a different model"):
         stage2_onnx._prepare_model_for_onnx(loaded)
+
+
+def test_fixed_chunk_zipformer_trace_preserves_attention_policy_and_batch():
+    class FakeStack(torch.nn.Module):
+        def forward(
+            self,
+            value,
+            *,
+            chunk_size,
+            feature_mask,
+            src_key_padding_mask,
+            attn_mask,
+        ):
+            del feature_mask, src_key_padding_mask
+            allowed = (~attn_mask).sum(dim=-1).to(value.dtype).view(-1, 1, 1)
+            return value + allowed + float(chunk_size)
+
+    class FakeZipformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoders = torch.nn.ModuleList([FakeStack()])
+            self.encoder_dim = (2,)
+            self.downsampling_factor = (1,)
+            self.downsample_output = torch.nn.Identity()
+
+    wrapper = stage2_onnx._FixedChunkZipformer2(
+        FakeZipformer(),
+        chunk_size=4,
+        left_context_frames=4,
+    ).eval()
+    value = torch.zeros(8, 1, 2)
+    lengths = torch.tensor([8], dtype=torch.int64)
+    padding_mask = torch.zeros(1, 8, dtype=torch.bool)
+
+    eager, eager_lengths = wrapper(value, lengths, padding_mask)
+    traced = torch.jit.trace(wrapper, (value, lengths, padding_mask))
+    value_batch2 = torch.zeros(8, 2, 2)
+    lengths_batch2 = torch.tensor([8, 6], dtype=torch.int64)
+    padding_batch2 = torch.arange(8).unsqueeze(0) >= lengths_batch2.unsqueeze(1)
+    actual, actual_lengths = traced(value_batch2, lengths_batch2, padding_batch2)
+
+    assert eager[:, 0, 0].tolist() == [8.0] * 4 + [12.0] * 4
+    torch.testing.assert_close(actual, wrapper(value_batch2, lengths_batch2, padding_batch2)[0])
+    torch.testing.assert_close(eager_lengths, torch.tensor([4]))
+    torch.testing.assert_close(actual_lengths, torch.tensor([4, 3]))
+
+    widened = wrapper._convert_num_channels(
+        value_batch2,
+        current_dim=2,
+        target_dim=4,
+    )
+    assert widened.shape == (8, 2, 4)
+    torch.testing.assert_close(widened[..., :2], value_batch2)
+    assert torch.count_nonzero(widened[..., 2:]) == 0
 
 
 def test_export_orchestration_is_atomic_and_writes_manifest(monkeypatch, tmp_path):

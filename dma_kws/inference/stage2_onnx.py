@@ -151,6 +151,136 @@ class Stage2FullOnnx(torch.nn.Module):
         return raw_logit
 
 
+class _FixedChunkDepthwiseConv1d(torch.nn.Module):
+    """Keep Icefall's eval chunk size active while tracing for ONNX.
+
+    Icefall's ``ConvolutionModule`` deliberately drops ``chunk_size`` whenever
+    ``torch.jit.is_tracing()`` is true. That is suitable for its non-streaming
+    exporter, but silently changes a Stage II 16/64 operating point to
+    full-context convolution.
+    """
+
+    def __init__(self, module: torch.nn.Module, *, chunk_size: int) -> None:
+        super().__init__()
+        self.module = module
+        self.chunk_size = int(chunk_size)
+
+    def forward(self, value: torch.Tensor, chunk_size: int = -1) -> torch.Tensor:
+        del chunk_size
+        return self.module(value, chunk_size=self.chunk_size)
+
+
+class _FixedChunkZipformer2(torch.nn.Module):
+    """Trace-friendly Zipformer2 forward at one fixed streaming policy."""
+
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        *,
+        chunk_size: int,
+        left_context_frames: int,
+    ) -> None:
+        super().__init__()
+        if chunk_size <= 0:
+            raise ValueError("fixed Zipformer export requires a positive chunk size")
+        self.module = module
+        self.fixed_chunk_size = int(chunk_size)
+        self.fixed_left_context_frames = int(left_context_frames)
+        # ``IcefallZipformerEncoder.apply_stream_config`` assigns these fields
+        # before every forward. Keep that surface available even though the
+        # graph is intentionally frozen to the checkpoint's eval policy.
+        self.chunk_size = (self.fixed_chunk_size,)
+        self.left_context_frames = (self.fixed_left_context_frames,)
+        self.encoder_dim = tuple(int(value) for value in module.encoder_dim)
+        self.downsampling_factor = tuple(
+            int(value) for value in module.downsampling_factor
+        )
+
+    def _attention_mask(self, value: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(
+            value.size(0),
+            dtype=torch.int32,
+            device=value.device,
+        )
+        chunks = positions // self.fixed_chunk_size
+        source_chunks = chunks
+        target_chunks = chunks.unsqueeze(-1)
+        if self.fixed_left_context_frames < 0:
+            left_context_chunks = 1_000_000
+        else:
+            left_context_chunks = max(
+                1,
+                self.fixed_left_context_frames // self.fixed_chunk_size,
+            )
+        return torch.logical_or(
+            source_chunks > target_chunks,
+            source_chunks < target_chunks - left_context_chunks,
+        )
+
+    @staticmethod
+    def _convert_num_channels(
+        value: torch.Tensor,
+        *,
+        current_dim: int,
+        target_dim: int,
+    ) -> torch.Tensor:
+        if target_dim <= current_dim:
+            return value[..., :target_dim]
+        padding = value.new_zeros(
+            (
+                value.size(0),
+                value.size(1),
+                target_dim - current_dim,
+            )
+        )
+        return torch.cat((value, padding), dim=-1)
+
+    def _full_dim_output(self, outputs: list[torch.Tensor]) -> torch.Tensor:
+        output_pieces = [outputs[-1]]
+        current_dim = self.encoder_dim[-1]
+        for index in range(len(self.encoder_dim) - 2, -1, -1):
+            target_dim = self.encoder_dim[index]
+            if target_dim > current_dim:
+                output_pieces.append(outputs[index][..., current_dim:target_dim])
+                current_dim = target_dim
+        return torch.cat(output_pieces, dim=-1)
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        value_lengths: torch.Tensor,
+        source_key_padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attention_mask = self._attention_mask(value)
+        outputs: list[torch.Tensor] = []
+        current_dim = self.encoder_dim[0]
+        for index, encoder in enumerate(self.module.encoders):
+            target_dim = self.encoder_dim[index]
+            value = self._convert_num_channels(
+                value,
+                current_dim=current_dim,
+                target_dim=target_dim,
+            )
+            downsampling = self.downsampling_factor[index]
+            value = encoder(
+                value,
+                chunk_size=self.fixed_chunk_size,
+                feature_mask=1.0,
+                src_key_padding_mask=(
+                    None
+                    if source_key_padding_mask is None
+                    else source_key_padding_mask[..., ::downsampling]
+                ),
+                attn_mask=attention_mask,
+            )
+            outputs.append(value)
+            current_dim = target_dim
+
+        value = self._full_dim_output(outputs)
+        value = self.module.downsample_output(value)
+        return value, (value_lengths + 1) // 2
+
+
 def _torch_load(path: Path) -> Any:
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
@@ -334,6 +464,80 @@ def _load_icefall_onnx_converter():
     return converter
 
 
+def _set_named_submodule(
+    root: torch.nn.Module,
+    name: str,
+    module: torch.nn.Module,
+) -> None:
+    if "." in name:
+        parent_name, child_name = name.rsplit(".", maxsplit=1)
+        parent = root.get_submodule(parent_name)
+    else:
+        parent, child_name = root, name
+    setattr(parent, child_name, module)
+
+
+def _install_fixed_chunk_icefall_export(
+    loaded: LoadedStage2Model,
+    chunk_modules: Sequence[tuple[str, torch.nn.Module]],
+) -> None:
+    """Preserve Icefall's fixed simulated-streaming policy under tracing."""
+
+    stage2_encoder = getattr(loaded.model, "encoder", None)
+    zipformer = getattr(stage2_encoder, "encoder", None)
+    encoders = getattr(zipformer, "encoders", None)
+    downsampling = getattr(zipformer, "downsampling_factor", None)
+    if encoders is None or downsampling is None:
+        raise Stage2OnnxExportError(
+            "Unexpected Icefall encoder structure; expected "
+            "model.encoder.encoder.encoders for fixed-chunk ONNX export"
+        )
+
+    chunk_size = int(loaded.stream_policy.chunk_size)
+    left_context_frames = int(loaded.stream_policy.left_context_frames)
+    factors = tuple(int(value) for value in downsampling)
+    if len(factors) != len(encoders):
+        raise Stage2OnnxExportError(
+            "Icefall encoder stack metadata is inconsistent: "
+            f"{len(factors)} downsampling factors for {len(encoders)} stacks"
+        )
+    if not chunk_modules:
+        raise Stage2OnnxExportError(
+            "No ChunkCausalDepthwiseConv1d modules found in a chunked Icefall model"
+        )
+
+    for name, module in chunk_modules:
+        parts = name.split(".")
+        try:
+            marker = parts.index("encoders")
+            stack_index = int(parts[marker + 1])
+            factor = factors[stack_index]
+        except (ValueError, IndexError) as exc:
+            raise Stage2OnnxExportError(
+                "Cannot associate Icefall chunk convolution with an encoder stack: "
+                f"{name}"
+            ) from exc
+        if chunk_size % factor != 0:
+            raise Stage2OnnxExportError(
+                f"Icefall eval chunk size {chunk_size} is not divisible by "
+                f"stack {stack_index} downsampling factor {factor}"
+            )
+        _set_named_submodule(
+            loaded.model,
+            name,
+            _FixedChunkDepthwiseConv1d(
+                module,
+                chunk_size=chunk_size // factor,
+            ),
+        )
+
+    stage2_encoder.encoder = _FixedChunkZipformer2(
+        zipformer,
+        chunk_size=chunk_size,
+        left_context_frames=left_context_frames,
+    )
+
+
 def _prepare_model_for_onnx(loaded: LoadedStage2Model) -> str | None:
     """Apply backend-specific, semantics-preserving ONNX graph rewrites."""
 
@@ -373,24 +577,18 @@ def _prepare_model_for_onnx(loaded: LoadedStage2Model) -> str | None:
         raise Stage2OnnxExportError(
             "Icefall convert_scaled_to_non_scaled(inplace=True) returned a different model"
         )
-    # Icefall's ONNX converter scripts SimpleDownsample (required for causal
-    # inputs whose time length is not divisible by the stack downsampling
-    # factor), but it also replaces every chunk convolution with a full-context
-    # implementation.  Restore those modules for fixed chunked checkpoints so
-    # export keeps the same eval operating point instead of silently changing
-    # 16/64-style models to non-streaming inference.
-    for name, module in chunk_modules:
-        if "." in name:
-            parent_name, child_name = name.rsplit(".", maxsplit=1)
-            parent = loaded.model.get_submodule(parent_name)
-        else:
-            parent, child_name = loaded.model, name
-        setattr(parent, child_name, module)
+    # Icefall's converter fixes causal padding and other unsupported ONNX ops,
+    # but its trace path intentionally disables simulated-streaming attention
+    # and convolution. Install fixed-policy adapters so 16/64-style checkpoints
+    # retain the exact eval graph instead of silently becoming full-context.
+    if preserve_chunk_convolution:
+        _install_fixed_chunk_icefall_export(loaded, chunk_modules)
     loaded.model.eval()
     if preserve_chunk_convolution:
         return (
             "icefall.convert_scaled_to_non_scaled(is_onnx=True), "
-            "preserve_chunk_convolution=true"
+            f"fixed_chunk_policy={loaded.stream_policy.chunk_size}/"
+            f"{loaded.stream_policy.left_context_frames}"
         )
     return "icefall.convert_scaled_to_non_scaled(is_onnx=True)"
 
