@@ -80,6 +80,113 @@ def _load_model_state(
     return model
 
 
+def build_stage2_inference_model(
+    *,
+    stage1_cfg: Mapping[str, Any],
+    stage2_cfg: Mapping[str, Any],
+    vocab_size: int,
+):
+    """Build the exact ``encoder -> adapter? -> QbyT`` inference graph.
+
+    Keeping this construction path outside :class:`Stage2Verifier` lets model
+    exporters restore a deployable ``.pt`` without instantiating waveform/fbank
+    preprocessing.  The returned model still uses the same fixed evaluation
+    stream policy and the same strict checkpoint keys as runtime inference.
+    """
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise SystemExit(
+            "Missing torch. Install the model-export environment first."
+        ) from exc
+
+    stage1 = dict(stage1_cfg)
+    stage2 = dict(stage2_cfg)
+    stage2_encoder_dim = int(stage2.get("encoder_output_dim", 144))
+    stream_policy = resolve_stream_policy(stage1)
+    adapter_cfg = stage2.get("phoneme_adapter", {}) or {}
+    if not isinstance(adapter_cfg, Mapping):
+        raise ValueError("stage2.phoneme_adapter must be a mapping")
+    adapter_enabled = bool(adapter_cfg.get("enabled", False))
+
+    from dma_kws.stage2.readout import resolve_qbyt_score_spec
+
+    qbyt_score = resolve_qbyt_score_spec(stage2)
+
+    class Stage2InferenceModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = build_encoder(stage1, output_dim=stage2_encoder_dim)
+            # Mirrors Stage2LightningModule: strict checkpoint loading catches an
+            # architecture/config mismatch instead of silently changing scores.
+            if adapter_enabled:
+                from dma_kws.phoneme_adapter.module import build_phoneme_adapter
+
+                self.adapter = build_phoneme_adapter(
+                    adapter_cfg,
+                    input_dim=stage2_encoder_dim,
+                    vocab_size=vocab_size,
+                    causal=bool(stage1.get("causal", False)),
+                )
+                qbyt_input_dim = self.adapter.output_dim
+            else:
+                self.adapter = None
+                qbyt_input_dim = stage2_encoder_dim
+            from dma_kws.stage2.model_factory import build_qbyt
+
+            self.qbyt = build_qbyt(
+                stage2,
+                input_dim=qbyt_input_dim,
+                vocab_size=vocab_size,
+            )
+
+        def encode_for_qbyt(self, feats, feat_lengths):
+            """Return ``(speech, encoder_lengths)`` exactly as QbyT sees them."""
+
+            encoder_out, encoder_mask = run_encoder(
+                self.encoder,
+                feats,
+                feat_lengths,
+                policy=stream_policy,
+                mode="eval",
+            )
+            encoder_lens = encoder_mask.squeeze(1).sum(1)
+            speech = encoder_out
+            if self.adapter is not None:
+                # The auxiliary CTC projection is not part of deployed scoring.
+                speech, _ = self.adapter(
+                    encoder_out, encoder_mask, with_log_probs=False
+                )
+            return speech, encoder_lens
+
+        def encode_and_score(
+            self,
+            feats,
+            feat_lengths,
+            anchors,
+            anchor_lengths,
+        ):
+            speech, encoder_lens = self.encode_for_qbyt(feats, feat_lengths)
+            return self.qbyt(
+                speech,
+                anchors,
+                speech_lengths=encoder_lens,
+                text_lengths=anchor_lengths,
+            )
+
+        def forward(self, feats, feat_lengths, anchors, anchor_lengths):
+            logits, _ = self.encode_and_score(
+                feats,
+                feat_lengths,
+                anchors,
+                anchor_lengths,
+            )
+            return logits
+
+    return Stage2InferenceModel(), qbyt_score, stream_policy
+
+
 class Stage2Verifier:
     """Verify Stage I candidates with the QbyT Stage II model."""
 
@@ -114,92 +221,16 @@ class Stage2Verifier:
         )
         self._fbank_kwargs = fbank_kwargs(fbank_cfg)
         self._fbank_extractor = FbankExtractor(**self._fbank_kwargs)
-        stage2_encoder_dim = int(stage2_cfg.get("encoder_output_dim", 144))
-        stream_policy = resolve_stream_policy(stage1_cfg)
+        model, qbyt_score, stream_policy = build_stage2_inference_model(
+            stage1_cfg=stage1_cfg,
+            stage2_cfg=stage2_cfg,
+            vocab_size=vocab_size,
+        )
         self._stream_policy = stream_policy
-        adapter_cfg = stage2_cfg.get("phoneme_adapter", {}) or {}
-        adapter_enabled = bool(adapter_cfg.get("enabled", False))
-        from dma_kws.stage2.readout import resolve_qbyt_score_spec
-
-        qbyt_score = resolve_qbyt_score_spec(stage2_cfg)
         self.qbyt_score = qbyt_score
         self.qbyt_alignment = (
             qbyt_score.value if qbyt_score.family != "pooling" else None
         )
-
-        class Stage2Model(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.encoder = build_encoder(stage1_cfg, output_dim=stage2_encoder_dim)
-                # Mirrors Stage2LightningModule: the checkpoint is loaded with
-                # strict=True below, so an architecture that disagrees with the
-                # training-time one fails here instead of scoring silently wrong.
-                if adapter_enabled:
-                    from dma_kws.phoneme_adapter.module import build_phoneme_adapter
-
-                    self.adapter = build_phoneme_adapter(
-                        adapter_cfg,
-                        input_dim=stage2_encoder_dim,
-                        vocab_size=vocab_size,
-                        causal=bool(stage1_cfg.get("causal", False)),
-                    )
-                    qbyt_input_dim = self.adapter.output_dim
-                else:
-                    self.adapter = None
-                    qbyt_input_dim = stage2_encoder_dim
-                from dma_kws.stage2.model_factory import build_qbyt
-
-                self.qbyt = build_qbyt(
-                    stage2_cfg,
-                    input_dim=qbyt_input_dim,
-                    vocab_size=vocab_size,
-                )
-
-            def encode_for_qbyt(self, feats, feat_lengths):
-                """Return ``(speech, encoder_lengths)`` exactly as QbyT sees them."""
-                # Inference always runs at the deployment operating point.
-                encoder_out, encoder_mask = run_encoder(
-                    self.encoder,
-                    feats,
-                    feat_lengths,
-                    policy=stream_policy,
-                    mode="eval",
-                )
-                encoder_lens = encoder_mask.squeeze(1).sum(1)
-                speech = encoder_out
-                if self.adapter is not None:
-                    # Inference never scores the CTC posteriors; ctc_lo stays in
-                    # the state dict only so training checkpoints load strictly.
-                    speech, _ = self.adapter(
-                        encoder_out, encoder_mask, with_log_probs=False
-                    )
-                return speech, encoder_lens
-
-            def _encode_and_score(
-                self,
-                feats,
-                feat_lengths,
-                anchors,
-                anchor_lengths,
-            ):
-                speech, encoder_lens = self.encode_for_qbyt(feats, feat_lengths)
-                return self.qbyt(
-                    speech,
-                    anchors,
-                    speech_lengths=encoder_lens,
-                    text_lengths=anchor_lengths,
-                )
-
-            def forward(self, feats, feat_lengths, anchors, anchor_lengths):
-                logits, _ = self._encode_and_score(
-                    feats,
-                    feat_lengths,
-                    anchors,
-                    anchor_lengths,
-                )
-                return logits
-
-        model = Stage2Model()
         try:
             _load_model_state(
                 model,

@@ -133,7 +133,13 @@ def _masked_normalized_softmin(position_logits, position_mask, temperature):
         torch.full_like(logits, -torch.inf),
     )
     shifted = torch.where(empty_sentinel, torch.zeros_like(shifted), shifted)
-    log_mean_exp = torch.logsumexp(shifted, dim=1) - counts.clamp_min(1).log()
+    # Keep the normalization explicitly floating-point.  PyTorch promotes the
+    # integer ``counts`` tensor for ``Tensor.log()``, but the legacy ONNX exporter
+    # can serialize that implicit promotion as a constant-one branch, changing
+    # the score by ``1 - log(keyword_length)``.  The explicit cast is numerically
+    # identical in eager mode and preserves the intended graph semantics.
+    log_counts = counts.clamp_min(1).to(dtype=logits.dtype).log()
+    log_mean_exp = torch.logsumexp(shifted, dim=1) - log_counts
     pooled = minimum - temperature * log_mean_exp
     return torch.where(empty, torch.zeros_like(pooled), pooled)
 
