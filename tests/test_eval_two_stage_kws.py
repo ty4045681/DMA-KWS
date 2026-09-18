@@ -516,6 +516,131 @@ def test_stage2_clip_eval_applies_and_records_default_padding(tmp_path, monkeypa
     assert saved_result["augmented_duration_sec"] == pytest.approx(1.25)
 
 
+def test_stage2_clip_eval_writes_eps_position_logits_and_result_details(
+    tmp_path, monkeypatch
+):
+    torch = pytest.importorskip("torch")
+    checkpoint_path = tmp_path / "stage2.pt"
+    torch.save(
+        {
+            "config": {
+                "stage2": {
+                    "qbyt_alignment": _qbyt_alignment(),
+                    "sequence_loss": {
+                        "target_mode": "ordered_contiguous_prefix",
+                        "progress_weight": 0.5,
+                        "normalization": "sample",
+                    }
+                }
+            }
+        },
+        checkpoint_path,
+    )
+    tokenizer_path = tmp_path / "lang_char.txt"
+    tokenizer_path.write_text("<blank> 0\nHH 1\n", encoding="utf-8")
+    rows = [
+        {
+            "audio_path": "clip.wav",
+            "keyword": "hello",
+            "label": 1,
+            "keyword_phonemes": "HH",
+            "text_variant": "hullo",
+        }
+    ]
+
+    class FakeStreamPolicy:
+        @staticmethod
+        def describe():
+            return {"mode": "test"}
+
+    class FakeRunner:
+        _demo_cfg = {"qbyt_threshold": 0.5}
+        stream_policy = FakeStreamPolicy()
+        supports_eps_position_logits = True
+
+        def run_batch(self, batch_rows, **kwargs):
+            del batch_rows, kwargs
+            return [
+                {
+                    "qbyt_score": 0.648,
+                    "qbyt_raw_logit": 0.61,
+                    "keyword_phonemes": ["HH"],
+                    "qbyt_eps_position_logits": [0.61],
+                    "detected": True,
+                    "threshold": 0.5,
+                    "skipped": False,
+                }
+            ]
+
+    class FakeRunnerFactory:
+        @staticmethod
+        def from_config(_config, _prep, _device):
+            return FakeRunner()
+
+    monkeypatch.setattr(
+        eval_stage2_clips,
+        "resolved_config",
+        lambda _cfg: {
+            "paths": {},
+            "stage1": {},
+            "stage2": {
+                "qbyt_alignment": _qbyt_alignment(),
+                "sequence_loss": {
+                    "target_mode": "ordered_contiguous_prefix",
+                    "progress_weight": 0.5,
+                    "normalization": "sample",
+                },
+                "validation": {"ece_num_bins": 9},
+            },
+            "demo": {},
+            "tokenizer": {
+                "dict_path": str(tokenizer_path),
+                "split_with_space": " ",
+            },
+        },
+    )
+    monkeypatch.setattr(eval_stage2_clips, "load_manifest", lambda _path: rows)
+    monkeypatch.setattr(
+        eval_stage2_clips, "resolve_accelerator", lambda _device: ("cpu", 1)
+    )
+    monkeypatch.setattr(eval_stage2_clips, "Stage2ClipRunner", FakeRunnerFactory)
+
+    cfg = OmegaConf.create(
+        {
+            "prep": {
+                "manifest": "manifest.csv",
+                "stage2_ckpt": str(checkpoint_path),
+                "output_dir": str(tmp_path),
+                "num_workers": 1,
+                "plot_curves": False,
+            },
+            "run": {"device": "cpu"},
+        }
+    )
+    summary = eval_stage2_clips.run_eval(cfg)
+    saved_result = json.loads(
+        (tmp_path / "results.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert saved_result["qbyt_eps_position_logits"] == [0.61]
+    assert saved_result["qbyt_raw_logit"] == pytest.approx(0.61)
+    assert saved_result["qbyt_score"] == pytest.approx(0.648)
+    assert saved_result["detected"] is True
+    assert saved_result["manifest_meta"] == {"text_variant": "hullo"}
+    details = summary["result_details"]["qbyt_eps_position_logits"]
+    assert details == {
+        "available": True,
+        "value_semantics": "raw_final_pos_fc_logit",
+        "calibrated": False,
+        "padding_positions_saved": False,
+        "per_row_alignment": "keyword_phonemes",
+        "any_mode_alignment": "keyword_results[].pronunciation_results[].phonemes",
+    }
+    json.dumps(saved_result, allow_nan=False)
+    json.dumps(summary, allow_nan=False)
+    saved_summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert saved_summary["result_details"] == summary["result_details"]
+
+
 def test_stage2_clip_eval_records_enabled_waveform_augmentations(
     tmp_path, monkeypatch
 ):

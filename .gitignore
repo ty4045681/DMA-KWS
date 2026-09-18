@@ -32,6 +32,7 @@ data/dict/*
 !data/dict/lang_char.txt
 !data/dict/README.md
 exp/
+output/
 outputs/
 checkpoints/
 *.ckpt

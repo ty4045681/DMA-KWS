@@ -303,6 +303,20 @@ def run_eval(cfg: DictConfig) -> dict:
         "score_semantics": (
             "max_over_keywords_and_pronunciations" if eval_mode == "any" else "per_row"
         ),
+        "result_details": {
+            "qbyt_eps_position_logits": {
+                "available": bool(
+                    getattr(runner, "supports_eps_position_logits", False)
+                ),
+                "value_semantics": "raw_final_pos_fc_logit",
+                "calibrated": False,
+                "padding_positions_saved": False,
+                "per_row_alignment": "keyword_phonemes",
+                "any_mode_alignment": (
+                    "keyword_results[].pronunciation_results[].phonemes"
+                ),
+            }
+        },
     }
     if eval_mode == "any" and keyword_set is not None:
         summary["eval_protocol"] = CLIP_EVAL_PROTOCOL

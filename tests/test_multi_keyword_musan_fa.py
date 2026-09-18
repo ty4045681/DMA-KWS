@@ -261,6 +261,12 @@ def test_score_window_features_multi_uses_shared_multi_scorer(monkeypatch):
         ]
     )
     verifier = FakeMultiVerifier(scored=[(2.0, 0.9), (0.2, 0.2)] * 8)
+
+    def _unexpected_details(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("window scoring requested EPS position details")
+
+    verifier.score_clip_feats_multi_with_details = _unexpected_details
     runner = Stage2ClipRunner(
         verifier=verifier,
         tokenizer=tokenizer,

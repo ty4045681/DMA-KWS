@@ -247,6 +247,12 @@ class Stage2ClipRunner:
         """Sample rate every clip is loaded and resampled to."""
         return self._sample_rate
 
+    @property
+    def supports_eps_position_logits(self) -> bool:
+        """True when the backing verifier can emit EPS per-phoneme raw logits."""
+
+        return bool(getattr(self.verifier, "supports_eps_position_logits", False))
+
     def _score_feats_with_logits(
         self,
         feats: Sequence,
@@ -262,6 +268,26 @@ class Stage2ClipRunner:
         return [
             (None, float(score))
             for score in self._verifier.score_clip_feats(feats, keyword_ids_batch)
+        ]
+
+    def _score_feats_with_details(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+    ):
+        from dma_kws.inference.stage2_verifier import Stage2ScoreDetails
+
+        scorer = getattr(self._verifier, "score_clip_feats_with_details", None)
+        if scorer is not None:
+            return list(scorer(feats, keyword_ids_batch))
+        pairs = self._score_feats_with_logits(feats, keyword_ids_batch)
+        return [
+            Stage2ScoreDetails(
+                qbyt_raw_logit=raw_logit,
+                qbyt_score=score,
+                qbyt_eps_position_logits=None,
+            )
+            for raw_logit, score in pairs
         ]
 
     @classmethod
@@ -494,23 +520,34 @@ class Stage2ClipRunner:
                 pending.append((index, end_sec, augmented_duration_sec))
             if not feats:
                 continue
-            scores = self._score_feats_with_logits(feats, keyword_ids_batch)
+            scores = self._score_feats_with_details(feats, keyword_ids_batch)
             for (
                 index,
                 end_sec,
                 augmented_duration_sec,
-            ), (raw_logit, score) in zip(pending, scores):
+            ), details in zip(pending, scores):
                 keyword = rows[index]["keyword"]
-                phonemes, _ = keyword_cache[row_keyword_keys[index]]
+                phonemes, keyword_ids = keyword_cache[row_keyword_keys[index]]
+                positions = details.qbyt_eps_position_logits
+                if positions is not None and (
+                    len(positions) != len(phonemes)
+                    or len(positions) != len(keyword_ids)
+                ):
+                    raise RuntimeError(
+                        "EPS position logits length does not match enrollment: "
+                        f"positions={len(positions)}, phonemes={len(phonemes)}, "
+                        f"token_ids={len(keyword_ids)}"
+                    )
                 results[index] = self._clip_result(
                     rows[index]["audio_path"],
                     keyword,
                     phonemes,
                     end_sec,
-                    float(score),
+                    float(details.qbyt_score),
                     threshold,
                     skipped=False,
-                    qbyt_raw_logit=raw_logit,
+                    qbyt_raw_logit=details.qbyt_raw_logit,
+                    qbyt_eps_position_logits=positions,
                     augmented_duration_sec=(
                         augmented_duration_sec
                         if reports_augmented_duration
@@ -553,6 +590,52 @@ class Stage2ClipRunner:
             query_ids,
             query_batch_size=query_batch_size,
         )
+        self._assert_multi_score_shape(scored, feats, query_ids)
+        return scored
+
+    def _score_feats_multi_with_details(
+        self,
+        feats: Sequence,
+        query_ids: Sequence[Sequence[int]],
+        *,
+        query_batch_size: int,
+    ):
+        from dma_kws.inference.stage2_verifier import Stage2ScoreDetails
+
+        scorer = getattr(self._verifier, "score_clip_feats_multi_with_details", None)
+        if scorer is None:
+            legacy = getattr(self._verifier, "score_clip_feats_multi_with_logits", None)
+            if legacy is None:
+                raise RuntimeError(
+                    "verifier does not implement score_clip_feats_multi_with_logits"
+                )
+            scored = legacy(
+                feats,
+                query_ids,
+                query_batch_size=query_batch_size,
+            )
+            self._assert_multi_score_shape(scored, feats, query_ids)
+            return [
+                [
+                    Stage2ScoreDetails(
+                        qbyt_raw_logit=raw_logit,
+                        qbyt_score=score,
+                        qbyt_eps_position_logits=None,
+                    )
+                    for raw_logit, score in row
+                ]
+                for row in scored
+            ]
+        scored = scorer(
+            feats,
+            query_ids,
+            query_batch_size=query_batch_size,
+        )
+        self._assert_multi_score_shape(scored, feats, query_ids)
+        return scored
+
+    @staticmethod
+    def _assert_multi_score_shape(scored, feats, query_ids) -> None:
         if len(scored) != len(feats):
             raise RuntimeError(
                 "Stage-II multi-query scorer returned a different number of "
@@ -566,7 +649,6 @@ class Stage2ClipRunner:
                     f"queries than enrolled: expected={expected_queries}, "
                     f"actual={len(row)}"
                 )
-        return scored
 
     def run_batch_multi(
         self,
@@ -653,7 +735,7 @@ class Stage2ClipRunner:
                 pending.append((index, end_sec, augmented_duration_sec))
             if not feats:
                 continue
-            scored = self._score_feats_multi_with_logits(
+            scored = self._score_feats_multi_with_details(
                 feats,
                 query_ids,
                 query_batch_size=keyword_set.query_batch_size,
@@ -663,17 +745,28 @@ class Stage2ClipRunner:
                     "Stage-II multi-query scorer returned a different number of "
                     f"clips than inputs: expected={len(pending)}, actual={len(scored)}"
                 )
-            for (index, end_sec, augmented_duration_sec), query_scores in zip(
+            for (index, end_sec, augmented_duration_sec), details_row in zip(
                 pending,
                 scored,
                 strict=True,
             ):
+                query_scores = [
+                    (details.qbyt_raw_logit, details.qbyt_score)
+                    for details in details_row
+                ]
+                query_eps_position_logits = [
+                    None
+                    if details.qbyt_eps_position_logits is None
+                    else list(details.qbyt_eps_position_logits)
+                    for details in details_row
+                ]
                 aggregation = aggregate_query_scores(
                     keyword_set,
                     query_scores,
                     threshold=threshold,
                     audio_id=rows[index]["audio_path"],
                     scored=True,
+                    query_eps_position_logits=query_eps_position_logits,
                 )
                 result = scored_keyword_set_fields(
                     keyword_set,
@@ -701,6 +794,7 @@ class Stage2ClipRunner:
         *,
         skipped: bool,
         qbyt_raw_logit: float | None = None,
+        qbyt_eps_position_logits: Sequence[float] | None = None,
         start_sec: float = 0.0,
         augmented_duration_sec: float | None = None,
     ) -> dict:
@@ -716,6 +810,10 @@ class Stage2ClipRunner:
         }
         if qbyt_raw_logit is not None:
             result["qbyt_raw_logit"] = float(qbyt_raw_logit)
+        if qbyt_eps_position_logits is not None:
+            result["qbyt_eps_position_logits"] = [
+                float(value) for value in qbyt_eps_position_logits
+            ]
         if augmented_duration_sec is not None:
             result["augmented_duration_sec"] = float(augmented_duration_sec)
         return result

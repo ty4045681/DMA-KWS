@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -124,6 +124,30 @@ def _optional_phoneme_sequence(value: object, *, field: str) -> list[str] | None
     )
 
 
+def _validate_eps_position_logits(
+    value: object,
+    *,
+    expected_length: int,
+    field: str,
+) -> list[float]:
+    if isinstance(value, (str, bytes, Mapping)) or isinstance(value, bool):
+        raise ValueError(f"{field} must be a sequence of finite numbers, got {value!r}")
+    if not isinstance(value, Sequence):
+        raise ValueError(f"{field} must be a sequence of finite numbers, got {value!r}")
+    if len(value) != expected_length:
+        raise ValueError(
+            f"{field} length {len(value)} != expected phoneme length {expected_length}"
+        )
+    parsed: list[float] = []
+    for item in value:
+        if isinstance(item, bool):
+            raise ValueError(
+                f"{field} must be a sequence of finite numbers, got {value!r}"
+            )
+        parsed.append(_finite_float(item, field=field))
+    return parsed
+
+
 def build_result_record(
     manifest_row: dict,
     runner_result: dict,
@@ -150,6 +174,17 @@ def build_result_record(
         record["qbyt_raw_logit"] = _finite_float(
             runner_result["qbyt_raw_logit"],
             field="qbyt_raw_logit",
+        )
+    if runner_result.get("qbyt_eps_position_logits") is not None:
+        if not keyword_phonemes:
+            raise ValueError(
+                "keyword_phonemes must be a non-empty sequence when "
+                "qbyt_eps_position_logits is present"
+            )
+        record["qbyt_eps_position_logits"] = _validate_eps_position_logits(
+            runner_result["qbyt_eps_position_logits"],
+            expected_length=len(keyword_phonemes),
+            field="qbyt_eps_position_logits",
         )
     if "label" in manifest_row:
         record["label"] = int(manifest_row["label"])
@@ -215,6 +250,19 @@ def _validate_nested_keyword_results(keyword_results: object, *, skipped: bool) 
             if not isinstance(pronunciation, Mapping):
                 raise ValueError("pronunciation_results entries must be mappings")
             pron = dict(pronunciation)
+            phonemes = pron.get("phonemes")
+            token_ids = pron.get("token_ids")
+            if not isinstance(phonemes, Sequence) or isinstance(phonemes, (str, bytes)):
+                raise ValueError("pronunciation phonemes must be a sequence")
+            if not isinstance(token_ids, Sequence) or isinstance(token_ids, (str, bytes)):
+                raise ValueError("pronunciation token_ids must be a sequence")
+            if len(phonemes) != len(token_ids):
+                raise ValueError(
+                    "pronunciation phonemes and token_ids length mismatch: "
+                    f"{len(phonemes)} != {len(token_ids)}"
+                )
+            pron["phonemes"] = list(phonemes)
+            pron["token_ids"] = list(token_ids)
             pron["qbyt_score"] = _finite_float(
                 pron.get("qbyt_score"),
                 field="pronunciation qbyt_score",
@@ -223,6 +271,12 @@ def _validate_nested_keyword_results(keyword_results: object, *, skipped: bool) 
                 pron["qbyt_raw_logit"] = _finite_float(
                     pron["qbyt_raw_logit"],
                     field="pronunciation qbyt_raw_logit",
+                )
+            if pron.get("qbyt_eps_position_logits") is not None:
+                pron["qbyt_eps_position_logits"] = _validate_eps_position_logits(
+                    pron["qbyt_eps_position_logits"],
+                    expected_length=len(phonemes),
+                    field="qbyt_eps_position_logits",
                 )
             nested.append(pron)
         item["pronunciation_results"] = nested

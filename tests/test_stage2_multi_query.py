@@ -8,9 +8,11 @@ torch = pytest.importorskip("torch")
 
 from dma_kws.inference.keyword_set import KeywordEvalConfigError, KeywordSetScoreError
 from dma_kws.inference.score_calibration import PositiveAffineCalibrator
-from dma_kws.inference.stage2_verifier import Stage2Verifier
+from dma_kws.inference.stage2_verifier import Stage2ScoreDetails, Stage2Verifier
 from dma_kws.stage2.model_factory import build_qbyt
+from dma_kws.stage2.readout import resolve_qbyt_score_spec
 from dma_kws.tokenizer import load_char_tokenizer
+from qbyt.pooling import _masked_normalized_softmin
 
 
 EMBED_DIM = 32
@@ -41,6 +43,18 @@ class _CountingQbyT(torch.nn.Module):
         self.batch_sizes.append(int(speech.size(0)))
         self.max_speech_batch = max(self.max_speech_batch, int(speech.size(0)))
         return self.inner(
+            speech,
+            text,
+            speech_lengths=speech_lengths,
+            text_lengths=text_lengths,
+        )
+
+    def forward_with_readout_details(
+        self, speech, text, speech_lengths=None, text_lengths=None
+    ):
+        self.batch_sizes.append(int(speech.size(0)))
+        self.max_speech_batch = max(self.max_speech_batch, int(speech.size(0)))
+        return self.inner.forward_with_readout_details(
             speech,
             text,
             speech_lengths=speech_lengths,
@@ -94,6 +108,7 @@ def _verifier_from_qbyt(
     slope: float = 1.0,
     bias: float = 0.0,
     adapter=None,
+    qbyt_score=None,
 ) -> Stage2Verifier:
     counting = qbyt if isinstance(qbyt, _CountingQbyT) else _CountingQbyT(qbyt)
     model = _TinyStage2(counting, adapter=adapter).eval()
@@ -104,6 +119,8 @@ def _verifier_from_qbyt(
     verifier._calibrator = PositiveAffineCalibrator(slope=slope, bias=bias)
     verifier._model = model
     verifier._min_fbank_frames = 1
+    if qbyt_score is not None:
+        verifier.qbyt_score = qbyt_score
     return verifier
 
 
@@ -402,3 +419,171 @@ def test_pair_count_mismatch_aborts():
             [_token_ids("HH"), _token_ids("EY1")],
             query_batch_size=4,
         )
+
+
+def _reconstruct_softmin(position_logits, temperature: float = 1.0) -> float:
+    logits = torch.tensor([list(position_logits)], dtype=torch.float32)
+    mask = torch.ones_like(logits, dtype=torch.bool)
+    return float(_masked_normalized_softmin(logits, mask, temperature)[0])
+
+
+def test_eps_scalar_apis_do_not_request_position_details():
+    qbyt_score = resolve_qbyt_score_spec(_POOLING_V41)
+    qbyt = _build_qbyt(_POOLING_V41, vocab_size=73, seed=13)
+    verifier = _verifier_from_qbyt(qbyt, qbyt_score=qbyt_score)
+
+    def _unexpected_details(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("scalar score API requested EPS position details")
+
+    verifier._model.qbyt.forward_with_readout_details = _unexpected_details
+    feats = _feats(12, 9, seed=7)
+    queries = [
+        _token_ids("HH", "EY1", "IY1"),
+        _token_ids("OW1", "K"),
+    ]
+
+    single = verifier.score_clip_feats_with_logits(feats, queries)
+    multi = verifier.score_clip_feats_multi_with_logits(
+        feats,
+        queries,
+        query_batch_size=2,
+    )
+
+    assert len(single) == 2
+    assert len(multi) == 2
+    assert all(len(row) == 2 for row in multi)
+
+
+def test_multi_query_details_align_positions_and_preserve_tuple_api():
+    qbyt_score = resolve_qbyt_score_spec(_POOLING_V41)
+    qbyt = _build_qbyt(_POOLING_V41, vocab_size=73, seed=11)
+    verifier = _verifier_from_qbyt(qbyt, slope=1.3, bias=-0.2, qbyt_score=qbyt_score)
+    feats = _feats(16, 20, seed=5)
+    queries = [
+        _token_ids("HH", "EY1", "IY1", "V", "AH0"),
+        _token_ids("HH", "EY1"),
+        _token_ids("OW1", "K", "L"),
+    ]
+    verifier._model.encoder_calls = 0
+    detailed = verifier.score_clip_feats_multi_with_details(
+        feats,
+        queries,
+        query_batch_size=2,
+    )
+    tuples = verifier.score_clip_feats_multi_with_logits(
+        feats,
+        queries,
+        query_batch_size=2,
+    )
+    assert verifier._model.encoder_calls == 2
+    assert max(verifier._model.qbyt.batch_sizes) <= 2
+    assert len(detailed) == 2
+    assert all(len(row) == 3 for row in detailed)
+    threshold = 0.5
+    for clip_row, tuple_row in zip(detailed, tuples):
+        for details, (raw, score), query in zip(clip_row, tuple_row, queries):
+            assert isinstance(details, Stage2ScoreDetails)
+            assert details.qbyt_eps_position_logits is not None
+            assert len(details.qbyt_eps_position_logits) == len(query)
+            assert all(math.isfinite(value) for value in details.qbyt_eps_position_logits)
+            assert details.qbyt_raw_logit == pytest.approx(raw, abs=1e-6, rel=1e-6)
+            assert details.qbyt_score == pytest.approx(score, abs=1e-6, rel=1e-6)
+            reconstructed = _reconstruct_softmin(
+                details.qbyt_eps_position_logits,
+                qbyt_score.value.temperature,
+            )
+            assert reconstructed == pytest.approx(
+                details.qbyt_raw_logit, abs=1e-5, rel=1e-5
+            )
+            assert (details.qbyt_score >= threshold) is (score >= threshold)
+
+
+def test_multi_query_details_match_per_query_and_do_not_drop_chunk_pairs():
+    qbyt_score = resolve_qbyt_score_spec(_POOLING_V41)
+    qbyt = _build_qbyt(_POOLING_V41, vocab_size=73, seed=3)
+    verifier = _verifier_from_qbyt(qbyt, slope=1.7, bias=-0.4, qbyt_score=qbyt_score)
+    feats = _feats(12, 9, 15, seed=8)
+    queries = [
+        _token_ids("HH", "EY1"),
+        _token_ids("IY1", "V", "AH0"),
+        _token_ids("OW1", "K"),
+        _token_ids("L", "AE1", "M", "P"),
+        _token_ids("AH0"),
+    ]
+    verifier._model.encoder_calls = 0
+    shared = verifier.score_clip_feats_multi_with_details(
+        feats,
+        queries,
+        query_batch_size=3,
+    )
+    assert verifier._model.encoder_calls == 1
+    assert max(verifier._model.qbyt.batch_sizes) <= 3
+    assert sum(verifier._model.qbyt.batch_sizes) == 15
+    assert len(shared) == 3
+    assert all(len(row) == 5 for row in shared)
+    for feat, row in zip(feats, shared):
+        for query, details in zip(queries, row):
+            single = verifier.score_clip_feats_with_details([feat], [query])[0]
+            assert details.qbyt_raw_logit == pytest.approx(
+                single.qbyt_raw_logit, abs=ATOL, rel=RTOL
+            )
+            assert details.qbyt_score == pytest.approx(
+                single.qbyt_score, abs=ATOL, rel=RTOL
+            )
+            assert details.qbyt_eps_position_logits == pytest.approx(
+                single.qbyt_eps_position_logits, abs=ATOL, rel=RTOL
+            )
+            assert len(details.qbyt_eps_position_logits) == len(query)
+
+
+def test_v41_relative_bias_details_are_finite():
+    qbyt_score = resolve_qbyt_score_spec(_POOLING_V41)
+    qbyt = _build_qbyt(_POOLING_V41, vocab_size=73, seed=11)
+    qbyt.train()
+    optimizer = torch.optim.Adam(qbyt.parameters(), lr=1e-2)
+    feats = torch.randn(1, 16, ENCODER_DIM)
+    text = torch.tensor([_token_ids("HH", "EY1", "IY1", "V", "AH0")], dtype=torch.long)
+    logits, _ = qbyt(
+        feats,
+        text,
+        speech_lengths=torch.tensor([16]),
+        text_lengths=torch.tensor([text.size(1)]),
+    )
+    logits.sum().backward()
+    optimizer.step()
+    qbyt.eval()
+    verifier = _verifier_from_qbyt(qbyt, slope=1.3, bias=-0.2, qbyt_score=qbyt_score)
+    clip_feats = _feats(16, 20, seed=5)
+    queries = [
+        _token_ids("HH", "EY1", "IY1", "V", "AH0"),
+        _token_ids("OW1", "K"),
+    ]
+    detailed = verifier.score_clip_feats_multi_with_details(
+        clip_feats,
+        queries,
+        query_batch_size=2,
+    )
+    for row in detailed:
+        for details in row:
+            assert math.isfinite(details.qbyt_raw_logit)
+            assert math.isfinite(details.qbyt_score)
+            assert details.qbyt_eps_position_logits is not None
+            assert all(math.isfinite(value) for value in details.qbyt_eps_position_logits)
+
+
+def test_non_eps_multi_query_details_leave_positions_none():
+    qbyt_score = resolve_qbyt_score_spec(_V7)
+    qbyt = _build_qbyt(_V7, vocab_size=73, seed=4)
+    verifier = _verifier_from_qbyt(qbyt, qbyt_score=qbyt_score)
+    feats = _feats(18, seed=9)
+    queries = [_token_ids("HH", "EY1", "IY1"), _token_ids("OW1", "K")]
+    detailed = verifier.score_clip_feats_multi_with_details(feats, queries)
+    tuples = verifier.score_clip_feats_multi_with_logits(feats, queries)
+    assert detailed[0][0].qbyt_eps_position_logits is None
+    assert detailed[0][0].qbyt_raw_logit == pytest.approx(
+        tuples[0][0][0], abs=1e-6, rel=1e-6
+    )
+    assert detailed[0][0].qbyt_score == pytest.approx(
+        tuples[0][0][1], abs=1e-6, rel=1e-6
+    )

@@ -7,10 +7,12 @@ from omegaconf import OmegaConf
 
 from dma_kws.config import compose_config, config_to_dict
 from dma_kws.inference.keyword_set import (
+    ANY_RESULT_SCHEMA_VERSION,
     KeywordEvalConfigError,
     KeywordSetScoreError,
     SCORE_SEMANTICS,
     aggregate_query_scores,
+    scored_keyword_set_fields,
     canonical_json_sha256,
     file_sha256,
     keyword_eval_mode,
@@ -416,6 +418,99 @@ def test_aggregation_rejects_non_finite_and_pair_count_mismatch():
         )
     with pytest.raises(KeywordSetScoreError, match="expected=2"):
         aggregate_query_scores(keyword_set, [(0.1, 0.2)], threshold=0.5)
+
+
+def test_aggregation_propagates_query_position_logits_to_pronunciations():
+    keyword_set = _enroll(
+        _any_prep(
+            [{"text": "hey eva", "pronunciations": [HEY_EVA_A, HEY_EVA_B]}]
+        )
+    )
+    assert keyword_set is not None
+    positions = [
+        [0.1 * (index + 1) for index in range(len(query.token_ids))]
+        for query in keyword_set.queries
+    ]
+    scores = [(0.2, 0.3), (1.5, 0.9)]
+    result = aggregate_query_scores(
+        keyword_set,
+        scores,
+        threshold=0.5,
+        query_eps_position_logits=positions,
+    )
+    pronunciations = result.keyword_results[0]["pronunciation_results"]
+    for pronunciation in pronunciations:
+        query = keyword_set.queries[next(
+            item.query_index
+            for item in keyword_set.keywords[0].pronunciations
+            if item.pronunciation_id == pronunciation["pronunciation_id"]
+        )]
+        expected = list(positions[query.query_index])
+        assert pronunciation["qbyt_eps_position_logits"] == expected
+        assert pronunciation["qbyt_eps_position_logits"] is not positions[query.query_index]
+        assert len(pronunciation["qbyt_eps_position_logits"]) == len(pronunciation["token_ids"])
+    payload = scored_keyword_set_fields(keyword_set, result, threshold=0.5)
+    assert payload["result_schema_version"] == 3
+    assert ANY_RESULT_SCHEMA_VERSION == 3
+
+
+def test_aggregation_rejects_mismatched_position_query_count_and_lengths():
+    keyword_set = _enroll(
+        _any_prep(
+            [{"text": "hey eva", "pronunciations": [HEY_EVA_A, HEY_EVA_B]}]
+        )
+    )
+    assert keyword_set is not None
+    scores = [(0.1, 0.2)] * keyword_set.num_queries
+    with pytest.raises(KeywordSetScoreError, match="query"):
+        aggregate_query_scores(
+            keyword_set,
+            scores,
+            threshold=0.5,
+            query_eps_position_logits=[[0.1]],
+        )
+    too_short = [
+        [0.1] * (len(query.token_ids) - 1) for query in keyword_set.queries
+    ]
+    with pytest.raises(KeywordSetScoreError, match="length|phoneme|token"):
+        aggregate_query_scores(
+            keyword_set,
+            scores,
+            threshold=0.5,
+            query_eps_position_logits=too_short,
+        )
+
+
+def test_aggregation_rejects_non_finite_position_logits():
+    keyword_set = _enroll(_any_prep([{"text": "hey eva", "pronunciations": [HEY_EVA_A]}]))
+    assert keyword_set is not None
+    width = len(keyword_set.queries[0].token_ids)
+    with pytest.raises(KeywordSetScoreError, match="finite"):
+        aggregate_query_scores(
+            keyword_set,
+            [(0.1, 0.2)],
+            threshold=0.5,
+            query_eps_position_logits=[[float("nan")] * width],
+        )
+    with pytest.raises(KeywordSetScoreError, match="finite"):
+        aggregate_query_scores(
+            keyword_set,
+            [(0.1, 0.2)],
+            threshold=0.5,
+            query_eps_position_logits=[[float("inf")] * width],
+        )
+
+
+def test_aggregation_without_position_logits_keeps_legacy_payload():
+    keyword_set = _enroll(_any_prep([{"text": "hey eva", "pronunciations": [HEY_EVA_A]}]))
+    assert keyword_set is not None
+    result = aggregate_query_scores(keyword_set, [(1.0, 0.8)], threshold=0.5)
+    pronunciation = result.keyword_results[0]["pronunciation_results"][0]
+    assert "qbyt_eps_position_logits" not in pronunciation
+    payload = scored_keyword_set_fields(keyword_set, result, threshold=0.5)
+    assert payload["qbyt_score"] == pytest.approx(0.8)
+    assert "qbyt_eps_position_logits" not in payload
+    assert payload["result_schema_version"] == ANY_RESULT_SCHEMA_VERSION
 
 
 def test_skipped_aggregation_never_detects_at_threshold_zero():

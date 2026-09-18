@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence
 
 if TYPE_CHECKING:
@@ -187,6 +188,52 @@ def build_stage2_inference_model(
     return Stage2InferenceModel(), qbyt_score, stream_policy
 
 
+_EPS_READOUT_MODES = frozenset({"eps_mean", "eps_softmin"})
+
+
+def _require_finite(value: object, *, field: str, error_cls: type[Exception]) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise error_cls(f"{field} is not finite: {number!r}")
+    return number
+
+
+def _extract_eps_positions(
+    position_logits_cpu,
+    position_mask_cpu,
+    expected_lengths,
+    *,
+    field: str,
+    error_cls: type[Exception],
+    torch,
+) -> list[tuple[float, ...]]:
+    mask = position_mask_cpu.to(dtype=torch.bool)
+    rows: list[tuple[float, ...]] = []
+    for index in range(int(position_logits_cpu.size(0))):
+        row_mask = mask[index]
+        expected = int(expected_lengths[index])
+        count = int(row_mask.sum().item())
+        if count != expected:
+            raise RuntimeError(
+                f"{field} valid position count {count} != anchor length "
+                f"{expected} for row {index}"
+            )
+        values = position_logits_cpu[index][row_mask]
+        if not bool(torch.isfinite(values).all().item()):
+            raise error_cls(f"{field} contains a non-finite value")
+        rows.append(tuple(float(value) for value in values.tolist()))
+    return rows
+
+
+@dataclass(frozen=True)
+class Stage2ScoreDetails:
+    """One clip/query score, with optional EPS per-phoneme raw logits."""
+
+    qbyt_raw_logit: float | None
+    qbyt_score: float
+    qbyt_eps_position_logits: tuple[float, ...] | None
+
+
 class Stage2Verifier:
     """Verify Stage I candidates with the QbyT Stage II model."""
 
@@ -292,6 +339,16 @@ class Stage2Verifier:
         """Shortest fbank input this encoder can score, in frames."""
         return self._min_fbank_frames
 
+    @property
+    def supports_eps_position_logits(self) -> bool:
+        """True when this verifier's pooling readout exposes ``final_pos_fc`` logits."""
+
+        spec = getattr(self, "qbyt_score", None)
+        if spec is None or getattr(spec, "family", None) != "pooling":
+            return False
+        mode = getattr(getattr(spec, "value", None), "mode", None)
+        return mode in _EPS_READOUT_MODES
+
     @classmethod
     def from_config(cls, config: Mapping[str, Any], prep: Mapping[str, Any], device) -> "Stage2Verifier":
         from dma_kws.pathing import resolve_dict_path
@@ -387,9 +444,38 @@ class Stage2Verifier:
     ) -> list[tuple[float, float]]:
         """Return ``(raw_logit, calibrated_probability)`` for every clip."""
 
-        torch = self._torch
         if not feats:
             return []
+        return self._score_clip_feats_logits_only(feats, keyword_ids_batch)
+
+    def score_clip_feats_with_details(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+    ) -> list[Stage2ScoreDetails]:
+        """Return raw, calibrated, and optional EPS position logits per clip."""
+
+        if not feats:
+            return []
+        if self.supports_eps_position_logits:
+            return self._score_eps_clip_feats_with_details(feats, keyword_ids_batch)
+        return [
+            Stage2ScoreDetails(
+                qbyt_raw_logit=raw_logit,
+                qbyt_score=calibrated,
+                qbyt_eps_position_logits=None,
+            )
+            for raw_logit, calibrated in self._score_clip_feats_logits_only(
+                feats, keyword_ids_batch
+            )
+        ]
+
+    def _score_clip_feats_logits_only(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+    ) -> list[tuple[float, float]]:
+        torch = self._torch
         padded_feats, feat_lengths, anchors, anchor_lengths = self._pad_clip_batch(
             feats, keyword_ids_batch
         )
@@ -400,11 +486,108 @@ class Stage2Verifier:
                 anchors,
                 anchor_lengths,
             )
-        raw_values = [float(value) for value in raw_logits.reshape(-1).cpu()]
+            raw_cpu = raw_logits.detach().float().reshape(-1).cpu()
+        raw_values = [float(value) for value in raw_cpu.tolist()]
         return [
             (raw_logit, self._calibrator.predict_one(raw_logit))
             for raw_logit in raw_values
         ]
+
+    def _score_eps_clip_feats_with_details(
+        self,
+        feats: Sequence,
+        keyword_ids_batch: Sequence[Sequence[int]],
+    ) -> list[Stage2ScoreDetails]:
+        torch = self._torch
+        padded_feats, feat_lengths, anchors, anchor_lengths = self._pad_clip_batch(
+            feats, keyword_ids_batch
+        )
+        with torch.no_grad(), self._inference_amp():
+            speech, encoder_lens = self._model.encode_for_qbyt(
+                padded_feats, feat_lengths
+            )
+            raw_cpu, position_rows = self._score_qbyt_pairs(
+                speech,
+                encoder_lens,
+                anchors,
+                anchor_lengths,
+                error_cls=ValueError,
+            )
+        if int(raw_cpu.numel()) != len(feats):
+            raise RuntimeError(
+                "QbyT returned a different number of clip scores than inputs: "
+                f"expected={len(feats)}, actual={int(raw_cpu.numel())}"
+            )
+        results: list[Stage2ScoreDetails] = []
+        for index, raw_logit in enumerate(raw_cpu.tolist()):
+            raw_value = _require_finite(
+                raw_logit, field=f"qbyt_raw_logit[{index}]", error_cls=ValueError
+            )
+            calibrated = _require_finite(
+                self._calibrator.predict_one(raw_value),
+                field=f"qbyt_score[{index}]",
+                error_cls=ValueError,
+            )
+            results.append(
+                Stage2ScoreDetails(
+                    qbyt_raw_logit=raw_value,
+                    qbyt_score=calibrated,
+                    qbyt_eps_position_logits=position_rows[index],
+                )
+            )
+        return results
+
+    def _score_qbyt_pairs(
+        self,
+        speech,
+        speech_lengths,
+        anchors,
+        anchor_lengths,
+        *,
+        error_cls: type[Exception],
+        include_eps_positions: bool = True,
+    ):
+        """Score one QbyT batch and optionally extract valid EPS positions.
+
+        Moves pair tensors to CPU once. ``error_cls`` is ``ValueError`` for the
+        single-query path and ``KeywordSetScoreError`` for multi-query.
+        """
+
+        torch = self._torch
+        qbyt = self._model.qbyt
+        if include_eps_positions and self.supports_eps_position_logits:
+            logits, _text_logits, details = qbyt.forward_with_readout_details(
+                speech,
+                anchors,
+                speech_lengths=speech_lengths,
+                text_lengths=anchor_lengths,
+            )
+            if details is None or details.position_logits is None:
+                raise RuntimeError(
+                    "EPS readout advertised position logits but QbyT returned "
+                    "position_logits=None"
+                )
+            raw_cpu = logits.detach().float().reshape(-1).cpu()
+            pos_cpu = details.position_logits.detach().float().cpu()
+            mask_cpu = details.position_mask.detach().cpu()
+            expected = anchor_lengths.detach().cpu()
+            positions = _extract_eps_positions(
+                pos_cpu,
+                mask_cpu,
+                expected,
+                field="qbyt_eps_position_logits",
+                error_cls=error_cls,
+                torch=torch,
+            )
+            return raw_cpu, positions
+        logits, _extra = qbyt(
+            speech,
+            anchors,
+            speech_lengths=speech_lengths,
+            text_lengths=anchor_lengths,
+        )
+        raw_cpu = logits.detach().float().reshape(-1).cpu()
+        return raw_cpu, None
 
     def score_clip_feats_multi_with_logits(
         self,
@@ -421,6 +604,42 @@ class Stage2Verifier:
         a configuration error. Pair tensors are chunked so one QbyT call never
         exceeds ``query_batch_size`` rows.
         """
+
+        return self._score_clip_feats_multi(
+            feats,
+            query_ids,
+            query_batch_size=query_batch_size,
+            include_eps_positions=False,
+            return_details=False,
+        )
+
+    def score_clip_feats_multi_with_details(
+        self,
+        feats: Sequence,
+        query_ids: Sequence[Sequence[int]],
+        *,
+        query_batch_size: int = 64,
+    ) -> list[list[Stage2ScoreDetails]]:
+        """Score every clip against every unique query, keeping EPS positions."""
+
+        return self._score_clip_feats_multi(
+            feats,
+            query_ids,
+            query_batch_size=query_batch_size,
+            include_eps_positions=True,
+            return_details=True,
+        )
+
+    def _score_clip_feats_multi(
+        self,
+        feats: Sequence,
+        query_ids: Sequence[Sequence[int]],
+        *,
+        query_batch_size: int,
+        include_eps_positions: bool,
+        return_details: bool,
+    ):
+        """Shared multi-query scorer with opt-in EPS position extraction."""
 
         from dma_kws.inference.keyword_set import (
             KeywordEvalConfigError,
@@ -450,6 +669,9 @@ class Stage2Verifier:
         num_clips = len(feats)
         num_queries = len(queries)
         raw_matrix = torch.empty(num_clips, num_queries, dtype=torch.float32)
+        position_slots: list[tuple[float, ...] | None] | None = None
+        if include_eps_positions and self.supports_eps_position_logits:
+            position_slots = [None] * (num_clips * num_queries)
 
         with torch.no_grad(), self._inference_amp():
             speech, encoder_lens = self._model.encode_for_qbyt(
@@ -488,36 +710,44 @@ class Stage2Verifier:
                     dtype=torch.long,
                     device=self._device,
                 )
-                logits, _extra = self._model.qbyt(
+                values, positions = self._score_qbyt_pairs(
                     chunk_speech,
+                    chunk_speech_lengths,
                     anchors,
-                    speech_lengths=chunk_speech_lengths,
-                    text_lengths=anchor_lengths,
+                    anchor_lengths,
+                    error_cls=KeywordSetScoreError,
+                    include_eps_positions=include_eps_positions,
                 )
-                values = logits.reshape(-1).detach().float().cpu()
                 if int(values.numel()) != pair_count:
                     raise RuntimeError(
                         "QbyT returned a different number of pair scores than "
                         f"inputs: expected={pair_count}, actual={int(values.numel())}"
+                    )
+                if positions is not None and len(positions) != pair_count:
+                    raise RuntimeError(
+                        "QbyT returned a different number of position rows than "
+                        f"inputs: expected={pair_count}, actual={len(positions)}"
                     )
                 for offset, pair_index in enumerate(range(start, end)):
                     raw_matrix[
                         pair_index // num_queries,
                         pair_index % num_queries,
                     ] = values[offset]
+                    if position_slots is not None:
+                        position_slots[pair_index] = positions[offset]
                 del (
                     speech_rows,
                     chunk_speech,
                     chunk_speech_lengths,
                     anchors,
                     anchor_lengths,
-                    logits,
                     values,
+                    positions,
                 )
 
-        results: list[list[tuple[float, float]]] = []
+        results = []
         for clip_index in range(num_clips):
-            row: list[tuple[float, float]] = []
+            row = []
             for query_index in range(num_queries):
                 raw_logit = float(raw_matrix[clip_index, query_index])
                 if not math.isfinite(raw_logit):
@@ -531,7 +761,22 @@ class Stage2Verifier:
                         "non-finite calibrated score for clip "
                         f"{clip_index} query {query_index}: {calibrated}"
                     )
-                row.append((raw_logit, calibrated))
+                if return_details:
+                    row.append(
+                        Stage2ScoreDetails(
+                            qbyt_raw_logit=raw_logit,
+                            qbyt_score=calibrated,
+                            qbyt_eps_position_logits=(
+                                None
+                                if position_slots is None
+                                else position_slots[
+                                    clip_index * num_queries + query_index
+                                ]
+                            ),
+                        )
+                    )
+                else:
+                    row.append((raw_logit, calibrated))
             results.append(row)
         return results
 

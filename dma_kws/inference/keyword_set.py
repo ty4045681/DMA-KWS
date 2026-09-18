@@ -28,7 +28,7 @@ DEFAULT_QUERY_BATCH_SIZE = 64
 SCORE_SEMANTICS = "max_over_keywords_and_pronunciations"
 CLIP_EVAL_PROTOCOL = "stage2_clip_keyword_set"
 WINDOW_EVAL_PROTOCOL = "stage2_window_keyword_set"
-ANY_RESULT_SCHEMA_VERSION = 2
+ANY_RESULT_SCHEMA_VERSION = 3
 SKIP_REASON_TOO_SHORT = "too_short"
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -615,6 +615,30 @@ def _finite_or_raise(value: object, *, field: str) -> float:
     return number
 
 
+def _optional_eps_position_logits(
+    value: object,
+    *,
+    expected_length: int,
+    field: str,
+) -> tuple[float, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, Mapping)) or isinstance(value, bool):
+        raise KeywordSetScoreError(f"{field} must be a sequence of finite numbers")
+    if not isinstance(value, Sequence):
+        raise KeywordSetScoreError(f"{field} must be a sequence of finite numbers")
+    if len(value) != expected_length:
+        raise KeywordSetScoreError(
+            f"{field} length {len(value)} != token_ids length {expected_length}"
+        )
+    parsed: list[float] = []
+    for item in value:
+        if isinstance(item, bool):
+            raise KeywordSetScoreError(f"{field} must be a sequence of finite numbers")
+        parsed.append(_finite_or_raise(item, field=field))
+    return tuple(parsed)
+
+
 def aggregate_query_scores(
     keyword_set: ResolvedKeywordSet,
     query_scores: Sequence[tuple[float | None, float] | Sequence[float]],
@@ -622,6 +646,7 @@ def aggregate_query_scores(
     threshold: float,
     audio_id: object = None,
     scored: bool = True,
+    query_eps_position_logits: Sequence[Sequence[float] | None] | None = None,
 ) -> KeywordSetAggregation:
     """Calibrated-per-query max aggregation.
 
@@ -637,6 +662,32 @@ def aggregate_query_scores(
             f"queries: expected={keyword_set.num_queries}, actual={len(query_scores)}"
             + (f" audio={audio_id!r}" if audio_id is not None else "")
         )
+    parsed_positions: list[tuple[float, ...] | None] | None = None
+    if query_eps_position_logits is not None:
+        if len(query_eps_position_logits) != keyword_set.num_queries:
+            raise KeywordSetScoreError(
+                "scorer returned a different number of query position arrays than "
+                f"enrolled queries: expected={keyword_set.num_queries}, "
+                f"actual={len(query_eps_position_logits)}"
+                + (f" audio={audio_id!r}" if audio_id is not None else "")
+            )
+        parsed_positions = []
+        for query, raw_positions in zip(
+            keyword_set.queries, query_eps_position_logits
+        ):
+            location = (
+                f"audio={audio_id!r} query_index={query.query_index} "
+                f"qbyt_eps_position_logits"
+                if audio_id is not None
+                else f"query_index={query.query_index} qbyt_eps_position_logits"
+            )
+            parsed_positions.append(
+                _optional_eps_position_logits(
+                    raw_positions,
+                    expected_length=len(query.token_ids),
+                    field=location,
+                )
+            )
 
     parsed: list[tuple[float | None, float]] = []
     for query, raw_pair in zip(keyword_set.queries, query_scores):
@@ -671,16 +722,19 @@ def aggregate_query_scores(
         for pronunciation in keyword.pronunciations:
             raw_logit, calibrated = parsed[pronunciation.query_index]
             detected = bool(scored) and calibrated >= threshold
-            pronunciation_results.append(
-                {
-                    "pronunciation_id": pronunciation.pronunciation_id,
-                    "phonemes": list(pronunciation.phonemes),
-                    "token_ids": list(pronunciation.token_ids),
-                    "qbyt_raw_logit": raw_logit,
-                    "qbyt_score": calibrated,
-                    "detected": detected,
-                }
-            )
+            pronunciation_payload: dict[str, Any] = {
+                "pronunciation_id": pronunciation.pronunciation_id,
+                "phonemes": list(pronunciation.phonemes),
+                "token_ids": list(pronunciation.token_ids),
+                "qbyt_raw_logit": raw_logit,
+                "qbyt_score": calibrated,
+                "detected": detected,
+            }
+            if parsed_positions is not None:
+                positions = parsed_positions[pronunciation.query_index]
+                if positions is not None:
+                    pronunciation_payload["qbyt_eps_position_logits"] = list(positions)
+            pronunciation_results.append(pronunciation_payload)
             candidate = (calibrated, pronunciation.token_ids, pronunciation, raw_logit)
             if keyword_best is None or candidate[0] > keyword_best[0] or (
                 candidate[0] == keyword_best[0] and candidate[1] < keyword_best[1]

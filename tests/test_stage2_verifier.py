@@ -9,7 +9,7 @@ torch = pytest.importorskip("torch")
 from dma_kws.config import fbank_kwargs
 from dma_kws.configs.schema import FbankConfig
 from dma_kws.inference.score_calibration import PositiveAffineCalibrator
-from dma_kws.inference.stage2_verifier import Stage2Verifier
+from dma_kws.inference.stage2_verifier import Stage2ScoreDetails, Stage2Verifier
 from dma_kws.stage1.candidates import KeywordCandidate
 from dma_kws.stage2.fbank import FbankExtractor
 from dma_kws.stage2.readout import QbyTScoreSpec
@@ -601,3 +601,118 @@ def test_t09_attention_diagnostics_reuses_encoder_and_preserves_score_api(monkey
             ablations=ablations,
         )
     assert verifier._model.encode_calls == 4
+
+
+def _eps_verifier(*, stage2_cfg, slope=2.0, bias=-1.0, seed=0):
+    from dma_kws.stage2.readout import resolve_qbyt_score_spec
+    from tests.test_stage2_multi_query import (
+        _build_qbyt,
+        _verifier_from_qbyt,
+    )
+
+    qbyt_score = resolve_qbyt_score_spec(stage2_cfg)
+    qbyt = _build_qbyt(stage2_cfg, vocab_size=73, seed=seed)
+    return _verifier_from_qbyt(
+        qbyt,
+        slope=slope,
+        bias=bias,
+        qbyt_score=qbyt_score,
+    ), qbyt_score
+
+
+def test_v41_detailed_api_returns_valid_position_logits_without_padding():
+    from tests.test_stage2_multi_query import (
+        _POOLING_V41,
+        _feats,
+        _reconstruct_softmin,
+        _token_ids,
+    )
+
+    verifier, qbyt_score = _eps_verifier(stage2_cfg=_POOLING_V41, seed=6)
+    assert verifier.supports_eps_position_logits is True
+    queries = [
+        _token_ids("HH", "EY1", "IY1", "V", "AH0"),
+        _token_ids("OW1", "K"),
+    ]
+    feats = _feats(16, 9, seed=2)
+    detailed = verifier.score_clip_feats_with_details(feats, queries)
+    tuples = verifier.score_clip_feats_with_logits(feats, queries)
+    assert len(detailed) == 2
+    threshold = 0.5
+    for details, (raw, score), query in zip(detailed, tuples, queries):
+        assert isinstance(details, Stage2ScoreDetails)
+        assert details.qbyt_eps_position_logits is not None
+        assert len(details.qbyt_eps_position_logits) == len(query)
+        assert all(math.isfinite(value) for value in details.qbyt_eps_position_logits)
+        assert details.qbyt_raw_logit == pytest.approx(raw, abs=1e-6, rel=1e-6)
+        assert details.qbyt_score == pytest.approx(score, abs=1e-6, rel=1e-6)
+        reconstructed = _reconstruct_softmin(
+            details.qbyt_eps_position_logits,
+            qbyt_score.value.temperature,
+        )
+        assert reconstructed == pytest.approx(details.qbyt_raw_logit, abs=1e-5, rel=1e-5)
+        assert (details.qbyt_score >= threshold) is (score >= threshold)
+
+
+def test_non_eps_detailed_api_returns_none_positions_and_keeps_totals():
+    from tests.test_stage2_multi_query import _POOLING_V4, _V7, _feats, _token_ids
+
+    for stage2_cfg in (_POOLING_V4, _V7):
+        verifier, _spec = _eps_verifier(stage2_cfg=stage2_cfg, seed=4)
+        assert verifier.supports_eps_position_logits is False
+        query = _token_ids("HH", "EY1", "IY1")
+        feats = _feats(18, seed=9)
+        detailed = verifier.score_clip_feats_with_details(feats, [query])
+        tuples = verifier.score_clip_feats_with_logits(feats, [query])
+        assert detailed[0].qbyt_eps_position_logits is None
+        assert detailed[0].qbyt_raw_logit == pytest.approx(
+            tuples[0][0], abs=1e-6, rel=1e-6
+        )
+        assert detailed[0].qbyt_score == pytest.approx(tuples[0][1], abs=1e-6, rel=1e-6)
+
+
+def test_eps_model_missing_position_logits_fails_loudly():
+    from qbyt.pooling import QbyTReadoutDetails
+    from tests.test_stage2_multi_query import _POOLING_V41, _feats, _token_ids
+
+    verifier, _spec = _eps_verifier(stage2_cfg=_POOLING_V41, seed=1)
+
+    def _missing_positions(speech, text, speech_lengths=None, text_lengths=None):
+        logits = torch.zeros(speech.size(0))
+        text_mask = torch.ones(text.size(0), text.size(1), dtype=torch.bool)
+        return logits, torch.zeros_like(text, dtype=torch.float32), QbyTReadoutDetails(
+            position_logits=None,
+            position_mask=text_mask,
+        )
+
+    verifier._model.qbyt.forward_with_readout_details = _missing_positions
+    with pytest.raises(RuntimeError, match="position_logits"):
+        verifier.score_clip_feats_with_details(
+            _feats(8),
+            [_token_ids("HH", "EY1")],
+        )
+
+
+def test_non_finite_position_logits_fail_loudly():
+    from qbyt.pooling import QbyTReadoutDetails
+    from tests.test_stage2_multi_query import _POOLING_V41, _feats, _token_ids
+
+    verifier, _spec = _eps_verifier(stage2_cfg=_POOLING_V41, seed=1)
+    query = _token_ids("HH", "EY1")
+
+    def _nan_positions(speech, text, speech_lengths=None, text_lengths=None):
+        del speech_lengths, text_lengths
+        batch = speech.size(0)
+        width = text.size(1)
+        logits = torch.zeros(batch)
+        positions = torch.zeros(batch, width)
+        positions[0, 0] = float("nan")
+        mask = torch.ones(batch, width, dtype=torch.bool)
+        return logits, torch.zeros(batch, width), QbyTReadoutDetails(
+            position_logits=positions,
+            position_mask=mask,
+        )
+
+    verifier._model.qbyt.forward_with_readout_details = _nan_positions
+    with pytest.raises((ValueError, RuntimeError), match="non-finite|finite"):
+        verifier.score_clip_feats_with_details(_feats(8), [query])

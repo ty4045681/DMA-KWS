@@ -1195,7 +1195,7 @@ def test_run_batch_multi_one_row_one_result_and_skip_at_threshold_zero(monkeypat
     assert "keyword" not in results[0]
     assert results[0]["keyword_eval_mode"] == "any"
     assert results[0]["eval_protocol"] == "stage2_clip_keyword_set"
-    assert results[0]["result_schema_version"] == 2
+    assert results[0]["result_schema_version"] == 3
     assert results[0]["detected"] is True
     assert results[0]["matched_keywords"] == ["hey eva"]
     assert results[1]["skipped"] is True
@@ -1291,3 +1291,256 @@ def test_run_batch_multi_p1_matches_per_row(monkeypatch):
     assert per_row[0]["qbyt_score"] == any_mode[0]["qbyt_score"]
     assert per_row[0]["qbyt_raw_logit"] == any_mode[0]["qbyt_raw_logit"]
     assert per_row[0]["detected"] is any_mode[0]["detected"]
+
+
+class FakeDetailedBatchVerifier(FakeRawBatchVerifier):
+    def __init__(
+        self,
+        items: list[tuple[float, float, tuple[float, ...] | None]],
+    ) -> None:
+        super().__init__([(raw, score) for raw, score, _positions in items])
+        self._detail_items = list(items)
+        self.supports_eps_position_logits = True
+
+    def score_clip_feats_with_details(self, feats, keyword_ids_batch):
+        from dma_kws.inference.stage2_verifier import Stage2ScoreDetails
+
+        assert len(feats) == len(keyword_ids_batch)
+        self.batches.append(len(feats))
+        self.keyword_ids_batches.append(
+            [list(keyword_ids) for keyword_ids in keyword_ids_batch]
+        )
+        chunk = self._detail_items[: len(feats)]
+        self._detail_items = self._detail_items[len(feats) :]
+        return [
+            Stage2ScoreDetails(
+                qbyt_raw_logit=raw,
+                qbyt_score=score,
+                qbyt_eps_position_logits=positions,
+            )
+            for raw, score, positions in chunk
+        ]
+
+
+class FakeDetailedMultiVerifier(FakeDetailedBatchVerifier):
+    def __init__(
+        self,
+        items: list[tuple[float, float, tuple[float, ...] | None]],
+    ) -> None:
+        super().__init__(items)
+        self.multi_calls = 0
+
+    def score_clip_feats_multi_with_details(
+        self,
+        feats,
+        query_ids,
+        *,
+        query_batch_size=64,
+    ):
+        del query_batch_size
+        self.multi_calls += 1
+        rows = []
+        for _feat in feats:
+            row = []
+            for _query in query_ids:
+                row.extend(self.score_clip_feats_with_details([_feat], [_query]))
+            rows.append(row)
+        return rows
+
+
+def test_run_batch_aligns_position_logits_with_keyword_phonemes(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchaudio")
+
+    def loader(path: str, *, sample_rate: int):
+        if path.endswith("short.wav"):
+            return torch.zeros(1, 10), sample_rate
+        return torch.zeros(1, sample_rate * 2), sample_rate
+
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.load_audio", loader)
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.make_g2p", _fake_g2p)
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.text_to_phonemes",
+        lambda _g2p, text: _fake_phonemes(text),
+    )
+    tokenizer = load_char_tokenizer("data/dict/lang_char.txt", split_with_space=" ")
+    ee_vah = ["HH", "EY1", "IY1", "V", "AH0"]
+    ay_vah = ["HH", "EY1", "EY1", "V", "AH0"]
+    ee_logits = (0.82, 0.71, 0.66, 0.59, 0.47)
+    ay_logits = (0.11, 0.22, 0.33, 0.44, 0.55)
+    verifier = FakeDetailedBatchVerifier(
+        [
+            (0.61, 0.648, ee_logits),
+            (0.40, 0.40, ay_logits),
+        ]
+    )
+    runner = Stage2ClipRunner(
+        verifier=verifier,
+        tokenizer=tokenizer,
+        demo_cfg={"qbyt_threshold": 0.5},
+        sample_rate=16000,
+    )
+    results = runner.run_batch(
+        [
+            {
+                "audio_path": "/tmp/ee-vah.wav",
+                "keyword": "hey eva",
+                "keyword_phonemes": "HH EY1 IY1 V AH0",
+            },
+            {"audio_path": "/tmp/short.wav", "keyword": "hey eva"},
+            {
+                "audio_path": "/tmp/ay-vah.wav",
+                "keyword": "hey eva",
+                "keyword_phonemes": ay_vah,
+            },
+        ],
+        batch_size=8,
+        num_workers=0,
+    )
+    assert results[0]["keyword_phonemes"] == ee_vah
+    assert results[0]["qbyt_eps_position_logits"] == list(ee_logits)
+    assert results[0]["qbyt_raw_logit"] == pytest.approx(0.61)
+    assert results[0]["qbyt_score"] == pytest.approx(0.648)
+    assert results[0]["detected"] is True
+    assert "qbyt_eps_position_logits" not in results[1]
+    assert results[1]["skipped"] is True
+    assert results[2]["keyword_phonemes"] == ay_vah
+    assert results[2]["qbyt_eps_position_logits"] == list(ay_logits)
+
+
+def test_run_batch_legacy_fake_verifier_omits_position_field(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchaudio")
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.load_audio",
+        lambda _path, *, sample_rate: (torch.zeros(1, sample_rate * 2), sample_rate),
+    )
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.make_g2p", _fake_g2p)
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.text_to_phonemes",
+        lambda _g2p, text: _fake_phonemes(text),
+    )
+    tokenizer = load_char_tokenizer("data/dict/lang_char.txt", split_with_space=" ")
+    runner = Stage2ClipRunner(
+        verifier=FakeBatchVerifier(scores=[0.9]),
+        tokenizer=tokenizer,
+        demo_cfg={"qbyt_threshold": 0.5},
+        sample_rate=16000,
+    )
+    results = runner.run_batch(
+        [{"audio_path": "/tmp/a.wav", "keyword": "hello"}],
+        num_workers=0,
+    )
+    assert "qbyt_eps_position_logits" not in results[0]
+    assert results[0]["qbyt_score"] == 0.9
+    assert results[0]["detected"] is True
+
+
+def test_run_batch_multi_puts_positions_on_pronunciations_not_top_level(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchaudio")
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.load_audio",
+        lambda _path, *, sample_rate: (torch.zeros(1, sample_rate * 2), sample_rate),
+    )
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.make_g2p", _fake_g2p)
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.text_to_phonemes",
+        lambda _g2p, text: _fake_phonemes(text),
+    )
+    tokenizer = load_char_tokenizer("data/dict/lang_char.txt", split_with_space=" ")
+    keyword_set = _enroll_hey_eva(
+        tokenizer,
+        ["HH EY1 IY1 V AH0", "HH EY1 EY1 V AH0"],
+    )
+    by_tokens = {
+        tuple(pron.token_ids): pron for pron in keyword_set.keywords[0].pronunciations
+    }
+    items = []
+    for query in keyword_set.queries:
+        pron = by_tokens[query.token_ids]
+        positions = tuple(0.1 * (index + 1) for index in range(len(pron.phonemes))
+        )
+        items.append((0.5 + 0.1 * query.query_index, 0.6 + 0.1 * query.query_index, positions))
+    verifier = FakeDetailedMultiVerifier(items)
+    runner = Stage2ClipRunner(
+        verifier=verifier,
+        tokenizer=tokenizer,
+        demo_cfg={"qbyt_threshold": 0.5},
+        sample_rate=16000,
+    )
+    results = runner.run_batch_multi(
+        [{"audio_path": "/tmp/a.wav"}],
+        keyword_set,
+        num_workers=0,
+    )
+    assert "qbyt_eps_position_logits" not in results[0]
+    assert results[0]["result_schema_version"] == 3
+    pronunciations = results[0]["keyword_results"][0]["pronunciation_results"]
+    assert "qbyt_eps_position_logits" not in results[0]["keyword_results"][0]
+    for pronunciation in pronunciations:
+        assert len(pronunciation["qbyt_eps_position_logits"]) == len(
+            pronunciation["phonemes"]
+        )
+        assert len(pronunciation["qbyt_eps_position_logits"]) == len(
+            pronunciation["token_ids"]
+        )
+    winner = results[0]["best_pronunciation_id"]
+    winning = [item for item in pronunciations if item["pronunciation_id"] == winner][0]
+    assert results[0]["qbyt_score"] == pytest.approx(winning["qbyt_score"])
+    assert results[0]["detected"] is True
+
+
+def test_run_batch_multi_shared_query_copies_position_arrays(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchaudio")
+    monkeypatch.setattr(
+        "dma_kws.inference.stage2_clip.load_audio",
+        lambda _path, *, sample_rate: (torch.zeros(1, sample_rate * 2), sample_rate),
+    )
+    monkeypatch.setattr("dma_kws.inference.stage2_clip.make_g2p", _fake_g2p)
+    from dma_kws.inference.keyword_set import resolve_keyword_set
+
+    tokenizer = load_char_tokenizer("data/dict/lang_char.txt", split_with_space=" ")
+    keyword_set = resolve_keyword_set(
+        {
+            "keyword": "",
+            "keyword_phonemes": "",
+            "keywords": [],
+            "keyword_eval": {
+                "mode": "any",
+                "query_batch_size": 4,
+                "targets": [
+                    {"text": "hey eva", "pronunciations": ["HH EY1 IY1 V AH0"]},
+                    {"text": "ok lamp", "pronunciations": ["HH EY1 IY1 V AH0"]},
+                ],
+            },
+        },
+        tokenizer,
+        g2p=_fake_g2p(),
+        tokenizer_dict_path="data/dict/lang_char.txt",
+    )
+    assert keyword_set.num_queries == 1
+    positions = (0.82, 0.71, 0.66, 0.59, 0.47)
+    verifier = FakeDetailedMultiVerifier([(1.5, 0.9, positions)])
+    runner = Stage2ClipRunner(
+        verifier=verifier,
+        tokenizer=tokenizer,
+        demo_cfg={"qbyt_threshold": 0.5},
+        sample_rate=16000,
+    )
+    results = runner.run_batch_multi(
+        [{"audio_path": "/tmp/a.wav"}],
+        keyword_set,
+        num_workers=0,
+    )
+    first = results[0]["keyword_results"][0]["pronunciation_results"][0][
+        "qbyt_eps_position_logits"
+    ]
+    second = results[0]["keyword_results"][1]["pronunciation_results"][0][
+        "qbyt_eps_position_logits"
+    ]
+    assert first == list(positions)
+    assert second == list(positions)
+    assert first is not second
+    assert results[0]["best_keyword"] in {"hey eva", "ok lamp"}

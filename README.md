@@ -1643,6 +1643,7 @@ Output is JSON:
     "start_sec": 0.0,
     "end_sec": 1.23
   },
+  "qbyt_raw_logit": 0.61,
   "qbyt_score": 0.87,
   "threshold": 0.5,
   "detected": true,
@@ -1650,7 +1651,7 @@ Output is JSON:
 }
 ```
 
-Batch evaluation uses the same manifest format as the two-stage batch runner: `audio_path`, `keyword`, and optional `label`. In this mode, each `audio_path` must point to a cropped clip.
+Batch evaluation uses the same manifest format as the two-stage batch runner: `audio_path`, `keyword`, and optional `label`. In this mode, each `audio_path` must point to a cropped clip. For pooling EPS readouts, each scored `results.jsonl` row additionally contains `qbyt_eps_position_logits`, aligned with `keyword_phonemes`; the single-clip `run_stage2_demo.py` output above remains scalar-only.
 
 `scripts/prepare_two_stage_manifest.py` now supports two manifest build modes:
 
@@ -1691,7 +1692,7 @@ python3 scripts/eval_stage2_clips.py \
 
 In `auto_assign` mode, unmatched files are skipped when `prep.skip_unmatched=true` (default), and the script summary reports counts and examples of skipped files.
 
-Default output directory: `outputs/eval_stage2_clips` (`prep.stage2_clip_output_dir`). Override with `prep.output_dir=/path/to/output` if needed. The script writes `results.jsonl` with per-clip scores and `summary.json` with accuracy, precision, recall, f1, auc, and eer when labels are present. With both classes present and `prep.plot_curves=true` (the default) it also writes `roc_curve.png`, `det_curve.png`, and `roc_curve.csv` (`threshold`, `tpr`, `fpr` for every empirical operating point). If a manifest row contains extra columns beyond `audio_path`, `keyword`, and optional `label`, those key-value pairs are copied into `results.jsonl` under `manifest_meta`.
+Default output directory: `outputs/eval_stage2_clips` (`prep.stage2_clip_output_dir`). Override with `prep.output_dir=/path/to/output` if needed. The script writes `results.jsonl` with per-clip scores and `summary.json` with accuracy, precision, recall, f1, auc, and eer when labels are present. Pooling EPS readouts (`eps_mean` / `eps_softmin`, including v4.1) also write `qbyt_eps_position_logits`: raw `final_pos_fc` logits aligned with `keyword_phonemes` in per-row mode, or with each `keyword_results[].pronunciation_results[].phonemes` in `mode=any`. They are not sigmoided or calibrated; `qbyt_raw_logit` remains the pooled utterance logit and `qbyt_score` remains the deployed calibrated score. Skipped clips and non-EPS models omit the array. `summary.json.result_details` records whether the field is available. With both classes present and `prep.plot_curves=true` (the default) it also writes `roc_curve.png`, `det_curve.png`, and `roc_curve.csv` (`threshold`, `tpr`, `fpr` for every empirical operating point). If a manifest row contains extra columns beyond `audio_path`, `keyword`, and optional `label`, those key-value pairs are copied into `results.jsonl` under `manifest_meta`.
 
 ### Multi-keyword / multi-pronunciation (`prep.keyword_eval.mode=any`)
 
