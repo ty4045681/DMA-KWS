@@ -136,11 +136,51 @@ threshold drops below ~0.4 (1.1 per 24 h at 0.2, 2.7 at 0.1). The corpus granula
 0.55 FAs per 24 h (one window), so "0" here means "no accept in 43.7 h", not a measured
 rate below that.
 
-### 7.2 LibriSpeech train-other-500 (stride-6 subset, 24,782 files)
+### 7.2 MUSAN with a 1 s window / 1 s hop grid (stress test)
 
-_running — results are appended when the three passes finish._
+Same corpus, checkpoints and keyword, but `prep.window_sec=1.0 prep.hop_sec=1.0`
+(156,929 non-overlapping windows over 43.72 h). The official grid stays 3 s / 3 s:
+**FA per hour is not comparable across hops**, and a shorter hop also turns one
+sustained sound into several windows. Read this as a finer-time-resolution stress test
+of the same models, not as a replacement headline number.
 
-### 7.3 Raw artefacts
+| metric | v3 | v4 | v4.1 |
+| --- | --- | --- | --- |
+| accepted windows @ 0.5 (of 156,929) | 65 | 82 | **53** |
+| **FA per 24 h @ 0.5** | 35.7 | 45.0 | **29.1** |
+| distinct source files with ≥ 1 accept | 56 | 63 | **42** |
+| merged detection events (consecutive accepted windows collapsed) | 65 | 81 | **52** |
+| events per 24 h @ 0.2 / @ 0.1 | 90.0 / 152.6 | 109.2 / 155.4 | 102.7 / 182.3 |
+| per subset @ 0.5 (music 17.0 h / noise 2.5 h / speech 24.2 h) | 24 / 1 / 40 | 25 / 3 / 54 | **17 / 0 / 36** |
+| highest score seen | 0.926 | 0.929 | 0.961 |
+| p99.99 / p99.9 score | 0.745 / 0.223 | 0.821 / 0.297 | 0.686 / 0.238 |
+
+**Reading.** With only 1 s of context the picture inverts relative to the 3 s grid: the
+0.5 threshold was calibrated on 3 s inputs, so every readout now produces false accepts,
+and **v4.1 becomes the cleanest at 0.5** (29.1 per 24 h vs 35.7 for v3 and 45.0 for v4)
+while degrading fastest below ~0.2 (182 vs 155 / 153 events per 24 h at 0.1). Collapsing
+consecutive accepted windows barely changes the counts (52 events vs 53 windows for
+v4.1), i.e. the accepts are short isolated blips, not sustained detections. **Speech is
+the hardest subset for every readout** (36–54 of the accepts, from 24.2 h of audio),
+music next (17–25 from 17.0 h) and noise nearly clean (0–3 from 2.5 h).
+
+### 7.3 LibriSpeech train-other-500 (stride-6 subset, 24,782 files / 82.71 h)
+
+Clean read speech, scored with the same 3 s / 3 s grid, `prep.amp=fp16`, keyword
+`hey eva`; 87,243 windows.
+
+| metric | v4.1 |
+| --- | --- |
+| false accepts @ 0.5 | **0** |
+| **FA per 24 h @ 0.5** | **0** |
+| accepts / FA per 24 h @ 0.2 | 2 / 0.58 |
+| accepts / FA per 24 h @ 0.1 | 22 / 6.38 |
+| accepts / FA per 24 h @ 0.05 | 92 / 26.69 |
+| highest / p99.99 / p99.9 score | 0.234 / 0.131 / 0.051 |
+
+v3 and v4 passes are still running; their rows are appended when they finish.
+
+### 7.4 Raw artefacts
 
 * `data/dma-kws/exp/stage2_qbyt/fa/<tag>-musan/{results.jsonl, summary.json, fa_per_hour_curve.csv, fa_per_hour_curve.png}`
 * `data/dma-kws/exp/stage2_qbyt/fa/<tag>-ls-other/…`
