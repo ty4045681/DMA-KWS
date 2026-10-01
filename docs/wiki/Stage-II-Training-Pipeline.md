@@ -225,33 +225,53 @@ which has no hardware support there).
 
 ## 5. Measured throughput and time budget
 
-Measured with `icefall_zipformer_stage2` on **1× V100** — batch 128/GPU,
-`accumulate_grad_batches=1`, `precision=16-mixed`, frozen Zipformer + QbyT,
-`num_workers=4` (from `logs/.../runs.csv` and `eval_history.csv`):
+Measured on **1× V100** with `batch_size_per_gpu: 128`,
+`accumulate_grad_batches: 1`, `precision: 16-mixed`, frozen zh-en Zipformer encoder and
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. Raw numbers live in the
+[Experiment Log](Experiment-Log).
 
-| Quantity | Measured |
-| --- | --- |
-| Training | **3.9 s/step** (`duration_s=194.8` for 50 steps) ≈ 924 steps/h |
-| Validation (2,048-sample sample, 16 batches) | 31.1 s → **1.94 s/batch** |
-| Full hard-split validation (270,684 rows = 2,115 batches) | **≈ 69 min** |
+**Per-step cost is set by the QbyT readout, not by the encoder:**
 
-Validation is data-loading bound (per-item G2P + fbank `.npy` read with 4 workers), not
-GPU bound.
-
-Projection for **50,000 steps**:
-
-| `stage2.validation.val_check_interval` | validations | train | validation | total |
+| readout | steady state | per step | GPU util | VRAM |
 | --- | --- | --- | --- | --- |
-| 500 (preset default) | 100 | 54.1 h | 114.2 h | **168 h ≈ 7.0 days** |
-| 1000 | 50 | 54.1 h | 57.1 h | 111 h ≈ 4.6 days |
-| 2000 | 25 | 54.1 h | 28.5 h | 83 h ≈ 3.4 days |
-| 5000 | 10 | 54.1 h | 11.4 h | 66 h ≈ 2.7 days |
-| no validation | 0 | 54.1 h | — | 54 h ≈ 2.3 days |
+| v3 `eps_mean` | ~5.5 steps/s | ~0.18 s | ~99 % (co-located) | ~2 GB |
+| v4 `eps_softmin` | ~6.2 steps/s | ~0.16 s | ~99 % (co-located) | ~2 GB |
+| v4.1 (+ sink token, learned text / relative-bias audio positions) | 2.28 steps/s | **0.44 s** | 88 % solo | 2.1 GB |
+| v7 keyword-filler (`one_vs_rest`) | 0.26–0.29 steps/s | **3.4–3.9 s** | 20–25 % | 15–25 GB |
 
-Levers, in order of value: raise `val_check_interval`; raise `stage2.eval.num_workers`
-(4 → 16; validation is CPU bound); evaluate offline after training with
-`scripts/batch_eval_stage2_clips.sh`; add GPUs (`run.devices=2` halves both training and
-the sharded validation); consider batch 256 (memory allows — ~12 GB used of 32 GB).
+**Batch size does not change throughput.** 128 / 256 / 512 / 1024 all give ≈276–300
+samples/s; the V100 saturates at batch 128, and larger batches only lengthen the step
+(1.16 / 0.57 / 0.27 it/s). Worker count 4 vs 8 vs 10 is inside the noise; batch 256 OOMs
+for the v7 readout (31.7 GiB requested).
+
+**Validation is cheap, and a small sample lies about it.** The full hard split
+(270,684 rows = 2,115 batches) measured **2 min 10 s (16.25 it/s, 0.061 s/batch)** inside
+a live v4.1 run, so 20 validations at `val_check_interval=2500` cost ~44 min. Measuring
+the same thing on a 2,048-row sample reports 1.5–2 s/batch because the eval dataloader's
+fixed start-up dwarfs 16 batches — never extrapolate from a tiny sample.
+
+**Measured 50,000-step wall times on this host** (identical data/encoder, only the
+readout differs): v3 **3.38 h**, v4 **3.59 h**, v4.1 **8.23 h** (the latter includes a
+resume plus a long stretch of GPU sharing).
+
+**Co-locating a heavy and a light readout multiplies aggregate throughput** — the GPU is
+only 88 % busy under the heavy one, so light runs fill the gaps:
+
+| scenario | v4.1 | v4 | v3 | aggregate | GPU util |
+| --- | --- | --- | --- | --- | --- |
+| v4.1 alone | 2.28 | — | — | 2.28 steps/s | 87.9 % |
+| v4.1 + v4 | 1.58 | 6.23 | — | 7.82 steps/s | 96.8 % |
+| v4.1 + v4 + v3 | 1.27 | 4.89 | 4.93 | **11.09 steps/s** | **99.0 %** |
+| after the light runs finish | 2.09 | done | done | 2.09 steps/s | ~90 % |
+
+Two *heavy* runs do not help — they simply split the saturated GPU. CPU load reached 7.4
+of 10 cores with three runs; a fourth run is not advised.
+
+Levers, in order of value: pick the lightest readout that meets the metric target (v3/v4
+train in ~3.5 h at the same quality band as v4.1); run 40 k instead of 50 k steps (all
+measured curves plateau after ~35–40 k); co-locate light + heavy runs; keep validation at
+2500–5000-step intervals. Batch size, workers and precision are already optimal — only a
+second GPU would double the throughput.
 
 ## 6. MUSAN backgrounds (optional, v4.1)
 

@@ -11,6 +11,10 @@ Welcome to the DMA-KWS wiki! Operational guides for the [DMA-KWS](https://github
   route: data prep (GigaPhrase-1000 + LibriPhrase-460, eval set, MUSAN, LibriSpeech
   train-other-500), icefall + k2 + cuDNN + PYTHONPATH setup, encoder checkpoints and
   configs, single-step smoke results, and the measured time budget.
+- **[Experiment Log](Experiment-Log)** — archive of every Stage II QbyT run: configs,
+  readout ladder (v3 / v4 / v4.1) validation curves and best-checkpoint metrics,
+  throughput and multi-run concurrency measurements, artefacts, evaluation status and a
+  record template for new runs.
 
 ## Repository docs
 
