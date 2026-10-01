@@ -169,16 +169,23 @@ music next (17–25 from 17.0 h) and noise nearly clean (0–3 from 2.5 h).
 Clean read speech, scored with the same 3 s / 3 s grid, `prep.amp=fp16`, keyword
 `hey eva`; 87,243 windows.
 
-| metric | v4.1 |
-| --- | --- |
-| false accepts @ 0.5 | **0** |
-| **FA per 24 h @ 0.5** | **0** |
-| accepts / FA per 24 h @ 0.2 | 2 / 0.58 |
-| accepts / FA per 24 h @ 0.1 | 22 / 6.38 |
-| accepts / FA per 24 h @ 0.05 | 92 / 26.69 |
-| highest / p99.99 / p99.9 score | 0.234 / 0.131 / 0.051 |
+| metric | v3 | v4 | v4.1 |
+| --- | --- | --- | --- |
+| false accepts @ 0.5 | **0** | **0** | **0** |
+| **FA per 24 h @ 0.5** | **0** | **0** | **0** |
+| accepts / FA per 24 h @ 0.2 | 1 / 0.29 | 1 / 0.29 | 2 / 0.58 |
+| accepts / FA per 24 h @ 0.1 | 1 / 0.29 | 1 / 0.29 | 22 / 6.38 |
+| accepts / FA per 24 h @ 0.05 | – | – | 92 / 26.69 |
+| highest score | 0.082 | **0.036** | 0.234 |
+| p99.99 score | 0.024 | 0.014 | 0.131 |
 
-v3 and v4 passes are still running; their rows are appended when they finish.
+**Reading.** Clean read speech is the harder corpus per hour: the highest background
+score climbs from 0.019 / 0.015 / 0.409 on MUSAN (43.7 h) to 0.082 / 0.036 / 0.234 here,
+yet the deployment threshold still gives **zero accepts in 82.7 h ≈ 0 次/24h for all
+three**. The margin ordering repeats the MUSAN result — v4 keeps the tightest score
+distribution, v4.1 the heaviest tail (22 accepts at threshold 0.1 versus 1 for v3/v4),
+which is the price of its sharper hard-negative separation on LibriPhrase
+(TPR@1 % FPR 0.183 vs 0.157 / 0.170).
 
 ### 7.4 Raw artefacts
 

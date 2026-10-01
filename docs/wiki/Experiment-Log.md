@@ -228,7 +228,7 @@ Console transcripts of the tmux panes: `data/dma-kws/exp/stage2_qbyt/<session>.p
 | LibriPhrase hard-split AUC/EER/TPR (above) | ✅ done for v3 / v4 / v4.1 |
 | MUSAN held-out false alarms per 24 h (`processed/musan_split/eval_musan.list`, 902 recordings / 43.72 h, 51,994 windows) | ✅ **0 accepts at threshold 0.5 → 0 次/24h for v3, v4 and v4.1**; worst-case background score 0.019 / 0.015 / 0.409, so v4.1's margin is ~20× smaller ([False-Alarm Evaluation](False-Alarm-Evaluation)) |
 | MUSAN 1 s window / 1 s hop grid (156,929 windows) | ✅ **v4.1 29.1 < v3 35.7 < v4 45.0 false accepts per 24 h at threshold 0.5**; the 3 s grid is still 0 for all three — the shorter window inverts the ordering and shows the 0.5 threshold is calibrated for 3 s inputs ([False-Alarm Evaluation](False-Alarm-Evaluation) §7.2) |
-| LibriSpeech `train-other-500` false alarms per 24 h (stride-6 subset, 24,782 flac / 82.71 h, 87,243 windows) | ✅ v4.1 **0 accepts @ 0.5 → 0 次/24h** (0.58 per 24 h at 0.2, 6.4 at 0.1); v3 / v4 ⏳ running |
+| LibriSpeech `train-other-500` false alarms per 24 h (stride-6 subset, 24,782 flac / 82.71 h, 87,243 windows) | ✅ **v3, v4 and v4.1 all 0 accepts @ 0.5 → 0 次/24h**; worst-case scores 0.082 / 0.036 / 0.234 and at threshold 0.1 only v4.1 leaks (6.4 per 24 h vs 0.29) ([False-Alarm Evaluation](False-Alarm-Evaluation) §7.3) |
 | Two-stage (QbyT + verifier) end-to-end event rate | ⏳ planned |
 
 ## 7. Reproducing a run
