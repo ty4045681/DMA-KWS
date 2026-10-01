@@ -1,0 +1,39 @@
+# @package _global_
+# Stage II QbyT training with the bilingual Icefall KWS Zipformer
+# `zh-en-3M-2025-12-20` as the frozen encoder.
+#
+# Why a separate experiment: the zh-en checkpoint was trained with
+# `cnn_module_kernel = 15` in every stack (its config.json records
+# [15,15,15,15,15,15]), while the GigaSpeech KWS recipe used by
+# `icefall_zipformer_stage2` sets 31 for stacks 0/1/5. Everything else in the
+# encoder is identical (encoder_dim 128x6, one layer per stack, downsampling
+# 1,2,4,8,4,2, num_heads 4,4,4,8,4,4, feedforward_dim 192x6, causal streaming,
+# chunk_size 16 / left_context_frames 64).
+#
+# Verified with this config: the extracted checkpoint
+# (zh-en-3M-2025-12-20/pretrained-epoch-13-avg-2.pt, sha256 62188d07...f6eb)
+# loads with encoder_embed missing=0 unexpected=0 and encoder missing=0
+# unexpected=0 (311 encoder tensors).
+#
+# Usage:
+#   export ICEFALL_ROOT=/path/to/icefall
+#   python scripts/train_stage2_qbyt.py \
+#     +experiment=icefall_zipformer_stage2_zhen3m \
+#     stage2.precision=16-mixed   # V100 has no bf16 hardware support
+defaults:
+  - icefall_zipformer_stage2
+
+stage1:
+  # zh-en-3M: kernel 15 in all six stacks (GigaSpeech KWS recipe: 31,31,15,15,15,31).
+  cnn_module_kernel: "15,15,15,15,15,15"
+
+stage2:
+  # Extracted zh-en checkpoint by default; override with ZHEN_KWS_CHECKPOINT or
+  # stage2.init_checkpoint=/path/to/other.pt.
+  init_checkpoint: ${oc.env:ZHEN_KWS_CHECKPOINT,data/dma-kws/raw/kws-checkpoints/zh-en-3M-2025-12-20/pretrained-epoch-13-avg-2.pt}
+  # The prepared LS-GS-1460 set (GigaPhrase-1000 + LibriPhrase-460).
+  parquet_file: ${paths.processed_root}/stage2_qbyt/ls-gs-1460/aggregated_segments_with_g2p_distance.parquet
+  wav_dir: ${paths.feature_root}/fbank_icefall_kws
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-zhen3m
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-zhen3m
+  run_name: icefall-zipformer-frozen-zhen3m
