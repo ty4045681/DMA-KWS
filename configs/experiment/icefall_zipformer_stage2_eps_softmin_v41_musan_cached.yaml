@@ -1,0 +1,36 @@
+# @package _global_
+# Frozen Zipformer Stage II v4.1 with a **MUSAN-only** fbank-cached background
+# source. The ready-made overlay
+# `icefall_zipformer_stage2_eps_softmin_v41_multisource_cached` expects MUSAN,
+# DNS and FSD50K catalogs; only MUSAN is available on this machine, so this
+# overlay restates the source list with MUSAN at weight 1.0.
+#
+# Add DNS / FSD50K back (or just use the multisource overlay) once their
+# catalogs and caches exist under ${paths.processed_root}/background/<id>/.
+#
+# Data prepared for this run (2026-10):
+#   processed/musan_split/{train_background.list,eval_musan.list,split.json}
+#   processed/background/musan/{recordings.jsonl,catalog.json,train.list,val.list,test.list}
+#   processed/background/musan/cache/manifest.json   (K=323 crops/recording)
+#
+# Usage:
+#   export ICEFALL_ROOT=/path/to/icefall
+#   python scripts/train_stage2_qbyt.py \
+#     +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached \
+#     stage2.precision=16-mixed        # V100 has no bf16
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41_multisource_cached
+  - _self_
+
+stage2:
+  background_negative:
+    sources:
+      - id: musan
+        weight: 1.0
+        manifest: ${paths.processed_root}/background/musan/recordings.jsonl
+        cache_manifest: ${paths.processed_root}/background/musan/cache/manifest.json
+  parquet_file: ${paths.processed_root}/stage2_qbyt/ls-gs-1460/aggregated_segments_with_g2p_distance.parquet
+  wav_dir: ${paths.feature_root}/fbank_icefall_kws
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-eps-softmin-v41-musan-cached
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-eps-softmin-v41-musan-cached
+  run_name: icefall-zipformer-frozen-eps-softmin-v41-musan-cached
