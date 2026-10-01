@@ -1,0 +1,36 @@
+# @package _global_
+# QbyT v3 (eps_mean pooling readout) with the same zh-en-3M encoder, LS-GS-1460 data
+# and MUSAN fbank-cache backgrounds as the v4 / v4.1 runs, so the three form a clean
+# readout ladder:
+#
+#   v3   : mode=eps_mean,   no v4.1 extensions        (this run)
+#   v4   : mode=eps_softmin, no v4.1 extensions
+#   v4.1 : mode=eps_softmin, sink_token + learned text / relative-bias audio positions
+#
+# Version 3 forbids mode=eps_softmin and any v4.1 extension field
+# (dma_kws/stage2/readout.py: "QbyT readout version 3 cannot carry mode 'eps_softmin'"),
+# so the legacy defaults are pinned explicitly below.
+#
+# Concurrency: third run on the shared V100 - 3 train / 4 eval workers, validation
+# every 4000 steps to stay clear of the v4.1 (2500) and v4 (3000) schedules.
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+  - _self_
+
+stage2:
+  qbyt_readout_version: 3
+  qbyt_readout:
+    mode: eps_mean
+    temperature: 1.0
+    sink_token: false
+    text_position: sinusoidal
+    audio_position: sinusoidal
+  num_workers: 3
+  eval:
+    num_workers: 4
+  validation:
+    val_check_interval: 4000
+  val_check_interval: 4000
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v3-musan-zhen3m-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v3-musan-zhen3m-50k
+  run_name: v3-musan-zhen3m-50k

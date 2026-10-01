@@ -1,0 +1,48 @@
+# @package _global_
+# Production 50k-step Stage II QbyT run: bilingual zh-en-3M encoder on the prepared
+# LS-GS-1460 set, single V100. Tuned from measurements on 2026-10-01.
+#
+# Measured on 1x V100-32GB / 10 CPUs (icefall_zipformer_stage2 family, fp16, frozen
+# encoder + QbyT):
+#   batch_size_per_gpu 128  -> ~4.0 s/step; 256 OOMs (31.7 GiB requested)
+#   num_workers 4 vs 8     -> 121.5 s vs 129.2 s for 30 steps; training is not
+#                             dataloader bound, so keep 4 and leave CPU to eval
+#   validation             -> 1.45-1.94 s/batch on the eval set
+#                             (full hard split = 270,684 rows = 2,115 batches
+#                              ~ 51-69 min per validation)
+#   => validate every 2000 steps (25 validations) instead of the preset's 500 (100),
+#      which alone removes ~90 h from a 50k-step run.
+#
+# Total estimate: 50,000 x 4.0 s = 55.6 h training + 25 x ~51 min = 21 h validation
+# ~ 77 h (~3.2 days). Use a larger val_check_interval (e.g. 5000) or a sampled eval
+# CSV for a faster schedule; see the wiki page Stage-II-Training-Pipeline.
+defaults:
+  - icefall_zipformer_stage2_zhen3m
+  - _self_
+
+stage2:
+  max_steps: 50000
+  # Keep max_steps == total_scheduler_steps: a longer horizon would let the cosine
+  # schedule climb back to peak after num_training_steps.
+  total_scheduler_steps: 50000
+  batch_size_per_gpu: 128
+  accumulate_grad_batches: 1
+  num_workers: 4
+  precision: 16-mixed        # V100 has no bf16 hardware support
+  validation:
+    batch_size: 128
+    val_check_interval: 2000
+  val_check_interval: 2000
+  eval:
+    split: hard
+    batch_size: 128
+    num_workers: 8           # validation is data bound; 8 keeps the 10 CPUs busy
+    fbank_dir: ${paths.feature_root}/fbank_icefall_kws_eval
+  checkpoint:
+    every_n_train_steps: 1000
+    save_top_k: 3
+    monitor: val_auc
+    mode: max
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/icefall-zipformer-frozen-zhen3m-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/icefall-zipformer-frozen-zhen3m-50k
+  run_name: zhen3m-lsgs1460-50k

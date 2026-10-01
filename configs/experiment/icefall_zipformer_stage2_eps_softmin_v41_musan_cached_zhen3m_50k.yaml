@@ -1,0 +1,46 @@
+# @package _global_
+# v4.1 QbyT + MUSAN fbank-cache background noise, with the bilingual zh-en-3M
+# (avg-2) Icefall Zipformer encoder, on the prepared LS-GS-1460 set. Single V100.
+#
+# Combination of:
+#   * icefall_zipformer_stage2_eps_softmin_v41_musan_cached  (v4.1 readout, MUSAN cache)
+#   * icefall_zipformer_stage2_zhen3m                        (cnn_module_kernel 15,
+#                                                             zh-en avg-2 checkpoint)
+#   * the tuning measured on 2026-10-01 (see ..._zhen3m_50k.yaml), with one change:
+#     this v4.1 readout is ~8x cheaper per step than v7 (0.43 s vs 3.5 s at batch 128),
+#     so validation - not training - dominates; it runs every 5000 steps (10x) instead
+#     of 2000 (25 x ~51 min = 21 h vs 10 x ~51 min = 8.5 h).
+#       batch 128 (256 OOMs), train workers 4, eval workers 8, fp16-mixed,
+#       validation every 5000 steps, checkpoint every 1000 steps.
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41_musan_cached
+  - _self_
+
+stage1:
+  # zh-en-3M: kernel 15 in all six stacks (GigaSpeech recipe: 31,31,15,15,15,31).
+  cnn_module_kernel: "15,15,15,15,15,15"
+
+stage2:
+  init_checkpoint: ${oc.env:ZHEN_KWS_CHECKPOINT,data/dma-kws/raw/kws-checkpoints/zh-en-3M-2025-12-20/pretrained-epoch-13-avg-2.pt}
+  max_steps: 50000
+  total_scheduler_steps: 50000
+  batch_size_per_gpu: 128
+  accumulate_grad_batches: 1
+  num_workers: 8
+  precision: 16-mixed
+  validation:
+    batch_size: 128
+    val_check_interval: 2500
+  val_check_interval: 2500
+  eval:
+    split: hard
+    batch_size: 128
+    num_workers: 8
+  checkpoint:
+    every_n_train_steps: 1000
+    save_top_k: 3
+    monitor: val_auc
+    mode: max
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v41-musan-zhen3m-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v41-musan-zhen3m-50k
+  run_name: v41-musan-zhen3m-50k

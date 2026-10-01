@@ -1,0 +1,37 @@
+# @package _global_
+# QbyT v4 (legacy pooling readout, i.e. without the v4.1 sink token and positional
+# variants) with the same zh-en-3M encoder, LS-GS-1460 data and MUSAN fbank-cache
+# backgrounds as ..._v41_musan_cached_zhen3m_50k, so the pair is a clean A/B on the
+# v4.1 additions:
+#
+#   v4.1 : sink_token=true, text_position=learned, audio_position=relative_bias
+#   v4   : sink_token=false, text_position=sinusoidal, audio_position=sinusoidal
+#          (legacy defaults from qbyt/pooling.py)
+#
+# Both keep mode=eps_softmin and temperature=1.0, readout version 4, the frozen zh-en
+# encoder (cnn_module_kernel 15), the MUSAN cache and 50k steps at batch 128.
+#
+# Concurrency: this run shares the single V100 with the v4.1 run, so it takes
+# 4 train / 4 eval workers and validates every 3000 steps (the v4.1 run uses 2500)
+# to keep full hard-split validations from overlapping.
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+  - _self_
+
+stage2:
+  qbyt_readout_version: 4
+  qbyt_readout:
+    mode: eps_softmin
+    temperature: 1.0
+    sink_token: false
+    text_position: sinusoidal
+    audio_position: sinusoidal
+  num_workers: 4
+  eval:
+    num_workers: 4
+  validation:
+    val_check_interval: 3000
+  val_check_interval: 3000
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v4-musan-zhen3m-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v4-musan-zhen3m-50k
+  run_name: v4-musan-zhen3m-50k
