@@ -15,7 +15,10 @@ from dma_kws.config import (
 )
 from dma_kws.pathing import resolve_dict_path
 from dma_kws.inference.score_provenance import PROVENANCE_SCHEMA_VERSION
-from dma_kws.stage2.objective import checkpoint_sequence_objective
+from dma_kws.stage2.objective import (
+    QBYT_V1_SEQUENCE_OBJECTIVE,
+    checkpoint_sequence_objective,
+)
 from dma_kws.stage2.readout import resolve_qbyt_score_spec
 
 def _file_identity(path: str | Path, *, kind: str) -> dict[str, str | int]:
@@ -65,17 +68,23 @@ def build_score_provenance(
         raise SystemExit(
             f"Failed to read Stage II checkpoint objective metadata: {exc}"
         ) from exc
-    try:
-        sequence_objective = checkpoint_sequence_objective(checkpoint)
-    except ValueError as exc:
-        raise SystemExit(
-            f"Stage II checkpoint is missing v6 objective metadata: {exc}"
-        ) from exc
     score = resolve_qbyt_score_spec(stage2)
-    if score.family == "pooling":
-        qbyt_alignment = {"topology": "pooling", **score.value.as_dict()}
-    else:
+    if score.family == "v1":
+        # v1 is a frozen score contract with no trainable objective metadata to
+        # read: the readout spec plus the fixed v1 objective is the provenance.
         qbyt_alignment = score.value.as_dict()
+        sequence_objective = QBYT_V1_SEQUENCE_OBJECTIVE
+    else:
+        try:
+            sequence_objective = checkpoint_sequence_objective(checkpoint)
+        except ValueError as exc:
+            raise SystemExit(
+                f"Stage II checkpoint is missing v6 objective metadata: {exc}"
+            ) from exc
+        if score.family == "pooling":
+            qbyt_alignment = {"topology": "pooling", **score.value.as_dict()}
+        else:
+            qbyt_alignment = score.value.as_dict()
 
     return {
         "schema_version": PROVENANCE_SCHEMA_VERSION,

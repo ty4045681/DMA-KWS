@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from dma_kws.pathing import load_qbyt_class
+from dma_kws.pathing import ensure_qbyt_on_path, load_qbyt_class
 from dma_kws.stage2.readout import (
     QbyTAlignmentSpec,
     QbyTScoreSpec,
@@ -20,11 +20,23 @@ def build_qbyt(
     input_dim: int,
     vocab_size: int,
 ):
-    """Construct the QbyT family described by ``stage2_cfg``."""
+    """Construct the QbyT family described by stage2_cfg."""
 
+    # The vendored families are a namespace package; make qbyt.* importable
+    # regardless of how this constructor was reached.
+    ensure_qbyt_on_path()
     score = resolve_qbyt_score_spec(stage2_cfg)
     embed_dim = int(stage2_cfg.get("qbyt_embed_dim", 128))
     layers = int(stage2_cfg.get("qbyt_layers", 2))
+    if score.family == "v1":
+        from qbyt.model_v1 import QbyT
+
+        return QbyT(
+            encoder_output_size=int(input_dim),
+            num_embeds=int(vocab_size),
+            embed_dim=embed_dim,
+            post_num_layers=layers,
+        )
     if score.family == "pooling":
         from qbyt.pooling import QbyT
 

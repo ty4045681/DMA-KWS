@@ -66,6 +66,56 @@ _REQUIRED_ARPABET_PHONES = frozenset(
 # 71-symbol phoneme inventory reported in the paper.
 CANONICAL_VOCAB_SIZE = len(_REQUIRED_SPECIAL_TOKENS) + len(_REQUIRED_ARPABET_PHONES)
 
+#: The author's paper-original v1 release uses a 73-symbol dictionary: the
+#: canonical inventory plus a reserved <sos/eos> id and a stress-less UW. Ids
+#: shift after both insertions, so the two dictionaries are not interchangeable:
+#: every checkpoint must be loaded with the one it was trained on.
+VOCAB_PROFILE_CANONICAL = "canonical"
+VOCAB_PROFILE_V1_73 = "v1_73"
+VOCAB_PROFILES = (VOCAB_PROFILE_CANONICAL, VOCAB_PROFILE_V1_73)
+V1_VOCAB_SIZE = 73
+V1_DICT_PATH = Path(__file__).resolve().parents[1] / "data" / "dict" / "lang_char_v1_73.txt"
+V1_EXTRA_SPECIAL_TOKENS = frozenset({"<sos/eos>"})
+V1_EXTRA_PHONES = frozenset({"UW"})
+
+#: profile -> (expected token count, required specials, required extra phones)
+_PROFILE_REQUIREMENTS: dict[str, tuple[int, frozenset, frozenset]] = {
+    VOCAB_PROFILE_CANONICAL: (
+        CANONICAL_VOCAB_SIZE,
+        _REQUIRED_SPECIAL_TOKENS,
+        frozenset(),
+    ),
+    VOCAB_PROFILE_V1_73: (
+        V1_VOCAB_SIZE,
+        _REQUIRED_SPECIAL_TOKENS | V1_EXTRA_SPECIAL_TOKENS,
+        V1_EXTRA_PHONES,
+    ),
+}
+_VOCAB_SIZE_TO_PROFILE = {
+    size: name for name, (size, _specials, _extras) in _PROFILE_REQUIREMENTS.items()
+}
+
+
+def resolve_vocab_profile(dict_path: Path, symbol_table: dict[str, int], profile: str | None) -> str:
+    """Return the vocabulary profile, inferring it from the size when unset."""
+
+    if profile is None:
+        inferred = _VOCAB_SIZE_TO_PROFILE.get(len(symbol_table))
+        if inferred is None:
+            # Unknown size: fall back to canonical so the size / missing-token
+            # checks below report the concrete defect instead of a bare profile
+            # mismatch. Callers that need the v1 dictionary pass v1_73
+            # explicitly (or use the size-73 file, which infers it).
+            return VOCAB_PROFILE_CANONICAL
+        return inferred
+    normalized = str(profile).strip().lower()
+    if normalized not in VOCAB_PROFILES:
+        raise ValueError(
+            f"Unsupported tokenizer vocab profile {profile!r}; expected one of "
+            f"{', '.join(VOCAB_PROFILES)}"
+        )
+    return normalized
+
 
 def unsupported_phones(phones: Iterable[str]) -> list[str]:
     """Return sorted phones that fall outside the canonical ARPAbet inventory.
@@ -93,12 +143,14 @@ def _parse_dict_line(line: str, line_no: int, dict_path: Path) -> tuple[str, int
     return token, token_id
 
 
-def validate_lang_char_dict(dict_path: Path) -> None:
-    """Validate a Wenet-format ``lang_char.txt`` phoneme vocabulary.
+def validate_lang_char_dict(dict_path: Path, *, profile: str | None = None) -> None:
+    """Validate a Wenet-format phoneme vocabulary against a known profile.
 
-    Raises ``ValueError`` when the file does not match the repo-canonical
-    constraints: 71 tokens with contiguous ids 0-70, ``<blank>``/``<unk>``, and
-    the full stress-marked ARPAbet phone inventory (AA0-ZH).
+    Two profiles exist. "canonical" is the repo's 71-token dictionary
+    (contiguous ids 0-70). "v1_73" is the author's paper-original dictionary
+    (73 tokens, adding a reserved <sos/eos> and a stress-less UW). Passing
+    profile=None infers the profile from the token count and then applies the
+    same strict checks. Raises ValueError on any mismatch.
     """
     dict_path = Path(dict_path)
     if not dict_path.is_file():
@@ -111,26 +163,39 @@ def validate_lang_char_dict(dict_path: Path) -> None:
             raise ValueError(f"{dict_path}:{line_no}: duplicate token {token!r}")
         symbol_table[token] = token_id
 
-    missing_special = _REQUIRED_SPECIAL_TOKENS - symbol_table.keys()
+    resolved_profile = resolve_vocab_profile(dict_path, symbol_table, profile)
+    expected_size, required_specials, required_extra_phones = _PROFILE_REQUIREMENTS[
+        resolved_profile
+    ]
+
+    missing_special = required_specials - symbol_table.keys()
     if missing_special:
         missing = ", ".join(sorted(missing_special))
-        raise ValueError(f"{dict_path}: missing required special tokens: {missing}")
+        raise ValueError(
+            f"{dict_path}: profile {resolved_profile!r} is missing required "
+            f"special tokens: {missing}"
+        )
 
-    missing_phones = _REQUIRED_ARPABET_PHONES - symbol_table.keys()
+    required_phones = _REQUIRED_ARPABET_PHONES | required_extra_phones
+    missing_phones = required_phones - symbol_table.keys()
     if missing_phones:
         missing = ", ".join(sorted(missing_phones))
-        raise ValueError(f"{dict_path}: missing required ARPAbet phones: {missing}")
-
-    if len(symbol_table) != CANONICAL_VOCAB_SIZE:
         raise ValueError(
-            f"{dict_path}: expected {CANONICAL_VOCAB_SIZE} tokens, got {len(symbol_table)}"
+            f"{dict_path}: profile {resolved_profile!r} is missing required "
+            f"ARPAbet phones: {missing}"
+        )
+
+    if len(symbol_table) != expected_size:
+        raise ValueError(
+            f"{dict_path}: profile {resolved_profile!r} expects {expected_size} "
+            f"tokens, got {len(symbol_table)}"
         )
 
     ids = sorted(symbol_table.values())
-    expected_ids = list(range(CANONICAL_VOCAB_SIZE))
+    expected_ids = list(range(expected_size))
     if ids != expected_ids:
         raise ValueError(
-            f"{dict_path}: token ids must be contiguous 0-{CANONICAL_VOCAB_SIZE - 1}, "
+            f"{dict_path}: token ids must be contiguous 0-{expected_size - 1}, "
             f"got ids {ids}"
         )
 
@@ -153,9 +218,15 @@ def _ensure_qbyt_on_path() -> None:
         sys.path.insert(0, qbyt_path)
 
 
-def load_char_tokenizer(dict_path: Path, split_with_space: str = " "):
-    """Load Wenet ``CharTokenizer`` from ``dict_path``."""
-    validate_lang_char_dict(dict_path)
+def load_char_tokenizer(
+    dict_path: Path,
+    split_with_space: str = " ",
+    *,
+    profile: str | None = None,
+):
+    """Load Wenet CharTokenizer from dict_path under a validated vocab profile."""
+
+    validate_lang_char_dict(dict_path, profile=profile)
     _ensure_qbyt_on_path()
     from models.text.char_tokenizer import CharTokenizer
 

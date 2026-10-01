@@ -30,6 +30,7 @@ data/*
 !data/dict/
 data/dict/*
 !data/dict/lang_char.txt
+!data/dict/lang_char_v1_73.txt
 !data/dict/README.md
 exp/
 output/

@@ -471,6 +471,7 @@ def checkpoint_qbyt_readout_spec(
 
     from dma_kws.stage2.readout import (
         QbyTScoreSpec,
+        QbyTV1Spec,
         SUPPORTED_QBYT_READOUT_VERSIONS,
     )
 
@@ -482,7 +483,12 @@ def checkpoint_qbyt_readout_spec(
     if saved not in SUPPORTED_QBYT_READOUT_VERSIONS:
         raise ValueError(f"unsupported QbyT readout version {saved!r}")
 
-    if saved in (2, 3, 4):
+    if saved == 1:
+        # Version 1 is a single frozen contract: the padded-sequence GRU
+        # readout of the paper-original SI model. Config agreement below still
+        # rejects a v1 stamp whose embedded config asks for another family.
+        spec = QbyTScoreSpec(version=1, value=QbyTV1Spec())
+    elif saved in (2, 3, 4):
         spec = QbyTScoreSpec(
             version=int(saved),
             value=_decode_pooling_checkpoint(checkpoint, int(saved)),
@@ -494,9 +500,16 @@ def checkpoint_qbyt_readout_spec(
     if isinstance(config, Mapping):
         stage2 = config.get("stage2")
         if isinstance(stage2, Mapping):
-            configured = _resolve_qbyt_score_value(
-                stage2, default_version=int(saved)
-            )
+            try:
+                configured = _resolve_qbyt_score_value(
+                    stage2, default_version=int(saved)
+                )
+            except ValueError as exc:
+                # A config that cannot even resolve under the stamped version
+                # is a stamp/config disagreement, not a separate failure mode.
+                raise ValueError(
+                    f"stamped QbyT score disagrees with config.stage2: {exc}"
+                ) from exc
             if not qbyt_readout_specs_equal(spec, configured):
                 raise ValueError(
                     "stamped QbyT score disagrees with config.stage2"
@@ -530,10 +543,12 @@ def assert_qbyt_readout_version(
     """Fail unless QbyT weights match the expected score semantics.
 
     Encoder-only checkpoints return before version validation and remain valid
-    warm starts. Unversioned and v1 QbyT weights are never loadable. When
-    ``expected_alignment`` is omitted, any supported v2-v7 checkpoint that
-    decodes is accepted. When it is provided, pooling v2/v3/v4 may match on
-    mode/temperature; v5/v6/v7 require an equal version and spec.
+    warm starts. Unversioned QbyT weights are never loadable, including the raw
+    author v1 releases before scripts/import_author_v1_checkpoints.py stamps
+    them. When expected_alignment is omitted, any stamped supported v1-v7
+    checkpoint that decodes is accepted. When it is provided, pooling v2/v3/v4
+    may match on mode/temperature; v1 and v5/v6/v7 require an equal version and
+    spec.
     """
 
     if not _carries_qbyt_weights(checkpoint):

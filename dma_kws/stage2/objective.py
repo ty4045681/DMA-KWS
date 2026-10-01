@@ -41,6 +41,17 @@ CURRENT_SEQUENCE_OBJECTIVE = SequenceObjective(
     normalization="sample",
 )
 
+#: Fixed training objective of the paper-original v1 SI QbyT: every masked
+#: anchor position (including the final one) carries binary membership of the
+#: anchor phone in the query, with a 1:1 weighting against utterance BCE and
+#: token normalization. v1 has no configurable objective, so this constant is
+#: recorded in provenance rather than resolved from a checkpoint config.
+QBYT_V1_SEQUENCE_OBJECTIVE = SequenceObjective(
+    target_mode="membership",
+    progress_weight=1.0,
+    normalization="token",
+)
+
 def resolve_sequence_objective(
     stage2_cfg: Mapping[str, Any],
 ) -> SequenceObjective:

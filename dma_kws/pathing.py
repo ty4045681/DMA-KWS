@@ -13,11 +13,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def ensure_qbyt_on_path() -> Path:
-    """Ensure vendored ``qbyt/`` is importable; return its root path."""
+    """Ensure vendored qbyt/ is importable; return its root path.
+
+    Two entries are needed. The qbyt/ directory itself is prepended so inner
+    imports such as "from models.encoder import ..." resolve to the vendored
+    copy. The project root is appended because the readout families live in a
+    namespace package (no __init__.py): "import qbyt.model_v1" only resolves
+    with the root on sys.path, and qbyt/model.py imports its siblings through
+    the qbyt.* package name. Appending (not inserting) keeps site-packages
+    precedence for unrelated top-level names.
+    """
     qbyt_root = PROJECT_ROOT / "qbyt"
     qbyt_path = str(qbyt_root)
+    root_path = str(PROJECT_ROOT)
     if qbyt_path not in sys.path:
         sys.path.insert(0, qbyt_path)
+    if root_path not in sys.path:
+        sys.path.append(root_path)
     return qbyt_root
 
 

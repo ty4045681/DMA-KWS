@@ -1,0 +1,37 @@
+# @package _global_
+# Stage II-only clip evaluation with the paper-original (v1) SI QbyT.
+#
+# Usage:
+#   python scripts/import_author_v1_checkpoints.py \
+#     --stage1 /path/to/ckpts/stage1/ls-gs-1460.pt \
+#     --stage2 /path/to/ckpts/stage2/155k-v2-ft.ckpt \
+#     --output-dir data/dma-kws/exp/author_v1
+#
+#   python scripts/eval_stage2_clips.py +experiment=v1_eval_author_si \
+#     prep.stage2_ckpt=data/dma-kws/exp/author_v1/stage2_v1_si.pt \
+#     prep.manifest=/path/to/manifest.csv
+#
+# The v1 readout is defined on the padded [text][audio] concatenation, so the
+# runner scores clips one at a time regardless of prep.batch_size.
+
+defaults:
+  - override /paths: default
+
+tokenizer:
+  # Author dictionary: 73 symbols (<blank>, <unk>, <sos/eos>, 71 phoneme symbols
+  # including a stress-less UW). The 71-symbol canonical dict is not compatible
+  # with the released weights.
+  dict_path: data/dict/lang_char_v1_73.txt
+
+training:
+  recipe: author-v1-si
+
+stage2:
+  qbyt_readout_version: 1
+  qbyt_alignment: null
+  negative_tail_loss:
+    enabled: false
+  background_negative:
+    enabled: false
+  phoneme_adapter:
+    enabled: false

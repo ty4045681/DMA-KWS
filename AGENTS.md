@@ -30,9 +30,18 @@ caused it.
 ## QbyT readout version
 
 `QBYT_READOUT_VERSION` (`CURRENT_QBYT_READOUT_VERSION`) is 7, the default for
-new Stage II runs. `SUPPORTED_QBYT_READOUT_VERSIONS` is `{2, 3, 4, 5, 6, 7}`.
+new Stage II runs. `SUPPORTED_QBYT_READOUT_VERSIONS` is `{1, 2, 3, 4, 5, 6, 7}`.
 Stamp the version that actually produced the weights; do not write 7 onto a
 pooling or v6 checkpoint.
+
+Version 1 is the paper-original speaker-independent QbyT
+(`qbyt/model_v1.py`, `gru_last_padded` readout: the GRU state at the final
+position of the padded text-then-audio concatenation). Its score is
+batch-padding dependent by construction, so the verifier scores v1 clips one at
+a time and must never batch them. It has no tunable spec and no alignment
+fields; the raw author releases are unversioned until
+`scripts/import_author_v1_checkpoints.py` stamps them with version 1. The
+multimodal enrolment variants (SD) are not supported.
 
 Loaders (`assert_qbyt_readout_version`) accept any supported checkpoint that
 decodes. When a run config is supplied, pooling v2/v3/v4 match on the full
@@ -46,8 +55,9 @@ The v4 pooling spec now carries the v4.1 fields `sink_token`, `text_position`,
 reproduce legacy v4; a checkpoint's `qbyt_readout` mapping is the compatibility
 key. Do not stamp version 8, and do not write 7 onto a pooling checkpoint.
 
-Families live in `qbyt/pooling.py` (v2-v4), `qbyt/bounded.py` (v5), and
-`qbyt/model.py` (v6/v7). `build_qbyt` is the only constructor. Checkpoints are
+Families live in `qbyt/model_v1.py` (v1), `qbyt/pooling.py` (v2-v4),
+`qbyt/bounded.py` (v5), and `qbyt/model.py` (v6/v7). `build_qbyt` is the only
+constructor. Checkpoints are
 stamped by `Stage2LightningModule.on_save_checkpoint` and the explicit
 `torch.save` calls in `dma_kws/stage2/train.py` and `dma_kws/stage2/adapt.py`.
 Test fixtures that simulate a current-build checkpoint must call

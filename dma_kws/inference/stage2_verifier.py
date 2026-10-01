@@ -169,6 +169,11 @@ def build_stage2_inference_model(
             anchor_lengths,
         ):
             speech, encoder_lens = self.encode_for_qbyt(feats, feat_lengths)
+            if qbyt_score.family == "v1":
+                # The paper v1 scorer accepts no mask or length inputs: its
+                # utterance logit is the final position of the padded
+                # concatenation, by construction.
+                return self.qbyt(speech, anchors)
             return self.qbyt(
                 speech,
                 anchors,
@@ -276,7 +281,7 @@ class Stage2Verifier:
         self._stream_policy = stream_policy
         self.qbyt_score = qbyt_score
         self.qbyt_alignment = (
-            qbyt_score.value if qbyt_score.family != "pooling" else None
+            qbyt_score.value if qbyt_score.family not in ("pooling", "v1") else None
         )
         try:
             _load_model_state(
@@ -340,8 +345,15 @@ class Stage2Verifier:
         return self._min_fbank_frames
 
     @property
+    def _v1_readout(self) -> bool:
+        """True when the deployed score is the v1 padded-sequence readout."""
+
+        spec = getattr(self, "qbyt_score", None)
+        return getattr(spec, "family", None) == "v1"
+
+    @property
     def supports_eps_position_logits(self) -> bool:
-        """True when this verifier's pooling readout exposes ``final_pos_fc`` logits."""
+        """True when this verifier's pooling readout exposes final_pos_fc logits."""
 
         spec = getattr(self, "qbyt_score", None)
         if spec is None or getattr(spec, "family", None) != "pooling":
@@ -475,6 +487,15 @@ class Stage2Verifier:
         feats: Sequence,
         keyword_ids_batch: Sequence[Sequence[int]],
     ) -> list[tuple[float, float]]:
+        if self._v1_readout and len(feats) > 1:
+            # v1's deployed score depends on the padded sequence, so a batch of
+            # clips is not the function the checkpoint was trained on. Loop at
+            # batch size one instead of silently changing the score.
+            return [
+                pair
+                for feat, ids in zip(feats, keyword_ids_batch)
+                for pair in self._score_clip_feats_logits_only([feat], [ids])
+            ]
         torch = self._torch
         padded_feats, feat_lengths, anchors, anchor_lengths = self._pad_clip_batch(
             feats, keyword_ids_batch
@@ -589,6 +610,32 @@ class Stage2Verifier:
         raw_cpu = logits.detach().float().reshape(-1).cpu()
         return raw_cpu, None
 
+    def _score_v1_readout_multi(
+        self,
+        feats: Sequence,
+        queries: Sequence[Sequence[int]],
+        *,
+        return_details: bool,
+    ):
+        """Score v1 clips one at a time against every enrolled query.
+
+        Neither the clip axis nor the query axis may be padded into a shared
+        batch: v1 reads the final position of the padded concatenation, so any
+        neighbour in the batch changes the deployed score.
+        """
+
+        matrix: list[list] = []
+        for feat in feats:
+            row: list = []
+            for query in queries:
+                ids = [list(query)]
+                if return_details:
+                    row.append(self.score_clip_feats_with_details([feat], ids)[0])
+                else:
+                    row.append(self.score_clip_feats_with_logits([feat], ids)[0])
+            matrix.append(row)
+        return matrix
+
     def score_clip_feats_multi_with_logits(
         self,
         feats: Sequence,
@@ -661,6 +708,10 @@ class Stage2Verifier:
         )
         if not feats:
             return []
+        if self._v1_readout:
+            return self._score_v1_readout_multi(
+                feats, queries, return_details=return_details
+            )
 
         from torch.nn.utils.rnn import pad_sequence
 

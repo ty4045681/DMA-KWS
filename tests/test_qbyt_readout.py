@@ -56,7 +56,7 @@ def _payload(
 
 def test_v6_alignment_defaults_are_the_only_topology() -> None:
     assert QBYT_READOUT_VERSION == CURRENT_QBYT_READOUT_VERSION == 7
-    assert SUPPORTED_QBYT_READOUT_VERSIONS == frozenset({2, 3, 4, 5, 6, 7})
+    assert SUPPORTED_QBYT_READOUT_VERSIONS == frozenset({1, 2, 3, 4, 5, 6, 7})
     assert normalize_qbyt_alignment_topology(None) == QBYT_ALIGNMENT_TOPOLOGY
     assert resolve_qbyt_alignment({}).as_dict() == {
         "topology": "keyword_filler_segmental_crf_v1",
@@ -399,10 +399,9 @@ def test_current_checkpoint_requires_exact_stamped_and_configured_spec() -> None
         )
 
 
-@pytest.mark.parametrize("version", [None, 1])
-def test_unversioned_and_v1_qbyt_weights_are_rejected(version: int | None) -> None:
+def test_unversioned_qbyt_weights_are_rejected() -> None:
     payload = _payload(
-        version=version,
+        version=None,
         stamped_spec=None,
         config_spec=None,
     )
@@ -410,6 +409,23 @@ def test_unversioned_and_v1_qbyt_weights_are_rejected(version: int | None) -> No
         assert_qbyt_readout_version(
             payload,
             source="legacy.pt",
+        )
+
+
+def test_stamped_v1_qbyt_weights_load_only_for_v1_runs() -> None:
+    payload = _payload(version=1, stamped_spec=None, config_spec=None)
+    payload["config"] = {"stage2": {"qbyt_readout_version": 1}}
+    assert_qbyt_readout_version(payload, source="v1.pt")
+    assert_qbyt_readout_version(
+        payload,
+        source="v1.pt",
+        expected_alignment=resolve_qbyt_score_spec({"qbyt_readout_version": 1}),
+    )
+    with pytest.raises(SystemExit, match="Readout semantics differ"):
+        assert_qbyt_readout_version(
+            payload,
+            source="v1.pt",
+            expected_alignment=resolve_qbyt_score_spec({}),
         )
 
 

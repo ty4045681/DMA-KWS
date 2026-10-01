@@ -251,8 +251,38 @@ _KEYWORD_FILLER_ONLY_ALIGNMENT_FIELDS = frozenset(
     {"weakest_phone_temperature", "weakest_phone_weight"}
 )
 _BOUNDED_ONLY_ALIGNMENT_FIELDS = frozenset({"temperature"})
-SUPPORTED_QBYT_READOUT_VERSIONS = frozenset({2, 3, 4, 5, 6, 7})
+SUPPORTED_QBYT_READOUT_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7})
 CURRENT_QBYT_READOUT_VERSION = 7
+
+#: Readout contract of the paper-original SI QbyT (readout version 1).
+QBYT_V1_READOUT = "gru_last_padded"
+_QBYT_V1_READOUTS = frozenset({QBYT_V1_READOUT})
+
+
+@dataclass(frozen=True)
+class QbyTV1Spec:
+    """Score semantics of the paper-original SI QbyT (readout version 1).
+
+    The readout is the GRU state at the final position of the padded
+    text-then-audio concatenation. It deliberately carries no tunable fields:
+    the released weights only mean something under this one contract, and the
+    raw author checkpoints are unversioned until
+    scripts/import_author_v1_checkpoints.py stamps them.
+    """
+
+    readout: str = QBYT_V1_READOUT
+
+    def __post_init__(self) -> None:
+        value = str(self.readout).strip().lower()
+        if value not in _QBYT_V1_READOUTS:
+            raise ValueError(
+                f"Unsupported QbyT v1 readout {self.readout!r}; "
+                f"expected {QBYT_V1_READOUT!r}"
+            )
+        object.__setattr__(self, "readout", value)
+
+    def as_dict(self) -> dict[str, str]:
+        return {"readout": self.readout}
 
 
 @dataclass(frozen=True)
@@ -264,6 +294,8 @@ class QbyTScoreSpec:
 
     @property
     def family(self) -> str:
+        if self.version == 1:
+            return "v1"
         if self.version in (2, 3, 4):
             return "pooling"
         if self.version == 5:
@@ -388,6 +420,19 @@ def resolve_qbyt_score_spec(stage2_config: Mapping[str, Any]) -> QbyTScoreSpec:
     readout = stage2_config.get("qbyt_readout")
     alignment = stage2_config.get("qbyt_alignment")
 
+    if version == 1:
+        if readout is not None:
+            raise ValueError(
+                "stage2.qbyt_readout is a legacy GRU/EPS switch and is unsupported "
+                "by QbyT v1; remove it and set stage2.qbyt_readout_version=1"
+            )
+        if alignment is not None:
+            raise ValueError(
+                "stage2.qbyt_alignment is unsupported by QbyT v1; the paper v1 "
+                "readout has no tunable alignment fields"
+            )
+        return QbyTScoreSpec(version=1, value=QbyTV1Spec())
+
     if version in (2, 3, 4):
         from dma_kws.stage2.readout_pooling import (
             pooling_extension_offenders,
@@ -473,8 +518,10 @@ __all__ = [
     "DEFAULT_WEAKEST_PHONE_TEMPERATURE",
     "DEFAULT_WEAKEST_PHONE_WEIGHT",
     "QBYT_ALIGNMENT_TOPOLOGY",
+    "QBYT_V1_READOUT",
     "QbyTAlignmentSpec",
     "QbyTScoreSpec",
+    "QbyTV1Spec",
     "SUPPORTED_QBYT_READOUT_VERSIONS",
     "assert_qbyt_alignment_state_loaded",
     "default_clip_padding_ms",
