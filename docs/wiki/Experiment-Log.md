@@ -226,8 +226,8 @@ Console transcripts of the tmux panes: `data/dma-kws/exp/stage2_qbyt/<session>.p
 | evaluation | status |
 | --- | --- |
 | LibriPhrase hard-split AUC/EER/TPR (above) | ✅ done for v3 / v4 / v4.1 |
-| MUSAN held-out false alarms per 24 h (`processed/musan_split/eval_musan.list`, 902 recordings / 43.7 h) | ⏳ planned |
-| LibriSpeech `train-other-500` false alarms per 24 h (`raw/LibriSpeech/train-other-500.list`, 148,688 flac) | ⏳ planned |
+| MUSAN held-out false alarms per 24 h (`processed/musan_split/eval_musan.list`, 902 recordings / 43.72 h, 51,994 windows) | ✅ **0 accepts at threshold 0.5 → 0 次/24h for v3, v4 and v4.1**; worst-case background score 0.019 / 0.015 / 0.409, so v4.1's margin is ~20× smaller ([False-Alarm Evaluation](False-Alarm-Evaluation)) |
+| LibriSpeech `train-other-500` false alarms per 24 h (stride-6 subset, 24,782 flac ≈ 87 h) | ⏳ running |
 | Two-stage (QbyT + verifier) end-to-end event rate | ⏳ planned |
 
 ## 7. Reproducing a run
