@@ -1,0 +1,21 @@
+# @package _global_
+# GigaSpeech KWS Zipformer counterpart of icefall_zipformer_stage2_v3_musan_cached_zhen3m_50k
+# Identical readout (v3 eps_mean), data (LS-GS-1460), MUSAN fbank cache, 50k steps,
+# batch 128 and validation schedules; only the frozen encoder differs - this is the
+# GigaSpeech half of the zh-en vs GigaSpeech comparison.
+#
+# GigaSpeech KWS recipe uses cnn_module_kernel 31 for stacks 0/1/5 (the zh-en-3M
+# checkpoint uses 15 everywhere); with 31/31/15/15/15/31 the
+# gigaspeech-20240219/exp-finetune checkpoint loads 0/0.
+defaults:
+  - icefall_zipformer_stage2_v3_musan_cached_zhen3m_50k
+  - _self_
+
+stage1:
+  cnn_module_kernel: "31,31,15,15,15,31"
+
+stage2:
+  init_checkpoint: ${oc.env:ICEFALL_CHECKPOINT,data/dma-kws/raw/kws-checkpoints/gigaspeech-20240219/exp-finetune/pretrained.pt}
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v3-musan-gs-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v3-musan-gs-50k
+  run_name: v3-musan-gs-50k
