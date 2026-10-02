@@ -248,6 +248,50 @@ may differ), and score scales are **not comparable across readouts** (0.5 sits f
 this model's EER threshold of 0.942). A threshold-matched comparison (same hard-split
 FPR/TPR) is the honest one and is the next step.
 
+#### 7.6.1 Why a high hard-set AUC coexists with poor background rejection
+
+The two evaluations measure different capabilities: the hard split asks for *ranking
+inside speech* (same domain, different speakers / near-homophone words), MUSAN asks for
+*rejecting non-speech*, i.e. a distribution shift — nothing links the two. The per-window
+rates above 0.5 make it concrete:
+
+| sound | author v1 | our v3 / v4 / v4.1 |
+| --- | --- | --- |
+| LibriPhrase hard **speech** negatives | **17.75 %** (24,020/135,342) | ~20 % / ~22 % / ~22 % |
+| MUSAN **music** (17.0 h) | **15.93 %** (3,238/20,322) | 0 % |
+| MUSAN **noise** (2.5 h) | **23.88 %** (662/2,772) — *higher than the speech negatives* | 0 % |
+| MUSAN background speech (24.2 h) | 0.79 % | 0 % |
+| LibriSpeech clean read speech (82.7 h) | 0.89 % | 0 % |
+
+The release fires on music/noise about as often as on its own hard speech negatives: its
+decision boundary has no "this is not speech, so it cannot be the keyword" dimension.
+Three compounding reasons:
+
+1. **No background-only negatives in the recipe.** The authors' shipped training code
+   uses MUSAN only as *additive noise augmentation on positive clips*
+   (`qbyt/dataset/features.py`: `add_noise` + `noise.list` = 2,016 MUSAN files,
+   `_add_noise_with_snr(...)`) plus speed perturbation — a pure music/noise crop is never
+   presented as label 0. Our runs do exactly that
+   (`stage2.background_negative: enabled: true, probability: 0.25, mode: fbank_cache,
+   sources: [musan]`), which is where the "0 accepts in 43.7 h" behaviour comes from.
+2. **Readout structure.** v1 scores the GRU state at the final position of the padded
+   text-then-audio concatenation: an absolute, presence-style score with no explicit
+   filler/sink contrast. The v2–v4.1 pooling readouts score a *contrast*
+   (eps-mean/softmin pooling + sink token + relative positional bias), so "no keyword
+   evidence" mechanically drives the score down.
+3. **Role mismatch.** The paper system is two-stage — a Stage-I keyword locator proposes
+   candidates and QbyT re-scores them. Scanning every 3 s window of arbitrary audio with
+   the verifier alone is outside its trained role; our models, trained with 25 %
+   background negatives, behave like single-stage detectors.
+
+Secondary factors: the release is a **step-3000 snapshot** (the authors evaluate
+`avg_10`), and score scales are not comparable (its EER threshold is 0.942, so 0.5 sits
+far below its operating point).
+
+Falsifiable follow-up (planned): fine-tune the released checkpoint with background-only
+negatives (MUSAN fbank cache, probability 0.25) and re-measure. If the mechanism above is
+right, its MUSAN/LibriSpeech FA rate should collapse towards our models' 0.
+
 Artifacts: `data/dma-kws/exp/stage2_qbyt/eval_author_v1/lp-hard/` and
 `data/dma-kws/exp/stage2_qbyt/fa/author-v1-{musan,ls-other,musan-1s0}/merged/`; campaign
 script `/tmp/author_v1_sharded.sh`, shard logs `/tmp/av1_*.log`.
