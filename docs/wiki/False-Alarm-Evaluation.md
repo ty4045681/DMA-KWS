@@ -296,6 +296,55 @@ Artifacts: `data/dma-kws/exp/stage2_qbyt/eval_author_v1/lp-hard/` and
 `data/dma-kws/exp/stage2_qbyt/fa/author-v1-{musan,ls-other,musan-1s0}/merged/`; campaign
 script `/tmp/author_v1_sharded.sh`, shard logs `/tmp/av1_*.log`.
 
+### 7.7 Causal check — background negatives on the author SI-KWS (v1)
+
+Section 7.6.1 argues that the release has no background-rejection capability because its
+recipe never presents a pure background crop as a negative. That is testable: take the
+imported release and fine-tune it twice with an **identical** configuration — same init,
+same data, same paper objective (membership, progress 1.0, token normalisation), same
+5,000 steps, same LR 1e-4 — changing exactly one thing: whether pure MUSAN background
+crops are drawn as label-0 samples (`stage2.background_negative`, `mode=online`,
+`probability=0.25`, the train side of the MUSAN split).
+
+The fine-tune used the author's own feature domain (Wenet/Kaldi fbank, a 2,684-anchor /
+99,286-clip subset at `data/dma-kws/features/fbank_wenet_subset`), and v1 is scored one
+clip at a time, so both arms were evaluated with the same 4-shard protocol as 7.6.
+
+| evaluation (threshold 0.5) | author v1 (original) | Arm control — no backgrounds | Arm bg — + backgrounds |
+| --- | --- | --- | --- |
+| LibriPhrase hard split AUC | 0.9595 | 0.9443 | **0.9472** |
+| hard split EER | 0.0986 | 0.1221 | **0.1134** |
+| hard split TPR@0.5 / FPR@0.5 | 0.9750 / 0.1775 | 0.9940 / 0.3641 | 0.9914 / 0.3434 |
+| hard split TPR@1 % FPR | 0.2877 | 0.1906 | 0.1937 |
+| MUSAN false accepts / 43.72 h | 4,129 | 9,000 | **0** |
+| **MUSAN FA per 24 h** | 2,266.8 | 4,940.9 | **0.0** |
+| MUSAN highest / p99.9 score | 0.9999 / 0.9628 | 1.0000 / 0.9982 | **0.0168 / 0.0005** |
+
+**Result.** One variable — 25 % background-only negatives — moves the MUSAN false-alarm
+rate from 4,941 per 24 h to **0**, while every hard-split metric stays inside the
+run-to-run noise (AUC 0.9472 vs 0.9443, TPR@0.5 0.9914 vs 0.9940, TPR@1 % FPR 0.1937 vs
+0.1906). Background rejection is therefore not something the release lacks for capacity
+or readout reasons: it lacks **training signal**, and 5,000 steps (~6.5 min) are enough
+to install it without hurting keyword discrimination. Mechanism 1 of 7.6.1 is confirmed.
+
+**Feature domain matters (side result).** The same two arms were first run on this
+repo's icefall/lhotse fbank tree (`features/fbank_icefall_kws`: dither 0,
+snip_edges false, high_freq -400). Both collapsed — control AUC 0.6893, bg AUC 0.5698,
+and the bg arm simply stopped firing (hard TPR@0.5 0.0253); its MUSAN FA was 0 as well,
+but that is a dead model, not a fix. v1 was trained on Kaldi/Wenet fbank, so fine-tuning
+it on the icefall profile destroys it. Any future v1 training must use the author profile
+(`+experiment=v1_eval_author_si` or an explicit fbank override with the same settings).
+
+**Reproduce.** Fine-tune: `TAG=wenet LR=1e-4 DATA_PARQUET=.../v1-wenet-subset/aggregated_segments_with_g2p_distance.parquet
+WAV_DIR=.../fbank_wenet_subset bash /tmp/v1_ft_arms3.sh`; evaluation: `TAG=wenet bash /tmp/v1_ft_eval.sh`.
+Arm checkpoints: `data/dma-kws/exp/stage2_qbyt/checkpoints/v1-ft-wenet-{control,bg}/v1-ft-wenet-{control,bg}/version_1/stage2_step005000.pt`.
+Artefacts: `eval_v1_ft/wenet-{control,bg}-lp-hard/` and `fa/v1-ft-wenet-{control,bg}-musan/merged/`.
+
+Two code changes make this reproducible from the repo: v1 now accepts
+`stage2.background_negative` (a background draw already carries an all-zero membership
+target over an all-ones mask, and `_assert_v1_background_targets` enforces that contract),
+and sliced datasets fall back to a regular negative when a hard-negative ngram is outside
+the dataset anchor set.
 ## 8. Reproduce
 
 ```bash
