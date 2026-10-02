@@ -254,6 +254,12 @@ fixed start-up dwarfs 16 batches — never extrapolate from a tiny sample.
 readout differs): v3 **3.38 h**, v4 **3.59 h**, v4.1 **8.23 h** (the latter includes a
 resume plus a long stretch of GPU sharing).
 
+**The encoder matters far more than the readout.** The same three readouts retrained with
+the GigaSpeech KWS encoder score 0.8565–0.8687 AUC (EER 0.208–0.220, TPR@1 % FPR
+0.074–0.081) against 0.9316–0.9350 (EER 0.131–0.134, TPR@1 % FPR 0.157–0.183) for the
+zh-en-3M encoder — a ~0.07 AUC / ~2× TPR gap that dwarfs the ±0.012 readout spread. See
+[Experiment Log](Experiment-Log) §3 for the full 2×3 grid and curves.
+
 **Co-locating a heavy and a light readout multiplies aggregate throughput** — the GPU is
 only 88 % busy under the heavy one, so light runs fill the gaps:
 

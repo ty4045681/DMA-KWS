@@ -106,12 +106,6 @@ once per family (one `--experiment` per call).
 
 ## 7. Results — zh-en encoder, LS-GS-1460 + MUSAN backgrounds
 
-Same data, encoder and training budget for all three; only the QbyT readout differs
-(see the [Experiment Log](Experiment-Log) for the training curves). Keyword
-`hey eva` (`HH EY1 IY1 V AH0`), 3 s window / 3 s hop, `prep.amp=fp16`.
-
-## 7. Results — zh-en encoder, LS-GS-1460 + MUSAN backgrounds
-
 Same data, encoder and training budget for all three checkpoints; only the QbyT readout
 differs (training curves: [Experiment Log](Experiment-Log)). Keyword `hey eva`
 (`HH EY1 IY1 V AH0`), 3 s window / 3 s hop, `prep.amp=fp16`, deployment threshold 0.5.
@@ -193,6 +187,22 @@ which is the price of its sharper hard-negative separation on LibriPhrase
 * `data/dma-kws/exp/stage2_qbyt/fa/<tag>-ls-other/…`
 * campaign script/logs: `/tmp/fa_campaign.sh`, `/tmp/fa_<tag>_{musan,ls}.log`
 
+
+### 7.5 GigaSpeech-encoder models — pending
+
+The three GigaSpeech-encoder counterparts (§3 of the [Experiment Log](Experiment-Log))
+are trained and exported, but their false-alarm runs have **not** been executed yet:
+
+| tag | experiment config | exported checkpoint |
+| --- | --- | --- |
+| v3-gs | `icefall_zipformer_stage2_v3_musan_cached_gs_50k` | `.../checkpoints/v3-musan-gs-50k/v3-musan-gs-50k/version_0/stage2_step048000.pt` |
+| v4-gs | `icefall_zipformer_stage2_v4_musan_cached_gs_50k` | `.../checkpoints/v4-musan-gs-50k/v4-musan-gs-50k/version_0/stage2_step048000.pt` |
+| v4.1-gs | `icefall_zipformer_stage2_eps_softmin_v41_musan_cached_gs_50k` | `.../checkpoints/v41-musan-gs-50k/v41-musan-gs-50k/version_0/stage2_step045000.pt` |
+
+Their LibriPhrase hard-split metrics (best AUC 0.8565–0.8687, EER 0.2077–0.2196,
+TPR@1 % FPR 0.0737–0.0814) sit ~0.07 AUC below the zh-en models, so expect a visibly
+higher false-accept rate at the same 0.5 threshold. Run the §8 loop with these
+`experiment:checkpoint:tag` triples and compare against the zh-en artefacts above.
 
 ## 8. Reproduce
 

@@ -15,9 +15,10 @@ Welcome to the DMA-KWS wiki! Operational guides for the [DMA-KWS](https://github
   (false accepts per 24 h) with `eval_musan_fa.py` on MUSAN and LibriSpeech
   train-other-500, plus the recorded v3 / v4 / v4.1 results.
 - **[Experiment Log](Experiment-Log)** — archive of every Stage II QbyT run: configs,
-  readout ladder (v3 / v4 / v4.1) validation curves and best-checkpoint metrics,
-  throughput and multi-run concurrency measurements, artefacts, evaluation status and a
-  record template for new runs.
+  validation curves and best-checkpoint metrics for the readout ladder (v3 / v4 / v4.1)
+  **and** the zh-en-3M vs GigaSpeech KWS encoder grid, throughput and multi-run
+  concurrency measurements, exported artefacts, evaluation status and a record template
+  for new runs.
 
 ## Repository docs
 

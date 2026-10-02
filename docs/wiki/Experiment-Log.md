@@ -3,6 +3,8 @@
 Archive of every Stage II QbyT run on this host: configuration, throughput
 measurements, validation curves, artefacts and open evaluations.
 
+**Last updated:** 2026-10-02 — added the GigaSpeech KWS encoder comparison (§3).
+
 * Environment and version pins: [Environment Setup](Environment-Setup)
 * Data prep, icefall/k2/cuDNN setup, smoke test: [Stage II Training Pipeline](Stage-II-Training-Pipeline)
 
@@ -18,7 +20,8 @@ k2 1.24.4 · icefall `3f848bb` · cuDNN 9.5.1 (forced through `LD_LIBRARY_PATH`)
 | validation | LibriPhrase **hard split** (270,684 rows = 2,115 batches), full split every time (`drop_last=False`) |
 | eval fbank | `data/dma-kws/features/fbank_icefall_kws_eval` |
 | background noise | MUSAN fbank cache `data/dma-kws/processed/background/musan/cache` — cache_id `f1ff880b3165c262ed7b6f2f9980ed698a00d74653bb9fe0a691a021466fc19b`, 993 train recordings, 320,739 crops, `mode: fbank_cache`, probability 0.25, 1–3 s crops |
-| encoder | `raw/kws-checkpoints/zh-en-3M-2025-12-20/pretrained-epoch-13-avg-2.pt`, `cnn_module_kernel: 15,15,15,15,15,15`, causal, frozen (2,751,965 params, 0 missing / 0 unexpected) |
+| encoder (zh-en runs, §1–§2) | `raw/kws-checkpoints/zh-en-3M-2025-12-20/pretrained-epoch-13-avg-2.pt`, `cnn_module_kernel: 15,15,15,15,15,15`, causal, frozen (2,751,965 params, 0 missing / 0 unexpected) |
+| encoder (GigaSpeech runs, §3) | `raw/kws-checkpoints/gigaspeech-20240219/exp-finetune/pretrained.pt`, `cnn_module_kernel: 31,31,15,15,15,31`, causal, frozen (0 missing / 0 unexpected) |
 | optimiser / schedule | inherited from the icefall Stage II preset; `batch_size_per_gpu: 128`, `accumulate_grad_batches: 1`, `precision: 16-mixed`, `max_steps == total_scheduler_steps` |
 
 ## 1. Runs at a glance
@@ -29,6 +32,9 @@ k2 1.24.4 · icefall `3f848bb` · cuDNN 9.5.1 (forced through `LD_LIBRARY_PATH`)
 | **v4** | `qbyt-v4-musan-zhen3m` | `icefall_zipformer_stage2_v4_musan_cached_zhen3m_50k` | version 4, `eps_softmin` | MUSAN cache | 50,000 | **3.59 h** | 422 K | 0.932327 | 0.133621 | 0.1703 | ✅ complete |
 | **v4.1** | `qbyt-v41-musan-zhen3m` | `icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k` | version 4, `eps_softmin` + `sink_token` + learned text / relative-bias audio positions | MUSAN cache | 50,000 | **8.23 h**¹ | 439 K | **0.935007** | **0.131075** | **0.1832** | ✅ complete |
 | v7 | `qbyt-zhen3m-50k` | `icefall_zipformer_stage2_zhen3m_50k` | version 7 keyword-filler (`one_vs_rest`) | none | 215 / 50,000 | — | 160 K | — | — | — | ⛔ aborted (switched to the v4.1 recipe on request) |
+| **v3** | `qbyt-v3-musan-gs` | `icefall_zipformer_stage2_v3_musan_cached_gs_50k` | version 3, `eps_mean` | GS encoder, MUSAN cache | 50,000 | **3.57 h** | 422 K | 0.859759 | 0.216651 | 0.0771 | ✅ complete |
+| **v4** | `qbyt-v4-musan-gs` | `icefall_zipformer_stage2_v4_musan_cached_gs_50k` | version 4, `eps_softmin` | GS encoder, MUSAN cache | 50,000 | **3.85 h** | 422 K | 0.856506 | 0.219640 | 0.0737 | ✅ complete |
+| **v4.1** | `qbyt-v41-musan-gs` | `icefall_zipformer_stage2_eps_softmin_v41_musan_cached_gs_50k` | version 4, `eps_softmin` + `sink_token` + learned text / relative-bias audio | GS encoder, MUSAN cache | 50,000 | **8.61 h** | 439 K | 0.868674 | 0.207674 | 0.0814 | ✅ complete |
 
 ¹ includes the resume from step 5,000, the concurrent period with v3/v4 and 18 full-split
 validations; pure training was 6 h 53 min.
@@ -145,9 +151,135 @@ audio_position=sinusoidal`.
 ¹ from the pre-resume segment of the same weight lineage (validation interval was 5000
 before it was re-tuned to 2500).
 
-## 3. Throughput and concurrency measurements
+## 3. Encoder comparison — zh-en-3M vs GigaSpeech KWS
 
-### 3.1 Batch-size sweep (v4.1 config, 30–40 steps per point, steady-state rates)
+The same three readouts were retrained with the **GigaSpeech KWS Zipformer**
+(`raw/kws-checkpoints/gigaspeech-20240219/exp-finetune/pretrained.pt`,
+`cnn_module_kernel: 31,31,15,15,15,31`, 0 missing / 0 unexpected) so that the encoder
+effect can be separated from the readout effect. Everything else matches §2 exactly: same
+parquet and fbank, same MUSAN fbank cache at probability 0.25, 50,000 steps, batch 128,
+`16-mixed`, frozen encoder, and the same staggered full-hard-split validation intervals
+(v4.1 2500, v4 3000, v3 4000). The three GigaSpeech runs were co-located on the V100 the
+same way as the zh-en trio, so the wall times are comparable.
+
+### 3.1 GigaSpeech runs at a glance
+
+| run | tmux session | experiment config | readout | steps | wall time | trainable | best val AUC | EER @ best | TPR@FPR1e-2 | status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **v3** | `qbyt-v3-musan-gs` | `icefall_zipformer_stage2_v3_musan_cached_gs_50k` | version 3, `eps_mean` | 50,000 | **3.57 h** | 422 K | 0.859759 | 0.216651 | 0.0771 | ✅ complete |
+| **v4** | `qbyt-v4-musan-gs` | `icefall_zipformer_stage2_v4_musan_cached_gs_50k` | version 4, `eps_softmin` | 50,000 | **3.85 h** | 422 K | 0.856506 | 0.219640 | 0.0737 | ✅ complete |
+| **v4.1** | `qbyt-v41-musan-gs` | `icefall_zipformer_stage2_eps_softmin_v41_musan_cached_gs_50k` | version 4, `eps_softmin` + `sink_token` + learned text / relative-bias audio | 50,000 | **8.61 h** | 439 K | 0.868674 | 0.207674 | 0.0814 | ✅ complete |
+
+### 3.2 The 2×3 grid — best-checkpoint metrics
+
+| readout | encoder | best AUC | EER | TPR@1%FPR | TPR@0.1%FPR | pAUC(≤1%) | Brier | best step | wall time |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| v3 `eps_mean` | **zh-en** | 0.931601 | 0.132239 | 0.156781 | 0.018331 | 0.538021 | 0.105891 | 48,000 | 3.38 h |
+| v3 `eps_mean` | **GigaSpeech** | 0.859759 | 0.216651 | 0.077079 | 0.012531 | 0.517957 | 0.156922 | 48,000 | 3.57 h |
+| v4 `eps_softmin` | **zh-en** | 0.932327 | 0.133621 | 0.170258 | 0.017223 | 0.539058 | 0.106843 | 48,000 | 3.59 h |
+| v4 `eps_softmin` | **GigaSpeech** | 0.856506 | 0.219640 | 0.073658 | 0.010307 | 0.517027 | 0.158888 | 48,000 | 3.85 h |
+| **v4.1** (+sink/pos) | **zh-en** | **0.935007** | **0.131075** | **0.183210** | 0.020533 | **0.543203** | 0.108810 | 47,500 | 8.23 h |
+| **v4.1** (+sink/pos) | **GigaSpeech** | 0.868674 | 0.207674 | 0.081423 | 0.010869 | 0.518470 | 0.153237 | 45,000 | 8.61 h |
+
+### 3.3 Aligned milestones (AUC, EER in brackets)
+
+| step | v3 GS | v4 GS | v4.1 GS | v3 zh-en | v4 zh-en | v4.1 zh-en |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5000 | 0.6320 (0.4094) | 0.5964 (0.4387) | 0.6849 (0.3707) | 0.8453 (0.2289) | 0.7956 (0.2808) | — (—) |
+| 10000 | 0.7567 (0.3100) | 0.7720 (0.3024) | 0.7805 (0.2912) | 0.8704 (0.2039) | 0.8839 (0.1894) | 0.8854 (0.1858) |
+| 20000 | 0.8219 (0.2543) | 0.8247 (0.2500) | 0.8352 (0.2418) | 0.9109 (0.1577) | 0.9036 (0.1656) | 0.9092 (0.1627) |
+| 30000 | 0.8468 (0.2293) | 0.8363 (0.2386) | 0.8559 (0.2188) | 0.9230 (0.1417) | 0.9171 (0.1510) | 0.9222 (0.1440) |
+| 40000 | 0.8560 (0.2205) | 0.8531 (0.2232) | 0.8652 (0.2114) | 0.9280 (0.1360) | 0.9309 (0.1349) | 0.9330 (0.1341) |
+| 48000 | 0.8598 (0.2167) | 0.8565 (0.2196) | 0.8678 (0.2091) | 0.9316 (0.1322) | 0.9323 (0.1338) | 0.9350 (0.1311) |
+
+### 3.4 Full GigaSpeech validation curves (raw)
+
+**v3-gs (`eps_mean`), 12 points**
+
+| step | val_loss | AUC | EER | TPR@1e-2 | Brier |
+|---|---|---|---|---|---|
+| 4000 | 0.6943 | 0.6320 | 0.4094 | 0.0149 | 0.2515 |
+| 8000 | 0.6294 | 0.7567 | 0.3100 | 0.0438 | 0.2179 |
+| 12000 | 0.5782 | 0.7807 | 0.2913 | 0.0484 | 0.1972 |
+| 16000 | 0.5473 | 0.8129 | 0.2612 | 0.0534 | 0.1823 |
+| 20000 | 0.5569 | 0.8219 | 0.2543 | 0.0603 | 0.1805 |
+| 24000 | 0.5346 | 0.8390 | 0.2371 | 0.0658 | 0.1704 |
+| 28000 | 0.5449 | 0.8468 | 0.2293 | 0.0743 | 0.1684 |
+| 32000 | 0.5337 | 0.8478 | 0.2280 | 0.0719 | 0.1659 |
+| 36000 | 0.5091 | 0.8537 | 0.2233 | 0.0771 | 0.1598 |
+| 40000 | 0.5179 | 0.8560 | 0.2205 | 0.0755 | 0.1611 |
+| 44000 | 0.5038 | 0.8591 | 0.2177 | 0.0751 | 0.1570 |
+| 48000 | 0.5059 | 0.8598 | 0.2167 | 0.0770 | 0.1569 |
+
+**v4-gs (`eps_softmin`), 16 points**
+
+| step | val_loss | AUC | EER | TPR@1e-2 | Brier |
+|---|---|---|---|---|---|
+| 3000 | 0.7272 | 0.5964 | 0.4387 | 0.0138 | 0.2669 |
+| 6000 | 0.6335 | 0.7267 | 0.3357 | 0.0280 | 0.2245 |
+| 9000 | 0.6355 | 0.7720 | 0.3024 | 0.0479 | 0.2232 |
+| 12000 | 0.5871 | 0.7815 | 0.2898 | 0.0439 | 0.1973 |
+| 15000 | 0.5660 | 0.8034 | 0.2700 | 0.0523 | 0.1870 |
+| 18000 | 0.5166 | 0.8247 | 0.2500 | 0.0581 | 0.1710 |
+| 21000 | 0.5475 | 0.8213 | 0.2558 | 0.0665 | 0.1787 |
+| 24000 | 0.5500 | 0.8313 | 0.2460 | 0.0608 | 0.1784 |
+| 27000 | 0.5204 | 0.8350 | 0.2405 | 0.0619 | 0.1679 |
+| 30000 | 0.5277 | 0.8363 | 0.2386 | 0.0654 | 0.1689 |
+| 33000 | 0.5468 | 0.8408 | 0.2347 | 0.0609 | 0.1714 |
+| 36000 | 0.5345 | 0.8504 | 0.2261 | 0.0715 | 0.1649 |
+| 39000 | 0.5214 | 0.8531 | 0.2232 | 0.0708 | 0.1612 |
+| 42000 | 0.5196 | 0.8527 | 0.2229 | 0.0714 | 0.1612 |
+| 45000 | 0.5124 | 0.8562 | 0.2197 | 0.0732 | 0.1589 |
+| 48000 | 0.5218 | 0.8565 | 0.2196 | 0.0737 | 0.1604 |
+
+**v4.1-gs (sink + learned text / relative-bias audio positions), 20 points**
+
+| step | val_loss | AUC | EER | TPR@1e-2 | Brier |
+|---|---|---|---|---|---|
+| 2500 | 0.7290 | 0.5269 | 0.4838 | 0.0106 | 0.2661 |
+| 5000 | 0.6646 | 0.6849 | 0.3707 | 0.0256 | 0.2363 |
+| 7500 | 0.5916 | 0.7548 | 0.3135 | 0.0396 | 0.2029 |
+| 10000 | 0.6002 | 0.7805 | 0.2912 | 0.0454 | 0.2069 |
+| 12500 | 0.5460 | 0.7945 | 0.2781 | 0.0390 | 0.1841 |
+| 15000 | 0.5572 | 0.8169 | 0.2606 | 0.0608 | 0.1824 |
+| 17500 | 0.5360 | 0.8279 | 0.2464 | 0.0538 | 0.1751 |
+| 20000 | 0.5159 | 0.8352 | 0.2418 | 0.0512 | 0.1678 |
+| 22500 | 0.5039 | 0.8470 | 0.2278 | 0.0644 | 0.1612 |
+| 25000 | 0.5307 | 0.8459 | 0.2314 | 0.0753 | 0.1694 |
+| 27500 | 0.5755 | 0.8465 | 0.2306 | 0.0610 | 0.1723 |
+| 30000 | 0.5286 | 0.8559 | 0.2188 | 0.0693 | 0.1613 |
+| 32500 | 0.5427 | 0.8576 | 0.2178 | 0.0686 | 0.1624 |
+| 35000 | 0.5497 | 0.8590 | 0.2181 | 0.0704 | 0.1644 |
+| 37500 | 0.5191 | 0.8646 | 0.2134 | 0.0778 | 0.1573 |
+| 40000 | 0.5120 | 0.8652 | 0.2114 | 0.0808 | 0.1558 |
+| 42500 | 0.5196 | 0.8666 | 0.2113 | 0.0755 | 0.1569 |
+| 45000 | 0.5058 | 0.8687 | 0.2077 | 0.0803 | 0.1532 |
+| 47500 | 0.5136 | 0.8678 | 0.2091 | 0.0810 | 0.1549 |
+| 50000 | 0.5151 | 0.8683 | 0.2084 | 0.0814 | 0.1548 |
+
+### 3.5 Reading
+
+* **The encoder dominates the readout by an order of magnitude.** At the same readout and
+  the same recipe, zh-en-3M beats GigaSpeech KWS by **+0.066 … +0.076 AUC** and
+  **0.131–0.134 vs 0.208–0.220 EER**; at the deployment-relevant operating point
+  (TPR at 1 % FPR) the gap is roughly **2×** (0.157–0.183 vs 0.074–0.081), and Brier is
+  0.106–0.109 vs 0.153–0.159. Changing the readout moves AUC by at most ±0.012.
+* **v4.1 is the best readout for both encoders** (+0.003 AUC on zh-en, +0.010/+0.012 on
+  GigaSpeech over v3/v4), at 2–2.5× the per-step cost.
+* **v3 vs v4 has no consistent winner**: on zh-en v4 is ahead by 0.0007 (noise), on
+  GigaSpeech v3 is ahead by 0.003. Do not claim `eps_softmin` > `eps_mean` from these runs.
+* **The GigaSpeech curves are still creeping up at 48–50 k** (v4.1: 0.8652 @40 k → 0.8687
+  @45 k) while all three zh-en runs had plateaued, so the GigaSpeech encoder is
+  undertrained at 50 k steps — but the size of the gap suggests an encoder/pretraining
+  mismatch with this English LibriPhrase-style query task rather than a step-count issue.
+* Low-FPR ranking is closer than the global AUC suggests (pAUC(≤1 %) 0.517–0.518 GS vs
+  0.538–0.543 zh-en), but the practical 1 %-FPR operating point is where the 2× gap shows.
+* Metric noise is the same as §2.3 (±0.002 AUC / ±0.005 EER), so only the encoder gap is
+  decisive here.
+
+## 4. Throughput and concurrency measurements
+
+### 4.1 Batch-size sweep (v4.1 config, 30–40 steps per point, steady-state rates)
 
 | batch | workers | steady state | samples/s |
 | --- | --- | --- | --- |
@@ -160,7 +292,7 @@ before it was re-tuned to 2500).
 Throughput is flat (~276–300 samples/s): the V100 is saturated at batch 128. Larger
 batches only lengthen each step (and batch 256 OOMs for the v7 readout: 31.7 GiB requested).
 
-### 3.2 Per-step cost by readout
+### 4.2 Per-step cost by readout
 
 | readout | steady state | per step | GPU util | VRAM |
 | --- | --- | --- | --- | --- |
@@ -169,7 +301,7 @@ batches only lengthen each step (and batch 256 OOMs for the v7 readout: 31.7 GiB
 | v4.1 | 2.28 steps/s | 0.44 s | 88 % solo | 2.1 GB |
 | v7 keyword-filler | 0.26–0.29 steps/s | 3.4–3.9 s | 20–25 % | 15–25 GB |
 
-### 3.3 Running several readouts at once
+### 4.3 Running several readouts at once
 
 | scenario | v4.1 | v4 | v3 | aggregate | GPU util | VRAM |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -183,7 +315,7 @@ throughput; two heavy runs would just split the same saturated GPU. The heavy ru
 for it (2.28 → 1.27 steps/s) but recovers completely once the light runs finish. CPU load
 reached 7.4 of 10 cores with three runs; do not add a fourth.
 
-### 3.4 Validation cost
+### 4.4 Validation cost
 
 | measurement | value |
 | --- | --- |
@@ -191,7 +323,7 @@ reached 7.4 of 10 cores with three runs; do not add a fourth.
 | 50k-step run with `val_check_interval=2500` (20 validations) | ~44 min of validation |
 | 2,048-row sample (16 batches), same workers | 31 s → looks like 1.94 s/batch — **fixed start-up dominates a tiny sample; do not extrapolate** |
 
-## 4. Aborted run — v7 keyword-filler
+## 5. Aborted run — v7 keyword-filler
 
 | item | value |
 | --- | --- |
@@ -205,13 +337,16 @@ The same model/config reached `loss_total 20.16, loss_utt_raw 17.26,
 loss_seq_weighted 2.90, illegal_path_rate 0.0078` in the single-step smoke test, and
 50 steps took 194.8 s (`runs.csv`).
 
-## 5. Artefacts (exported best-val_AUC weights)
+## 6. Artefacts (exported best-val_AUC weights)
 
 | run | exported checkpoint | stamp | size |
 | --- | --- | --- | --- |
 | v3 | `data/dma-kws/exp/stage2_qbyt/checkpoints/v3-musan-zhen3m-50k/v3-musan-zhen3m-50k/version_1/stage2_step048000.pt` | version 3, `mode=eps_mean`, no extensions | 15.5 MB |
 | v4 | `data/dma-kws/exp/stage2_qbyt/checkpoints/v4-musan-zhen3m-50k/v4-musan-zhen3m-50k/version_1/stage2_step048000.pt` | version 4, `mode=eps_softmin`, no extensions | 15.5 MB |
 | v4.1 | `data/dma-kws/exp/stage2_qbyt/checkpoints/v41-musan-zhen3m-50k/v41-musan-zhen3m-50k/version_9/stage2_step047500.pt` | version 4, `eps_softmin`, `sink_token=true`, learned text / relative-bias audio | 15.5 MB |
+| v3 (GS) | `data/dma-kws/exp/stage2_qbyt/checkpoints/v3-musan-gs-50k/v3-musan-gs-50k/version_0/stage2_step048000.pt` | version 3, `mode=eps_mean`, no extensions | 15.5 MB |
+| v4 (GS) | `data/dma-kws/exp/stage2_qbyt/checkpoints/v4-musan-gs-50k/v4-musan-gs-50k/version_0/stage2_step048000.pt` | version 4, `mode=eps_softmin`, no extensions | 15.5 MB |
+| v4.1 (GS) | `data/dma-kws/exp/stage2_qbyt/checkpoints/v41-musan-gs-50k/v41-musan-gs-50k/version_0/stage2_step045000.pt` | version 4, `eps_softmin`, `sink_token=true`, learned text / relative-bias audio | 15.5 MB |
 
 Each file carries `model_state_dict`, `config`, `qbyt_readout`, `qbyt_readout_version`,
 `tokenizer_dict_path`, `vocab_size`, `qbyt_alignment_spec` and `dma_kws_run_context`.
@@ -221,7 +356,7 @@ Per-run logs/metrics/hparams live under
 is appended to `data/dma-kws/exp/stage2_qbyt/runs.csv`.
 Console transcripts of the tmux panes: `data/dma-kws/exp/stage2_qbyt/<session>.pane.log`.
 
-## 6. Evaluation status
+## 7. Evaluation status
 
 | evaluation | status |
 | --- | --- |
@@ -229,9 +364,11 @@ Console transcripts of the tmux panes: `data/dma-kws/exp/stage2_qbyt/<session>.p
 | MUSAN held-out false alarms per 24 h (`processed/musan_split/eval_musan.list`, 902 recordings / 43.72 h, 51,994 windows) | ✅ **0 accepts at threshold 0.5 → 0 次/24h for v3, v4 and v4.1**; worst-case background score 0.019 / 0.015 / 0.409, so v4.1's margin is ~20× smaller ([False-Alarm Evaluation](False-Alarm-Evaluation)) |
 | MUSAN 1 s window / 1 s hop grid (156,929 windows) | ✅ **v4.1 29.1 < v3 35.7 < v4 45.0 false accepts per 24 h at threshold 0.5**; the 3 s grid is still 0 for all three — the shorter window inverts the ordering and shows the 0.5 threshold is calibrated for 3 s inputs ([False-Alarm Evaluation](False-Alarm-Evaluation) §7.2) |
 | LibriSpeech `train-other-500` false alarms per 24 h (stride-6 subset, 24,782 flac / 82.71 h, 87,243 windows) | ✅ **v3, v4 and v4.1 all 0 accepts @ 0.5 → 0 次/24h**; worst-case scores 0.082 / 0.036 / 0.234 and at threshold 0.1 only v4.1 leaks (6.4 per 24 h vs 0.29) ([False-Alarm Evaluation](False-Alarm-Evaluation) §7.3) |
+| GigaSpeech-encoder models (v3 / v4 / v4.1 GS) — LibriPhrase AUC/EER/TPR | ✅ done (§3) |
+| GigaSpeech-encoder models — MUSAN / LibriSpeech false alarms per 24 h | ⏳ not run yet |
 | Two-stage (QbyT + verifier) end-to-end event rate | ⏳ planned |
 
-## 7. Reproducing a run
+## 8. Reproducing a run
 
 ```bash
 # start (or restart) a run in tmux; the session is named after the experiment unless given
@@ -248,7 +385,7 @@ EXTRA_OVERRIDES="run.resume_from=data/dma-kws/exp/stage2_qbyt/checkpoints/<run>/
   bash scripts/start_stage2_qbyt_tmux.sh <experiment> <session>
 ```
 
-## 8. Template for the next record
+## 9. Template for the next record
 
 ```markdown
 ### <run name> — <date>
