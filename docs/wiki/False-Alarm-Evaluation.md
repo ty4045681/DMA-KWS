@@ -204,6 +204,54 @@ TPR@1 % FPR 0.0737–0.0814) sit ~0.07 AUC below the zh-en models, so expect a v
 higher false-accept rate at the same 0.5 threshold. Run the §8 loop with these
 `experiment:checkpoint:tag` triples and compare against the zh-en artefacts above.
 
+### 7.6 Author SI-KWS (paper-original v1) baseline — different pipeline
+
+The authors' released Stage-2 SI checkpoint (`155k-v2-ft.ckpt` → imported
+`data/dma-kws/exp/author_v1/stage2_v1_si.pt`, `qbyt_readout_version=1`) is a
+**different pipeline** and has to be scored with it (see
+[Author v1 checkpoints](Author-v1-checkpoints)): Wenet **Conformer** encoder,
+Kaldi/Wenet fbank (`dither=0.1`, `snip_edges=true`, no resampling), **full context**
+(`chunking=off`), the 73-symbol dictionary and fp32 scores. Its score is defined on the
+padded text-then-audio concatenation, so clips are scored **one at a time**; these passes
+were therefore run as **4 shards** (`prep.num_shards/prep.shard_index`, each shard in its
+own `shard_<i>/` directory, merged with `scripts/merge_musan_fa.py`).
+
+| threshold | MUSAN 3 s — 43.72 h / 51,994 windows | MUSAN 1 s — 156,929 windows | LibriSpeech subset — 82.71 h / 87,243 windows |
+| --- | --- | --- | --- |
+| **0.5** | **2,266.8 per 24 h** (4,129 accepts) | **10,212.9 per 24 h** (18,603) | **226.3 per 24 h** (780) |
+| 0.9 | 174.0 | 2,031.8 | 28.7 |
+| 0.95 | 46.7 | 766.9 | 11.6 |
+| 0.99 | 6.6 | 42.8 | 0.9 |
+| ≈1 per 24 h at threshold | ~0.9999 | > 0.99 | 0.9925 |
+| max / p99.99 score | 0.9999 / 0.9976 | 0.9973 / 0.9945 | 0.9925 / 0.9767 |
+| per subset @ 0.5 | music 3,238 (17.0 h) · noise 662 (2.5 h) · speech 229 (24.2 h) | – | – |
+
+LibriPhrase hard split — the same 270,684 rows as §7.1, scored through the author's
+pipeline (`scripts/eval_stage2_clips.py +experiment=v1_eval_author_si`):
+
+| metric | **author v1** | our v3 | our v4 | our v4.1 |
+| --- | --- | --- | --- | --- |
+| AUC | **0.959524** | 0.931601 | 0.932327 | 0.935007 |
+| EER | **0.098613** | 0.132239 | 0.133621 | 0.131075 |
+| TPR@FPR1e-2 | **0.287716** | 0.156781 | 0.170258 | 0.183210 |
+| TPR@FPR1e-3 | **0.041517** | 0.018331 | 0.017223 | 0.020533 |
+| pAUC(≤1e-2) | **0.574881** | 0.538021 | 0.539058 | 0.543203 |
+| Brier / ECE | 0.084738 / 0.077793 | 0.105891 / 0.063258 | 0.106843 / 0.041725 | 0.108810 / 0.057976 |
+| FPR @ 0.5 / EER threshold | 0.1775 / 0.942 | ~0.20 | ~0.22 | ~0.22 |
+
+**How to read it.** The release is clearly the stronger *discriminator* (+2.5 AUC points,
+TPR@1 % FPR 0.288 vs 0.183) but the weaker *background rejector*: at threshold 0.5 — where
+its hard-negative FPR (0.1775) is comparable to ours (~0.18–0.22) — its MUSAN FA rate is
+~2,267 per 24 h versus 0 for all three of our readouts. Caveats: the released file is a
+single **step-3000 snapshot** (the authors evaluate `avg_10`, so their published numbers
+may differ), and score scales are **not comparable across readouts** (0.5 sits far below
+this model's EER threshold of 0.942). A threshold-matched comparison (same hard-split
+FPR/TPR) is the honest one and is the next step.
+
+Artifacts: `data/dma-kws/exp/stage2_qbyt/eval_author_v1/lp-hard/` and
+`data/dma-kws/exp/stage2_qbyt/fa/author-v1-{musan,ls-other,musan-1s0}/merged/`; campaign
+script `/tmp/author_v1_sharded.sh`, shard logs `/tmp/av1_*.log`.
+
 ## 8. Reproduce
 
 ```bash
