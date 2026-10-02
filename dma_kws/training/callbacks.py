@@ -446,6 +446,8 @@ def build_run_summary_rows(
                     ("qbyt_readout_temperature", str(score.value.temperature)),
                 ]
             )
+        elif score.family == "v1":
+            rows.append(("qbyt_readout", score.value.readout))
         else:
             alignment = score.value
             rows.extend(

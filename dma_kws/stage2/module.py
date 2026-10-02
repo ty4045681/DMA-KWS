@@ -18,7 +18,10 @@ from dma_kws.inference.score_calibration import PositiveAffineCalibrator
 from dma_kws.nn import build_encoder, run_encoder
 from dma_kws.stage2.losses import compute_stage2_losses
 from dma_kws.stage2.model_factory import build_qbyt
-from dma_kws.stage2.objective import resolve_sequence_objective
+from dma_kws.stage2.objective import (
+    QBYT_V1_SEQUENCE_OBJECTIVE,
+    resolve_sequence_objective,
+)
 from dma_kws.stage2.readout import resolve_qbyt_score_spec
 from dma_kws.training.checkpoint_io import (
     assert_qbyt_readout_version,
@@ -144,6 +147,20 @@ class Stage2LightningModule(pl.LightningModule):
 
         sequence_objective = resolve_sequence_objective(stage2)
         self.qbyt_score = resolve_qbyt_score_spec(stage2)
+        if self.qbyt_score.family == "v1":
+            # The paper v1 release has one fixed training objective, and the
+            # dataset derives its sequence targets from the same config. A
+            # mismatch would train membership-shaped labels with progress
+            # semantics (or the reverse), so refuse instead of guessing.
+            if sequence_objective != QBYT_V1_SEQUENCE_OBJECTIVE:
+                raise ValueError(
+                    "QbyT v1 is trained with the paper's fixed objective "
+                    f"({QBYT_V1_SEQUENCE_OBJECTIVE.describe()}) but "
+                    "stage2.sequence_loss resolves to "
+                    f"({sequence_objective.describe()}). Remove "
+                    "stage2.sequence_loss or set it to the v1 values."
+                )
+            sequence_objective = QBYT_V1_SEQUENCE_OBJECTIVE
         self.qbyt_alignment = (
             self.qbyt_score.value
             if self.qbyt_score.family != "pooling"
@@ -161,12 +178,25 @@ class Stage2LightningModule(pl.LightningModule):
         if not isinstance(negative_tail_cfg, dict):
             raise ValueError("stage2.negative_tail_loss must be a mapping")
         negative_tail_enabled = bool(negative_tail_cfg.get("enabled", False))
+        if negative_tail_enabled and self.qbyt_score.family == "v1":
+            raise ValueError(
+                "stage2.negative_tail_loss is not supported for QbyT v1; the "
+                "paper v1 objective is utterance BCE plus full-prefix sequence BCE"
+            )
         if negative_tail_enabled and self.qbyt_score.family == "bounded":
             raise ValueError(
                 "stage2.negative_tail_loss is not supported for bounded "
                 f"QbyT (v5); this run is {self.qbyt_score.family} v{self.qbyt_score.version}"
             )
         background_cfg = stage2.get("background_negative", {}) or {}
+        if (
+            isinstance(background_cfg, dict)
+            and bool(background_cfg.get("enabled", False))
+            and self.qbyt_score.family == "v1"
+        ):
+            raise ValueError(
+                "stage2.background_negative is not supported for QbyT v1"
+            )
         if (
             isinstance(background_cfg, dict)
             and bool(background_cfg.get("enabled", False))
@@ -197,6 +227,11 @@ class Stage2LightningModule(pl.LightningModule):
             self._checkpoint_config["stage2"]["qbyt_readout"] = (
                 self.qbyt_score.value.as_dict()
             )
+        elif self.qbyt_score.family == "v1":
+            # v1 carries no tunable spec; the default qbyt_alignment left in the
+            # stamped config would make the checkpoint fail its own loader.
+            self._checkpoint_config["stage2"].pop("qbyt_alignment", None)
+            self._checkpoint_config["stage2"].pop("qbyt_readout", None)
         else:
             self._checkpoint_config["stage2"][
                 "qbyt_alignment"
@@ -210,6 +245,11 @@ class Stage2LightningModule(pl.LightningModule):
         # trunk; it is not required by the adapter-free architecture.
         adapter_cfg = stage2.get("phoneme_adapter", {}) or {}
         self.adapter_enabled = bool(adapter_cfg.get("enabled", False))
+        if self.adapter_enabled and self.qbyt_score.family == "v1":
+            raise ValueError(
+                "stage2.phoneme_adapter is not supported for QbyT v1; the paper "
+                "v1 matcher reads the encoder output directly"
+            )
         self.freeze_adapter = self.adapter_enabled and bool(adapter_cfg.get("freeze", False))
         # There is no trunk to apply CTC to when the adapter is off, so keep the
         # reported weight honest instead of leaving a configured value dangling.
@@ -569,12 +609,17 @@ class Stage2LightningModule(pl.LightningModule):
                 with_log_probs=bool(self.ctc_weight),
             )
 
-        logits, seq_logits = self.qbyt(
-            speech,
-            anchor,
-            speech_lengths=encoder_lens,
-            text_lengths=anchor_lengths,
-        )
+        if self.qbyt_score.family == "v1":
+            # The paper v1 scorer accepts no mask or length inputs: its readout
+            # is the final position of the padded concatenation by construction.
+            logits, seq_logits = self.qbyt(speech, anchor)
+        else:
+            logits, seq_logits = self.qbyt(
+                speech,
+                anchor,
+                speech_lengths=encoder_lens,
+                text_lengths=anchor_lengths,
+            )
         return logits, seq_logits, (ctc_log_probs, encoder_mask)
 
     def on_train_start(self) -> None:
@@ -685,6 +730,25 @@ class Stage2LightningModule(pl.LightningModule):
         anchor_lengths = batch["anchor"].ne(0).sum(dim=1).to(dtype=torch.long)
         labels = batch["label"]
         utt_sample_mask = torch.ones(labels.shape[0], dtype=torch.bool, device=labels.device)
+        if self.qbyt_score.family == "v1":
+            total_loss, losses = compute_stage2_losses(
+                logits=logits,
+                seq_logits=seq_logits,
+                labels=labels,
+                seq_labels=batch["seq_label"],
+                seq_label_mask=batch["seq_label_mask"],
+                seq_progress_weight=self.seq_progress_weight,
+                seq_normalization=self.seq_normalization,
+                negative_tail_weight=0.0,
+                negative_tail_fraction=self.negative_tail_fraction,
+                # The paper supervises every masked anchor position, including
+                # the final one, with token normalization.
+                include_final_position=True,
+                ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
+                ctc_weight=self.ctc_weight,
+            )
+            losses["utt_sample_mask"] = utt_sample_mask
+            return total_loss, losses, logits
         if self.qbyt_score.family == "pooling":
             from dma_kws.stage2.losses_pooling import (
                 compute_stage2_losses as compute_pooling_losses,

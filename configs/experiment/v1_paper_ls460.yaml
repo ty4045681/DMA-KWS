@@ -1,0 +1,62 @@
+# @package _global_
+# Paper-original v1 (SI) QbyT: Stage II init on LibriPhrase-460.
+#
+# Mirrors the author's train/two_stage/train.py: the encoder is trained from
+# scratch together with QbyT (no init checkpoint), Adam lr 1e-3, cosine warmup
+# 2500, 50k steps, hard_negative_ratio 1.
+defaults:
+  - override /paths: default
+
+tokenizer:
+  dict_path: data/dict/lang_char_v1_73.txt
+
+paths:
+  libriphrase460_root: data/dma-kws/raw/LibriPhrase-460
+
+training:
+  recipe: v1-init-ls-460
+
+stage1:
+  train_splits:
+    - train-clean-460
+  dev_splits:
+    - dev-clean
+
+stage2:
+  qbyt_readout_version: 1
+  # v1 has no tunable alignment; explicitly null so the inherited default
+  # keyword-filler alignment cannot leak into the stamped config.
+  qbyt_alignment: null
+  sequence_loss:
+    target_mode: membership
+    progress_weight: 1.0
+    normalization: token
+  negative_tail_loss:
+    enabled: false
+  background_negative:
+    enabled: false
+  phoneme_adapter:
+    enabled: false
+
+  parquet_file: data/dma-kws/processed/stage2_qbyt/aggregated_segments_with_g2p_distance.parquet
+  wav_dir: data/dma-kws/features/fbank
+  hard_negative_ratio: 1
+  sample_lens: 100000000
+  batch_size_per_gpu: 512
+  learning_rate: 0.001
+  warmup_steps: 2500
+  total_scheduler_steps: 50000
+  max_steps: 50000
+  num_workers: 16
+  accumulate_grad_batches: 2
+  strategy: ddp
+  precision: 32-true
+  gradient_clip_val: 1.0
+  freeze_encoder: false
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v1-init-ls-460
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v1-init-ls-460
+  run_name: v1-init-ls-460
+  eval:
+    split: hard
+    test_dir: data/dma-kws/raw/LibriPhrase-460/eval
+    batch_size: 256

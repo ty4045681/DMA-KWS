@@ -41,7 +41,11 @@ batch-padding dependent by construction, so the verifier scores v1 clips one at
 a time and must never batch them. It has no tunable spec and no alignment
 fields; the raw author releases are unversioned until
 `scripts/import_author_v1_checkpoints.py` stamps them with version 1. The
-multimodal enrolment variants (SD) are not supported.
+multimodal enrolment variants (SD) are not supported. Training v1 uses the
+membership sequence target and supervises every masked position
+(token-normalized), unlike the v2-v4 progress loss; the module rejects a v1 run
+whose `stage2.sequence_loss` disagrees, and refuses the phoneme adapter,
+negative-tail and background-negative features.
 
 Loaders (`assert_qbyt_readout_version`) accept any supported checkpoint that
 decodes. When a run config is supplied, pooling v2/v3/v4 match on the full

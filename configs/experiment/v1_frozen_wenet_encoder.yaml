@@ -1,0 +1,16 @@
+# @package _global_
+# Paper-original v1 (SI) QbyT with a frozen encoder.
+#
+# Mirrors the author's train/two_stage/train_frozen.py, the frozen-encoder
+# control for the 155k-v2-ft fine-tune. Only QbyT receives gradients.
+defaults:
+  - v1_paper_ls460
+
+training:
+  recipe: v1-frozen-wenet-encoder
+
+stage2:
+  freeze_encoder: true
+  run_name: v1-frozen-wenet-encoder
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v1-frozen-wenet-encoder
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v1-frozen-wenet-encoder

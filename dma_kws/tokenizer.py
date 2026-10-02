@@ -240,8 +240,15 @@ def tokenize_phoneme_string(tokenizer, g2p_text: str) -> list[int]:
 
 
 SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX = "ordered_contiguous_prefix"
+#: Paper-original v1 target: 1 when the anchor phone occurs anywhere in the
+#: clip's phoneme sequence. It has no progress ordering and no keyword-
+#: containment gate, matching the author's membership formula
+#: (1 if x in query_seq else 0, for x in anchor_seq).
+SEQ_LABEL_MEMBERSHIP = "membership"
 DEFAULT_SEQ_LABEL_MODE = SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
-SEQ_LABEL_MODES = frozenset({SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX})
+SEQ_LABEL_MODES = frozenset(
+    {SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX, SEQ_LABEL_MEMBERSHIP}
+)
 
 
 def normalize_seq_label_mode(mode: str) -> str:
@@ -289,10 +296,18 @@ def build_seq_label(
     context is allowed, but insertions, reordering and reusing one occurrence of
     a repeated phoneme cannot advance the target.
 
-    Ids remain stress-marked, so e.g. ``AH0`` and ``AH1`` are distinct.
+    With mode="membership" (the paper-original v1 target) every position is
+    independent: it is 1 exactly when that anchor phone occurs anywhere in the
+    query. That is what the v1 checkpoint was trained on, so its training runs
+    must use the membership mode rather than the ordered-prefix default.
+
+    Ids remain stress-marked, so for example AH0 and AH1 are distinct.
     """
     mode = normalize_seq_label_mode(mode)
     if not anchor_ids:
         raise ValueError("anchor_ids must contain at least one phoneme")
+    if mode == SEQ_LABEL_MEMBERSHIP:
+        present = set(query_ids)
+        return [1 if token in present else 0 for token in anchor_ids]
     matched = _longest_contiguous_anchor_prefix(anchor_ids, query_ids)
     return [1] * matched + [0] * (len(anchor_ids) - matched)

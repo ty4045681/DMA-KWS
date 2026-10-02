@@ -269,6 +269,10 @@ def collect_hparams(
         if score.family == "pooling":
             hparams["qbyt_readout_mode"] = score.value.mode
             hparams["qbyt_readout_temperature"] = float(score.value.temperature)
+        elif score.family == "v1":
+            # The paper v1 contract has no alignment fields; the readout name is
+            # the whole spec.
+            hparams["qbyt_readout"] = score.value.readout
         else:
             alignment = score.value
             hparams.update(

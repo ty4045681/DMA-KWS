@@ -249,3 +249,181 @@ def test_v1_multi_query_scoring_delegates_to_single_clip_path() -> None:
     )
     assert len(matrix) == 2 and len(matrix[0]) == 2
     assert stub.delegated == (2, 2, False)
+
+# ---------------------------------------------------------------------------
+# Training support (paper v1 loss, labels, and module wiring)
+# ---------------------------------------------------------------------------
+
+
+def test_membership_seq_label_matches_upstream_formula() -> None:
+    from dma_kws.tokenizer import (
+        SEQ_LABEL_MEMBERSHIP,
+        SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX,
+        build_seq_label,
+    )
+
+    anchor = [10, 11, 12, 13]
+    query = [13, 99, 10, 11]
+    assert build_seq_label(anchor, query, mode=SEQ_LABEL_MEMBERSHIP) == [1, 1, 0, 1]
+    # The ordered default is unchanged and still requires a contiguous prefix.
+    assert build_seq_label(
+        anchor, query, mode=SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
+    ) == [1, 1, 0, 0]
+    assert build_seq_label(
+        [1, 2, 3], [1, 2, 3], mode=SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
+    ) == [1, 1, 1]
+
+
+def test_v1_loss_matches_the_paper_formula() -> None:
+    import torch.nn.functional as F
+
+    from dma_kws.stage2.losses import compute_stage2_losses
+
+    torch.manual_seed(0)
+    logits = torch.randn(3)
+    labels = torch.tensor([1, 0, 1])
+    seq_logits = torch.randn(3, 4)
+    seq_labels = torch.tensor([[1, 1, 0, 0], [0, -1, -1, -1], [1, 1, 1, 1]])
+    seq_mask = (seq_labels != -1).float()
+
+    total, losses = compute_stage2_losses(
+        logits=logits,
+        seq_logits=seq_logits,
+        labels=labels,
+        seq_labels=seq_labels,
+        seq_label_mask=seq_mask,
+        seq_progress_weight=1.0,
+        seq_normalization="token",
+        include_final_position=True,
+    )
+    reference_utt = F.binary_cross_entropy_with_logits(logits, labels.float())
+    reference_seq = F.binary_cross_entropy_with_logits(
+        seq_logits,
+        seq_labels.clamp_min(0).float(),
+        weight=seq_mask,
+        reduction="sum",
+    ) / seq_mask.sum()
+    assert torch.allclose(losses["utt_loss"], reference_utt)
+    assert torch.allclose(losses["seq_progress_loss"], reference_seq, atol=1e-6)
+    assert torch.allclose(total, reference_utt + reference_seq, atol=1e-6)
+
+    # The default still excludes the final valid position, so the two objectives
+    # are not silently interchangeable.
+    _, default_losses = compute_stage2_losses(
+        logits=logits,
+        seq_logits=seq_logits,
+        labels=labels,
+        seq_labels=seq_labels,
+        seq_label_mask=seq_mask,
+        seq_progress_weight=1.0,
+        seq_normalization="token",
+    )
+    assert not torch.allclose(
+        default_losses["seq_progress_loss"], reference_seq, atol=1e-6
+    )
+
+
+def _tiny_v1_module_config() -> dict:
+    return {
+        "stage1": {
+            "input_dim": 80,
+            "encoder_output_dim": 16,
+            "attention_heads": 2,
+            "linear_units": 32,
+            "num_blocks": 1,
+            "dropout_rate": 0.0,
+            "positional_dropout_rate": 0.0,
+            "attention_dropout_rate": 0.0,
+            "cnn_module_kernel": 3,
+        },
+        "stage2": {
+            "encoder_output_dim": 16,
+            "qbyt_embed_dim": 8,
+            "qbyt_layers": 1,
+            "qbyt_readout_version": 1,
+            "sequence_loss": {
+                "target_mode": "membership",
+                "progress_weight": 1.0,
+                "normalization": "token",
+            },
+            "learning_rate": 1e-3,
+            "warmup_steps": 2,
+            "total_scheduler_steps": 10,
+            "max_steps": 10,
+        },
+    }
+
+
+def test_v1_module_training_step_and_checkpoint_stamp() -> None:
+    from unittest.mock import MagicMock
+
+    pytest.importorskip("pytorch_lightning")
+    from dma_kws.stage2.module import Stage2LightningModule
+
+    torch.manual_seed(0)
+    module = Stage2LightningModule(_tiny_v1_module_config(), vocab_size=73)
+    assert module.qbyt_score.family == "v1"
+    assert module.seq_progress_weight == 1.0
+    assert module.seq_normalization == "token"
+
+    batch = {
+        "feat": torch.randn(2, 20, 80),
+        "feat_lengths": torch.tensor([20, 20]),
+        "anchor": torch.tensor([[3, 4, 5], [6, 7, 8]]),
+        "label": torch.tensor([1, 0]),
+        "seq_label": torch.tensor([[1, 1, 0], [0, 0, 0]]),
+        "seq_label_mask": torch.ones(2, 3),
+    }
+    module.optimizers = MagicMock(
+        return_value=MagicMock(param_groups=[{"lr": 1e-3}])
+    )
+    loss = module.training_step(batch, 0)
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert module.qbyt.gru.weight_ih_l0.grad is not None
+    assert module.encoder.encoders[0].self_attn.linear_q.weight.grad is not None
+
+    checkpoint: dict = {}
+    module.on_save_checkpoint(checkpoint)
+    assert checkpoint["qbyt_readout_version"] == 1
+    assert "qbyt_alignment_spec" not in checkpoint
+    stamped_stage2 = checkpoint["config"]["stage2"]
+    assert stamped_stage2["qbyt_readout_version"] == 1
+    assert "qbyt_alignment" not in stamped_stage2
+    assert stamped_stage2["sequence_loss"]["target_mode"] == "membership"
+    assert stamped_stage2["sequence_loss"]["progress_weight"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        (
+            {
+                "sequence_loss": {
+                    "target_mode": "ordered_contiguous_prefix",
+                    "progress_weight": 0.3,
+                    "normalization": "sample",
+                }
+            },
+            "fixed objective",
+        ),
+        (
+            {"negative_tail_loss": {"enabled": True, "weight": 0.5, "fraction": 0.1}},
+            "negative_tail_loss is not supported",
+        ),
+        ({"background_negative": {"enabled": True}}, "background_negative is not supported"),
+        ({"phoneme_adapter": {"enabled": True}}, "phoneme_adapter is not supported"),
+    ],
+)
+def test_v1_module_rejects_unsupported_training_features(
+    patch: dict, message: str
+) -> None:
+    pytest.importorskip("pytorch_lightning")
+    from dma_kws.stage2.module import Stage2LightningModule
+
+    config = _tiny_v1_module_config()
+    config["stage2"].update(patch)
+    with pytest.raises(ValueError, match=message):
+        Stage2LightningModule(config, vocab_size=73)
+

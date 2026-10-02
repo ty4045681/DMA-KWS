@@ -58,7 +58,34 @@ this repo's imported payload on identical fbank features and requires
 agreement within 1e-5. The first run on LibriPhrase-100 audio matched to
 0.000e+00.
 
-## 4. Known differences from the paper numbers
+## 4. Training
+
+Three Hydra experiments mirror the author's train/two_stage/ scripts. All of
+them pin the 73-token dictionary, readout version 1, the membership sequence
+target and the paper's fixed objective (utterance BCE plus full-prefix sequence
+BCE at 1:1, token-normalized), and disable the features v1 never had
+(negative-tail loss, background negatives, phoneme adapter):
+
+| Config | Author script | Encoder | Data | LR | Steps |
+| --- | --- | --- | --- | --- | --- |
+| +experiment=v1_paper_ls460 | train.py | trained from scratch | LibriPhrase-460 | 1e-3 | 50k |
+| +experiment=v1_paper_ls_gs1460 | train_2.py + train_2_2ft.py | initialized from the v1 init average, unfrozen | LS+GigaPhrase-1460 (155k anchors), hard negatives 100:1 | 5e-4 | 100k |
+| +experiment=v1_frozen_wenet_encoder | train_frozen.py | frozen | LibriPhrase-460 | 1e-3 | 50k |
+
+Example: finetune from the imported author release instead of a local init:
+
+    python scripts/train_stage2_qbyt.py +experiment=v1_paper_ls_gs1460 \
+      run.init_checkpoint=data/dma-kws/exp/author_v1/stage2_v1_si.pt
+
+The module refuses to start when a v1 run asks for a different sequence
+objective or enables an unsupported feature, because the dataset derives its
+sequence targets from the same config: a mismatch would train membership-shaped
+labels with progress semantics. Every saved checkpoint is stamped with
+qbyt_readout_version=1 and the membership objective, so the exported .pt file
+loads straight into Stage2Verifier and eval_stage2_clips with a strict
+state-dict match.
+
+## 5. Known differences from the paper numbers
 
 * `155k-v2-ft.ckpt` is a single step-3000 snapshot; the author's own scripts
   evaluate `155k-v2-ft/avg_10.ckpt` (average of the last ten). Expect small

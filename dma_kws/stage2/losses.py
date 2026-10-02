@@ -77,12 +77,15 @@ def _masked_progress_bce(
     *,
     normalization: str,
     valid_path_mask: torch.Tensor | None = None,
+    include_final_position: bool = False,
 ) -> torch.Tensor:
     """BCE on non-final valid prefixes, balanced by sample or token.
 
     The final valid position is the complete keyword path and is supervised only
     by utterance BCE. Removing it here avoids training the deployed scalar twice.
-    A one-phone anchor therefore has no progress targets.
+    A one-phone anchor therefore has no progress targets. Passing True reproduces
+    the paper-original v1 objective instead, which supervises every masked
+    position with token normalization over the same positions.
     """
     valid = seq_label_mask.bool()
     if valid_path_mask is not None:
@@ -93,7 +96,7 @@ def _masked_progress_bce(
             )
         valid = valid & valid_path_mask.to(device=valid.device).bool().unsqueeze(1)
     width = valid.size(1)
-    if width:
+    if width and not include_final_position:
         positions = torch.arange(width, device=valid.device).unsqueeze(0)
         last_valid = torch.where(valid, positions, -1).amax(dim=1)
         valid = valid & positions.ne(last_valid.unsqueeze(1))
@@ -134,6 +137,7 @@ def compute_stage2_losses(
     negative_tail_weight: float = 0.0,
     negative_tail_fraction: float = 0.1,
     valid_path_mask: torch.Tensor | None = None,
+    include_final_position: bool = False,
     ctc_loss: torch.Tensor | None = None,
     ctc_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -187,6 +191,7 @@ def compute_stage2_losses(
         seq_label_mask,
         normalization=seq_normalization,
         valid_path_mask=valid_samples,
+        include_final_position=include_final_position,
     )
     seq_progress_weighted_loss = seq_progress_weight * seq_progress_loss
     seq_loss = seq_progress_weighted_loss
