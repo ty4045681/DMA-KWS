@@ -272,6 +272,9 @@ def test_membership_seq_label_matches_upstream_formula() -> None:
     assert build_seq_label(
         [1, 2, 3], [1, 2, 3], mode=SEQ_LABEL_ORDERED_CONTIGUOUS_PREFIX
     ) == [1, 1, 1]
+    # A background draw carries no query transcript, so every anchor position is
+    # 0 while the collate keeps the mask all ones: "no position is the keyword".
+    assert build_seq_label(anchor, [], mode=SEQ_LABEL_MEMBERSHIP) == [0, 0, 0, 0]
 
 
 def test_v1_loss_matches_the_paper_formula() -> None:
@@ -412,7 +415,6 @@ def test_v1_module_training_step_and_checkpoint_stamp() -> None:
             {"negative_tail_loss": {"enabled": True, "weight": 0.5, "fraction": 0.1}},
             "negative_tail_loss is not supported",
         ),
-        ({"background_negative": {"enabled": True}}, "background_negative is not supported"),
         ({"phoneme_adapter": {"enabled": True}}, "phoneme_adapter is not supported"),
     ],
 )
@@ -427,3 +429,64 @@ def test_v1_module_rejects_unsupported_training_features(
     with pytest.raises(ValueError, match=message):
         Stage2LightningModule(config, vocab_size=73)
 
+
+
+def _background_v1_module():
+    """Tiny v1 module with background negatives enabled (the B3 contract)."""
+
+    pytest.importorskip("pytorch_lightning")
+    from dma_kws.stage2.module import Stage2LightningModule
+
+    config = _tiny_v1_module_config()
+    config["stage2"]["background_negative"] = {
+        "enabled": True,
+        "probability": 0.25,
+        "audio_list_path": "/tmp/x.list",
+    }
+    return Stage2LightningModule(config, vocab_size=73)
+
+
+def test_v1_module_accepts_background_negatives() -> None:
+    """v1 trains on pure background draws.
+
+    The dataset derives an all-zero membership target over an all-ones mask for
+    them (empty query transcript), which is exactly the "no keyword anywhere"
+    supervision the paper objective expects, so the module must accept them.
+    """
+
+    from unittest.mock import MagicMock
+
+    module = _background_v1_module()
+    assert module._background_negative_enabled is True
+
+    batch = {
+        "feat": torch.randn(2, 20, 80),
+        "feat_lengths": torch.tensor([20, 20]),
+        "anchor": torch.tensor([[3, 4, 5], [6, 7, 8]]),
+        "label": torch.tensor([1, 0]),
+        "seq_label": torch.tensor([[1, 1, 0], [0, 0, 0]]),
+        "seq_label_mask": torch.ones(2, 3),
+        "background_source_id": torch.tensor([-1, 0]),
+    }
+    module.optimizers = MagicMock(
+        return_value=MagicMock(param_groups=[{"lr": 1e-3}])
+    )
+    loss = module.training_step(batch, 0)
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+
+
+def test_v1_background_target_invariant() -> None:
+    """A background row with a non-zero membership target is refused."""
+
+    module = _background_v1_module()
+    good = {
+        "background_source_id": torch.tensor([0, -1]),
+        "seq_label": torch.tensor([[0, 0, 0], [1, 0, -1]]),
+        "seq_label_mask": torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.float32),
+    }
+    module._assert_v1_background_targets(good)
+    bad = dict(good)
+    bad["seq_label"] = torch.tensor([[1, 0, 0], [1, 0, -1]])
+    with pytest.raises(ValueError, match="all-zero membership target"):
+        module._assert_v1_background_targets(bad)

@@ -189,14 +189,16 @@ class Stage2LightningModule(pl.LightningModule):
                 f"QbyT (v5); this run is {self.qbyt_score.family} v{self.qbyt_score.version}"
             )
         background_cfg = stage2.get("background_negative", {}) or {}
-        if (
+        self._background_negative_enabled = bool(
             isinstance(background_cfg, dict)
-            and bool(background_cfg.get("enabled", False))
-            and self.qbyt_score.family == "v1"
-        ):
-            raise ValueError(
-                "stage2.background_negative is not supported for QbyT v1"
-            )
+            and background_cfg.get("enabled", False)
+        )
+        # v1 accepts pure background negatives as well. The dataset already emits the
+        # contract the paper objective needs for such a draw: an empty query transcript
+        # makes build_seq_label(..., mode="membership") all zeros over an all-ones mask,
+        # i.e. "no anchor position is a keyword member", and the utterance target is 0.
+        # _forward_train_losses re-checks that invariant whenever a batch draws
+        # backgrounds. The bounded family keeps its refusal below.
         if (
             isinstance(background_cfg, dict)
             and bool(background_cfg.get("enabled", False))
@@ -718,6 +720,33 @@ class Stage2LightningModule(pl.LightningModule):
         )
         return ctc_loss
 
+    def _assert_v1_background_targets(self, batch: dict[str, torch.Tensor]) -> None:
+        """Enforce the v1 background contract on steps that draw backgrounds.
+
+        A background draw must carry utterance target 0 plus an all-zero membership
+        sequence over an all-ones mask, i.e. "no position in this audio is the
+        keyword". The dataset produces that automatically once stage2.sequence_loss
+        uses the v1 membership mode; anything else would train "background is a
+        keyword member", so refuse instead of silently training the wrong contract.
+        """
+
+        if not getattr(self, "_background_negative_enabled", False):
+            return
+        source_ids = batch.get("background_source_id")
+        if source_ids is None:
+            return
+        drawn = source_ids.ge(0)
+        if not bool(drawn.any()):
+            return
+        mask = batch["seq_label_mask"][drawn].bool()
+        if bool((batch["seq_label"][drawn].ne(0) & mask).any()):
+            raise ValueError(
+                "QbyT v1 background samples must carry an all-zero membership target; "
+                "got non-zero labels on rows with background_source_id >= 0. Use the "
+                "v1 objective (stage2.sequence_loss target_mode=membership) so the "
+                "dataset derives background targets with the membership rule."
+            )
+
     def _forward_train_losses(
         self, batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
@@ -731,6 +760,7 @@ class Stage2LightningModule(pl.LightningModule):
         labels = batch["label"]
         utt_sample_mask = torch.ones(labels.shape[0], dtype=torch.bool, device=labels.device)
         if self.qbyt_score.family == "v1":
+            self._assert_v1_background_targets(batch)
             total_loss, losses = compute_stage2_losses(
                 logits=logits,
                 seq_logits=seq_logits,

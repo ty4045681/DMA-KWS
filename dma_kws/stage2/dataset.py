@@ -379,9 +379,19 @@ class LibriPhraseTrainDataset(Dataset):
         negative_g2p = self._ngram_g2p[random_index]
         return negative_wav, negative_g2p, negative
 
-    def get_hard_negative(self, hard_negative: dict) -> tuple[dict, str, str]:
+    def get_hard_negative(
+        self, hard_negative: dict, *, fallback_index: int | None = None
+    ) -> tuple[dict, str, str]:
         hard_ngram = hard_negative["ngram"]
-        idx = self.anchor2idx[hard_ngram]
+        idx = self.anchor2idx.get(hard_ngram)
+        if idx is None:
+            # A sliced dataset (e.g. a fine-tune subset) still advertises hard
+            # negatives drawn from the full corpus. Fall back to a regular
+            # negative rather than failing when the ngram is outside this
+            # dataset's anchor set.
+            if fallback_index is None:
+                raise KeyError(hard_ngram)
+            return self.get_negative(fallback_index)
         hard_ngram_wav = self.get_random_clips(self._clips_files[idx])
         hard_ngram_g2p = self._ngram_g2p[idx]
         return hard_ngram_wav, hard_ngram_g2p, hard_ngram
@@ -412,7 +422,9 @@ class LibriPhraseTrainDataset(Dataset):
         if negative_type == 1 or hard_neg is None:
             negative_wav, negative_g2p, _negative = self.get_negative(index)
         else:
-            negative_wav, negative_g2p, _negative = self.get_hard_negative(hard_neg)
+            negative_wav, negative_g2p, _negative = self.get_hard_negative(
+                hard_neg, fallback_index=index
+            )
         return negative_wav["audio_path"], negative_g2p
 
     def __getitem__(self, index: int) -> dict:

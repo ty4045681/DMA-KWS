@@ -44,8 +44,12 @@ fields; the raw author releases are unversioned until
 multimodal enrolment variants (SD) are not supported. Training v1 uses the
 membership sequence target and supervises every masked position
 (token-normalized), unlike the v2-v4 progress loss; the module rejects a v1 run
-whose `stage2.sequence_loss` disagrees, and refuses the phoneme adapter,
-negative-tail and background-negative features.
+whose `stage2.sequence_loss` disagrees, and refuses the phoneme adapter and
+negative-tail features. Pure background negatives are allowed: the dataset
+already emits the contract the paper objective needs for such a draw (empty
+query transcript -> all-zero membership over an all-ones mask, utterance target
+0), and `_assert_v1_background_targets` re-checks it on every step that draws
+backgrounds.
 
 Loaders (`assert_qbyt_readout_version`) accept any supported checkpoint that
 decodes. When a run config is supplied, pooling v2/v3/v4 match on the full
