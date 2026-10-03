@@ -1,0 +1,28 @@
+# @package _global_
+# v4.1 (`eps_softmin` + sink token + learned text / relative-bias audio positions) QbyT + MUSAN fbank cache + the GigaSpeech ASR XL (non-streaming) encoder.
+#
+# Identical data, readout, background, 50k steps, batch 128 and validation schedule as
+# icefall_zipformer_stage2_eps_softmin_v41_musan_cached_gs_50k; only the frozen encoder differs (the GigaSpeech ASR Zipformer from
+# RESULTS.md's original XL result, 63.99 M encoder params, non-causal). Stage II sees its
+# 512-dim output, so stage2.encoder_output_dim is raised from 128 to 512.
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41_musan_cached_gs_50k
+  - override /stage1: icefall_zipformer_asr_xl
+  - _self_
+
+# The inherited experiment overlays set causal:true and a chunk_size/left_context_frames
+# deployment point (that is how the KWS and zh-en encoders run). This encoder is the
+# non-streaming ASR one, whose checkpoint has no causal_conv / chunkwise_conv keys, so the
+# causal flags and the declared stream point must be cleared again here.
+stage1:
+  causal: false
+  stream:
+    chunk_size: null
+    left_context_frames: null
+
+stage2:
+  encoder_output_dim: 512
+  init_checkpoint: ${oc.env:ASR_XL_CHECKPOINT,data/dma-kws/raw/kws-checkpoints/gigaspeech-asr-xl-2023-10-17/pretrained.pt}
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v41-musan-asrxl-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v41-musan-asrxl-50k
+  run_name: v41-musan-asrxl-50k

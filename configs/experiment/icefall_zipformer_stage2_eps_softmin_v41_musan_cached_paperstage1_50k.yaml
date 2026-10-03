@@ -1,0 +1,70 @@
+# @package _global_
+# v4.1 (`eps_softmin` + sink token + learned text / relative-bias audio positions) QbyT + MUSAN background + the **paper authors' Stage I Wenet Conformer**
+# (https://github.com/aizhiqi-work/DMA-KWS ckpts/stage1/ls-gs-1460.pt) as the frozen
+# encoder, 50k steps.
+#
+# Feature / streaming settings follow the paper source:
+#   * train/stage1_wenet/examples/librispeech-g2p/s0/conf/train_conformer_1460.yaml
+#       encoder_conf: output_size 144, attention_heads 4, linear_units 576, num_blocks 6,
+#                     cnn_module_kernel 3, normalize_before, rel_pos, rel_selfattn, swish
+#       dataset_conf.fbank_conf: num_mel_bins 80, frame_length 25, frame_shift 10
+#       (no use_dynamic_chunk -> offline / full-context training; no cmvn key -> the model
+#        consumes raw, un-normalised fbank)
+#   * wenet/dataset/processor.py compute_fbank: waveform * (1 << 15) then
+#     torchaudio.compliance.kaldi.fbank(..., energy_floor=0.0, window_type=povey),
+#     i.e. snip_edges=True, low_freq=20, high_freq=0.
+#   Our repo's default fbank profile (configs/fbank/default.yaml, backend torchaudio_kaldi,
+#   snip_edges=true, low_freq 20, high_freq 0, povey, and the 1<<15 scale in
+#   dma_kws/stage2/fbank.py) reproduces that. Only dither differs: the paper's training
+#   extracts on the fly with dither 0.1 (fresh noise every epoch = augmentation), while a
+#   precomputed tree bakes one realisation in, so the tree is extracted with dither 0.0.
+#
+# Verified: the released checkpoint's 249 encoder tensors load into this repo's conformer
+# with 0 missing / 0 unexpected / 0 shape mismatch (3.60 M encoder params), policy
+# "backend=conformer chunking=off (full context)", forward (1,200,80) -> (1,49,144).
+#
+# Needs the Wenet-profile fbank tree at features/fbank (train) and features/fbank_eval
+# (validation); every other knob matches the icefall_zipformer_stage2_eps_softmin_v41 family runs.
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41_musan_cached_gs_50k
+  - override /fbank: default
+  - _self_
+
+fbank:
+  # Wenet / torchaudio-kaldi profile (matches the paper's compute_fbank) with dither
+  # disabled: the paper draws fresh dither 0.1 noise every epoch, a precomputed tree
+  # would bake one realisation in.
+  dither: 0.0
+
+training:
+  recipe: frozen-wenet-encoder
+
+stage1:
+  encoder_type: conformer
+  causal: false
+  use_dynamic_chunk: false
+  use_dynamic_left_chunk: false
+  cnn_module_kernel: 3
+  cmvn: ""
+  encoder_output_dim: 144
+  stream:
+    chunk_size: null
+    left_context_frames: null
+
+stage2:
+  # The inherited source list points at the icefall-profile MUSAN cache; Stage II refuses
+  # to mix fbank profiles, so restate the list against the Wenet-profile cache.
+  background_negative:
+    sources:
+      - id: musan
+        weight: 1.0
+        manifest: ${paths.processed_root}/background/musan/recordings.jsonl
+        cache_manifest: ${paths.processed_root}/background/musan/cache_wenet/manifest.json
+  encoder_output_dim: 144
+  wav_dir: ${paths.feature_root}/fbank
+  init_checkpoint: ${oc.env:PAPER_STAGE1_CHECKPOINT,data/dma-kws/raw/kws-checkpoints/paper-stage1/ls-gs-1460.pt}
+  eval:
+    fbank_dir: ${paths.feature_root}/fbank_eval
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v41-musan-paperstage1-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v41-musan-paperstage1-50k
+  run_name: v41-musan-paperstage1-50k

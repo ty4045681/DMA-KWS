@@ -1,0 +1,21 @@
+# @package _global_
+# v4.1 (`eps_softmin` + sink token + learned text / relative-bias audio positions) QbyT + MUSAN background + the GigaSpeech KWS **base** checkpoint
+# (gigaspeech-20240219/exp/pretrained.pt) at the **streaming** operating point.
+#
+# Identical to the *_gsbase_fullctx_50k configs except stage1.stream: chunk_size 16 /
+# left_context_frames 64 (320 ms chunks, 1.28 s left context at 50 Hz) instead of the
+# full-context -1/-1 point. The checkpoint is the same causal one (24 causal_conv + 36
+# chunkwise tensors), so stage1.causal stays true and the weights load 0/0.
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41_musan_cached_gsbase_fullctx_50k
+  - _self_
+
+stage1:
+  stream:
+    chunk_size: 16
+    left_context_frames: 64
+
+stage2:
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v41-musan-gsbase-stream-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v41-musan-gsbase-stream-50k
+  run_name: v41-musan-gsbase-stream-50k

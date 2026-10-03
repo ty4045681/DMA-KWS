@@ -1,0 +1,54 @@
+# GigaSpeech ASR Zipformer (XL subset, non-streaming) as a frozen Stage II encoder.
+#
+# Source - icefall egs/gigaspeech/ASR/RESULTS.md, first section
+# "zipformer (zipformer + pruned stateless transducer)": the original non-streaming
+# GigaSpeech result, 65.55 M parameters, trained with --subset XL --causal 0:
+#   https://huggingface.co/yfyeung/icefall-asr-gigaspeech-zipformer-2023-10-17
+#   exp/pretrained.pt  ->  data/dma-kws/raw/kws-checkpoints/gigaspeech-asr-xl-2023-10-17/
+#
+# Verified against that checkpoint: 2,2,3,4,3,2 layers per stack, dims
+# 192,256,384,512,384,256, cnn_module_kernel 31,31,15,15,15,31; encoder_embed 16/16 and
+# encoder 715/715 tensors load with missing=0 unexpected=0 (63.99 M encoder params).
+# The keys contain no causal_conv / chunkwise_conv, i.e. the model is non-causal, so
+# stage1.causal must stay false and the stream policy resolves to chunking off (full
+# context). Do not declare stream.chunk_size / left_context_frames for this encoder.
+#
+# GPU cost at batch 128 (V100, fp16 autocast, encoder forward only): 83 ms / 1.28 GiB at
+# 200 fbank frames, 145 ms / 2.23 GiB at 400 frames.
+encoder_type: icefall_zipformer
+
+num_encoder_layers: "2,2,3,4,3,2"
+encoder_dim: "192,256,384,512,384,256"
+encoder_unmasked_dim: "192,192,256,256,256,192"
+downsampling_factor: "1,2,4,8,4,2"
+feedforward_dim: "512,768,1024,1536,1024,768"
+num_heads: "4,4,4,8,4,4"
+query_head_dim: "32"
+value_head_dim: "12"
+pos_head_dim: "4"
+pos_dim: 48
+cnn_module_kernel: "31,31,15,15,15,31"
+
+attention_dropout_rate: 0.0
+dropout_rate: 0.1
+use_icefall_dropout_schedule: true
+
+causal: false
+stream:
+  train_policy: match
+  train_chunk_size: "16,32,64,-1"
+  train_left_context_frames: "64,128,256,-1"
+
+warmup_batches: 4000.0
+input_dim: 80
+
+# Ignored for the icefall encoder (present for config consistency).
+attention_heads: 4
+linear_units: 576
+num_blocks: 6
+positional_dropout_rate: 0.1
+cnn_module_norm: batch_norm
+use_dynamic_chunk: false
+use_dynamic_left_chunk: false
+gradient_checkpointing: false
+cmvn: null

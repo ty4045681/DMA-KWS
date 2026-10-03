@@ -1,0 +1,35 @@
+# @package _global_
+# QbyT **v2** (pooling, `gru_last`) + MUSAN fbank cache + the GigaSpeech KWS **finetune** Zipformer (cnn_module_kernel 31,31,15,15,15,31),
+# 50,000 steps, streaming operating point 16/64 (same as the other runs of this encoder).
+#
+# Version 2 is the GRU-last pooling readout: the spec must be `mode: gru_last` and it may
+# not carry any v4.1 extension field (sink_token / text_position / audio_position /
+# relative_*), so the legacy defaults are pinned explicitly. Recipe and the adapter /
+# negative-tail switches mirror the repo's existing gru-last experiment
+# (configs/experiment/icefall_zipformer_stage2_pooling.yaml).
+defaults:
+  - icefall_zipformer_stage2_v3_musan_cached_gs_50k
+  - _self_
+
+training:
+  recipe: icefall-zipformer-frozen-pooling-gru
+
+stage2:
+  qbyt_readout_version: 2
+  qbyt_readout:
+    mode: gru_last
+    temperature: 1.0
+    sink_token: false
+    text_position: sinusoidal
+    audio_position: sinusoidal
+  phoneme_adapter:
+    enabled: false
+    ctc_weight: 0.0
+  negative_tail_loss:
+    enabled: false
+  validation:
+    val_check_interval: 3000
+  val_check_interval: 3000
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v2-musan-gs-stream-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v2-musan-gs-stream-50k
+  run_name: v2-musan-gs-stream-50k
