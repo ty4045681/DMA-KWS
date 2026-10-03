@@ -14,7 +14,8 @@ Welcome to the DMA-KWS wiki! Operational guides for the [DMA-KWS](https://github
 - **[False-Alarm Evaluation](False-Alarm-Evaluation)** — how to measure 误唤醒率
   (false accepts per 24 h) with `eval_musan_fa.py` on MUSAN and LibriSpeech
   train-other-500, plus the recorded results for the zh-en v3 / v4 / v4.1 trio
-  (GS-finetune, GS-base and every v2 model are still pending).
+  (all 12 remaining checkpoints measured 2026-10-03: MUSAN 0 for every model, LibriSpeech
+  0.29 次/24 h only for GS-finetune v2 and GS-base full-context v4.1).
 - **[Experiment Log](Experiment-Log)** — archive of **all 15 completed 50k-step runs**:
   the readout ladder (v2 / v3 / v4 / v4.1) × three frozen encoders (zh-en-3M avg-2,
   GigaSpeech KWS finetune, GigaSpeech KWS base at two operating points), with full
@@ -25,7 +26,7 @@ everywhere; zh-en > GS-base > GS-finetune), throughput / co-location measurement
 - **[Paper Stage II Recipe](Paper-Stage-II-Recipe)** — what the authors' code actually does:
   the per-sample 50/50 positive/negative switch, the hard : normal negative weights
   (1:1 by default, 1:100 in the two-stage finetune), and the full initialisation lineage
-  (which scripts start from an already trained QbyT via \`load_from_checkpoint\`) — plus how
+  (which scripts start from an already trained QbyT via `load_from_checkpoint`) — plus how
   this repository mirrors it and how to reproduce that stage locally.
 
 ## Repository docs

@@ -11,6 +11,9 @@ metrics, throughput measurements, artefacts and open evaluations.
 **Last updated:** 2026-10-03 — **15 completed 50k-step runs**: 4 readouts (v2 / v3 / v4 / v4.1) ×
 3 frozen encoders (zh-en-3M avg-2, GigaSpeech KWS finetune, GigaSpeech KWS base), plus the
 GigaSpeech-base encoder at a second operating point (full context vs streaming).
+Afterwards: MUSAN training backgrounds corrected to **music + noise only** (§6.6), the FA campaign
+finished for all 12 remaining checkpoints (§9), and the paper Stage I conformer ladder (v2/v3/v4/v4.1)
+started.
 
 **Testbed:** 1× Tesla V100-SXM2-32GB (sm_70) · 10 CPUs · 38 GB RAM (+ 47 GB swap) · torch 2.7.1+cu126 ·
 k2 1.24.4 · icefall `3f848bb` · cuDNN 9.5.1 (forced via `LD_LIBRARY_PATH`).
@@ -23,7 +26,7 @@ k2 1.24.4 · icefall `3f848bb` · cuDNN 9.5.1 (forced via `LD_LIBRARY_PATH`).
 | training fbank | `data/dma-kws/features/fbank_icefall_kws` — 133 GB, lhotse profile (`snip_edges=False`, `high_freq=-400`, no `1<<15` scale) |
 | validation | LibriPhrase **hard split** (270,684 rows = 2,115 batches), full split every time (`drop_last=False`) |
 | eval fbank | `data/dma-kws/features/fbank_icefall_kws_eval` |
-| background noise | MUSAN cache `data/dma-kws/processed/background/musan/cache` — cache_id `f1ff880b…`, 993 train recordings, 320,739 crops, `mode: fbank_cache`, probability 0.25, 1–3 s crops |
+| background noise | MUSAN cache, **music + noise only** (speech excluded; see §6.6): icefall-profile `processed/background/musan/cache` — cache_id `2b83f85f30ff3af8…`, 774 train recordings, K=414, 320,436 crops; Wenet-profile `…/cache_wenet` — cache_id `3b73024a08bbdbf4…`, same counts; `mode: fbank_cache`, probability 0.25, 1–3 s crops |
 | zh-en encoder | `raw/kws-checkpoints/zh-en-3M-2025-12-20/pretrained-epoch-13-avg-2.pt` — `cnn_module_kernel: 15,15,15,15,15,15`, causal, frozen 2.75 M params, 0 missing / 0 unexpected |
 | GS-KWS finetune encoder | `raw/kws-checkpoints/gigaspeech-20240219/exp-finetune/pretrained.pt` — `cnn_module_kernel: 31,31,15,15,15,31`, causal, 0/0 |
 | GS-KWS base encoder | `raw/kws-checkpoints/gigaspeech-20240219/exp/pretrained.pt` — same architecture, causal, 0/0 |
@@ -567,6 +570,42 @@ recovers once the light runs finish. Three concurrent runs push CPU load to ~7�
   directly on the device, there is no partition table), which removed the need to delete the icefall
   fbank tree to make room for the Wenet one.
 
+### 6.6 MUSAN training-set correction (2026-10-03)
+
+The training background pool is now **music + noise only**. The earlier runs — the 15 completed
+50k runs and the first (aborted) attempt at the paper Stage I trio — sampled music, noise **and
+speech**, because the eligibility list and the catalog carried all three MUSAN categories and the
+sampler has no category filter.
+
+| item | before (speech-inclusive) | after (music + noise) |
+| --- | --- | --- |
+| catalog recordings | 2,016 (music 660 / noise 930 / speech 426) | **1,590** (music 660 / noise 930) |
+| eligible train recordings | 993 | **774** |
+| crops per recording (K) | 323 | **414** |
+| crops in the cache | 320,739 | **320,436** |
+| icefall-profile cache id | `f1ff880b…` | `2b83f85f30ff3af8…` |
+| Wenet-profile cache id | (built later, also speech-inclusive) | `3b73024a08bbdbf4…` |
+
+Procedure:
+
+1. a new prepare config with `category_allow: [music, noise]`
+   (`data/dma-kws/processed/bg_prepare/prepare_musan_music_noise.yaml`);
+2. catalog + splits rebuilt (774 train / 93 val / 723 test, all eligible);
+3. both fbank-profile caches rebuilt with K=414 — the tool's own suggestion for 774 sources, which
+   keeps the crop-pool size equal to the old one (320k) — via
+   `scripts/rebuild_musan_music_noise_cache.sh` (~21 min, two builders in parallel);
+4. `--verify-only` on both: `ok: true`;
+5. the old tree was deleted and the new one renamed into its place, so every experiment overlay
+   keeps pointing at `processed/background/musan/{recordings.jsonl,cache,cache_wenet}`
+   without edits.
+
+The evaluation corpus is deliberately untouched: `processed/musan_split/eval_musan.list` (902
+recordings) still covers all three categories, and the FA scripts read raw audio.
+
+Consequence for this log: the 15 completed runs in §1–§5 were trained with the speech-inclusive
+pool. Their numbers stand for that recipe; re-running them with the corrected pool is a separate
+campaign that has **not** been started.
+
 ## 7. Aborted / superseded runs
 
 | run | detail |
@@ -607,9 +646,9 @@ pane transcripts are saved as `data/dma-kws/exp/stage2_qbyt/<session>.pane.log`.
 | LibriPhrase hard-split AUC / EER / TPR — all 15 runs | ✅ done (§1–§5) |
 | MUSAN held-out false alarms per 24 h (902 files / 43.72 h) for the zh-en v3/v4/v4.1 trio | ✅ 0 accepts at threshold 0.5 → 0 次/24 h; 1 s-window stress grid: v4.1 29.1 < v3 35.7 < v4 45.0 FA/24 h ([False-Alarm Evaluation](False-Alarm-Evaluation)) |
 | LibriSpeech train-other-500 FA (stride-6 subset, 82.71 h) for the zh-en trio | ✅ 0 accepts at 0.5 → 0 次/24 h |
-| FA for the GS-finetune / GS-base / all v2 models | ⏳ not run yet (MUSAN lists ready; FA reads raw audio, so no fbank tree is needed) |
+| FA for the 12 remaining checkpoints (MUSAN + LibriSpeech) | ✅ done 2026-10-03: **MUSAN held-out all 0 accepts → 0 次/24 h** (51,994 windows / 43.72 h); LibriSpeech train-other-500 stride-6 subset (87,243 windows / 82.71 h): **GS-finetune v2 = 1 accept → 0.29 次/24 h**, **GS-base full-context v4.1 = 1 accept → 0.29 次/24 h**, every other model 0 (incl. zh-en v2) |
 | Two-stage (QbyT + verifier) end-to-end event rate | ⏳ planned |
-| Paper Stage I Wenet Conformer (non-streaming) × v3/v4/v4.1 | ⏳ prepared and verified (encoder 0/0, policy `chunking=off`, Wenet fbank + Wenet MUSAN cache being built); queued behind the current prep |
+| Paper Stage I Wenet Conformer (non-streaming) × v2/v3/v4/v4.1 | 🔄 training started 2026-10-03 08:14 UTC (encoder 0/0, policy `chunking=off`, Wenet fbank tree + the corrected music+noise Wenet MUSAN cache). v2 and v3 were relaunched at ~12 steps/s with v4 and v4.1 paused to give them the machine; the first attempt used the speech-inclusive cache and was discarded |
 
 ## 10. Reproducing a run
 

@@ -1,0 +1,33 @@
+# @package _global_
+# QbyT **v2** (pooling, gru_last) + MUSAN background (music+noise only) + the paper authors'
+# Stage I Wenet Conformer, 50,000 steps, non-streaming (paper config).
+#
+# Same encoder / fbank / cache / schedule as the other *_paperstage1_50k overlays; only the
+# readout differs (v2 gru_last instead of v3 eps_mean). Version 2 may not carry eps_softmin
+# or any v4.1 extension field, so the legacy defaults are pinned explicitly.
+defaults:
+  - icefall_zipformer_stage2_v3_musan_cached_paperstage1_50k
+  - _self_
+
+training:
+  recipe: icefall-zipformer-frozen-pooling-gru
+
+stage2:
+  qbyt_readout_version: 2
+  qbyt_readout:
+    mode: gru_last
+    temperature: 1.0
+    sink_token: false
+    text_position: sinusoidal
+    audio_position: sinusoidal
+  phoneme_adapter:
+    enabled: false
+    ctc_weight: 0.0
+  negative_tail_loss:
+    enabled: false
+  validation:
+    val_check_interval: 2500
+  val_check_interval: 2500
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v2-musan-paperstage1-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v2-musan-paperstage1-50k
+  run_name: v2-musan-paperstage1-50k
