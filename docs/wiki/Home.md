@@ -13,12 +13,14 @@ Welcome to the DMA-KWS wiki! Operational guides for the [DMA-KWS](https://github
   configs, single-step smoke results, and the measured time budget.
 - **[False-Alarm Evaluation](False-Alarm-Evaluation)** — how to measure 误唤醒率
   (false accepts per 24 h) with `eval_musan_fa.py` on MUSAN and LibriSpeech
-  train-other-500, plus the recorded v3 / v4 / v4.1 results.
-- **[Experiment Log](Experiment-Log)** — archive of every Stage II QbyT run: configs,
-  validation curves and best-checkpoint metrics for the readout ladder (v3 / v4 / v4.1)
-  **and** the zh-en-3M vs GigaSpeech KWS encoder grid, throughput and multi-run
-  concurrency measurements, exported artefacts, evaluation status and a record template
-  for new runs.
+  train-other-500, plus the recorded results for the zh-en v3 / v4 / v4.1 trio
+  (GS-finetune, GS-base and every v2 model are still pending).
+- **[Experiment Log](Experiment-Log)** — archive of **all 15 completed 50k-step runs**:
+  the readout ladder (v2 / v3 / v4 / v4.1) × three frozen encoders (zh-en-3M avg-2,
+  GigaSpeech KWS finetune, GigaSpeech KWS base at two operating points), with full
+  validation curves, best-checkpoint metrics, the cross-encoder ranking (v2 wins
+everywhere; zh-en > GS-base > GS-finetune), throughput / co-location measurements,
+  data-prep lessons and a record template for new runs.
 
 ## Repository docs
 
