@@ -22,6 +22,12 @@ Welcome to the DMA-KWS wiki! Operational guides for the [DMA-KWS](https://github
 everywhere; zh-en > GS-base > GS-finetune), throughput / co-location measurements,
   data-prep lessons and a record template for new runs.
 
+- **[Paper Stage II Recipe](Paper-Stage-II-Recipe)** — what the authors' code actually does:
+  the per-sample 50/50 positive/negative switch, the hard : normal negative weights
+  (1:1 by default, 1:100 in the two-stage finetune), and the full initialisation lineage
+  (which scripts start from an already trained QbyT via \`load_from_checkpoint\`) — plus how
+  this repository mirrors it and how to reproduce that stage locally.
+
 ## Repository docs
 
 - [README](https://github.com/ty4045681/DMA-KWS#readme) — pipeline overview, configs,

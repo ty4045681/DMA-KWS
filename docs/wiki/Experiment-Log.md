@@ -6,6 +6,7 @@ metrics, throughput measurements, artefacts and open evaluations.
 * Environment and version pins: [Environment Setup](Environment-Setup)
 * Data prep, icefall/k2/cuDNN setup, smoke test: [Stage II Training Pipeline](Stage-II-Training-Pipeline)
 * False alarms (误唤醒率): [False-Alarm Evaluation](False-Alarm-Evaluation)
+* Paper Stage II recipe (negative mixing, finetune lineage): [Paper Stage II Recipe](Paper-Stage-II-Recipe)
 
 **Last updated:** 2026-10-03 — **15 completed 50k-step runs**: 4 readouts (v2 / v3 / v4 / v4.1) ×
 3 frozen encoders (zh-en-3M avg-2, GigaSpeech KWS finetune, GigaSpeech KWS base), plus the
