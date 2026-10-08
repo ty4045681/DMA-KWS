@@ -74,6 +74,24 @@ ARMS = {
 }
 
 
+# (基础 encoder 来历, 增训时 encoder 是否可训)
+# 来历用逐元素比对确认过：SS-zh-en 与上游 zh-en-3M 最大差 0，SS-gsbase-stream 与上游
+# GS-base 最大差 0，R1-bare 与上游 zh-en-3M 最大差 1.0997，SS-R1 与 R1-bare 最大差 0。
+ENCODER = {
+    "增训前 SS-zh-en": ("zh-en-3M 原始", "未增训"),
+    "增训前 SS-R1": ("zh-en-3M + R1 微调 13.3k 步", "未增训"),
+    "C1 + LoRA（现役）": ("zh-en-3M 原始", "冻结"),
+    "C1 + QbyT 全参": ("zh-en-3M 原始", "冻结"),
+    "C1 + encoder 与 QbyT 全参": ("zh-en-3M 原始", "可训"),
+    "R1 + LoRA": ("zh-en-3M + R1 微调", "冻结"),
+    "R1 + QbyT 全参": ("zh-en-3M + R1 微调", "冻结"),
+    "R1 + encoder lr1e-5": ("zh-en-3M + R1 微调", "可训"),
+    "R1 + encoder lr2e-5 +CVaR": ("zh-en-3M + R1 微调", "可训"),
+    "R1 + encoder lr5e-5": ("zh-en-3M + R1 微调", "可训"),
+    "GS-base 流式 + QbyT 全参": ("GS-base 原始", "冻结"),
+    "GS-base 流式 + encoder 与 QbyT 全参": ("GS-base 原始", "可训"),
+}
+
 ORDER = [
     "增训前 SS-zh-en", "增训前 SS-R1",
     "C1 + LoRA（现役）", "C1 + QbyT 全参", "C1 + encoder 与 QbyT 全参",
@@ -138,14 +156,31 @@ def main() -> None:
     rows: list[str] = []
     detail: dict = {}
     ordered = [name for name in ORDER if name in ARMS]
-    skipped: list[str] = []
+    pending: list[str] = []
     for name in ordered:
         real_dir, tts_dir, musan_dir, ls_dir = ARMS[name]
         needed = [EVAL / real_dir, EVAL / tts_dir, musan_dir, ls_dir]
-        if any(not (path / "results.jsonl").is_file() for path in needed):
-            skipped.append(name)
+        lph_value = retention(name)
+        # A grid that is still running already has results.jsonl but no
+        # summary.json yet; treat it as pending rather than crashing on the
+        # missing hours.
+        incomplete = any(
+            not (path / "results.jsonl").is_file() or not (path / "summary.json").is_file()
+            for path in needed
+        )
+        if incomplete:
+            # 评测还没跑完的臂照样占一行，未测的格子标"测试中"，
+            # 这样表格的行数和顺序在补齐过程中保持不变。
+            pending.append(name)
+            for target in TARGETS:
+                rows.append(
+                    "| {} | {} | {} | {} | 测试中 | 测试中 | 测试中 | 测试中 | 测试中 | 测试中 | {} |".format(
+                        name, *ENCODER.get(name, ("?", "?")), target,
+                        f"{lph_value:.4f}" if lph_value is not None else "测试中",
+                    )
+                )
             continue
-        lph = retention(name)
+        lph = lph_value
         real_s, real_l = scores(EVAL / real_dir)
         pos, neg = real_s[real_l == 1], real_s[real_l == 0]
         tts_s, tts_l = scores(EVAL / tts_dir)
@@ -167,8 +202,8 @@ def main() -> None:
             fa_musan = accepts_per_hour(musan_s, threshold, musan_h)
             fa_ls = accepts_per_hour(ls_s, threshold, ls_h)
             rows.append(
-                "| {} | {} | {:.4f} | **{:.4f}** | {:.4f} | {:.3f} | {:.3f} | {:.4f} | {} |".format(
-                    name, target, threshold,
+                "| {} | {} | {} | {} | {:.4f} | **{:.4f}** | {:.4f} | {:.3f} | {:.3f} | {:.4f} | {} |".format(
+                    name, *ENCODER.get(name, ("?", "?")), target, threshold,
                     rate_at_threshold(pos, threshold),
                     rate_at_threshold(tts_pos, threshold),
                     fa_musan, fa_ls,
@@ -186,12 +221,12 @@ def main() -> None:
                 "lph_auc": lph,
             }
 
-    if skipped:
-        print("skipped (evaluation missing): " + ", ".join(skipped), file=sys.stderr)
+    if pending:
+        print("pending evaluation (marked 测试中): " + ", ".join(pending), file=sys.stderr)
 
     header = (
-        "| 模型 | 目标 FA/h | 阈值 | 真人唤醒率 | TTS 唤醒率 | MUSAN FA/h | LibriSpeech FA/h | 近音词误触发（仅报告） | 通用能力 LibriPhrase AUC |\n"
-        "|---|---|---|---|---|---|---|---|---|"
+        "| 模型 | 基础 encoder | 增训时 encoder | 目标 FA/h | 阈值 | 真人唤醒率 | TTS 唤醒率 | MUSAN FA/h | LibriSpeech FA/h | 近音词误触发（仅报告） | 通用能力 LibriPhrase AUC |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|"
     )
     text = header + "\n" + "\n".join(rows)
     print(text)
