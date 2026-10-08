@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -32,8 +33,16 @@ from dma_kws.tokenizer import unsupported_phones
 logger = logging.getLogger(__name__)
 
 
+# Absolute POSIX prefix written into the generated manifests: the shared corpus
+# was built on the host below, and the manifest rows keep that prefix so the tree
+# can be copied without rewriting them. This is provenance, not a path this
+# checkout must contain - override with DMA_KWS_REMOTE_DATASET_ROOT or the
+# manifest_root= argument when regenerating for another host.
 DEFAULT_REMOTE_DATASET_ROOT = PurePosixPath(
-    "/home/q00931063/DMA-KWS/data/dma-kws/chinese_accent_english_datasets"
+    os.environ.get(
+        "DMA_KWS_REMOTE_DATASET_ROOT",
+        "/home/q00931063/DMA-KWS/data/dma-kws/chinese_accent_english_datasets",
+    )
 )
 DEFAULT_SPLIT_SEED = 20260806
 

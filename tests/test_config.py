@@ -547,8 +547,7 @@ def test_hey_eva_adapter_v2_config_uses_the_complete_stage2_base(monkeypatch):
     assert adapter["ctc_weight"] == 0.0
     assert adapter["trunk"]["output_dim"] == 192
     assert config["adapt"]["data_root"] == (
-        "/home/q00931063/DMA-KWS/data/dma-kws/"
-        "chinese_accent_english_datasets/views/hey_eva_adapt"
+        "data/dma-kws/chinese_accent_english_datasets/views/hey_eva_adapt"
     )
     assert config["prep"]["manifest_csv"].endswith(
         "views/hey_eva_adapt/manifests/real_source.csv"

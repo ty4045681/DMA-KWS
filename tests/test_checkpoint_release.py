@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from types import SimpleNamespace
+
 from scripts.checkpoint_release import (
     COLUMNS,
     asset_name,
+    format_readout,
+    hydra_overrides,
     iter_model_files,
     pending_rows,
     read_manifest,
+    readout_spec,
     snapshot_candidates,
     stage_asset,
     unique_asset_names,
@@ -35,6 +41,7 @@ def test_manifest_round_trip(tmp_path):
         "relpath": "exp/a.pt",
         "bytes": 3,
         "sha256": "abc",
+        "readout": "",
         "run": "exp",
         "snapshot": "",
     }
@@ -77,6 +84,45 @@ def test_pending_rows_skips_uploaded_sizes_and_filters():
     assert [row["asset"] for row in pending_rows(rows, {"a": 99})] == ["a", "b"]
     assert [row["asset"] for row in pending_rows(rows, {}, only="other")] == ["b"]
     assert [row["asset"] for row in pending_rows(rows, {}, limit=1)] == ["a"]
+
+
+@dataclass
+class _Pooling:
+    mode: str = "eps_softmin"
+    sink_readout: str = "additive"
+    sink_zero_init: bool = True
+    score_temperature: float | None = None
+
+
+def test_hydra_overrides_list_every_pooling_field():
+    spec = SimpleNamespace(version=4, value=_Pooling())
+    lines = hydra_overrides(spec)
+    assert lines[0] == "stage2.qbyt_readout_version=4"
+    assert "stage2.qbyt_readout.mode=eps_softmin" in lines
+    assert "stage2.qbyt_readout.sink_readout=additive" in lines
+    assert "stage2.qbyt_readout.sink_zero_init=true" in lines
+    assert "stage2.qbyt_readout.score_temperature=null" in lines
+
+
+def test_hydra_overrides_for_v1_only_sets_the_version():
+    spec = SimpleNamespace(version=1, value=SimpleNamespace(readout="gru_last_padded"))
+    assert hydra_overrides(spec) == ["stage2.qbyt_readout_version=1"]
+
+
+class _Multiline:
+    def __str__(self) -> str:
+        return "a b\n  c\td"
+
+
+def test_format_readout_is_empty_for_no_spec_and_collapses_whitespace():
+    assert format_readout(None) == ""
+    assert format_readout(_Multiline()) == "a b c d"
+
+
+def test_readout_spec_returns_none_for_a_non_checkpoint(tmp_path):
+    bogus = tmp_path / "encoder.pt"
+    bogus.write_bytes(b"not a torch checkpoint")
+    assert readout_spec(bogus) is None
 
 
 def test_stage_asset_names_the_symlink_after_the_asset(tmp_path):

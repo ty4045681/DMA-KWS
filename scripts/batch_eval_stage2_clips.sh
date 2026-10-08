@@ -43,8 +43,8 @@ CKPT_DIRS=()
 EXPLICIT_PTS=()
 DIRS_FILE=""
 PTS_FILE=""
-MANIFEST="/home/q00931063/DMA-KWS/data/dma-kws/test/hey_eva_and_its_variants/merged.csv"
-BASE_OUT="/home/q00931063/DMA-KWS/data/dma-kws/test/outputs/zipformer_stage2_only_hey_eva_and_its_variants_new"
+MANIFEST="${MANIFEST:-data/dma-kws/test/hey_eva_and_its_variants/merged.csv}"
+BASE_OUT="${BASE_OUT:-data/dma-kws/test/outputs/zipformer_stage2_only_hey_eva_and_its_variants_new}"
 EXPERIMENT="icefall_zipformer_stage2"
 
 usage() {

@@ -14,10 +14,10 @@ prep:
   # Default to the speaker-disjoint real-data source built by
   # prepare_chinese_accent_english.py.  Point HEY_EVA_ADAPT_MANIFEST at a
   # combined TTS + real + mined-negative CSV when those sources are available.
-  manifest_csv: ${oc.env:HEY_EVA_ADAPT_MANIFEST,"/home/q00931063/DMA-KWS/data/dma-kws/chinese_accent_english_datasets/views/hey_eva_adapt/manifests/real_source.csv"}
+  manifest_csv: ${oc.env:HEY_EVA_ADAPT_MANIFEST,"data/dma-kws/chinese_accent_english_datasets/views/hey_eva_adapt/manifests/real_source.csv"}
 
 adapt:
-  data_root: /home/q00931063/DMA-KWS/data/dma-kws/chinese_accent_english_datasets/views/hey_eva_adapt
+  data_root: ${oc.env:HEY_EVA_ADAPT_DATA_ROOT,data/dma-kws/chinese_accent_english_datasets/views/hey_eva_adapt}
   exp_root: ${paths.exp_root}/lora/hey-eva-adapter-v2
   # No TTS files were present in the supplied local dataset.  This keeps the
   # approved real-data pipeline runnable now; override to [tts, real] after

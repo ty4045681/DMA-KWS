@@ -1,7 +1,8 @@
 # @package _global_
 # Continue the Icefall phoneme adapter on the Chinese-accent mixture while
-# replaying LibriSpeech. Both manifests contain Linux absolute wav_path values
-# rooted below /home/q00931063/DMA-KWS/data/dma-kws.
+# replaying LibriSpeech. The defaults below are repo-relative; manifests built on
+# another host may still carry absolute wav_path values, so point the env vars
+# (or the CLI) at a locally rewritten copy in that case.
 #
 # Usage:
 #   export ICEFALL_ROOT=/path/to/icefall
@@ -22,8 +23,8 @@ phoneme_adapter:
   # Adapter-only warm-start; optimizer/scheduler/global step start from zero.
   adapter_init_checkpoint: ${oc.env:PHONEME_ADAPTER_CHECKPOINT}
 
-  train_manifest: /home/q00931063/DMA-KWS/data/dma-kws/chinese_accent_english_datasets/manifests/adapter/train_mix.jsonl
-  dev_manifest: /home/q00931063/DMA-KWS/data/dma-kws/chinese_accent_english_datasets/manifests/adapter/dev_select.jsonl
+  train_manifest: ${oc.env:CHINESE_ACCENT_ADAPTER_TRAIN_MANIFEST,data/dma-kws/chinese_accent_english_datasets/manifests/adapter/train_mix.jsonl}
+  dev_manifest: ${oc.env:CHINESE_ACCENT_ADAPTER_DEV_MANIFEST,data/dma-kws/chinese_accent_english_datasets/manifests/adapter/dev_select.jsonl}
 
   max_steps: 20000
   learning_rate: 0.0002

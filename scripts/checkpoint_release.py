@@ -47,7 +47,7 @@ STAGING_DEFAULT = "outputs/_checkpoint_release"
 SNAPSHOT_ROOT_DEFAULT = "run_snapshots/lightning/exp"
 SCAN_ROOTS = ("exp", "raw/kws-checkpoints")
 MODEL_SUFFIXES = (".pt", ".ckpt", ".pth")
-COLUMNS = ("asset", "relpath", "bytes", "sha256", "run", "snapshot")
+COLUMNS = ("asset", "relpath", "bytes", "sha256", "readout", "run", "snapshot")
 MAX_ASSET_NAME = 200
 _SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -86,6 +86,52 @@ def sha256_file(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
         for block in iter(lambda: handle.read(chunk), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def readout_spec(path: Path) -> Any | None:
+    """Return the QbyT score spec a checkpoint carries, or None.
+
+    torch and dma_kws are imported lazily so the publish/fetch paths keep
+    working on a machine that only has the gh CLI.
+    """
+    try:
+        import torch  # noqa: PLC0415
+        from dma_kws.training.checkpoint_io import checkpoint_qbyt_readout_spec
+    except Exception:
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    try:
+        return checkpoint_qbyt_readout_spec(payload)
+    except Exception:
+        return None
+
+
+def format_readout(spec: Any | None) -> str:
+    if spec is None:
+        return ""
+    return " ".join(str(spec).split())
+
+
+def hydra_overrides(spec: Any) -> list[str]:
+    """Ready-to-paste overrides describing the spec a checkpoint expects."""
+    version = getattr(spec, "version", None)
+    value = getattr(spec, "value", None)
+    lines = [f"stage2.qbyt_readout_version={version}"]
+    if version in (2, 3, 4) and hasattr(value, "__dataclass_fields__"):
+        for name in value.__dataclass_fields__:
+            lines.append(f"stage2.qbyt_readout.{name}={_hydra_literal(getattr(value, name))}")
+    return lines
+
+
+def _hydra_literal(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def iter_model_files(data_root: Path) -> list[str]:
@@ -198,12 +244,14 @@ def cmd_build(args: argparse.Namespace) -> int:
                 snapshot = f"run_snapshots/lightning/exp/{key}/hparams.yaml"
                 run = key.rsplit("/version_", 1)[0]
                 break
+        readout = "" if args.no_readout else format_readout(readout_spec(path))
         rows.append(
             {
                 "asset": names[relpath],
                 "relpath": relpath,
                 "bytes": size,
                 "sha256": sha256_file(path),
+                "readout": readout,
                 "run": run,
                 "snapshot": snapshot,
             }
@@ -214,8 +262,10 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     write_manifest(Path(args.manifest), rows)
     matched = sum(1 for row in rows if row["snapshot"])
+    with_readout = sum(1 for row in rows if row["readout"])
     print(f"{len(rows)} files, {total / 1024 ** 3:.2f} GiB -> {args.manifest}")
     print(f"snapshots matched: {matched}/{len(rows)}; unique asset names: {len(set(names.values()))}")
+    print(f"checkpoints carrying a QbyT readout spec: {with_readout}/{len(rows)}")
     return 0
 
 
@@ -326,6 +376,20 @@ def cmd_publish(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_show_readout(args: argparse.Namespace) -> int:
+    path = Path(args.checkpoint)
+    spec = readout_spec(path)
+    if spec is None:
+        print(f"{path}: no QbyT readout spec (raw encoder or unreadable checkpoint)")
+        return 1
+    print(f"{path}")
+    print(f"  {format_readout(spec)}")
+    print("  hydra overrides (add a leading '+' to keys your preset does not define):")
+    for line in hydra_overrides(spec):
+        print(f"    {line}")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # fetch
 # --------------------------------------------------------------------------- #
@@ -379,11 +443,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+
     build = subparsers.add_parser("build", help="rewrite the manifest from data/dma-kws")
     build.add_argument("--manifest", default=MANIFEST_DEFAULT)
     build.add_argument("--data-root", default=DATA_ROOT_DEFAULT)
     build.add_argument("--snapshot-root", default=SNAPSHOT_ROOT_DEFAULT)
+    build.add_argument(
+        "--no-readout",
+        action="store_true",
+        help="skip loading every checkpoint to record its QbyT readout spec",
+    )
     build.set_defaults(func=cmd_build)
+
+    show = subparsers.add_parser(
+        "show-readout", help="print the QbyT readout spec a checkpoint expects"
+    )
+    show.add_argument("checkpoint", help="path to a .pt/.ckpt checkpoint")
+    show.set_defaults(func=cmd_show_readout)
 
     publish = subparsers.add_parser("publish", help="upload manifest assets with the gh CLI")
     publish.add_argument("--manifest", default=MANIFEST_DEFAULT)

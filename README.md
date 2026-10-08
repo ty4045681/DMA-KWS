@@ -17,6 +17,7 @@ This repository implements a two-stage keyword spotting pipeline with a **single
 - [Stage II training scripts](#stage-ii-training-scripts)
 - [Continual adaptation (Stage II LoRA)](#continual-adaptation-stage-ii-lora)
 - [Checkpoints and resume](#checkpoints-and-resume)
+- [Run on a new machine](docs/wiki/Run-On-A-New-Machine.md) — fresh V100 checklist, release fetch, verified inference commands
 - [What is implemented now](#what-is-implemented-now)
 - [Recommended hardware](#recommended-hardware)
 
@@ -122,6 +123,20 @@ Exported weight files use names like `stage1_step000020.pt` and `stage2_step0000
 `scripts/average_checkpoints.py` averages Lightning checkpoints. Use `prep.pattern="*.ckpt"` for checkpoint directories. Demo Stage I auto-averages to `avg_10.ckpt` and exports `stage1_avg.pt` at end of training.
 
 If you started a smoke run with `run.limit_steps=20`, pass the same limit again when resuming with `run.resume_from=last`.
+
+Trained weights are not committed. The full set (453 files, 9.2 GiB) is published as the
+[`checkpoints-2026-10-08`](https://github.com/ty4045681/DMA-KWS/releases/tag/checkpoints-2026-10-08)
+release and indexed by [`checkpoints/manifest.tsv`](checkpoints/manifest.tsv):
+
+```bash
+python scripts/checkpoint_release.py fetch --list          # what is available
+python scripts/checkpoint_release.py fetch                 # restore into data/dma-kws/ (sha256 verified)
+python scripts/checkpoint_release.py fetch --only final/   # delivery set only
+python scripts/checkpoint_release.py show-readout <ckpt>   # readout spec + ready-to-paste overrides
+```
+
+See [docs/wiki/Run-On-A-New-Machine.md](docs/wiki/Run-On-A-New-Machine.md) for the end-to-end
+route on a fresh V100 box.
 
 ---
 
@@ -1545,22 +1560,30 @@ Place wavs under `/data/dma-kws/processed/adapt/hi_lumina/raw/...` before runnin
 
 ## 9. Run the two-stage demo
 
-After both stages have checkpoints:
+Two-stage inference needs a Stage I phoneme CTC checkpoint **and** a Stage II QbyT
+checkpoint. Fetch the released author pair first (see
+[Checkpoints and resume](#checkpoints-and-resume); `--only author_v1` pulls ~38 MiB):
 
 ```bash
-STAGE1_CKPT=data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/stage1_step000020.pt
-STAGE2_CKPT=data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step000020.pt
-AUDIO=/path/to/test.wav
-KEYWORD="hello world"
+python scripts/checkpoint_release.py fetch --only author_v1
 
 python3 scripts/run_two_stage_demo.py \
-  +experiment=demo_librispeech100 \
-  prep.stage1_ckpt="$STAGE1_CKPT" \
-  prep.stage2_ckpt="$STAGE2_CKPT" \
-  prep.audio="$AUDIO" \
-  prep.keyword="$KEYWORD" \
-  demo.qbyt_threshold=0.6
+  +experiment=v1_paper_ls460 \
+  prep.stage1_ckpt=data/dma-kws/exp/author_v1/stage1_v1.pt \
+  prep.stage2_ckpt=data/dma-kws/exp/author_v1/stage2_v1_si.pt \
+  prep.audio=/path/to/test.wav \
+  prep.keyword="hello world"
 ```
+
+`v1_paper_ls460` also switches the tokenizer to the author's 73-symbol
+`data/dict/lang_char_v1_73.txt`, which the v1 weights require.
+
+Self-trained Stage I (README §5 writes to
+`data/dma-kws/exp/stage1_phoneme_ctc/checkpoints/`) cannot be mixed with just any
+Stage II preset: the `icefall_zipformer_stage2*` presets override `/stage1` with
+`encoder_only` (they describe the Stage II encoder, not a CTC locator). A preset
+that carries both a Stage I CTC model and the Stage II encoder is required. See
+[docs/wiki/Run-On-A-New-Machine.md](docs/wiki/Run-On-A-New-Machine.md) §4/§6.
 
 The decision threshold defaults to `0.5` in config; override on the CLI as above or in yaml:
 
@@ -1622,13 +1645,24 @@ This is not keyword localization. If you pass a long utterance, the script score
 Single clip:
 
 ```bash
-python3 scripts/run_stage2_demo.py \
-  +experiment=wenet_asr_stage2 \
-  prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/stage2_step050000.pt \
+# verified with the released v4.2 delivery checkpoint
+python3 scripts/checkpoint_release.py fetch --only final/C1-sink-50k
+
+PYTHONPATH=.:$ICEFALL_ROOT ICEFALL_ROOT=$ICEFALL_ROOT python3 scripts/run_stage2_demo.py \
+  +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k \
+  +stage2.qbyt_readout.sink_readout=additive \
+  +stage2.qbyt_readout.sink_zero_init=true \
+  prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/final/C1-sink-50k/checkpoints/C1-sink-50k/version_0/stage2_step050000.pt \
   prep.audio=/path/keyword_clip.wav \
   prep.keyword="hey eva" \
   demo.qbyt_threshold=0.5
 ```
+
+The preset must match the checkpoint's **encoder family** (`*_zhen3m*` presets set
+`cnn_module_kernel: 15`; the GigaSpeech KWS recipe uses 31 in stacks 0/1/5) and its
+**readout spec** — `python scripts/checkpoint_release.py show-readout <ckpt>` prints
+the spec plus the exact overrides (prefix `+` for keys the preset does not define).
+Loading a mismatched pair fails loudly instead of scoring with different semantics.
 
 Only `prep.stage2_ckpt`, `prep.audio`, and `prep.keyword` are required. Do not pass `prep.stage1_ckpt` or `+locator=...`; this path bypasses Stage I entirely.
 
