@@ -1,0 +1,132 @@
+# Hey Google corpus plan for scripts/generate_hey_eva_tts.py.
+#
+# Same shape as configs/tts/hey_eva.yaml: the word table carries the ARPAbet
+# phones (the manifest's source of truth) plus the IPA spelling each engine
+# needs. IPA strings come from espeak-ng itself, so Piper reads its own
+# alphabet.
+run_root: outputs/tts/hey_google
+
+keyword: hey google
+
+words:
+  hey: {phones: [HH, EY1], ipa: "hˈeɪ"}
+  # The bare "Google" phrase would be rewritten end to end by the phoneme
+  # rules, so it switches to the alias dictionary. "Googal" is the respelling
+  # espeak-ng maps to ɡˈuːɡəl, the same phones as Google.
+  google: {phones: [G, UW1, G, AH0, L], ipa: "ɡˈuːɡəl", say_as: "Googal"}
+  goggle: {phones: [G, AA1, G, AH0, L], ipa: "ɡˈɑːɡəl"}
+  gaggle: {phones: [G, AE1, G, AH0, L], ipa: "ɡˈæɡəl"}
+  giggle: {phones: [G, IH1, G, AH0, L], ipa: "ɡˈɪɡəl"}
+  gurgle: {phones: [G, ER1, G, AH0, L], ipa: "ɡˈɜːɡəl"}
+  googles: {phones: [G, UW1, G, AH0, L, Z], ipa: "ɡˈuːɡəlz"}
+  googly: {phones: [G, UW1, G, L, IY0], ipa: "ɡˈuːɡli"}
+  goog: {phones: [G, UW1, G], ipa: "ɡˈuːɡ"}
+  googol: {phones: [G, UW1, G, AA0, L], ipa: "ɡˈuːɡɑːl"}
+  bugle: {phones: [B, Y, UW1, G, AH0, L], ipa: "bjˈuːɡəl"}
+  goober: {phones: [G, UW1, B, ER0], ipa: "ɡˈuːbɚ"}
+
+phoneme_words: [google, goggle, gaggle, giggle, gurgle, googles, googly, goog, googol, bugle, goober]
+
+# Five positives, same prosody family as Hey Eva: punctuation only.
+phrases:
+  - {text: "Hey Google", label: 1}
+  - {text: "Hey, Google", label: 1}
+  - {text: "Hey Google.", label: 1}
+  - {text: "Hey Google!", label: 1}
+  - {text: "Hey! Google", label: 1}
+  # Vowel change in the stressed syllable.
+  - {text: "Hey Goggle", label: 0}
+  - {text: "Hey Gaggle", label: 0}
+  - {text: "Hey Giggle", label: 0}
+  - {text: "Hey Gurgle", label: 0}
+  # Coda and syllable changes.
+  - {text: "Hey Googles", label: 0}
+  - {text: "Hey Googly", label: 0}
+  # Truncations.
+  - {text: "Hey Goog", label: 0}
+  - {text: "Google", label: 0}
+  - {text: "Hey", label: 0}
+  # Different word, same neighbourhood.
+  - {text: "Hey Googol", label: 0}
+  - {text: "Hey Bugle", label: 0}
+  - {text: "Hey Goober", label: 0}
+
+providers:
+  elevenlabs:
+    alias: elevenlabs
+    model_id: eleven_v3
+    output_format: wav_16000
+    dictionary_name: hey-google-corpus
+    dictionary_alphabet: ipa
+    api_key_env: ELEVENLABS_API_KEY
+    voice_settings:
+      stability: 0.5
+      similarity_boost: 0.75
+    speeds: [0.9, 1.0, 1.1]
+    voices:
+      - {voice_id: CwhRBWXzGAHq8TQ4Fs17, name: Roger, accent: american, gender: male}
+      - {voice_id: EXAVITQu4vr4xnSDxMaL, name: Sarah, accent: american, gender: female}
+      - {voice_id: FGY2WhTYpPnrIDTdsKH5, name: Laura, accent: american, gender: female}
+      - {voice_id: IKne3meq5aSn9XLyUdCD, name: Charlie, accent: australian, gender: male}
+      - {voice_id: JBFqnCBsd6RMkjVDRZzb, name: George, accent: british, gender: male}
+      - {voice_id: N2lVS1w4EtoT3dr4eOWO, name: Callum, accent: american, gender: male}
+      - {voice_id: SAz9YHcvj6GT2YYXdXww, name: River, accent: american, gender: neutral}
+      - {voice_id: SOYHLrjzK2X1ezoPC6cr, name: Harry, accent: american, gender: male}
+      - {voice_id: TX3LPaxmHKxFdv7VOQHJ, name: Liam, accent: american, gender: male}
+      - {voice_id: Xb7hH8MSUJpSbSDYk0k2, name: Alice, accent: british, gender: female}
+      - {voice_id: XrExE9yKIg1WjnnlVkGX, name: Matilda, accent: american, gender: female}
+      - {voice_id: bIHbv24MWmeRgasZH58o, name: Will, accent: american, gender: male}
+      - {voice_id: cgSgspJ2msm6clMCkdW9, name: Jessica, accent: american, gender: female}
+      - {voice_id: cjVigY5qzO86Huf0OWal, name: Eric, accent: american, gender: male}
+      - {voice_id: hpp4J3VqNfWAUOO0d1Us, name: Bella, accent: american, gender: female}
+      - {voice_id: iP95p4xoKVk53GoZ742B, name: Chris, accent: american, gender: male}
+      - {voice_id: nPczCjzI2devNBz1zQrb, name: Brian, accent: american, gender: male}
+      - {voice_id: onwK4e9ZLuTAKqWW03F9, name: Daniel, accent: british, gender: male}
+      - {voice_id: pFZP5JQG7iQjIQuC4Bku, name: Lily, accent: british, gender: female}
+      - {voice_id: pNInz6obpgDQGcFmaJgB, name: Adam, accent: american, gender: male}
+      - {voice_id: pqHfZKP75CvOlQylNhV4, name: Bill, accent: american, gender: male}
+      - {voice_id: tOuLUAIdXShmWH7PEUrU, name: Julia, accent: standard, gender: female}
+
+  piper:
+    alias: piper
+    python: .venv/bin/python
+    data_dir: outputs/tts/piper_models
+    speeds: [0.9, 1.0, 1.1]
+    volumes: [1.0]
+    voices:
+      - {voice_id: en_US-lessac-medium, name: Lessac, accent: american, gender: female}
+      - {voice_id: en_US-amy-medium, name: Amy, accent: american, gender: female}
+      - {voice_id: en_US-hfc_female-medium, name: HFC female, accent: american, gender: female}
+      - {voice_id: en_US-ryan-medium, name: Ryan, accent: american, gender: male}
+      - {voice_id: en_US-joe-medium, name: Joe, accent: american, gender: male}
+      - {voice_id: en_US-bryce-medium, name: Bryce, accent: american, gender: male}
+      - {voice_id: en_US-kristin-medium, name: Kristin, accent: american, gender: female}
+      - {voice_id: en_GB-alan-medium, name: Alan, accent: british, gender: male}
+      - {voice_id: en_GB-jenny_dioco-medium, name: Jenny, accent: british, gender: female}
+      - {voice_id: en_GB-northern_english_male-medium, name: Northern male, accent: british, gender: male}
+      - {voice_id: en_GB-cori-medium, name: Cori, accent: british, gender: female}
+      - {voice_id: en_GB-alba-medium, name: Alba, accent: scottish, gender: female}
+
+  kokoro:
+    alias: kokoro
+    lang_code: a
+    speeds: [0.9, 1.0, 1.1]
+    voices:
+      - {voice_id: af_bella, name: Bella, gender: female}
+      - {voice_id: af_heart, name: Heart, gender: female}
+      - {voice_id: af_nicole, name: Nicole, gender: female}
+      - {voice_id: af_nova, name: Nova, gender: female}
+      - {voice_id: af_river, name: River, gender: female}
+      - {voice_id: af_sarah, name: Sarah, gender: female}
+      - {voice_id: af_sky, name: Sky, gender: female}
+      - {voice_id: am_adam, name: Adam, gender: male}
+      - {voice_id: am_michael, name: Michael, gender: male}
+      - {voice_id: am_onyx, name: Onyx, gender: male}
+      - {voice_id: am_puck, name: Puck, gender: male}
+      - {voice_id: bf_emma, name: Emma, gender: female}
+      - {voice_id: bm_george, name: George, gender: male}
+      - {voice_id: bm_lewis, name: Lewis, gender: male}
+
+budget:
+  max_characters: 40000
+  max_jobs: 4000

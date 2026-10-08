@@ -1,0 +1,151 @@
+# Hey Eva corpus plan for scripts/generate_hey_eva_tts.py.
+#
+# "words" is the only place that defines pronunciation. Every phrase resolves
+# its phones from this table, so each generated clip carries the exact phone
+# string that was requested.
+run_root: outputs/tts/hey_eva
+
+keyword: hey eva
+
+# phones: project ARPAbet, the source of truth for the manifest.
+# ipa: what the ElevenLabs dictionary rule sends. Measured 2026-10-05:
+#   cmu_arpabet rules drop the replaced word on flash_v2, v3, and v4;
+#   IPA rules on eleven_flash_v2 garble the word ("Eva" came back as "eBay");
+#   IPA rules on eleven_v3 render it correctly.
+words:
+  hey: {phones: [HH, EY1], ipa: "ˈheɪ"}
+  # say_as is only used where a phrase would otherwise be rewritten end to end
+  # by the phoneme rules, which eleven_v3 rejects as empty text.
+  eva: {phones: [IY1, V, AH0], ipa: "ˈiːvə", say_as: "Eevah"}
+  ava: {phones: [EY1, V, AH0], ipa: "ˈeɪvə"}
+  eve: {phones: [IY1, V], ipa: "ˈiːv"}
+  evan: {phones: [EH1, V, AH0, N], ipa: "ˈɛvən"}
+  evie: {phones: [IY1, V, IY0], ipa: "ˈiːvi"}
+  everest: {phones: [EH1, V, ER0, IH0, S, T], ipa: "ˈɛvərɪst"}
+  evil: {phones: [IY1, V, AH0, L], ipa: "ˈiːvəl"}
+  either: {phones: [IY1, DH, ER0], ipa: "ˈiːðər"}
+  ivan: {phones: [AY1, V, AH0, N], ipa: "ˈaɪvən"}
+  eric: {phones: [EH1, R, IH0, K], ipa: "ˈɛrɪk"}
+
+# Only these words get pronunciation rules. "hey" stays ordinary text on
+# purpose: when the rules cover every word of a phrase, eleven_flash_v2 returns
+# silence and eleven_v3 rejects the request with an "empty text" error.
+phoneme_words: [eva, ava, eve, evan, evie, everest, evil, either, ivan, eric]
+
+# label 1 = the wake word. Every label 1 phrase must resolve to the project
+# phones HH EY1 IY1 V AH0, or the script refuses to start.
+# Every label 1 phrase must contain "hey eva" exactly once. Punctuation is
+# the only difference, so these variants vary prosody and nothing else.
+phrases:
+  - {text: "Hey Eva", label: 1}
+  - {text: "Hey, Eva", label: 1}
+  - {text: "Hey Eva.", label: 1}
+  - {text: "Hey Eva!", label: 1}
+  - {text: "Hey! Eva", label: 1}
+  - {text: "Hey Ava", label: 0}
+  - {text: "Hey Eve", label: 0}
+  - {text: "Hey Evan", label: 0}
+  - {text: "Hey Evie", label: 0}
+  - {text: "Hey Everest", label: 0}
+  - {text: "Hey evil", label: 0}
+  - {text: "Hey either", label: 0}
+  - {text: "Hey Ivan", label: 0}
+  - {text: "Hey Eric", label: 0}
+  # Truncated wake word. Every word here is covered by the phoneme rules, so
+  # this phrase switches to the alias dictionary instead.
+  - {text: "Eva", label: 0}
+  - {text: "Hey", label: 0}
+
+providers:
+  elevenlabs:
+    alias: elevenlabs
+    model_id: eleven_v3
+    # configs/stage1/default.yaml sets sample_rate: 16000. Native 16k avoids a resample in load_audio.
+    output_format: wav_16000
+    dictionary_name: hey-eva-corpus
+    # cmu_arpabet takes the project phones almost verbatim. Only eleven_v3,
+    # eleven_v4, and eleven_flash_v2 honor dictionary phoneme rules.
+    dictionary_alphabet: ipa
+    api_key_env: ELEVENLABS_API_KEY
+    voice_settings:
+      stability: 0.5
+      similarity_boost: 0.75
+    # ElevenLabs exposes speed only (voice_settings.speed). There is no pitch
+    # and no volume parameter. 1.0 is the default and is not sent, so clips
+    # generated before this list existed keep their job keys.
+    speeds: [0.9, 1.0, 1.1]
+    voices:
+      - {voice_id: CwhRBWXzGAHq8TQ4Fs17, name: Roger, accent: american, gender: male}
+      - {voice_id: EXAVITQu4vr4xnSDxMaL, name: Sarah, accent: american, gender: female}
+      - {voice_id: FGY2WhTYpPnrIDTdsKH5, name: Laura, accent: american, gender: female}
+      - {voice_id: IKne3meq5aSn9XLyUdCD, name: Charlie, accent: australian, gender: male}
+      - {voice_id: JBFqnCBsd6RMkjVDRZzb, name: George, accent: british, gender: male}
+      - {voice_id: N2lVS1w4EtoT3dr4eOWO, name: Callum, accent: american, gender: male}
+      - {voice_id: SAz9YHcvj6GT2YYXdXww, name: River, accent: american, gender: neutral}
+      - {voice_id: SOYHLrjzK2X1ezoPC6cr, name: Harry, accent: american, gender: male}
+      - {voice_id: TX3LPaxmHKxFdv7VOQHJ, name: Liam, accent: american, gender: male}
+      - {voice_id: Xb7hH8MSUJpSbSDYk0k2, name: Alice, accent: british, gender: female}
+      - {voice_id: XrExE9yKIg1WjnnlVkGX, name: Matilda, accent: american, gender: female}
+      - {voice_id: bIHbv24MWmeRgasZH58o, name: Will, accent: american, gender: male}
+      - {voice_id: cgSgspJ2msm6clMCkdW9, name: Jessica, accent: american, gender: female}
+      - {voice_id: cjVigY5qzO86Huf0OWal, name: Eric, accent: american, gender: male}
+      - {voice_id: hpp4J3VqNfWAUOO0d1Us, name: Bella, accent: american, gender: female}
+      - {voice_id: iP95p4xoKVk53GoZ742B, name: Chris, accent: american, gender: male}
+      - {voice_id: nPczCjzI2devNBz1zQrb, name: Brian, accent: american, gender: male}
+      - {voice_id: onwK4e9ZLuTAKqWW03F9, name: Daniel, accent: british, gender: male}
+      - {voice_id: pFZP5JQG7iQjIQuC4Bku, name: Lily, accent: british, gender: female}
+      - {voice_id: pNInz6obpgDQGcFmaJgB, name: Adam, accent: american, gender: male}
+      - {voice_id: pqHfZKP75CvOlQylNhV4, name: Bill, accent: american, gender: male}
+      - {voice_id: tOuLUAIdXShmWH7PEUrU, name: Julia, accent: standard, gender: female}
+
+  piper:
+    alias: piper
+    python: .venv/bin/python
+    data_dir: outputs/tts/piper_models
+    speeds: [0.9, 1.0, 1.1]
+    # Piper applies --volume before its own normalization, so values above 1.0
+    # land on the same output as 1.0. The axis stays available but off.
+    volumes: [1.0]
+    voices:
+      # Medium models only. The -high checkpoints render forced IPA badly:
+      # "Hey Eva" came back as something like /ˈiːðə/ on lessac-high.
+      - {voice_id: en_US-lessac-medium, name: Lessac, accent: american, gender: female}
+      - {voice_id: en_US-amy-medium, name: Amy, accent: american, gender: female}
+      - {voice_id: en_US-hfc_female-medium, name: HFC female, accent: american, gender: female}
+      - {voice_id: en_US-ryan-medium, name: Ryan, accent: american, gender: male}
+      - {voice_id: en_US-joe-medium, name: Joe, accent: american, gender: male}
+      - {voice_id: en_US-bryce-medium, name: Bryce, accent: american, gender: male}
+      - {voice_id: en_US-kristin-medium, name: Kristin, accent: american, gender: female}
+      - {voice_id: en_GB-alan-medium, name: Alan, accent: british, gender: male}
+      - {voice_id: en_GB-jenny_dioco-medium, name: Jenny, accent: british, gender: female}
+      - {voice_id: en_GB-northern_english_male-medium, name: Northern male, accent: british, gender: male}
+      - {voice_id: en_GB-cori-medium, name: Cori, accent: british, gender: female}
+      - {voice_id: en_GB-alba-medium, name: Alba, accent: scottish, gender: female}
+
+  kokoro:
+    alias: kokoro
+    lang_code: a
+    # Kokoro takes speed only. It has no loudness and no pitch control, so its
+    # clips carry no volume axis.
+    speeds: [0.9, 1.0, 1.1]
+    voices:
+      - {voice_id: af_bella, name: Bella, gender: female}
+      - {voice_id: af_heart, name: Heart, gender: female}
+      - {voice_id: af_nicole, name: Nicole, gender: female}
+      - {voice_id: af_nova, name: Nova, gender: female}
+      - {voice_id: af_river, name: River, gender: female}
+      - {voice_id: af_sarah, name: Sarah, gender: female}
+      - {voice_id: af_sky, name: Sky, gender: female}
+      - {voice_id: am_adam, name: Adam, gender: male}
+      - {voice_id: am_michael, name: Michael, gender: male}
+      - {voice_id: am_onyx, name: Onyx, gender: male}
+      - {voice_id: am_puck, name: Puck, gender: male}
+      - {voice_id: bf_emma, name: Emma, gender: female}
+      - {voice_id: bm_george, name: George, gender: male}
+      - {voice_id: bm_lewis, name: Lewis, gender: male}
+
+budget:
+  # Only the elevenlabs jobs cost money: 1056 clips is about 7920 characters.
+  # The local engines are free, so the cap covers the whole job list.
+  max_characters: 40000
+  max_jobs: 4000

@@ -1,0 +1,147 @@
+# @package _global_
+# "hey eva" adaptation on the v4.2 zh-en-3M pooling base (SS-zh-en).
+#
+# Base:  C1-sink-50k  ->  SS-zh-en (freeze all but sink, 3k steps, sink_loss bce)
+#        ->  stage2_step003000.pt, qbyt_readout_version 4 with
+#            sink_readout=additive / sink_zero_init=true.
+# Recipe: paper-faithful LoRA on the QbyT phone matcher attention projections
+#        (rank 16, everything else frozen), sequential TTS -> real phases, each
+#        mixed 1:1 with the general LibriPhrase replay stream, MUSAN background
+#        negatives at p=0.25 and the CVaR negative-tail term kept on.
+#
+# Data:  data/dma-kws/processed/adapt/hey_eva_v42/source/combined.csv
+#        (voice-disjoint TTS split, speaker-disjoint real split).
+#
+# Usage:
+#   python scripts/run_keyword_adaptation.py +experiment=adapt_hey_eva_v42 \
+#     adapt.stage=prepare
+#   python scripts/run_keyword_adaptation.py +experiment=adapt_hey_eva_v42 \
+#     adapt.stage=train adapt.train_phases=[tts] adapt.max_steps=600
+#   python scripts/run_keyword_adaptation.py +experiment=adapt_hey_eva_v42 \
+#     adapt.stage=train adapt.train_phases=[real] adapt.max_steps=1500
+#   python scripts/run_keyword_adaptation.py +experiment=adapt_hey_eva_v42 \
+#     adapt.stage=eval
+#
+# The second phase resumes the LoRA adapter from <exp_root>/tts/ automatically,
+# so the two phases may carry different step budgets.
+
+defaults:
+  - icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+  - _self_
+
+prep:
+  stage2_ckpt: data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-zh-en/checkpoints/SS-zh-en/version_0/stage2_step003000.pt
+  manifest_csv: data/dma-kws/processed/adapt/hey_eva_v42/source/combined.csv
+
+adapt:
+  keyword: hey eva
+  slug: hey_eva_v42
+  method: lora
+  # Keep the prepared tree outside the corpora so prepare_adapt's fbank mirror
+  # never lands inside a source directory.
+  data_root: data/dma-kws/processed/adapt/hey_eva_v42
+  # A dedicated namespace: never pick up another keyword's sweep/best_params.yaml.
+  exp_root: data/dma-kws/exp/stage2_adapt_v42/hey_eva
+  train_phases: [tts, real]
+  phase: tts
+
+  # Paper recipe: rank 16 on the matcher attention QKV, ~73k trainable params.
+  rank: 16
+  alpha: 32
+  # Pooling-family targets (v2-v4). The keyword-filler names (audio_key.weight /
+  # text_query.weight) belong to v6/v7 and are rejected for this base.
+  lora_targets:
+    - in_proj_weight
+    - out_proj.weight
+
+  learning_rate: 4.0e-4
+  warmup_steps: 100
+  max_steps: 1000
+  optimizer: adam
+  weight_decay: 0.0
+
+  # 1:1 keyword : LibriPhrase replay, the recurring anti-forgetting ratio.
+  mix_ratio: 0.5
+  sample_lens: 64000
+  batch_size_per_gpu: 64
+  val_batch_size: 64
+  num_workers: 4
+  val_num_workers: 2
+  eval_fraction: 0.2       # unused: the source manifest declares every split
+  checkpoint_monitor: val_target_auc
+  validation:
+    # Training microbatches per rank. Each validation also scores the full
+    # 270,684-pair LibriPhrase hard split, so the cadence trades forgetting
+    # resolution against wall clock: 300 gives 2 points in the TTS phase and 5
+    # in the real phase.
+    val_check_interval: 300
+    limit_val_batches: null
+  logging:
+    backends: [csv, tensorboard]
+
+stage2:
+  # Must match the base checkpoint spec exactly; a mismatch aborts the load.
+  qbyt_readout_version: 4
+  qbyt_readout:
+    mode: eps_softmin
+    temperature: 1.0
+    sink_token: true
+    text_position: learned
+    audio_position: relative_bias
+    relative_num_buckets: 32
+    relative_max_distance: 64
+    sink_readout: additive
+    sink_zero_init: true
+    temperature_learnable: false
+    score_temperature: null
+
+  # sink_loss is the frozen-trunk, sink-only tool (see qbyt-v4.2-design.md §7.2).
+  # Inside a LoRA matcher fine-tune it only steals gradient, so it stays off;
+  # the sink head is refitted afterwards on held-out data.
+  sink_loss:
+    enabled: false
+  freeze_all_but_sink: false
+  freeze_encoder: true
+  phoneme_adapter:
+    enabled: false
+    ctc_weight: 0.0
+
+  sequence_loss:
+    target_mode: ordered_contiguous_prefix
+    progress_weight: 0.3
+    normalization: sample
+  negative_tail_loss:
+    enabled: true
+    weight: 0.5
+    fraction: 0.1
+  background_negative:
+    enabled: true
+    probability: 0.25
+    mode: fbank_cache
+    sources:
+      - id: musan
+        weight: 1.0
+        manifest: ${paths.processed_root}/background/musan/recordings.jsonl
+        cache_manifest: ${paths.processed_root}/background/musan/cache/manifest.json
+
+  precision: 16-mixed
+  batch_size_per_gpu: 64
+  accumulate_grad_batches: 1
+  num_workers: 4
+  learning_rate: 4.0e-4
+  # The from-scratch Stage II overlay turns this on; it only prints a 5-step
+  # diagnostic pass and has no place in a short adaptation run.
+  gradient_diagnostics:
+    enabled: false
+  checkpoint:
+    every_n_train_steps: 200
+    save_top_k: 3
+    monitor: val_target_auc
+    mode: max
+  eval:
+    split: hard
+    batch_size: 128
+    num_workers: 4
+  checkpoint_dir: ${paths.exp_root}/stage2_adapt_v42/hey_eva
+  log_dir: ${paths.exp_root}/stage2_adapt_v42/hey_eva
+  run_name: hey_eva_v42
