@@ -309,8 +309,10 @@ def test_background_negative_is_skipped_by_the_auxiliary_ctc_loss_end_to_end(mon
 
     module = _build(monkeypatch, _config(ctc_weight=0.3))
     module.log = MagicMock()
-    _logits, _seq_logits, (ctc_log_probs, encoder_mask) = module.forward_with_encoder(
-        batch["feat"], batch["feat_lengths"], batch["anchor"], mode="train"
+    _logits, _seq_logits, (ctc_log_probs, encoder_mask), _details = (
+        module.forward_with_encoder(
+            batch["feat"], batch["feat_lengths"], batch["anchor"], mode="train"
+        )
     )
     loss = module._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask)
 

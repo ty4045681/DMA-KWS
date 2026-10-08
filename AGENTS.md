@@ -53,15 +53,25 @@ backgrounds.
 
 Loaders (`assert_qbyt_readout_version`) accept any supported checkpoint that
 decodes. When a run config is supplied, pooling v2/v3/v4 match on the full
-`qbyt_readout` spec (mode, temperature, and the v4.1 knobs; omitted knobs
+`qbyt_readout` spec (mode, temperature, and the v4.1/v4.2 knobs; omitted knobs
 default to legacy v4). v5/v6/v7 require an equal version and spec. v6 and v7
 share parameter shapes but not the emission formula (query-relative vs
 one-vs-rest), so a v6 file cannot be scored as v7.
+`stage2.init_allow_readout_mismatch` relaxes the check to a warned
+weights-only warm start (`strict=False`) from `stage2.init_checkpoint`;
+inference and evaluation paths must never pass it.
 
-The v4 pooling spec now carries the v4.1 fields `sink_token`, `text_position`,
-`audio_position`, `relative_num_buckets`, and `relative_max_distance`. Defaults
-reproduce legacy v4; a checkpoint's `qbyt_readout` mapping is the compatibility
-key. Do not stamp version 8, and do not write 7 onto a pooling checkpoint.
+The v4 pooling spec carries the v4.1 fields `sink_token`, `text_position`,
+`audio_position`, `relative_num_buckets`, and `relative_max_distance`, plus the
+v4.2 fields `sink_readout` (`none`/`additive`/`mixture`), `sink_identity`,
+`sink_zero_init`, `temperature_learnable`, and `score_temperature` (eval-only;
+`null` means the training temperature). Defaults reproduce legacy v4; a
+checkpoint's `qbyt_readout` mapping is the compatibility key. Do not stamp
+version 8, and do not write 7 onto a pooling checkpoint.
+
+`stage2.sink_loss` (bce/rank supervision of the raw sink logit, before the alpha
+gate) is training-only: it is stamped into `config.stage2.sink_loss` for
+provenance and never enters the `qbyt_readout` scoring spec.
 
 Families live in `qbyt/model_v1.py` (v1), `qbyt/pooling.py` (v2-v4),
 `qbyt/bounded.py` (v5), and `qbyt/model.py` (v6/v7). `build_qbyt` is the only

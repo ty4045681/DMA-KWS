@@ -539,6 +539,7 @@ def assert_qbyt_readout_version(
     *,
     source: Any,
     expected_alignment: Any | None = None,
+    allow_mismatch: bool = False,
 ) -> None:
     """Fail unless QbyT weights match the expected score semantics.
 
@@ -549,6 +550,11 @@ def assert_qbyt_readout_version(
     checkpoint that decodes is accepted. When it is provided, pooling v2/v3/v4
     may match on mode/temperature; v1 and v5/v6/v7 require an equal version and
     spec.
+
+    allow_mismatch exists only for explicit weights-only warm starts
+    (stage2.init_allow_readout_mismatch): the mismatch is reported and the load
+    continues so a new readout head can be fine-tuned from an older checkpoint.
+    Inference and evaluation paths must never pass it.
     """
 
     if not _carries_qbyt_weights(checkpoint):
@@ -591,6 +597,14 @@ def assert_qbyt_readout_version(
     expected_version = (
         expected.version if expected is not None else QBYT_READOUT_VERSION
     )
+    if allow_mismatch:
+        print(
+            "WARNING: allowing a QbyT readout mismatch for a weights-only warm start: "
+            f"{source} carries {described}{mode_detail}{expected_detail}. "
+            "The new readout head starts from its own initialization and must be "
+            "fine-tuned; do not use these weights for inference without an exact match."
+        )
+        return
     raise SystemExit(
         f"{source} carries QbyT weights at readout {described}{mode_detail}, but this build "
         f"uses version {expected_version}{expected_detail}. Readout semantics differ, "

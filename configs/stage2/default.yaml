@@ -75,6 +75,21 @@ negative_tail_loss:
   weight: 0.5
   fraction: 0.1
 
+# Dedicated supervision for the QbyT sink head (qbyt_readout.sink_readout).
+# The raw sink logit (before the learnable alpha gate) is trained with either a
+# plain BCE or a pairwise ranking loss over positives/negatives in the batch.
+# Motivation: the C1 run showed the jointly trained sink branch drifting to a
+# slight net negative (alpha 1.0 -> 0.64) while a dev-fitted linear head on the
+# same sink state added +0.003 AUC, i.e. the head needs a direct gradient that
+# does not shrink with alpha. Requires a pooling readout with sink_readout
+# enabled; the loss config is recorded under config.stage2.sink_loss, never in
+# the qbyt_readout scoring spec.
+sink_loss:
+  enabled: false
+  weight: 0.25
+  form: bce                    # bce | rank
+  temperature: 1.0             # rank form only
+
 # Pure background is sampled only inside the existing negative branch, so this
 # does not change the 50/50 positive/negative class balance. Pooling v2-v4 and
 # keyword-filler v6/v7 may enable it; bounded v5 may not. Point audio_list_path

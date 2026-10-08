@@ -58,6 +58,85 @@ def negative_tail_cvar_loss(
     return per_negative.topk(keep, sorted=False).values.mean()
 
 
+SINK_LOSS_FORMS = frozenset({"bce", "rank"})
+
+
+def normalize_sink_loss_form(form: object) -> str:
+    """Validate the stage2.sink_loss form name."""
+
+    normalized = str(form).strip().lower()
+    if normalized not in SINK_LOSS_FORMS:
+        choices = ", ".join(sorted(SINK_LOSS_FORMS))
+        raise ValueError(
+            f"Unsupported sink loss form {form!r}; expected one of: {choices}"
+        )
+    return normalized
+
+
+def validate_sink_loss(*, weight: float, form: str, temperature: float) -> None:
+    """Validate the stage2.sink_loss configuration."""
+
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError("sink loss weight must be finite and non-negative")
+    normalize_sink_loss_form(form)
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("sink loss temperature must be finite and positive")
+
+
+def sink_bce_loss(
+    sink_logit: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Binary cross-entropy on the raw sink logit.
+
+    The loss deliberately consumes the logit before any learnable alpha gate:
+    a gate that starts at zero would otherwise scale the sink gradient down
+    exactly while the head is still untrained, which is the failure mode the
+    C1 run showed (alpha drifted 1.0 to 0.64 while the sink head stayed weak).
+    """
+
+    if sink_logit.shape != labels.shape:
+        raise ValueError(
+            "sink bce expects sink_logit and labels with identical shapes; "
+            f"got {tuple(sink_logit.shape)} and {tuple(labels.shape)}"
+        )
+    return F.binary_cross_entropy_with_logits(
+        sink_logit.reshape(-1).float(),
+        labels.reshape(-1).float(),
+    )
+
+
+def sink_rank_loss(
+    sink_logit: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Pairwise logistic ranking loss over positive/negative rows in a batch.
+
+    The per-pair term is softplus(-(s_pos - s_neg) / temperature), averaged
+    over every positive-negative pair. The batch makes hard pairs free, and the
+    loss targets the low-FPR ordering that BCE only reaches indirectly. A batch
+    without both classes returns a differentiable zero.
+    """
+
+    validate_sink_loss(weight=0.0, form="rank", temperature=temperature)
+    if sink_logit.shape != labels.shape:
+        raise ValueError(
+            "sink rank loss expects sink_logit and labels with identical shapes; "
+            f"got {tuple(sink_logit.shape)} and {tuple(labels.shape)}"
+        )
+    flat_logits = sink_logit.reshape(-1).float()
+    flat_labels = labels.reshape(-1)
+    positive = flat_logits[flat_labels.eq(1)]
+    negative = flat_logits[flat_labels.eq(0)]
+    if positive.numel() == 0 or negative.numel() == 0:
+        # Keep a zero-gradient connection without materialising an empty grid.
+        return flat_logits[:0].sum()
+    differences = positive.unsqueeze(1) - negative.unsqueeze(0)
+    return F.softplus(-differences / float(temperature)).mean()
+
+
 def normalize_seq_loss_normalization(normalization: str) -> str:
     """Validate how the progress BCE is reduced across a batch."""
     normalized = str(normalization).strip().lower()

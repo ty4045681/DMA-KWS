@@ -18,19 +18,55 @@ DEFAULT_QBYT_TEXT_POSITION = "sinusoidal"
 DEFAULT_QBYT_AUDIO_POSITION = "sinusoidal"
 DEFAULT_QBYT_RELATIVE_NUM_BUCKETS = 32
 DEFAULT_QBYT_RELATIVE_MAX_DISTANCE = 64
+DEFAULT_QBYT_SINK_READOUT = "none"
+DEFAULT_QBYT_SINK_IDENTITY = False
+DEFAULT_QBYT_SINK_ZERO_INIT = False
+DEFAULT_QBYT_TEMPERATURE_LEARNABLE = False
 _MIN_RELATIVE_NUM_BUCKETS = 4
 QBYT_READOUT_MODES = frozenset(
     {GRU_LAST_READOUT, EPS_MEAN_READOUT, EPS_SOFTMIN_READOUT}
 )
 QBYT_TEXT_POSITIONS = frozenset({"sinusoidal", "learned"})
 QBYT_AUDIO_POSITIONS = frozenset({"sinusoidal", "relative_bias"})
+QBYT_SINK_READOUTS = frozenset({"none", "additive", "mixture"})
 QBYT_POOLING_EXTENSION_FIELDS = (
     "sink_token",
     "text_position",
     "audio_position",
     "relative_num_buckets",
     "relative_max_distance",
+    "sink_readout",
+    "sink_identity",
+    "sink_zero_init",
+    "temperature_learnable",
+    "score_temperature",
 )
+
+
+def normalize_qbyt_sink_readout(value: Any) -> str:
+    """Validate the v4.1+ sink-state readout switch."""
+
+    normalized = str(value).strip().lower()
+    if normalized not in QBYT_SINK_READOUTS:
+        choices = ", ".join(sorted(QBYT_SINK_READOUTS))
+        raise ValueError(
+            f"Unsupported QbyT sink_readout {value!r}; expected one of: {choices}"
+        )
+    return normalized
+
+
+def _normalize_qbyt_bool(value: Any, *, field: str) -> bool:
+    """Accept real booleans plus the string/int forms Hydra can produce."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, str)):
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"QbyT readout {field} must be a boolean, got {value!r}")
 
 
 def normalize_qbyt_readout_mode(value: Any) -> str:
@@ -158,6 +194,13 @@ class QbyTReadoutConfig:
     audio_position: str = DEFAULT_QBYT_AUDIO_POSITION
     relative_num_buckets: int = DEFAULT_QBYT_RELATIVE_NUM_BUCKETS
     relative_max_distance: int = DEFAULT_QBYT_RELATIVE_MAX_DISTANCE
+    sink_readout: str = DEFAULT_QBYT_SINK_READOUT
+    sink_identity: bool = DEFAULT_QBYT_SINK_IDENTITY
+    sink_zero_init: bool = DEFAULT_QBYT_SINK_ZERO_INIT
+    temperature_learnable: bool = DEFAULT_QBYT_TEMPERATURE_LEARNABLE
+    #: Scoring temperature used at eval/inference; None = the training
+    #: temperature (S8b: training and scoring temperatures are decoupled).
+    score_temperature: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", normalize_qbyt_readout_mode(self.mode))
@@ -204,6 +247,44 @@ class QbyTReadoutConfig:
         _validate_relative_attention_buckets(
             self.relative_num_buckets, self.relative_max_distance
         )
+        object.__setattr__(
+            self, "sink_readout", normalize_qbyt_sink_readout(self.sink_readout)
+        )
+        object.__setattr__(
+            self,
+            "sink_identity",
+            _normalize_qbyt_bool(self.sink_identity, field="sink_identity"),
+        )
+        object.__setattr__(
+            self,
+            "sink_zero_init",
+            _normalize_qbyt_bool(self.sink_zero_init, field="sink_zero_init"),
+        )
+        object.__setattr__(
+            self,
+            "temperature_learnable",
+            _normalize_qbyt_bool(
+                self.temperature_learnable, field="temperature_learnable"
+            ),
+        )
+        if self.sink_zero_init and self.sink_readout == DEFAULT_QBYT_SINK_READOUT:
+            raise ValueError("QbyT sink_zero_init requires a sink_readout")
+        if self.score_temperature is not None:
+            object.__setattr__(
+                self,
+                "score_temperature",
+                _normalize_qbyt_readout_temperature(self.score_temperature),
+            )
+        if self.sink_readout != DEFAULT_QBYT_SINK_READOUT and not self.sink_token:
+            raise ValueError("QbyT sink_readout requires sink_token=True")
+        if self.sink_identity and not self.sink_token:
+            raise ValueError("QbyT sink_identity requires sink_token=True")
+        if self.temperature_learnable and self.mode != EPS_SOFTMIN_READOUT:
+            raise ValueError(
+                "QbyT temperature_learnable requires the eps_softmin readout"
+            )
+        if self.sink_readout != DEFAULT_QBYT_SINK_READOUT and self.mode != EPS_SOFTMIN_READOUT:
+            raise ValueError("QbyT sink_readout requires the eps_softmin readout")
 
     def as_dict(self) -> dict[str, str | float | bool | int]:
         """Return the stable mapping embedded in checkpoints and provenance."""
@@ -216,6 +297,11 @@ class QbyTReadoutConfig:
             "audio_position": self.audio_position,
             "relative_num_buckets": self.relative_num_buckets,
             "relative_max_distance": self.relative_max_distance,
+            "sink_readout": self.sink_readout,
+            "sink_identity": self.sink_identity,
+            "sink_zero_init": self.sink_zero_init,
+            "temperature_learnable": self.temperature_learnable,
+            "score_temperature": self.score_temperature,
         }
 
 
@@ -252,6 +338,13 @@ def resolve_qbyt_readout(
         relative_max_distance = value.get(
             "relative_max_distance", DEFAULT_QBYT_RELATIVE_MAX_DISTANCE
         )
+        sink_readout = value.get("sink_readout", DEFAULT_QBYT_SINK_READOUT)
+        sink_identity = value.get("sink_identity", DEFAULT_QBYT_SINK_IDENTITY)
+        sink_zero_init = value.get("sink_zero_init", DEFAULT_QBYT_SINK_ZERO_INIT)
+        score_temperature = value.get("score_temperature", None)
+        temperature_learnable = value.get(
+            "temperature_learnable", DEFAULT_QBYT_TEMPERATURE_LEARNABLE
+        )
     else:
         # Preserve the historical scalar/None shorthand accepted by the
         # mode-only resolver. Extension knobs stay at the legacy v4 defaults.
@@ -262,6 +355,11 @@ def resolve_qbyt_readout(
         audio_position = DEFAULT_QBYT_AUDIO_POSITION
         relative_num_buckets = DEFAULT_QBYT_RELATIVE_NUM_BUCKETS
         relative_max_distance = DEFAULT_QBYT_RELATIVE_MAX_DISTANCE
+        sink_readout = DEFAULT_QBYT_SINK_READOUT
+        sink_identity = DEFAULT_QBYT_SINK_IDENTITY
+        sink_zero_init = DEFAULT_QBYT_SINK_ZERO_INIT
+        temperature_learnable = DEFAULT_QBYT_TEMPERATURE_LEARNABLE
+        score_temperature = None
     return QbyTReadoutConfig(
         mode=mode,
         temperature=temperature,
@@ -270,6 +368,11 @@ def resolve_qbyt_readout(
         audio_position=audio_position,
         relative_num_buckets=relative_num_buckets,
         relative_max_distance=relative_max_distance,
+        sink_readout=sink_readout,
+        sink_identity=sink_identity,
+        sink_zero_init=sink_zero_init,
+        temperature_learnable=temperature_learnable,
+        score_temperature=score_temperature,
     )
 
 

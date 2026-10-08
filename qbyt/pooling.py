@@ -23,6 +23,7 @@ _AUDIO_MODALITY = 1
 _SINK_MODALITY = 2
 _TEXT_POSITIONS = frozenset({"sinusoidal", "learned"})
 _AUDIO_POSITIONS = frozenset({"sinusoidal", "relative_bias"})
+_QBYT_SINK_READOUTS = frozenset({"none", "additive", "mixture"})
 _MIN_RELATIVE_NUM_BUCKETS = 4
 
 
@@ -69,6 +70,10 @@ class QbyTReadoutDetails(NamedTuple):
 
     position_logits: torch.Tensor | None
     position_mask: torch.Tensor
+    #: Raw sink logit (before the learnable alpha gate), or None when the readout
+    #: has no sink head. Used by stage2.sink_loss to supervise the sink head
+    #: independently of the alpha weight.
+    sink_logit: torch.Tensor | None = None
 
 
 def _normalize_qbyt_readout_mode(value):
@@ -270,6 +275,41 @@ class RelativeAttentionBias(nn.Module):
         key_valid = valid.unsqueeze(1).unsqueeze(2)
         return bias.masked_fill(~key_valid, float("-inf"))
 
+    def compute_fast(self, modality, index, valid):
+        """Same additive bias as compute(), built batch-independently.
+
+        The audio-audio bucket term depends only on absolute packed positions
+        (each sample's text length cancels out of audio index differences), so
+        it is computed once on a [L, L] grid instead of gathered from a
+        per-batch [B, L, L] int64 index grid. The modality pair table is
+        contracted through one-hot vectors, avoiding the [B, L, L] advanced
+        indexing. The index argument is unused here and kept only for
+        signature parity.
+        """
+        modality = modality.long()
+        valid = valid.to(dtype=torch.bool)
+        total_width = modality.size(1)
+        num_buckets = int(self.audio_buckets.size(0))
+        max_distance = int(self.max_distance)
+        onehot = torch.nn.functional.one_hot(modality, num_classes=3).to(
+            torch.float32
+        )
+        pair = torch.einsum(
+            "bpd,bke,deh->bhpk", onehot, onehot, self.pair_table.float()
+        )
+        positions = torch.arange(total_width, device=modality.device)
+        relative_position = positions.unsqueeze(0) - positions.unsqueeze(1)
+        buckets = _relative_position_bucket(
+            relative_position, num_buckets, max_distance
+        )
+        audio = self.audio_buckets[buckets].permute(2, 0, 1).float().unsqueeze(0)
+        both_audio = (modality == _AUDIO_MODALITY).unsqueeze(2) & (
+            modality == _AUDIO_MODALITY
+        ).unsqueeze(1)
+        bias = pair + audio * both_audio.unsqueeze(1).to(dtype=audio.dtype)
+        key_valid = valid.unsqueeze(1).unsqueeze(2)
+        return bias.masked_fill(~key_valid, float("-inf"))
+
 
 class GRUFCModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -298,6 +338,11 @@ class QbyT(nn.Module):
         audio_position="sinusoidal",
         relative_num_buckets=32,
         relative_max_distance=64,
+        sink_readout="none",
+        sink_identity=False,
+        sink_zero_init=False,
+        temperature_learnable=False,
+        score_temperature=None,
     ):
         super().__init__()
         text_position = str(text_position).strip().lower()
@@ -351,6 +396,50 @@ class QbyT(nn.Module):
         self.readout_temperature = _normalize_readout_temperature(
             readout_temperature
         )
+        self.sink_readout = str(sink_readout).strip().lower()
+        if self.sink_readout not in _QBYT_SINK_READOUTS:
+            raise ValueError(
+                f"Unsupported QbyT sink_readout {sink_readout!r}; expected one of: "
+                + ", ".join(sorted(_QBYT_SINK_READOUTS))
+            )
+        if self.sink_readout != "none" and self.readout_mode != EPS_SOFTMIN_READOUT:
+            raise ValueError("sink_readout requires the eps_softmin readout")
+        if self.sink_readout != "none" and not sink_token:
+            raise ValueError("sink_readout requires sink_token=True")
+        self.sink_identity = bool(sink_identity)
+        if self.sink_identity and not sink_token:
+            raise ValueError("sink_identity requires sink_token=True")
+        self.sink_identity_emb = (
+            nn.Parameter(torch.zeros(embed_dim)) if self.sink_identity else None
+        )
+        self.sink_zero_init = bool(sink_zero_init)
+        if self.sink_zero_init and self.sink_readout == "none":
+            raise ValueError("sink_zero_init requires a sink_readout")
+        self.sink_fc = (
+            nn.Linear(embed_dim, 1) if self.sink_readout != "none" else None
+        )
+        if self.sink_fc is not None and self.sink_zero_init:
+            # Zero-start residual branch: the utterance score is unchanged at
+            # step 0 while gradients reach the sink head immediately, instead of
+            # waiting for an alpha gate that itself starts at zero.
+            nn.init.zeros_(self.sink_fc.weight)
+            nn.init.zeros_(self.sink_fc.bias)
+        self.sink_alpha = (
+            nn.Parameter(torch.ones(1) if self.sink_zero_init else torch.zeros(1))
+            if self.sink_readout == "additive"
+            else None
+        )
+        self.temperature_learnable = bool(temperature_learnable)
+        if self.temperature_learnable and self.readout_mode != EPS_SOFTMIN_READOUT:
+            raise ValueError("temperature_learnable requires the eps_softmin readout")
+        self.log_temperature_scale = (
+            nn.Parameter(torch.zeros(1)) if self.temperature_learnable else None
+        )
+        self.score_temperature = (
+            None
+            if score_temperature is None
+            else _normalize_readout_temperature(score_temperature)
+        )
         if self.readout_mode == GRU_LAST_READOUT:
             self.gru = nn.GRU(embed_dim, embed_dim, batch_first=True)
             self.fc = nn.Linear(embed_dim, 1)
@@ -361,6 +450,21 @@ class QbyT(nn.Module):
             self.final_pos_fc = nn.Linear(embed_dim, 1)
         self.seq_fc = nn.Linear(embed_dim, 1)
 
+
+    def _effective_temperature(self):
+        """Return the softmin temperature, optionally learned and clamped.
+
+        At inference (eval mode) a configured score_temperature wins over the
+        training temperature, implementing the S8b decoupling. Training always
+        uses the training temperature.
+        """
+
+        if not self.training and self.score_temperature is not None:
+            return self.score_temperature
+        if self.log_temperature_scale is None:
+            return self.readout_temperature
+        scale = self.log_temperature_scale.clamp(math.log(0.02), math.log(4.0))
+        return self.readout_temperature * scale.exp()
 
     def forward(self, speech, text, speech_lengths=None, text_lengths=None):
         """Score each (text, speech) pair in the batch.
@@ -453,6 +557,10 @@ class QbyT(nn.Module):
 
         if self.sink_token is not None:
             sink = self.sink_token.view(1, 1, -1).expand(batch_size, 1, -1)
+            if self.sink_identity_emb is not None:
+                sink = self.modality_enc(sink, "audio") + self.sink_identity_emb.view(
+                    1, 1, -1
+                )
             audio_emb = torch.cat([sink, audio_emb], dim=1)
             speech_lengths = speech_lengths + 1
 
@@ -489,7 +597,7 @@ class QbyT(nn.Module):
                 valid,
                 sink=self.sink_token is not None,
             )
-            attn_bias = self.relative_bias.compute(modality, index, valid)
+            attn_bias = self.relative_bias.compute_fast(modality, index, valid)
             attn_mask = attn_bias.reshape(
                 batch_size * self.nhead, total_width, total_width
             )
@@ -539,20 +647,42 @@ class QbyT(nn.Module):
                 position_logits,
                 torch.zeros_like(position_logits),
             )
+            temperature = self._effective_temperature()
+            pool_logits = position_logits
+            pool_mask = text_mask
+            sink_logit = None
+            if self.sink_fc is not None:
+                sink_rows = torch.arange(batch_size, device=text.device)
+                # Packed layout is [valid text][sink][valid audio][pad], so the
+                # sink sits at this sample's text length.
+                sink_positions = text_lengths.clamp(max=combined_feat.size(1) - 1)
+                sink_states = combined_feat[sink_rows, sink_positions]
+                sink_logit = self.sink_fc(sink_states).squeeze(-1)
+                if self.sink_readout == "mixture":
+                    sink_mask = torch.ones(
+                        (batch_size, 1), dtype=torch.bool, device=text.device
+                    )
+                    pool_logits = torch.cat(
+                        [position_logits, sink_logit.unsqueeze(1)], dim=1
+                    )
+                    pool_mask = torch.cat([text_mask, sink_mask], dim=1)
             if self.readout_mode == EPS_MEAN_READOUT:
                 logits = valid_position_logits.sum(dim=1) / text_mask.sum(
                     dim=1
                 ).clamp_min(1)
             else:
                 logits = _masked_normalized_softmin(
-                    position_logits,
-                    text_mask,
-                    self.readout_temperature,
+                    pool_logits,
+                    pool_mask,
+                    temperature,
                 )
+            if self.sink_alpha is not None and sink_logit is not None:
+                logits = logits + self.sink_alpha.reshape(()) * sink_logit
             readout_details = (
                 QbyTReadoutDetails(
                     position_logits=valid_position_logits,
                     position_mask=text_mask,
+                    sink_logit=sink_logit,
                 )
                 if include_readout_details
                 else None

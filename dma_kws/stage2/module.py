@@ -16,7 +16,13 @@ import torchmetrics
 from dma_kws.config import resolve_stream_policy
 from dma_kws.inference.score_calibration import PositiveAffineCalibrator
 from dma_kws.nn import build_encoder, run_encoder
-from dma_kws.stage2.losses import compute_stage2_losses
+from dma_kws.stage2.losses import (
+    compute_stage2_losses,
+    normalize_sink_loss_form,
+    sink_bce_loss,
+    sink_rank_loss,
+    validate_sink_loss,
+)
 from dma_kws.stage2.model_factory import build_qbyt
 from dma_kws.stage2.objective import (
     QBYT_V1_SEQUENCE_OBJECTIVE,
@@ -216,6 +222,33 @@ class Stage2LightningModule(pl.LightningModule):
         self.negative_tail_fraction = float(
             negative_tail_cfg.get("fraction", 0.1)
         )
+        sink_loss_cfg = stage2.get("sink_loss", {}) or {}
+        if not isinstance(sink_loss_cfg, dict):
+            raise ValueError("stage2.sink_loss must be a mapping")
+        self._sink_loss_enabled = bool(sink_loss_cfg.get("enabled", False))
+        self.sink_loss_weight = float(sink_loss_cfg.get("weight", 0.25))
+        self.sink_loss_form = normalize_sink_loss_form(
+            sink_loss_cfg.get("form", "bce")
+        )
+        self.sink_loss_temperature = float(sink_loss_cfg.get("temperature", 1.0))
+        validate_sink_loss(
+            weight=self.sink_loss_weight,
+            form=self.sink_loss_form,
+            temperature=self.sink_loss_temperature,
+        )
+        if self._sink_loss_enabled:
+            sink_readout = getattr(self.qbyt_score.value, "sink_readout", "none")
+            if self.qbyt_score.family != "pooling" or sink_readout == "none":
+                raise ValueError(
+                    "stage2.sink_loss requires a pooling readout with "
+                    "stage2.qbyt_readout.sink_readout enabled"
+                )
+        self._checkpoint_config.setdefault("stage2", {})["sink_loss"] = {
+            "enabled": self._sink_loss_enabled,
+            "weight": self.sink_loss_weight,
+            "form": self.sink_loss_form,
+            "temperature": self.sink_loss_temperature,
+        }
         # Minimal hand-written configs may omit this section. Stamp the resolved
         # objective into all new checkpoints so two same-shape QbyT models do not
         # become indistinguishable after being trained against different targets.
@@ -300,6 +333,24 @@ class Stage2LightningModule(pl.LightningModule):
                 Path(init_checkpoint),
                 require_full_qbyt=require_full_qbyt_init,
             )
+        if bool(stage2.get("freeze_all_but_sink", False)):
+            # Second-stage sink-head fine-tune: the trunk, text head and every
+            # other readout parameter stay frozen; only the new sink readout
+            # (sink_fc + sink_alpha) is trainable. Requires the dedicated sink
+            # loss so the head actually receives a gradient.
+            if not self._sink_loss_enabled:
+                raise ValueError(
+                    "stage2.freeze_all_but_sink requires stage2.sink_loss.enabled"
+                )
+            for param in self.qbyt.parameters():
+                param.requires_grad_(False)
+            for name, param in self.qbyt.named_parameters():
+                if name.startswith("sink_fc") or name == "sink_alpha":
+                    param.requires_grad_(True)
+            rank_zero_print(
+                "Froze every QbyT parameter except the sink readout head "
+                "(sink_fc + sink_alpha); only the sink head is trainable."
+            )
 
         adapter_checkpoint = str(adapter_cfg.get("init_checkpoint", "")).strip()
         if self.adapter_enabled and adapter_checkpoint:
@@ -369,6 +420,8 @@ class Stage2LightningModule(pl.LightningModule):
                     "loss_negative_tail_weighted",
                     "loss_ctc_raw",
                     "loss_ctc_weighted",
+                    "loss_sink_raw",
+                    "loss_sink_weighted",
                     "illegal_path_rate",
                 )
             }
@@ -388,10 +441,14 @@ class Stage2LightningModule(pl.LightningModule):
     ) -> None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         assert_stream_policy_matches(checkpoint, self.stream_policy, source=checkpoint_path)
+        allow_readout_mismatch = bool(
+            self._stage2_cfg.get("init_allow_readout_mismatch", False)
+        )
         assert_qbyt_readout_version(
             checkpoint,
             source=checkpoint_path,
             expected_alignment=self.qbyt_score,
+            allow_mismatch=allow_readout_mismatch,
         )
         
         # Check if this is an icefall checkpoint (has "model" key)
@@ -490,8 +547,20 @@ class Stage2LightningModule(pl.LightningModule):
                         stacklevel=2,
                     )
             if qbyt_state:
-                self.qbyt.load_state_dict(qbyt_state, strict=True)
-                rank_zero_print(f"Loaded QbyT v{self.qbyt_score.version} weights from {checkpoint_path}")
+                missing_qbyt, unexpected_qbyt = self.qbyt.load_state_dict(
+                    qbyt_state,
+                    strict=not allow_readout_mismatch,
+                )
+                if allow_readout_mismatch:
+                    rank_zero_print(
+                        "Loaded QbyT weights with a relaxed readout head from "
+                        f"{checkpoint_path}: missing={len(missing_qbyt)} "
+                        f"unexpected={len(unexpected_qbyt)}"
+                    )
+                else:
+                    rank_zero_print(
+                        f"Loaded QbyT v{self.qbyt_score.version} weights from {checkpoint_path}"
+                    )
 
     def _load_adapter_checkpoint(self, checkpoint_path: Path) -> None:
         """Load a Step A adapter export produced by ``scripts/train_ctc_adapter.py``.
@@ -567,7 +636,7 @@ class Stage2LightningModule(pl.LightningModule):
         *,
         mode: str = "eval",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        logits, seq_logits, _ = self.forward_with_encoder(
+        logits, seq_logits, _, _ = self.forward_with_encoder(
             feat, feat_lengths, anchor, mode=mode
         )
         return logits, seq_logits
@@ -579,7 +648,13 @@ class Stage2LightningModule(pl.LightningModule):
         anchor: torch.Tensor,
         *,
         mode: str = "eval",
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor | None, torch.Tensor]]:
+        with_readout_details: bool = False,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        tuple[torch.Tensor | None, torch.Tensor],
+        object | None,
+    ]:
         """Like :meth:`forward` but also returns ``(ctc_log_probs, encoder_mask)``.
 
         The CTC log-probabilities come from the same adapter call that produced
@@ -611,10 +686,22 @@ class Stage2LightningModule(pl.LightningModule):
                 with_log_probs=bool(self.ctc_weight),
             )
 
+        readout_details = None
         if self.qbyt_score.family == "v1":
             # The paper v1 scorer accepts no mask or length inputs: its readout
             # is the final position of the padded concatenation by construction.
             logits, seq_logits = self.qbyt(speech, anchor)
+        elif with_readout_details and hasattr(
+            self.qbyt, "forward_with_readout_details"
+        ):
+            logits, seq_logits, readout_details = (
+                self.qbyt.forward_with_readout_details(
+                    speech,
+                    anchor,
+                    speech_lengths=encoder_lens,
+                    text_lengths=anchor_lengths,
+                )
+            )
         else:
             logits, seq_logits = self.qbyt(
                 speech,
@@ -622,7 +709,7 @@ class Stage2LightningModule(pl.LightningModule):
                 speech_lengths=encoder_lens,
                 text_lengths=anchor_lengths,
             )
-        return logits, seq_logits, (ctc_log_probs, encoder_mask)
+        return logits, seq_logits, (ctc_log_probs, encoder_mask), readout_details
 
     def on_train_start(self) -> None:
         # Only warn once a fit actually starts; eval scripts build this module with
@@ -752,8 +839,14 @@ class Stage2LightningModule(pl.LightningModule):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
         self._set_frozen_submodules_to_eval()
 
-        logits, seq_logits, (ctc_log_probs, encoder_mask) = self.forward_with_encoder(
-            batch["feat"], batch["feat_lengths"], batch["anchor"], mode="train"
+        logits, seq_logits, (ctc_log_probs, encoder_mask), readout_details = (
+            self.forward_with_encoder(
+                batch["feat"],
+                batch["feat_lengths"],
+                batch["anchor"],
+                mode="train",
+                with_readout_details=self._sink_loss_enabled,
+            )
         )
         encoder_lengths = encoder_mask.squeeze(1).sum(dim=1).to(dtype=torch.long)
         anchor_lengths = batch["anchor"].ne(0).sum(dim=1).to(dtype=torch.long)
@@ -798,6 +891,12 @@ class Stage2LightningModule(pl.LightningModule):
                 ctc_loss=self._auxiliary_ctc_loss(batch, ctc_log_probs, encoder_mask),
                 ctc_weight=self.ctc_weight,
             )
+            if self._sink_loss_enabled:
+                sink_loss = self._sink_loss_from_readout(readout_details, labels)
+                sink_loss_weighted = self.sink_loss_weight * sink_loss
+                total_loss = total_loss + sink_loss_weighted
+                losses["sink_loss"] = sink_loss
+                losses["sink_loss_weighted"] = sink_loss_weighted
             losses["utt_sample_mask"] = utt_sample_mask
             return total_loss, losses, logits
 
@@ -832,6 +931,26 @@ class Stage2LightningModule(pl.LightningModule):
             losses["illegal_path_rate"] = (~valid_path_mask).float().mean()
         return total_loss, losses, logits
 
+    def _sink_loss_from_readout(
+        self,
+        readout_details: object | None,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Supervise the raw sink logit independently of the alpha gate."""
+
+        sink_logit = getattr(readout_details, "sink_logit", None)
+        if sink_logit is None:
+            raise RuntimeError(
+                "stage2.sink_loss is enabled but the readout produced no sink logit"
+            )
+        if self.sink_loss_form == "bce":
+            return sink_bce_loss(sink_logit, labels)
+        return sink_rank_loss(
+            sink_logit,
+            labels,
+            temperature=self.sink_loss_temperature,
+        )
+
     def _log_train_losses(self, total_loss: torch.Tensor, losses: dict[str, torch.Tensor]) -> None:
         metrics = {
             "loss_total": total_loss,
@@ -854,6 +973,9 @@ class Stage2LightningModule(pl.LightningModule):
             metrics["loss_negative_tail_weighted"] = losses[
                 "negative_tail_weighted_loss"
             ]
+        if "sink_loss" in losses:
+            metrics["loss_sink_raw"] = losses["sink_loss"]
+            metrics["loss_sink_weighted"] = losses["sink_loss_weighted"]
 
         progress_metrics = {
             "loss_total",
