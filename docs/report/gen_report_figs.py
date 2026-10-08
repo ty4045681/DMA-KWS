@@ -3,6 +3,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.patheffects as pe
 from matplotlib.gridspec import GridSpec
 import numpy as np
 
@@ -17,7 +18,7 @@ plt.rcParams.update({
     "figure.dpi": 110, "savefig.dpi": 300, "savefig.bbox": "tight",
 })
 RED="#C1272D"; BLUE="#0072B2"; GRAY="#8C8C8C"; MGRAY="#A6A6A6"; LGRAY="#C9C9C9"
-ORANGE="#E69F00"; DARK="#2B2B2B"
+ORANGE="#E69F00"; DARK="#2B2B2B"; GREEN="#009E73"; LGREEN="#7FCBAF"
 
 def plabel(ax, s, x=-0.20, y=1.05):
     ax.text(x, y, s, transform=ax.transAxes, fontsize=10.5, fontweight="bold", va="bottom", visible=True)
@@ -479,7 +480,7 @@ def fig7_2():
     ax.set_xticks(range(4)); ax.set_xticklabels(["增训前", "LoRA", "QbyT\n全参", "encoder\n全参"], fontsize=7.6)
     ax.set_ylabel("误唤醒（次/小时，1 秒窗，对数刻度）")
     ax.set_title("误唤醒：从 67.9 压回 4.0", fontsize=9, pad=8)
-    fig.suptitle("结论：放开可训范围到 encoder 全参，且基座留在 C1，不要换 R1", y=0.99, fontsize=10.2)
+    fig.suptitle("结论：放开可训范围到 encoder 全参，基座留在 C1，不换 R1 或 GS-base 流式", y=0.99, fontsize=10.2)
     fig.subplots_adjust(left=0.085, right=0.98, top=0.82, bottom=0.26)
     save(fig, "fig7-2_scope_and_base")
 
@@ -493,6 +494,7 @@ def fig7_3():
         ("C1 + LoRA", [0.746, 0.822, 0.904, 0.923], ORANGE, "s"),
         ("C1 + QbyT 全参", [0.926, 0.933, 0.970, 0.977], MGRAY, "^"),
         ("C1 + encoder 全参（交付）", [0.996, 0.996, 0.997, 0.998], RED, "D"),
+        ("GS-base 流式 + encoder 全参", [0.975, 0.979, 0.988, 0.991], GREEN, "P"),
         ("R1 + encoder 5e-5", [0.965, 0.967, 0.970, 0.971], BLUE, "v"),
     ]
     ax = fig.add_subplot(gs[:, 0]); plabel(ax, "(a)", x=-0.20, y=1.03)
@@ -504,21 +506,21 @@ def fig7_3():
     ax.legend(frameon=False, fontsize=6.8, loc="center right", bbox_to_anchor=(1.02, 0.42))
     ax.set_title("标准口径：唤醒率与误唤醒预算的交换曲线", fontsize=8.8, pad=8)
 
-    names = ["增训前", "LoRA", "QbyT", "R1+enc", "enc\n全参"]
-    cols = [LGRAY, MGRAY, GRAY, BLUE, RED]
+    names = ["增训前", "LoRA", "QbyT", "R1+enc", "enc\n全参", "GS\nbase"]
+    cols = [LGRAY, MGRAY, GRAY, BLUE, RED, GREEN]
     panels = [
-        (0, 1, "(b)", "TTS 唤醒率（预算 0.05）", [0.985, 0.848, 0.891, 0.948, 0.970], (0.80, 1.04)),
-        (1, 1, "(c)", "近音词误触发（预算 0.05）", [0.247, 0.000, 0.031, 0.260, 0.024], (0, 0.31)),
-        (0, 2, "(d)", "TTS 唤醒率（预算 1.0）", [0.991, 0.936, 0.909, 0.964, 0.970], (0.80, 1.04)),
-        (1, 2, "(e)", "近音词误触发（预算 1.0）", [0.305, 0.061, 0.065, 0.283, 0.039], (0, 0.37)),
+        (0, 1, "(b)", "TTS 唤醒率（预算 0.05）", [0.985, 0.848, 0.891, 0.948, 0.970, 0.930], (0.80, 1.04)),
+        (1, 1, "(c)", "近音词误触发（预算 0.05）", [0.247, 0.000, 0.031, 0.260, 0.024, 0.108], (0, 0.31)),
+        (0, 2, "(d)", "TTS 唤醒率（预算 1.0）", [0.991, 0.936, 0.909, 0.964, 0.970, 0.970], (0.80, 1.04)),
+        (1, 2, "(e)", "近音词误触发（预算 1.0）", [0.305, 0.061, 0.065, 0.283, 0.039, 0.257], (0, 0.37)),
     ]
     for (r, c, letter, title, vals, (ylo, yhi)) in panels:
         ax = fig.add_subplot(gs[r, c]); plabel(ax, letter, x=-0.30, y=1.05)
-        ax.bar(range(5), vals, 0.62, color=cols)
+        ax.bar(range(6), vals, 0.62, color=cols)
         for i, v in enumerate(vals):
-            ax.text(i, v + (yhi - ylo) * 0.035, f"{v:.3f}", ha="center", fontsize=6.8,
+            ax.text(i, v + (yhi - ylo) * 0.035, f"{v:.3f}", ha="center", fontsize=6.4,
                     color=RED if i == 4 else DARK, fontweight="bold" if i == 4 else "normal")
-        ax.set_xticks(range(5)); ax.set_xticklabels(names, fontsize=7.0)
+        ax.set_xticks(range(6)); ax.set_xticklabels(names, fontsize=6.0)
         ax.set_ylim(ylo, yhi); ax.tick_params(axis="y", labelsize=7.4)
         ax.set_title(title, fontsize=8.2, pad=7)
     fig.suptitle("两个误唤醒预算档的对照：交付模型在两档都是唤醒率最高、近音词误触发最低", y=1.0, fontsize=10.2)
@@ -527,8 +529,105 @@ def fig7_3():
     fig.subplots_adjust(left=0.08, right=0.985, top=0.87, bottom=0.14)
     save(fig, "fig7-3_operating_points")
 
-# ================================================ 图 7-4 配方与消融
+# ================================================ 图 7-4 换编码器系复核
 def fig7_4():
+    fig = plt.figure(figsize=(8.0, 5.2))
+    gs = GridSpec(2, 3, figure=fig, height_ratios=[1.12, 1.0], hspace=0.78, wspace=0.42)
+    arms = ["C1\n冻结", "C1 全参\n（交付）", "GS\n冻结", "GS 全参"]
+    cols = [MGRAY, RED, LGREEN, GREEN]
+
+    # (a) 标准口径交换曲线：四个臂 + 增训前参照
+    ax = fig.add_subplot(gs[0, :]); plabel(ax, "(a)", x=-0.075, y=1.05)
+    fa = [0.05, 0.1, 0.5, 1.0]
+    curves = [
+        ("增训前 SS-zh-en", [0.360, 0.384, 0.432, 0.454], LGRAY, "o"),
+        ("C1 + QbyT 全参", [0.926, 0.933, 0.970, 0.977], MGRAY, "^"),
+        ("C1 + encoder 全参（交付）", [0.996, 0.996, 0.997, 0.998], RED, "D"),
+        ("GS-base + QbyT 全参", [0.799, 0.814, 0.886, 0.909], LGREEN, "v"),
+        ("GS-base + encoder 全参", [0.975, 0.979, 0.988, 0.991], GREEN, "P"),
+    ]
+    for name, ys, c, m in curves:
+        ax.plot(fa, ys, marker=m, color=c, lw=1.5, ms=5, label=name, zorder=4 if c == RED else 3)
+    ax.set_xscale("log"); ax.set_xticks(fa); ax.set_xticklabels(["0.05", "0.1", "0.5", "1.0"])
+    ax.set_xlim(0.042, 1.30); ax.set_ylim(0.30, 1.06)
+    ax.set_xlabel("目标误唤醒预算（次/小时，对数刻度）"); ax.set_ylabel("真人留出唤醒率")
+    ax.legend(frameon=False, fontsize=6.8, ncol=2, loc="center right", bbox_to_anchor=(1.0, 0.42))
+    ax.set_title("同一套配方的交换曲线：GS-base 全参贴在交付模型身后，冻结那臂整体低一档", fontsize=8.6, pad=8)
+
+    # (b) 真人留出 AUC：同可训范围下换系全部落后
+    ax = fig.add_subplot(gs[1, 0]); plabel(ax, "(b)", x=-0.30, y=1.07)
+    auc = [0.9922, 0.9991, 0.9487, 0.9758]
+    ax.bar(range(4), auc, 0.62, color=cols)
+    for i, v in enumerate(auc):
+        ax.text(i, v + 0.0012, f"{v:.4f}", ha="center", va="bottom", fontsize=7.0,
+                fontweight="bold" if i == 1 else "normal", color=RED if i == 1 else DARK)
+    ax.set_xticks(range(4)); ax.set_xticklabels(arms, fontsize=7.0)
+    ax.set_ylim(0.94, 1.012); ax.set_ylabel("AUC")
+    ax.tick_params(axis="y", labelsize=7.4)
+    ax.set_title("真人留出 AUC（增训前 0.6085）", fontsize=8.4, pad=7)
+
+    # (c) 通用能力：两条参照线是各自编码器系增训前的旧任务水平
+    ax = fig.add_subplot(gs[1, 1]); plabel(ax, "(c)", x=-0.34, y=1.07)
+    lph = [0.9300, 0.9413, 0.9025, 0.9137]
+    ax.bar(range(4), lph, 0.62, color=cols)
+    for i, v in enumerate(lph):
+        ax.text(i, v + 0.0008, f"{v:.4f}", ha="center", va="bottom", fontsize=7.0,
+                fontweight="bold" if i == 1 else "normal", color=RED if i == 1 else DARK)
+    ax.axhline(0.9411, color=BLUE, lw=1.0, ls="--", zorder=3)
+    gs_ref = ax.axhline(0.9119, color=GREEN, lw=1.0, ls="--", zorder=3)
+    # 绿色参照线要横穿同为绿色的 GS 全参柱，加一圈白色描边保证全程可见
+    gs_ref.set_path_effects([pe.withStroke(linewidth=2.6, foreground="white")])
+    h_zh, = ax.plot([], [], color=BLUE, ls="--", lw=1.0)
+    h_gs, = ax.plot([], [], color=GREEN, ls="--", lw=1.0)
+    ax.legend([h_zh, h_gs], ["zh-en 基座 0.9411", "GS-base 流式基座 0.9119"],
+              frameon=False, fontsize=6.2, loc="upper right", handlelength=1.4,
+              handletextpad=0.5, labelspacing=0.3, borderaxespad=0.15)
+    ax.set_xticks(range(4)); ax.set_xticklabels(arms, fontsize=7.0)
+    ax.set_ylim(0.892, 0.968); ax.set_ylabel("LibriPhrase AUC")
+    ax.tick_params(axis="y", labelsize=7.4)
+    ax.set_title("通用能力：柱低于同色虚线即遗忘", fontsize=8.4, pad=7)
+
+    # (d) 1 次/小时预算下的取舍：交付模型独占左上角
+    ax_d = fig.add_subplot(gs[1, 2]); plabel(ax_d, "(d)", x=-0.34, y=1.07)
+    pts = [
+        ("C1 冻结", 0.065, 0.977, MGRAY, "^", (5, -8)),
+        ("C1 全参（交付）", 0.039, 0.998, RED, "D", (6, 0)),
+        ("GS 冻结", 0.086, 0.909, LGREEN, "v", (5, -1)),
+        ("GS 全参", 0.257, 0.991, GREEN, "P", (-7, -6)),
+    ]
+    for name, near, wake, c, m, off in pts:
+        ax_d.scatter([near], [wake], s=46, color=c, marker=m, zorder=4,
+                     edgecolor=DARK if c == RED else "none", linewidth=0.6 if c == RED else 0)
+        ax_d.annotate(name, (near, wake), textcoords="offset points", xytext=off,
+                      fontsize=6.8, color=RED if c == RED else DARK,
+                      ha="right" if off[0] < 0 else "left")
+    ax_d.set_xlim(0, 0.31); ax_d.set_ylim(0.885, 1.02)
+    ax_d.set_xlabel("近音词误触发率"); ax_d.set_ylabel("真人留出唤醒率")
+    ax_d.tick_params(labelsize=7.4)
+    ax_d.set_title("预算 1 次/小时：越靠左上越好", fontsize=8.4, pad=7)
+
+    fig.suptitle("换 GS-base 流式编码器系复核：配方可以迁移，近音词与通用能力仍要付代价", y=1.0, fontsize=10.2)
+    fig.text(0.5, 0.012, "同一可训范围下 C1 全面领先；GS-base 放开全参把 1 次/小时唤醒率追到 0.991，但近音词误触发是交付模型的 6.6 倍。",
+             ha="center", fontsize=7.8, color=DARK)
+    fig.subplots_adjust(left=0.075, right=0.985, top=0.885, bottom=0.115)
+
+    # 方向指示：先在显示坐标下量出轴宽高，再画一条真正的 45° 斜箭头。
+    # 文字锚在箭尾，箭头和标签不会各说各话。
+    fig.canvas.draw()
+    box = ax_d.get_window_extent()
+    dx_ax = 0.22
+    dy_ax = dx_ax * box.width / box.height
+    tail = (0.95, 0.10)
+    ax_d.annotate("", xy=(tail[0] - dx_ax, tail[1] + dy_ax), xytext=tail,
+                  xycoords="axes fraction",
+                  arrowprops=dict(arrowstyle="->", lw=1.0, color=BLUE, ls="--"))
+    ax_d.annotate("更好", xy=tail, xycoords="axes fraction", textcoords="offset points",
+                  xytext=(-6, -1), ha="right", va="center", fontsize=6.6, color=BLUE)
+
+    save(fig, "fig7-4_encoder_family_recheck")
+
+# ================================================ 图 7-5 配方与消融
+def fig7_5():
     fig = plt.figure(figsize=(8.0, 4.6))
     gs = GridSpec(2, 3, figure=fig, height_ratios=[1.0, 1.15], hspace=0.62, wspace=0.5)
     # (a) joint vs sequential：TTS AUC
@@ -593,7 +692,7 @@ def fig7_4():
     ax.set_title("负结果：sink 写回放大 128 倍", fontsize=8.8, pad=8)
     fig.suptitle("配方与消融：joint 配额是主配方，TTS 预热值得做，随机加压与 sink 写回都不要做", y=0.985, fontsize=10.2)
     fig.subplots_adjust(left=0.085, right=0.98, top=0.86, bottom=0.10)
-    save(fig, "fig7-4_recipe_and_ablations")
+    save(fig, "fig7-5_recipe_and_ablations")
 
 # ================================================ 图 8-1 收益总表
 def fig8_1():
@@ -646,7 +745,7 @@ def fig8_1():
     fig.subplots_adjust(left=0.01, right=0.99, top=0.90, bottom=0.02)
     save(fig, "fig8-1_gains_table", allpairs)
 
-for f in [fig0_1, fig1_1, fig3_1, fig3_2, fig4_1, fig5_1, fig5_2, fig6_1, fig7_1, fig7_2, fig7_3, fig7_4, fig8_1]:
+for f in [fig0_1, fig1_1, fig3_1, fig3_2, fig4_1, fig5_1, fig5_2, fig6_1, fig7_1, fig7_2, fig7_3, fig7_4, fig7_5, fig8_1]:
     try:
         f()
     except Exception:
