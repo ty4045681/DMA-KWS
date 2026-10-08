@@ -130,7 +130,7 @@ preset does not define it (`sink_readout` and `sink_zero_init` are not in the ba
 | Purpose | Checkpoint | Preset | Extra overrides |
 | --- | --- | --- | --- |
 | delivery base (verified) | `.../final/C1-sink-50k/.../stage2_step050000.pt` | `icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k` | `+stage2.qbyt_readout.sink_readout=additive +stage2.qbyt_readout.sink_zero_init=true` |
-| best general, R1 (verified) | `.../final/R1-unfreeze-hardneg100/.../stage2_step012500.pt` | same | same |
+| best general metric, R1 (verified) | `.../final/R1-unfreeze-hardneg100/.../stage2_step012500.pt` | same | same |
 | Hey-Eva sink head | `.../sinkhead_stage2/SS-zh-en/.../stage2_step003000.pt` | same | same |
 | Hey-Eva delivery (report §7) | `.../stage2_adapt_v42/c1_encfull/stage2_adapted.pt` | same | same |
 | author paper v1 pair | `author_v1/stage1_v1.pt` + `author_v1/stage2_v1_si.pt` | `v1_paper_ls460` | none |
@@ -138,6 +138,15 @@ preset does not define it (`sink_readout` and `sink_zero_init` are not in the ba
 
 Only the first two rows are freshly verified end to end here; the others carry the same readout
 spec — confirm with `show-readout` before use.
+
+Base selection has a third criterion beyond architecture and readout: the encoder's
+**provenance**. Releasing the encoder during adaptation only pays off when its lineage is
+untouched by an earlier general-ASR fine-tune. With everything else equal, the same recipe
+gives near-miss trigger rates (budget 0.05) of 0.024 for zh-en-3M (untouched), 0.108 for
+GS-base (untouched) and 0.110 to 0.260 for R1, whose encoder had already moved during an
+earlier 13.3k-step fine-tune. The element-wise proof per checkpoint is in
+[encoder-provenance.md](../encoder-provenance.md); the comparison itself is report section
+7.8 and the strategy document's §6.12 note.
 
 **A Lightning `.ckpt` is not accepted by `prep.stage2_ckpt`.** Many release files are
 `.ckpt`; either pick the run's exported `.pt` (`stage2_stepNNNNN.pt`,
