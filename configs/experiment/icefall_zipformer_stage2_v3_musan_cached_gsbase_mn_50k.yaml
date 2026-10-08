@@ -1,0 +1,19 @@
+# @package _global_
+# v3 (eps_mean) + GS-KWS base Zipformer, streaming 16/64 re-run with the **corrected MUSAN training pool (music + noise only)**.
+#
+# Same recipe as icefall_zipformer_stage2_v3_musan_cached_gsbase_stream_50k (which used the speech-inclusive pool that was deleted on
+# 2026-10-03) — the overlay exists only to give the corrected campaign its own run name /
+# log / checkpoint tree. Everything else is inherited, including the streaming 16/64
+# operating point and the MUSAN fbank cache, which now resolves to the corrected catalog
+# and cache (icefall profile, cache_id 2b83f85f30ff3af8…, 774 train recordings).
+defaults:
+  - icefall_zipformer_stage2_v3_musan_cached_gsbase_stream_50k
+  - _self_
+
+stage2:
+  validation:
+    val_check_interval: 5000
+  val_check_interval: 5000
+  checkpoint_dir: ${paths.exp_root}/stage2_qbyt/checkpoints/v3-musan-gsbase-mn-50k
+  log_dir: ${paths.exp_root}/stage2_qbyt/logs/v3-musan-gsbase-mn-50k
+  run_name: v3-musan-gsbase-mn-50k
