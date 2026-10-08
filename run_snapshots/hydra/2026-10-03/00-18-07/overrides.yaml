@@ -1,0 +1,7 @@
+- +experiment=paper_ls_gs1460
+- prep.input_parquet=data/dma-kws/raw/GigaPhrase-1000/aggregated_segments_with_g2p_distance.parquet
+- prep.decoded_parquet_root=data/dma-kws/raw/LibriPhrase-GS-1460/decoded
+- prep.output_subdir=stage2_qbyt/ls-gs-1460-wenetprep
+- +prep.fbank_dir=data/dma-kws/features/fbank
+- fbank.dither=0.0
+- prep.num_workers=6

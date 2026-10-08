@@ -1,0 +1,5 @@
+- +experiment=adapt_hey_eva_v42
+- prep.manifest=outputs/hey_eva_v42_eval/real_eval_clips.csv
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-R1/checkpoints/SS-R1/version_0/stage2_step003000.pt.sinkfit.pt
+- prep.output_dir=outputs/hey_eva_v42_eval/real_r1sinkfit
+- run.device=cuda

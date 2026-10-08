@@ -1,0 +1,6 @@
+- +experiment=icefall_zipformer_stage2_v2_musan_cached_zhen3m_stream_50k
+- prep.checkpoint=data/dma-kws/exp/stage2_qbyt/checkpoints/v2-musan-zhen3m-stream-50k/v2-musan-zhen3m-stream-50k/version_1/stage2_step050000.pt
+- prep.output_dir=/home/ubuntu/dma-kws/outputs/v41_keyword_eval/probe_v2-zh
+- +prep.output_name=probe.npz
+- prep.batch_size=128
+- prep.num_workers=4

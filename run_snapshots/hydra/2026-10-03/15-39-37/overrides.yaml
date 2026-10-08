@@ -1,0 +1,6 @@
+- +experiment=icefall_zipformer_stage2_v2_musan_cached_gsbase_stream_50k
+- prep.manifest=/tmp/heyeva_pos.csv
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/v2-musan-gsbase-stream-50k/v2-musan-gsbase-stream-50k/version_0/stage2_step048000.pt
+- run.device=cpu
+- prep.amp=off
+- prep.output_dir=/tmp/heyeva_eval_v2gsbase

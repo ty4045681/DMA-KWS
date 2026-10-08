@@ -1,0 +1,6 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+- prep.checkpoint=data/dma-kws/exp/stage2_qbyt/checkpoints/v41-musan-zhen3m-50k/v41-musan-zhen3m-50k/version_9/stage2_step047500.pt
+- prep.output_dir=outputs/v41_offline_probe
+- prep.limit=256
+- prep.batch_size=64
+- prep.num_workers=4

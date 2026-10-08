@@ -1,0 +1,4 @@
+- +experiment=icefall_zipformer_stage2_v3_musan_cached_paperstage1_50k
+- fbank.dither=0.0
+- prep.from_csv=true
+- prep.num_workers=6

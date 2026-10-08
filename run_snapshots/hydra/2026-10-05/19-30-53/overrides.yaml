@@ -1,0 +1,15 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+- +stage2.qbyt_readout.sink_readout=additive
+- +stage2.qbyt_readout.sink_zero_init=true
+- stage2.warmup_steps=500
+- stage2.max_steps=50000
+- stage2.total_scheduler_steps=50000
+- stage2.validation.val_check_interval=2500
+- stage2.val_check_interval=2500
+- stage2.num_workers=2
+- stage2.run_name=P3-unfreeze-1to1
+- stage2.checkpoint_dir=data/dma-kws/exp/stage2_qbyt/final/P3-unfreeze-1to1/checkpoints
+- stage2.log_dir=data/dma-kws/exp/stage2_qbyt/final/P3-unfreeze-1to1/logs
+- stage2.freeze_encoder=false
+- stage2.hard_negative_ratio=1
+- stage2.learning_rate=2.5e-4

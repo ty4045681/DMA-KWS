@@ -1,0 +1,6 @@
+- +experiment=wenet_asr_stage2
+- prep.input_parquet=data/dma-kws/raw/GigaPhrase-1000/aggregated_segments_with_g2p_distance.parquet
+- prep.decoded_parquet_root=data/dma-kws/raw/GigaPhrase-1000/.decoded_smoke
+- prep.output_subdir=stage2_qbyt/_smoke2
+- prep.limit_anchors=3
+- prep.num_workers=4

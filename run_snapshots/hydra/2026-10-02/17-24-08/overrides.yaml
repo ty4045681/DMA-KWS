@@ -1,0 +1,6 @@
+- +experiment=v1_eval_author_si
+- ++prep.input_parquet=data/dma-kws/processed/stage2_qbyt/v1-wenet-subset-input.parquet
+- ++prep.decoded_parquet_root=data/dma-kws/raw/LibriPhrase-GS-1460/decoded
+- ++prep.output_subdir=stage2_qbyt/v1-wenet-subset
+- ++stage2.wav_dir=data/dma-kws/features/fbank_wenet_subset
+- ++prep.num_workers=8

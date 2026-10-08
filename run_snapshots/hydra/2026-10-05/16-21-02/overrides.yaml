@@ -1,0 +1,5 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.stage=train
+- adapt.train_phases=[real]
+- adapt.exp_root=data/dma-kws/exp/stage2_adapt_v42/hey_eva_realonly
+- adapt.max_steps=1500

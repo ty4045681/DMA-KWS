@@ -1,0 +1,6 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.stage=train
+- adapt.train_phases=[tts]
+- adapt.exp_root=outputs/hey_eva_v42_smoke
+- run.limit_steps=3
+- adapt.validation.val_check_interval=2

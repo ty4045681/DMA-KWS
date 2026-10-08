@@ -1,0 +1,14 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_paperstage1_50k
+- +stage2.qbyt_readout.sink_readout=additive
+- +stage2.qbyt_readout.sink_zero_init=true
+- prep.keyword=hey google
+- prep.keyword_phonemes=HH EY1 G UW1 G AH0 L
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-paperstage1/checkpoints/SS-paperstage1/version_0/stage2_step003000.pt
+- prep.musan_root=outputs/tts/hey_eva
+- prep.musan_audio_list_path=/home/ubuntu/dma-kws/outputs/v41_keyword_eval/list_ttsx-v42-paper-eva-google.txt
+- prep.window_sec=3.0
+- prep.hop_sec=3.0
+- prep.batch_size=64
+- prep.num_workers=4
+- prep.amp=fp16
+- prep.output_dir=/home/ubuntu/dma-kws/data/dma-kws/exp/stage2_qbyt/fa/ttsx-v42-paper-eva-google

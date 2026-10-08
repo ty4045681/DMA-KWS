@@ -1,0 +1,7 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.stage=train
+- adapt.train_phases=[joint]
+- adapt.phase=joint
+- adapt.exp_root=data/dma-kws/exp/stage2_adapt_v42/hey_eva_joint
+- adapt.max_steps=2100
+- stage2.background_negative.probability=0.4

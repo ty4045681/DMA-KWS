@@ -1,0 +1,10 @@
+# The mirrored source paths contain directory names that the repository
+# .gitignore excludes at any depth (outputs/, exp/, checkpoints/, logs/), so
+# those snapshots would be swallowed silently. Re-include this tree from here;
+# real weight/audio artifacts stay ignored.
+!*
+*.pt
+*.ckpt
+*.pth
+*.onnx
+*.npz

@@ -1,0 +1,45 @@
+learning_rate: 0.0005
+optimizer: adam
+weight_decay: 0.0
+warmup_steps: 2500
+max_steps: 6
+batch_size_per_gpu: 384
+accumulate_grad_batches: 2
+seed: 2025
+recipe: icefall-zipformer-frozen-eps-softmin-v41
+val_check_interval_train_batches: 2500
+val_check_interval_optimizer_steps_approx: 1250
+qbyt_readout_version: 4
+qbyt_readout_mode: eps_softmin
+qbyt_readout_temperature: 1.0
+qbyt_deployment_threshold: 0.5
+score_ece_num_bins: 15
+seq_target_mode: ordered_contiguous_prefix
+seq_progress_weight: 0.3
+seq_normalization: sample
+run_id: probe-b384/version_0
+run_version: 0
+run_section: stage2
+parent_run_id: ''
+resume_from: ''
+checkpoint_dir: outputs/probe_b384/checkpoints/probe-b384/version_0
+background_mode: fbank_cache
+background_source_ids:
+- musan
+background_source_weights:
+- 1.0
+background_source_index:
+  musan: 0
+background_source:musan:
+  background_source_id: musan
+  background_manifest: data/dma-kws/processed/background/musan/recordings.jsonl
+  background_cache_manifest: /mnt/datadisk0/dma-kws/processed/background/musan/cache/manifest.json
+  background_cache_id: 2b83f85f30ff3af834aab937b3d7d6d1c60fc76251e659eb398f3d69b8fc06a5
+  background_cache_format_version: 2
+  background_recording_count: 774
+background_data_signature_version: 2
+background_data_signature: 6153e0d26f2a13e42e52c37841a4f58e45d68c5abe4ba916f4e13e8d280a041b
+vocab_size: 71
+freeze_encoder: false
+init_checkpoint: data/dma-kws/exp/stage2_qbyt/final/C1-sink-50k/checkpoints/C1-sink-50k/version_0/stage2_step050000.pt
+require_full_qbyt_init: false

@@ -1,0 +1,14 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.train_phases=[joint]
+- adapt.exp_root=data/dma-kws/exp/stage2_adapt_v42/gsstream_encfull
+- adapt.max_steps=2100
+- adapt.learning_rate=1e-4
+- adapt.encoder_learning_rate=5e-5
+- adapt.encoder_schedule.start_batch_count=20000
+- stage2.background_negative.probability=0.4
+- stage1.cnn_module_kernel='31,31,15,15,15,31'
+- adapt.keyword='hey eva'
+- adapt.method=encoder_qbyt_full
+- run.device=cuda
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-gsbase-stream/checkpoints/SS-gsbase-stream/version_0/stage2_step003000.pt
+- adapt.phase=joint

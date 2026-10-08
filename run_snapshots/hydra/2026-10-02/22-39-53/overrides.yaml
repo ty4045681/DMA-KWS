@@ -1,0 +1,2 @@
+- +experiment=icefall_zipformer_stage2_v3_musan_cached_gsbase_stream_50k
+- stage2.parquet_file=data/dma-kws/processed/stage2_qbyt/ls-gs-1460/aggregated_segments_with_g2p_distance.parquet

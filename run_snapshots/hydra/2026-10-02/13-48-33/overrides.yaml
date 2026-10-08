@@ -1,0 +1,14 @@
+- +experiment=v1_eval_author_si
+- ++stage2.init_checkpoint=data/dma-kws/exp/author_v1/stage2_v1_si.pt
+- ++stage2.parquet_file=data/dma-kws/processed/stage2_qbyt/ls-gs-1460/aggregated_segments_with_g2p_distance.parquet
+- ++stage2.wav_dir=data/dma-kws/features/fbank_icefall_kws
+- ++stage2.freeze_encoder=true
+- ++stage2.precision=16-mixed
+- ++stage2.background_negative.enabled=true
+- ++stage2.background_negative.mode=online
+- ++stage2.background_negative.audio_list_path=data/dma-kws/processed/musan_split/train_background.list
+- ++stage2.num_workers=4
+- ++stage2.validation.val_check_interval=1000000
+- ++stage2.checkpoint.every_n_train_steps=1000000
+- run.limit_steps=1
+- run.devices=1

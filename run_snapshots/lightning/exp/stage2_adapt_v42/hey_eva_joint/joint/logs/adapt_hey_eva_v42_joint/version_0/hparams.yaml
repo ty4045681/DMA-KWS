@@ -1,0 +1,42 @@
+adapt_method: lora
+learning_rate: 0.0004
+optimizer: adam
+weight_decay: 0.0
+warmup_steps: 100
+max_steps: 2100
+mix_ratio: 0.5
+keyword: hey eva
+phase: joint
+rank: 16
+alpha: 32.0
+batch_size_per_gpu: 64
+accumulate_grad_batches: 1
+seed: 2025
+recipe: icefall-zipformer-frozen-eps-softmin-v41
+val_check_interval_train_batches: 300
+val_check_interval_optimizer_steps_approx: 300
+qbyt_readout_version: 4
+qbyt_readout_mode: eps_softmin
+qbyt_readout_temperature: 1.0
+qbyt_deployment_threshold: 0.5
+score_ece_num_bins: 15
+seq_target_mode: ordered_contiguous_prefix
+seq_progress_weight: 0.3
+seq_normalization: sample
+slug: hey_eva_v42
+run_id: adapt_hey_eva_v42_joint/version_0
+run_version: 0
+run_section: adapt
+parent_run_id: ''
+resume_from: ''
+checkpoint_dir: data/dma-kws/exp/stage2_adapt_v42/hey_eva_joint/joint/checkpoints/adapt_hey_eva_v42_joint/version_0
+joint_sampling_weights: '{"background_generic": 0.05, "background_target": 0.05, "libri_negative":
+  0.15, "libri_positive": 0.25, "real_negative": 0.15, "real_positive": 0.15, "tts_negative":
+  0.1, "tts_positive": 0.1}'
+joint_data_signature: bee1719d4c7043ce0ab46c96be05c98f6fa47f0001054571b8de85d133bf741a
+background_data_signature_version: 2
+background_data_signature: 0e74f01597681f7906512ffd1508269afd4cf39d484770f7e17d4d498a6497fe
+vocab_size: 71
+freeze_encoder: true
+init_checkpoint: data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-zh-en/checkpoints/SS-zh-en/version_0/stage2_step003000.pt
+require_full_qbyt_init: true

@@ -1,0 +1,12 @@
+- +experiment=icefall_zipformer_stage2_v2_musan_cached_zhen3m_stream_50k
+- prep.keyword=hey eva
+- prep.keyword_phonemes=HH EY1 IY1 V AH0
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/v2-musan-zhen3m-stream-50k/v2-musan-zhen3m-stream-50k/version_1/stage2_step050000.pt
+- prep.musan_root=outputs/tts/hey_eva
+- prep.musan_audio_list_path=/home/ubuntu/dma-kws/outputs/v41_keyword_eval/list_tts-v2-zh-eva.txt
+- prep.window_sec=3.0
+- prep.hop_sec=3.0
+- prep.batch_size=64
+- prep.num_workers=4
+- prep.amp=fp16
+- prep.output_dir=/home/ubuntu/dma-kws/data/dma-kws/exp/stage2_qbyt/fa/tts-v2-zh-eva

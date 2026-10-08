@@ -1,0 +1,8 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+- +stage2.qbyt_readout.sink_readout=additive
+- +stage2.qbyt_readout.sink_zero_init=true
+- prep.checkpoint=data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-R1/checkpoints/SS-R1/version_0/stage2_step003000.pt.sinkfit.pt
+- prep.output_dir=outputs/v41_sinkhead_stage2/probe_sinkfit_SS-R1
+- +prep.output_name=probe.npz
+- prep.batch_size=128
+- prep.num_workers=4

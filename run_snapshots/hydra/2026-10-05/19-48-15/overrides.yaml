@@ -1,0 +1,12 @@
+- +experiment=adapt_hey_eva_v42
+- prep.keyword='hey eva'
+- prep.keyword_phonemes='HH EY1 IY1 V AH0'
+- prep.musan_root=/home/ubuntu/dma-kws/data/dma-kws/raw/LibriSpeech
+- prep.musan_audio_list_path=outputs/hey_eva_window_probe/librispeech_subset.list
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-zh-en/checkpoints/SS-zh-en/version_0/stage2_step003000.pt
+- prep.window_sec=2.0
+- prep.hop_sec=2.0
+- prep.batch_size=64
+- prep.num_workers=4
+- prep.amp=fp16
+- prep.output_dir=outputs/hey_eva_window_probe/cells/base_librispeech_w2

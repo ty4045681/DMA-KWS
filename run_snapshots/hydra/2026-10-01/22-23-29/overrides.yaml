@@ -1,0 +1,5 @@
+- +experiment=v1_eval_author_si
+- prep.stage2_ckpt=data/dma-kws/exp/author_v1/stage2_v1_si.pt
+- prep.manifest=data/dma-kws/exp/author_v1/manifest_lp100_1word.csv
+- prep.batch_size=8
+- prep.stage2_clip_output_dir=outputs/eval_v1_author_si

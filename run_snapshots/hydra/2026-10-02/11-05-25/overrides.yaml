@@ -1,0 +1,11 @@
+- +experiment=v1_eval_author_si
+- prep.stage2_ckpt=data/dma-kws/exp/author_v1/stage2_v1_si.pt
+- prep.keyword=hey eva
+- prep.keyword_phonemes=HH EY1 IY1 V AH0
+- prep.musan_root=data/dma-kws/raw/musan
+- prep.musan_audio_list_path=data/dma-kws/processed/musan_split/eval_musan.list
+- prep.window_sec=3.0
+- prep.hop_sec=3.0
+- prep.batch_size=8
+- prep.num_workers=8
+- prep.output_dir=data/dma-kws/exp/stage2_qbyt/fa/author-v1-musan

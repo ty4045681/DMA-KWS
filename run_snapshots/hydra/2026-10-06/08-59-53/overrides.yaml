@@ -1,0 +1,5 @@
+- +experiment=adapt_hey_eva_v42
+- prep.manifest=outputs/hey_eva_v42_eval/real_eval_clips.csv
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/final/R1-unfreeze-hardneg100/checkpoints/R1-unfreeze-hardneg100/version_0/stage2_step012500.pt
+- prep.output_dir=outputs/hey_eva_v42_eval/real_r1bare
+- run.device=cuda

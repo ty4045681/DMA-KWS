@@ -1,0 +1,6 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.stage=train
+- adapt.train_phases=[real]
+- adapt.exp_root=outputs/hey_eva_v42_base
+- run.limit_steps=2
+- adapt.validation.val_check_interval=2

@@ -1,0 +1,12 @@
+- +experiment=adapt_hey_eva_v42
+- prep.keyword=hey eva
+- prep.keyword_phonemes=HH EY1 IY1 V AH0
+- prep.musan_root=1.0
+- prep.musan_audio_list_path=data/dma-kws/raw/musan
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_adapt_v42/c1_qbytfull/stage2_adapted.pt
+- prep.window_sec=musan1s-musan-1s0
+- prep.hop_sec=1.0
+- prep.batch_size=64
+- prep.num_workers=4
+- prep.amp=fp16
+- prep.output_dir=outputs/hey_eva_v42_eval/fa_c1qbytfull-1.0

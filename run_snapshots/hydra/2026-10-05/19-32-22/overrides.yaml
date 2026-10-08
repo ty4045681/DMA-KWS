@@ -1,0 +1,3 @@
+- +experiment=adapt_hey_eva_v42
+- prep.checkpoint=data/dma-kws/exp/stage2_adapt_v42/hey_eva_joint/stage2_adapted.pt
+- prep.output_dir=outputs/hey_eva_v42_sinkfit/probe_joint

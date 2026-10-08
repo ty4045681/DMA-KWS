@@ -1,0 +1,6 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+- prep.manifest=/tmp/heyeva_pos.csv
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/v41-musan-zhen3m-50k/v41-musan-zhen3m-50k/version_9/stage2_step047500.pt
+- run.device=cpu
+- prep.amp=off
+- prep.output_dir=/tmp/heyeva_eval_v41zhen

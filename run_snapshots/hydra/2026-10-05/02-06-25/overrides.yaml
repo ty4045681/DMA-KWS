@@ -1,0 +1,9 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+- +stage2.qbyt_readout.sink_readout=additive
+- +stage2.qbyt_readout.sink_zero_init=true
+- stage2.qbyt_readout.text_position=sinusoidal
+- prep.checkpoint=data/dma-kws/exp/stage2_qbyt/final/C2-sinusoidal-50k/checkpoints/C2-sinusoidal-50k/version_0/stage2_step042500.pt
+- prep.output_dir=outputs/v41_final/C2-sinusoidal-50k
+- +prep.output_name=C2_probe.npz
+- prep.batch_size=128
+- prep.num_workers=8

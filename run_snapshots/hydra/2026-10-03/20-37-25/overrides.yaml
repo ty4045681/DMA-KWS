@@ -1,0 +1,12 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+- prep.keyword=hey eva
+- prep.keyword_phonemes=HH EY1 IY1 V AH0
+- prep.musan_root=data/dma-kws/raw/musan
+- prep.musan_audio_list_path=outputs/v41_bucket_probe/musan60.list
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/v41-musan-zhen3m-50k/v41-musan-zhen3m-50k/version_9/stage2_step047500.pt
+- prep.window_sec=3.0
+- prep.hop_sec=3.0
+- prep.batch_size=64
+- prep.num_workers=8
+- prep.amp=fp16
+- prep.output_dir=outputs/v41_bucket_probe/fa_orig

@@ -1,0 +1,10 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.train_phases=[real]
+- adapt.exp_root=outputs/hey_eva_v42_base
+- run.limit_steps=2
+- adapt.validation.val_check_interval=2
+- adapt.keyword='hey eva'
+- adapt.method=lora
+- run.device=cuda
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-zh-en/checkpoints/SS-zh-en/version_0/stage2_step003000.pt
+- adapt.phase=real

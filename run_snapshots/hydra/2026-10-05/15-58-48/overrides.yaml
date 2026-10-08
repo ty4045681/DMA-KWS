@@ -1,0 +1,8 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.stage=train
+- adapt.train_phases=[real]
+- adapt.exp_root=data/dma-kws/exp/stage2_adapt_v42/hey_eva_repair
+- adapt.max_steps=500
+- adapt.learning_rate=1.0e-4
+- adapt.mix_ratio=0.35
+- stage2.background_negative.probability=0.75

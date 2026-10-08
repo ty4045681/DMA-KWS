@@ -1,0 +1,13 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_gs_50k
+- +stage2.qbyt_readout.sink_readout=additive
+- +stage2.qbyt_readout.sink_zero_init=true
+- stage2.learning_rate=5e-4
+- stage2.warmup_steps=500
+- stage2.max_steps=50000
+- stage2.total_scheduler_steps=50000
+- stage2.validation.val_check_interval=2500
+- stage2.val_check_interval=2500
+- stage2.num_workers=2
+- stage2.run_name=V42-gsfinetune
+- stage2.checkpoint_dir=data/dma-kws/exp/stage2_qbyt/v42_encoders/V42-gsfinetune/checkpoints
+- stage2.log_dir=data/dma-kws/exp/stage2_qbyt/v42_encoders/V42-gsfinetune/logs

@@ -1,0 +1,8 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+- stage2.parquet_file=data/dma-kws/processed/stage2_qbyt/ls-gs-1460/aggregated_segments_with_g2p_distance.parquet
+- stage2.batch_size_per_gpu=128
+- stage2.num_workers=8
+- stage2.validation.val_check_interval=1000000
+- stage2.checkpoint.every_n_train_steps=1000000
+- run.limit_steps=40
+- run.devices=1

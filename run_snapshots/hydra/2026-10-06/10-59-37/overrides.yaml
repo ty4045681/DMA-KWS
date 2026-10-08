@@ -1,0 +1,11 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.stage=train
+- adapt.train_phases=[joint]
+- adapt.phase=joint
+- adapt.exp_root=data/dma-kws/exp/stage2_adapt_v42/screen_r64_1e3
+- adapt.max_steps=600
+- adapt.rank=64
+- adapt.alpha=128
+- adapt.learning_rate=1e-3
+- stage2.background_negative.probability=0.4
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-R1/checkpoints/SS-R1/version_0/stage2_step003000.pt

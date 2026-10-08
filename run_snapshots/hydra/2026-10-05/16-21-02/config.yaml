@@ -1,0 +1,550 @@
+paths:
+  librispeech_root: data/dma-kws/raw/LibriSpeech
+  processed_root: data/dma-kws/processed
+  feature_root: data/dma-kws/features
+  exp_root: data/dma-kws/exp
+  libriphrase100_root: data/dma-kws/raw/LibriPhrase-100
+tokenizer:
+  dict_path: data/dict/lang_char.txt
+  split_with_space: ' '
+training:
+  seed: 2025
+  recipe: icefall-zipformer-frozen-eps-softmin-v41
+fbank:
+  num_mel_bins: 80
+  frame_length: 25
+  frame_shift: 10
+  dither: 0.0
+  window_type: povey
+  backend: lhotse_fbank
+  target_sample_rate: 16000
+  snip_edges: false
+  low_freq: 20.0
+  high_freq: -400.0
+stage1:
+  encoder_type: icefall_zipformer
+  num_encoder_layers: 1,1,1,1,1,1
+  encoder_dim: 128,128,128,128,128,128
+  encoder_unmasked_dim: 128,128,128,128,128,128
+  downsampling_factor: 1,2,4,8,4,2
+  feedforward_dim: 192,192,192,192,192,192
+  num_heads: 4,4,4,8,4,4
+  query_head_dim: '32'
+  value_head_dim: '12'
+  pos_head_dim: '4'
+  pos_dim: 48
+  cnn_module_kernel: 15,15,15,15,15,15
+  attention_dropout_rate: 0.0
+  dropout_rate: 0.1
+  use_icefall_dropout_schedule: true
+  causal: true
+  stream:
+    train_policy: match
+    train_chunk_size: 16,32,64,-1
+    train_left_context_frames: 64,128,256,-1
+    chunk_size: 16
+    left_context_frames: 64
+  warmup_batches: 4000.0
+  input_dim: 80
+  attention_heads: 4
+  linear_units: 576
+  num_blocks: 6
+  positional_dropout_rate: 0.1
+  cnn_module_norm: batch_norm
+  use_dynamic_chunk: false
+  use_dynamic_left_chunk: false
+  gradient_checkpointing: false
+  cmvn: null
+stage2:
+  encoder_output_dim: 128
+  qbyt_embed_dim: 128
+  qbyt_layers: 2
+  qbyt_readout_version: 4
+  qbyt_alignment:
+    topology: keyword_filler_segmental_crf_v1
+    min_phone_duration_frames: 1
+    max_phone_duration_frames: 8
+    max_inter_phone_gap_frames: 3
+    max_keyword_span_frames: 30
+    local_context_kernel: 5
+    weakest_phone_temperature: 0.2
+    weakest_phone_weight: 1.0
+  negative_ratio: 1
+  learning_rate: 0.0004
+  warmup_steps: 500
+  total_scheduler_steps: 50000
+  accumulate_grad_batches: 1
+  precision: 16-mixed
+  optimizer: adam
+  weight_decay: 0.0
+  strategy: auto
+  find_unused_parameters: true
+  gradient_diagnostics:
+    enabled: false
+    max_steps: 5
+  gradient_clip_val: 1.0
+  log_interval: 10
+  val_check_interval: 2500
+  freeze_encoder: true
+  noise_augmentation:
+    enabled: false
+    probability: 0.3
+    waveform_dir: ''
+    noise_list_path: ''
+    snr_db_min: 10.0
+    snr_db_max: 20.0
+  sequence_loss:
+    target_mode: ordered_contiguous_prefix
+    progress_weight: 0.3
+    normalization: sample
+  negative_tail_loss:
+    enabled: true
+    weight: 0.5
+    fraction: 0.1
+  sink_loss:
+    enabled: false
+    weight: 0.25
+    form: bce
+    temperature: 1.0
+  background_negative:
+    enabled: true
+    probability: 0.25
+    audio_list_path: ''
+    duration_seconds_min: 1.0
+    duration_seconds_max: 3.0
+    mode: fbank_cache
+    cache_manifest: ''
+    max_open_shards: 8
+    sources:
+    - id: musan
+      weight: 1.0
+      manifest: ${paths.processed_root}/background/musan/recordings.jsonl
+      cache_manifest: ${paths.processed_root}/background/musan/cache/manifest.json
+    validation:
+      enabled: false
+      samples_per_source: 256
+      seed: 2025
+  metadata_cache:
+    max_entries: 128
+    max_bytes: 33554432
+  phoneme_adapter:
+    enabled: false
+    init_checkpoint: ''
+    freeze: false
+    ctc_weight: 0.0
+    ctc_dropout: 0.0
+    expose_posterior: false
+    trunk:
+      type: conv
+      output_dim: 192
+      num_layers: 2
+      kernel_size: 7
+      dropout: 0.1
+  checkpoint_dir: ${paths.exp_root}/stage2_adapt_v42/hey_eva
+  log_dir: ${paths.exp_root}/stage2_adapt_v42/hey_eva
+  run_name: hey_eva_v42
+  dataloader:
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+  ema:
+    enabled: false
+    decay: 0.999
+    start_step: 0
+  console:
+    rich: true
+    device_stats: false
+    throughput: false
+    refresh_rate: null
+    leave: true
+  logging:
+    backends:
+    - csv
+    - tensorboard
+    grad_norm: true
+    wandb:
+      project: dma-kws
+      mode: online
+    trackio:
+      project: dma-kws
+  validation:
+    batch_size: 128
+    val_check_interval: 2500
+    ece_num_bins: 15
+  eval:
+    fbank:
+      dither: 0.0
+    split: hard
+    aggregate_csv: evaluation_set/test_all_phrase.csv
+    batch_size: 128
+    fbank_dir: ${paths.feature_root}/fbank_icefall_kws_eval
+    num_workers: 4
+  checkpoint:
+    every_n_train_steps: 200
+    save_top_k: 3
+    monitor: val_target_auc
+    mode: max
+  init_checkpoint: ${oc.env:ZHEN_KWS_CHECKPOINT,data/dma-kws/raw/kws-checkpoints/zh-en-3M-2025-12-20/pretrained-epoch-13-avg-2.pt}
+  parquet_file: ${paths.processed_root}/stage2_qbyt/ls-gs-1460/aggregated_segments_with_g2p_distance.parquet
+  wav_dir: ${paths.feature_root}/fbank_icefall_kws
+  hard_negative_ratio: 1
+  sample_lens: 100000000
+  batch_size_per_gpu: 64
+  num_workers: 4
+  max_steps: 50000
+  qbyt_readout:
+    mode: eps_softmin
+    temperature: 1.0
+    sink_token: true
+    text_position: learned
+    audio_position: relative_bias
+    relative_num_buckets: 32
+    relative_max_distance: 64
+    sink_readout: additive
+    sink_zero_init: true
+    temperature_learnable: false
+    score_temperature: null
+  freeze_all_but_sink: false
+phoneme_adapter:
+  trunk:
+    type: conv
+    output_dim: 192
+    num_layers: 2
+    kernel_size: 7
+    dropout: 0.1
+  ctc_dropout: 0.0
+  expose_posterior: false
+  init_checkpoint: ''
+  adapter_init_checkpoint: ''
+  train_manifest: ''
+  dev_manifest: ''
+  batch_size_per_gpu: 32
+  num_workers: 4
+  max_steps: 60000
+  learning_rate: 0.001
+  optimizer: adamw
+  weight_decay: 0.01
+  warmup_steps: 500
+  total_scheduler_steps: 60000
+  accumulate_grad_batches: 1
+  precision: bf16-mixed
+  strategy: auto
+  find_unused_parameters: false
+  gradient_clip_val: 5.0
+  log_interval: 50
+  val_check_interval: 2000
+  checkpoint_dir: ${paths.exp_root}/phoneme_adapter/checkpoints
+  log_dir: ${paths.exp_root}/phoneme_adapter/logs
+  run_name: phoneme_adapter_ctc
+  dataloader:
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+  validation:
+    val_check_interval: 2000
+    num_decode_batches: 0
+    batch_size: 32
+  console:
+    rich: true
+    device_stats: false
+    throughput: false
+    refresh_rate: null
+    leave: true
+  logging:
+    backends:
+    - csv
+    - tensorboard
+    wandb:
+      project: dma-kws
+      mode: online
+  checkpoint:
+    every_n_train_steps: 2000
+    save_top_k: 3
+    monitor: val/per
+    mode: min
+demo:
+  stage1_candidate_margin_sec: 0.15
+  qbyt_threshold: 0.5
+  min_stage2_encoder_frames: 1
+run:
+  device: cuda
+  devices: 1
+  limit_steps: 0
+  resume_from: ''
+  init_checkpoint: ''
+  resume_checkpoint: ''
+  train_manifest: ''
+  dev_manifest: ''
+prep:
+  manifest: ''
+  output_dir: outputs/eval_two_stage_kws
+  stage2_clip_output_dir: outputs/eval_stage2_clips
+  plot_curves: true
+  plot_dpi: 160
+  plot_min_recall: null
+  plot_max_fpr: null
+  per_output_dir: outputs/eval_phoneme_adapter_per
+  per_reference_column: text_variant
+  per_label_filter: null
+  limit: 0
+  input_format: librispeech-dir
+  parquet_root: ''
+  parquet_split: ''
+  parquet_audio_dir: ''
+  dev_parquet_root: ''
+  dev_parquet_split: ''
+  dev_parquet_audio_dir: ''
+  input_parquet: ''
+  decoded_parquet_root: ''
+  dataset_root: ''
+  output_subdir: ''
+  limit_anchors: 0
+  force_g2p_recompute: false
+  num_workers: 0
+  use_rich: true
+  train_manifest: ''
+  dev_manifest: ''
+  fbank_root: ''
+  audio_root: ''
+  waveform_dir: ''
+  no_skip_existing: false
+  test_dir: ''
+  from_csv: false
+  log_interval: 1000
+  checkpoint: ''
+  split: hard
+  batch_size: 0
+  input_dir: ''
+  pattern: '*.ckpt'
+  last_k: 10
+  output: ''
+  stage1_ckpt: ''
+  stage2_ckpt: data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-zh-en/checkpoints/SS-zh-en/version_0/stage2_step003000.pt
+  stage2_calibration: ''
+  audio_export:
+    mode: disabled
+    count: 5
+    seed: 2025
+  musan_root: ''
+  musan_audio_list_path: ''
+  musan_mix:
+    seed: 2025
+    noise:
+      enabled: false
+      snr_db: 20.0
+    music:
+      enabled: false
+      snr_db: 20.0
+    speech:
+      enabled: false
+      relative_db: 0.0
+    stationary_noise:
+      enabled: false
+      kind: white_gaussian
+      snr_db: 20.0
+    burst_noise:
+      enabled: false
+      snr_db: 10.0
+      snr_scope: active_event
+      event_count_min: 1
+      event_count_max: 1
+      duration_ms_min: 100.0
+      duration_ms_max: 400.0
+      fade_ms: 10.0
+      allow_overlap: false
+      min_gap_ms: 50.0
+    volume_variation:
+      enabled: false
+      low_gain_db: -12.0
+      high_gain_db: 6.0
+      segment_ms_min: 250.0
+      segment_ms_max: 750.0
+      transition_ms: 50.0
+  audio_aug:
+    seed: 2025
+    speed_length_policy: variable
+    pcm_policy: clip_round_each_stage
+    allow_signal_mimic_overlap: false
+    transforms:
+      volume_gain:
+        enabled: false
+        gain_db: 3.0
+      speed_change:
+        enabled: false
+        speed_factor: 1.05
+      noise_mix:
+        enabled: false
+        snr_db: 30.0
+        snr_mode: exact_rms
+      subband_eq:
+        enabled: false
+        low_min_gain_db: -3.0
+        high_min_gain_db: -5.0
+      band_limit:
+        enabled: false
+        mode: iir
+        cutoff_hz: 6500.0
+        filter_order: 4
+        target_sample_rate: 8000
+      narrowband:
+        enabled: false
+        target_sample_rate: 12000
+      spectral_mask:
+        enabled: false
+        frequency_masks: 1
+        time_masks: 0
+        min_gain: 0.6
+        max_gain: 0.9
+      amp_distortion:
+        enabled: false
+        distortion_type: gain_db
+        rate: 0.25
+        gain_db: 3.0
+        max_db: -0.03
+        mask_number: 4
+        a: 1.0
+        m: 1
+        'n': 1
+      signal_mimic:
+        enabled: false
+        subband_probability: 0.6
+        mute_probability: 0.0
+        band_limit_probability: 0.0
+        spectral_mask_probability: 0.0
+        narrowband_probability: 0.0
+  window_sec: 3.0
+  hop_sec: 3.0
+  amp: false
+  fbank_windows: independent
+  num_shards: 1
+  shard_index: 0
+  audio: ''
+  keyword: ''
+  keyword_phonemes: ''
+  keyword_mode: single
+  keywords: []
+  keyword_labels: {}
+  keyword_eval:
+    mode: per_row
+    targets: []
+    query_batch_size: 64
+  skip_unmatched: true
+  match_casefold: true
+  recursive: true
+  manifest_format: auto
+  label: ''
+  sink_diagnostics:
+    mode: clips
+    capture_layers: all
+    capture_heads: all
+    save_traces: true
+    save_full_attention: false
+    ablations:
+    - block_sink_all
+    - block_sink_each_layer
+    max_combined_tokens: 1024
+    max_attention_bytes: 268435456
+    parity_atol: 1.0e-05
+    parity_rtol: 0.0001
+    max_report_samples: 40
+    plot_dpi: 160
+    length_bins:
+    - 0
+    - 100
+    - 200
+    - 400
+    - 800
+    group_field: condition
+    synthetic_fixture: false
+  recompute_distances:
+    input_parquet: ''
+    output_parquet: ''
+    top_k: 100
+    block_size: 1000
+    workers: -1
+    strip_stress: true
+  manifest_csv: data/dma-kws/processed/adapt/hey_eva_v42/source/combined.csv
+adapt:
+  method: lora
+  keyword: hey eva
+  slug: hey_eva_v42
+  phase: tts
+  train_phases:
+  - real
+  joint:
+    real_fraction: 0.6
+    background_keyword_fraction: 0.5
+    background_eval_list: ''
+    background_val_samples: 512
+    background_eval_seed: 2026
+  stage: train
+  data_root: data/dma-kws/processed/adapt/hey_eva_v42
+  exp_root: data/dma-kws/exp/stage2_adapt_v42/hey_eva_realonly
+  sources:
+    tts:
+      positive_dir: ''
+      negative_root: ''
+    real:
+      positive_dir: ''
+      negative_root: ''
+  rank: 16
+  alpha: 32
+  lr: null
+  learning_rate: 0.0004
+  encoder_learning_rate: 3.0e-06
+  encoder_schedule:
+    start_batch_count: 100000.0
+    reference_duration: 600.0
+  optimizer: adam
+  weight_decay: 0.0
+  warmup_steps: 100
+  max_steps: 1500
+  mix_ratio: 0.5
+  sample_lens: 64000
+  batch_size_per_gpu: 64
+  val_batch_size: 64
+  num_workers: 4
+  val_num_workers: 2
+  eval_fraction: 0.2
+  eval_seed: 2025
+  init_checkpoint: ''
+  params_file: ''
+  checkpoint_monitor: val_target_auc
+  checkpoint_filename: step_{step:06d}_target_auc_{val_target_auc:.6f}
+  lora_targets:
+  - in_proj_weight
+  - out_proj.weight
+  validation:
+    val_check_interval: 300
+    limit_val_batches: null
+  console:
+    rich: true
+    device_stats: false
+    throughput: false
+    refresh_rate: null
+    leave: true
+  logging:
+    backends:
+    - csv
+    - tensorboard
+    wandb:
+      project: dma-kws
+      mode: online
+    trackio:
+      project: dma-kws
+  sweep:
+    enabled: false
+    n_trials: 20
+    lambda_forget: 1.0
+    lph_subset: 2000
+    search_mix: false
+    single_phase: false
+    plot_curves: true
+    plot_dpi: 160
+    plot_min_recall: null
+    plot_max_fpr: null
+    storage: ''
+    study_name: ''
+locator:
+  type: phoneme_ctc
+  frame_shift_sec: 0.04

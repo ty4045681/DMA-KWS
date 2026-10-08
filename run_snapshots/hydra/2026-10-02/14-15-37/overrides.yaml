@@ -1,0 +1,16 @@
+- +experiment=v1_paper_ls_gs1460
+- run.device=cpu
+- run.devices=1
+- run.limit_steps=3
+- stage2.parquet_file=data/dma-kws/processed/stage2_qbyt/ls-gs-1460/aggregated_segments_with_g2p_distance.parquet
+- stage2.wav_dir=data/dma-kws/features/fbank
+- stage2.batch_size_per_gpu=4
+- stage2.num_workers=0
+- stage2.max_steps=3
+- stage2.total_scheduler_steps=3
+- stage2.val_check_interval=3
+- stage2.eval.test_dir=/tmp/v1_smoke/eval
+- stage2.eval.batch_size=4
+- run.init_checkpoint=data/dma-kws/exp/author_v1/stage2_v1_si.pt
+- stage2.checkpoint_dir=/tmp/v1_smoke/ckpt
+- stage2.log_dir=/tmp/v1_smoke/logs

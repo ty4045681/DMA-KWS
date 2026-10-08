@@ -1,0 +1,4 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.stage=train
+- adapt.train_phases=[tts]
+- adapt.max_steps=600

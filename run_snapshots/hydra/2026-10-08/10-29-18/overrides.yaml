@@ -1,0 +1,13 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.stage=train
+- adapt.train_phases=[joint]
+- adapt.phase=joint
+- adapt.exp_root=data/dma-kws/exp/stage2_adapt_v42/gsstream_encfull
+- adapt.max_steps=2100
+- adapt.method=encoder_qbyt_full
+- adapt.learning_rate=1e-4
+- adapt.encoder_learning_rate=5e-5
+- adapt.encoder_schedule.start_batch_count=20000
+- stage2.background_negative.probability=0.4
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-gsbase-stream/checkpoints/SS-gsbase-stream/version_0/stage2_step003000.pt
+- stage1.cnn_module_kernel='31,31,15,15,15,31'

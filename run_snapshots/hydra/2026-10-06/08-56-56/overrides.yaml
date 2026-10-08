@@ -1,0 +1,10 @@
+- +experiment=adapt_hey_eva_v42
+- adapt.train_phases=[joint]
+- adapt.exp_root=data/dma-kws/exp/stage2_adapt_v42/hey_eva_joint_r1
+- adapt.max_steps=2100
+- stage2.background_negative.probability=0.4
+- adapt.keyword='hey eva'
+- adapt.method=lora
+- run.device=cuda
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/sinkhead_stage2/SS-R1/checkpoints/SS-R1/version_0/stage2_step003000.pt
+- adapt.phase=joint

@@ -1,0 +1,2 @@
+- +experiment=icefall_zipformer_stage2
+- prep.from_csv=true

@@ -1,0 +1,5 @@
+- +experiment=v1_eval_author_si
+- prep.stage2_ckpt=/tmp/v1_smoke/ckpt/v1-ft-ls-gs-1460/version_0/stage2_step000003.pt
+- prep.manifest=data/dma-kws/exp/author_v1/manifest_lp100_1word.csv
+- prep.batch_size=8
+- prep.stage2_clip_output_dir=/tmp/v1_smoke/eval_out

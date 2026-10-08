@@ -1,0 +1,8 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+- stage2.qbyt_readout.text_position=sinusoidal
+- prep.checkpoint=data/dma-kws/exp/stage2_qbyt/checkpoints/v41-musan-zhen3m-50k/v41-musan-zhen3m-50k/version_9/stage2_step047500.pt
+- prep.output_dir=outputs/v41_offline_probe
+- +prep.allow_readout_mismatch=true
+- +prep.output_name=hard_probe_sinusoidal.npz
+- prep.batch_size=128
+- prep.num_workers=8

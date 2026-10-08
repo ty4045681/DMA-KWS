@@ -1,0 +1,9 @@
+- +experiment=paper_ls_gs1460
+- prep.input_parquet=data/dma-kws/raw/GigaPhrase-1000/aggregated_segments_with_g2p_distance.parquet
+- prep.decoded_parquet_root=data/dma-kws/raw/LibriPhrase-GS-1460/decoded
+- prep.output_subdir=/tmp/wenet_prep_test/out
+- +prep.fbank_dir=/tmp/wenet_prep_test/fbank
+- fbank.dither=0.0
+- prep.limit_anchors=3
+- prep.num_workers=2
+- prep.use_rich=false

@@ -1,0 +1,8 @@
+- +experiment=icefall_zipformer_stage2_zhen3m
+- stage2.precision=16-mixed
+- +stage2.eval.test_dir=/tmp/eval_small
+- +stage2.eval.num_workers=8
+- stage2.validation.val_check_interval=20
+- stage2.checkpoint.every_n_train_steps=1000000
+- run.limit_steps=25
+- run.devices=1

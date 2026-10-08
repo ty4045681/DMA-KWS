@@ -1,0 +1,6 @@
+- +experiment=v1_eval_author_si
+- prep.stage2_ckpt=data/dma-kws/exp/author_v1/stage2_v1_si.pt
+- prep.manifest=data/dma-kws/exp/stage2_qbyt/eval_author_v1/lp-hard/input_shard_0.csv
+- prep.batch_size=8
+- prep.num_workers=2
+- prep.output_dir=data/dma-kws/exp/stage2_qbyt/eval_author_v1/lp-hard/shard_0

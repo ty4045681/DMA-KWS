@@ -1,0 +1,4 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached
+- stage2.precision=16-mixed
+- run.limit_steps=1
+- run.devices=1

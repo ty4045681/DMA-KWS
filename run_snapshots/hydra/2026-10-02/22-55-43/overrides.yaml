@@ -1,0 +1,6 @@
+- +experiment=icefall_zipformer_stage2_v3_musan_cached_paperstage1_50k
+- stage2.eval.fbank_dir=/tmp/wenet_eval_test
+- fbank.dither=0.0
+- prep.from_csv=true
+- prep.limit=20
+- prep.num_workers=2

@@ -1,0 +1,45 @@
+learning_rate: 0.0005
+optimizer: adam
+weight_decay: 0.0
+warmup_steps: 500
+max_steps: 50000
+batch_size_per_gpu: 128
+accumulate_grad_batches: 1
+seed: 2025
+recipe: frozen-wenet-encoder
+val_check_interval_train_batches: 2500
+val_check_interval_optimizer_steps_approx: 2500
+qbyt_readout_version: 4
+qbyt_readout_mode: eps_softmin
+qbyt_readout_temperature: 1.0
+qbyt_deployment_threshold: 0.5
+score_ece_num_bins: 15
+seq_target_mode: ordered_contiguous_prefix
+seq_progress_weight: 0.3
+seq_normalization: sample
+run_id: v41-musan-paperstage1-50k/version_1
+run_version: 1
+run_section: stage2
+parent_run_id: ''
+resume_from: ''
+checkpoint_dir: data/dma-kws/exp/stage2_qbyt/checkpoints/v41-musan-paperstage1-50k/v41-musan-paperstage1-50k/version_1
+background_mode: fbank_cache
+background_source_ids:
+- musan
+background_source_weights:
+- 1.0
+background_source_index:
+  musan: 0
+background_source:musan:
+  background_source_id: musan
+  background_manifest: data/dma-kws/processed/background/musan/recordings.jsonl
+  background_cache_manifest: /mnt/datadisk0/dma-kws/processed/background/musan/cache_wenet/manifest.json
+  background_cache_id: 3b73024a08bbdbf4ad01a8563c1073bc32c7f066e38e125a265ab027fcdf28cd
+  background_cache_format_version: 2
+  background_recording_count: 774
+background_data_signature_version: 2
+background_data_signature: ec8a21f32c4879e6ddb956d0fc3b67cd2b189f9c43e7940db7d9b1169bfb6948
+vocab_size: 71
+freeze_encoder: true
+init_checkpoint: data/dma-kws/raw/kws-checkpoints/paper-stage1/ls-gs-1460.pt
+require_full_qbyt_init: false

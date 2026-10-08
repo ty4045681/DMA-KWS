@@ -1,0 +1,6 @@
+- +experiment=v1_eval_author_si
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/v1-ft-wenet-bg/v1-ft-wenet-bg/version_1/stage2_step005000.pt
+- prep.manifest=data/dma-kws/exp/stage2_qbyt/eval_v1_ft/wenet-bg-lp-hard/input_shard_3.csv
+- prep.batch_size=8
+- prep.num_workers=2
+- prep.output_dir=data/dma-kws/exp/stage2_qbyt/eval_v1_ft/wenet-bg-lp-hard/shard_3

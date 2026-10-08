@@ -1,0 +1,5 @@
+- +experiment=adapt_hey_eva_v42
+- prep.manifest=outputs/hey_eva_v42_eval/real_eval_clips.csv
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_adapt_v42/hey_eva_realonly/stage2_adapted.pt
+- prep.output_dir=outputs/hey_eva_v42_eval/real_realonly
+- run.device=cuda

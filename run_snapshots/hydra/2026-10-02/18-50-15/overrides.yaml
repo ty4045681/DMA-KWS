@@ -1,0 +1,13 @@
+- +experiment=v1_eval_author_si
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/v1-ft-icefall-control/v1-ft-icefall-control/version_0/stage2_step005000.pt
+- prep.keyword=hey eva
+- prep.keyword_phonemes=HH EY1 IY1 V AH0
+- prep.musan_root=data/dma-kws/raw/musan
+- prep.musan_audio_list_path=data/dma-kws/processed/musan_split/eval_musan.list
+- prep.window_sec=3.0
+- prep.hop_sec=3.0
+- prep.batch_size=8
+- prep.num_workers=2
+- prep.num_shards=4
+- prep.shard_index=3
+- prep.output_dir=data/dma-kws/exp/stage2_qbyt/fa/v1-ft-icefall-control-musan/shard_3

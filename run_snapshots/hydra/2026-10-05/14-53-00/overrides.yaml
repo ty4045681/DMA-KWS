@@ -1,0 +1,6 @@
+- +experiment=icefall_zipformer_stage2_v2_musan_cached_paperstage1_50k
+- prep.manifest=/home/ubuntu/dma-kws/outputs/v41_keyword_eval/manifest_google.jsonl
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/checkpoints/v2-musan-paperstage1-50k/v2-musan-paperstage1-50k/version_0/stage2_step050000.pt
+- prep.output_dir=/home/ubuntu/dma-kws/data/dma-kws/exp/stage2_qbyt/fa_clip/clip-v2-paper-google
+- prep.batch_size=64
+- prep.num_workers=2
