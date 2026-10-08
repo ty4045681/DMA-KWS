@@ -1,0 +1,13 @@
+- +experiment=adapt_hey_eva_v42
+- stage1.cnn_module_kernel='31,31,15,15,15,31'
+- prep.keyword=hey eva
+- prep.keyword_phonemes=HH EY1 IY1 V AH0
+- prep.musan_root=data/dma-kws/raw/musan
+- prep.musan_audio_list_path=data/dma-kws/processed/musan_split/eval_musan.list
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_adapt_v42/gsstream_qbytfull/stage2_adapted.pt
+- prep.window_sec=1.0
+- prep.hop_sec=1.0
+- prep.batch_size=64
+- prep.num_workers=4
+- prep.amp=fp16
+- prep.output_dir=outputs/hey_eva_v42_eval/fa_gsstream_qbytfull-musan-1s0

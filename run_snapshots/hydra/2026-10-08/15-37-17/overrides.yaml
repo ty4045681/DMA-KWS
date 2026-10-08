@@ -1,0 +1,5 @@
+- +experiment=v1_paper_ls460
+- prep.stage1_ckpt=data/dma-kws/exp/author_v1/stage1_v1.pt
+- prep.stage2_ckpt=data/dma-kws/exp/author_v1/stage2_v1_si.pt
+- prep.audio=wenet/test/resources/librispeech-1995-1837-0001.wav
+- prep.keyword=hello world

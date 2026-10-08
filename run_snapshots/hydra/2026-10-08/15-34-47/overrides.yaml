@@ -1,0 +1,6 @@
+- +experiment=icefall_zipformer_stage2_eps_softmin_v41_musan_cached_zhen3m_50k
+- +stage2.qbyt_readout.sink_readout=additive
+- +stage2.qbyt_readout.sink_zero_init=true
+- prep.stage2_ckpt=data/dma-kws/exp/stage2_qbyt/final/C1-sink-50k/checkpoints/C1-sink-50k/version_0/stage2_step050000.pt
+- prep.audio=wenet/test/resources/librispeech-1995-1837-0001.wav
+- prep.keyword=hello world

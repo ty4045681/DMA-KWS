@@ -13,8 +13,10 @@
       lightning/exp/<run>/version_N/hparams.yaml
       index.tsv                            # 快照 -> 源文件 -> sha256(前16位) -> 字节数
 
-共 1355 个快照文件：408 个 Hydra 运行（1224 个文件）+ 131 个 Lightning hparams
+共 1400 个快照文件：423 个 Hydra 运行（1269 个文件）+ 131 个 Lightning hparams
 （repo 侧 8 个，数据盘 `data/dma-kws/exp/` 侧 123 个，含 35 个 50k Stage II 正式 run）。
+
+统计口径：`wc -l < run_snapshots/index.tsv`（含表头）；每次 `--check` 报漂移时重新跑一遍收集器即可。
 
 ## 刷新
 
