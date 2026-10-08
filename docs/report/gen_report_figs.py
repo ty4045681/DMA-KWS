@@ -531,8 +531,8 @@ def fig7_3():
 
 # ================================================ 图 7-4 换编码器系复核
 def fig7_4():
-    fig = plt.figure(figsize=(8.0, 5.2))
-    gs = GridSpec(2, 3, figure=fig, height_ratios=[1.12, 1.0], hspace=0.78, wspace=0.42)
+    fig = plt.figure(figsize=(8.0, 6.4))
+    gs = GridSpec(3, 3, figure=fig, height_ratios=[1.05, 0.95, 0.80], hspace=0.80, wspace=0.42)
     arms = ["C1\n冻结", "C1 全参\n（交付）", "GS\n冻结", "GS 全参"]
     cols = [MGRAY, RED, LGREEN, GREEN]
 
@@ -606,8 +606,27 @@ def fig7_4():
     ax_d.tick_params(labelsize=7.4)
     ax_d.set_title("预算 1 次/小时：越靠左上越好", fontsize=8.4, pad=7)
 
-    fig.suptitle("换 GS-base 流式编码器系复核：配方可以迁移，近音词与通用能力仍要付代价", y=1.0, fontsize=10.2)
-    fig.text(0.5, 0.012, "同一可训范围下 C1 全面领先；GS-base 放开全参把 1 次/小时唤醒率追到 0.991，但近音词误触发是交付模型的 6.6 倍。",
+    # (e) 近音词误触发：同配方、同 encoder 学习率，encoder 来历决定守住多少
+    ax = fig.add_subplot(gs[2, :]); plabel(ax, "(e)", x=-0.075, y=1.06)
+    pos = [0.0, 1.0, 2.6, 3.8, 5.0]
+    vals = [0.0237, 0.1080, 0.1095, 0.1805, 0.2604]
+    cols_e = [RED, GREEN, "#A8CDE8", "#5FA3CF", BLUE]
+    labs = ["C1 全参\n（交付）", "GS-base\n全参", "R1 encoder\nlr 1e-5",
+            "R1 encoder\nlr 2e-5 +CVaR", "R1 encoder\nlr 5e-5"]
+    ax.bar(pos, vals, 0.7, color=cols_e)
+    for x, v in zip(pos, vals):
+        ax.text(x, v + 0.007, f"{v:.4f}", ha="center", va="bottom", fontsize=7.2, color=DARK)
+    ax.axvline(1.75, color=GRAY, lw=0.8, ls=":")
+    ax.text(0.5, 0.318, "原始 encoder 可训", ha="center", va="top", fontsize=7.0, color=DARK)
+    ax.text(3.8, 0.318, "通用微调 encoder 可训（R1 13.3k 步）", ha="center", va="top", fontsize=7.0, color=DARK)
+    ax.set_xticks(pos); ax.set_xticklabels(labs, fontsize=6.9)
+    ax.set_xlim(-0.8, 5.8); ax.set_ylim(0, 0.345)
+    ax.set_ylabel("近音词误触发率")
+    ax.tick_params(axis="y", labelsize=7.4)
+    ax.set_title("近音词误触发率（预算 0.05）：encoder 来历决定守住多少", fontsize=8.6, pad=8)
+
+    fig.suptitle("换编码器系复核：配方可以迁移，近音词与通用能力由 encoder 来历决定", y=1.0, fontsize=10.2)
+    fig.text(0.5, 0.012, "同一可训范围下 C1 全面领先；同为原始 encoder 可训，两系的近音词误触发是 0.024 与 0.108，被通用任务微调过的 R1 encoder 放开后升到 0.110 到 0.260。",
              ha="center", fontsize=7.8, color=DARK)
     fig.subplots_adjust(left=0.075, right=0.985, top=0.885, bottom=0.115)
 
