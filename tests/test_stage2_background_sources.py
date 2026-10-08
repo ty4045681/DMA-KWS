@@ -141,9 +141,15 @@ class _CountingRandom(random.Random):
         return super().random()
 
 
-class _ScriptedRandom(random.Random):
+class _ScriptedRandom:
+    """Minimal scripted RNG; only random() is used by the sampler.
+
+    Do not subclass random.Random here: its C constructor seeds itself from the
+    first positional argument, so building it from a list of draws raises
+    TypeError: unhashable type: 'list' before __init__ runs.
+    """
+
     def __init__(self, values: list[float]) -> None:
-        super().__init__(0)
         self._values = list(values)
 
     def random(self) -> float:
