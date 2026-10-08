@@ -54,3 +54,10 @@ work/
 .codegraph
 .commandcode
 .superpowers/
+
+# Keep the released-checkpoint manifest and notes tracked; weights stay ignored.
+!checkpoints/
+checkpoints/*
+!checkpoints/manifest.tsv
+!checkpoints/README.md
+!checkpoints/RELEASE_NOTES.md
